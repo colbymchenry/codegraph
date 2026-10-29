@@ -197,7 +197,10 @@ describe('codegraph_explore output respects the adaptive budget', () => {
     const result = await handler.execute('codegraph_explore', { query: 'Session method helper' });
     const text = result.content?.[0]?.text ?? '';
     expect(text).not.toContain('### Additional relevant files');
-    expect(text).not.toContain('Complete source code is included above');
+    // The completeness note, which reads "Complete source for 1 file is
+    // included above…" on this fixture ("Verbatim source for N files…" after
+    // a trim).
+    expect(text).not.toContain('is included above');
     expect(text).not.toContain('advisory only, NOT a quota');
   });
 
@@ -213,6 +216,9 @@ describe('codegraph_explore output respects the adaptive budget', () => {
       const text = result.content?.[0]?.text ?? '';
       expect(text).toContain('advisory only, NOT a quota');
       expect(text).toContain('extra calls are never rejected or rate-limited');
+      // The completeness note is on here, so the small tier's check for its
+      // absence above still names text the note has.
+      expect(text).toContain('is included above');
       expect(text).not.toContain('remaining calls');
       expect(text).not.toContain('Synthesize once');
     } finally {

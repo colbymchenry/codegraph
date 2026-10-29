@@ -764,6 +764,86 @@ function main() {
     const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
     expect(calls.some((c) => c.referenceName === 'processData')).toBe(true);
   });
+
+  // tree-sitter-typescript parses `await f<T>(x)` as a call whose callee is
+  // `await f`, so the ref was named `await f` and matched nothing (#2586).
+  it.each([['user.ts'], ['user.tsx']])('an awaited call with type arguments names its callee: %s (#2586)', (file) => {
+    const code = [
+      'export async function awaited() { return await fetchApi<User>("/me"); }',
+      'export async function assigned() { const u = await fetchApi<User>("/me"); return u; }',
+      'export async function viaNamespace() { return await api.fetchApi<User>("/me"); }',
+      'export async function viaThis() { return await this.load<User>("/me"); }',
+      '',
+    ].join('\n');
+    const result = extractFromSource(file, code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const byFn = (name: string) => {
+      const fn = result.nodes.find((n) => n.name === name)!;
+      return calls.filter((c) => c.fromNodeId === fn.id).map((c) => c.referenceName);
+    };
+    expect(byFn('awaited')).toEqual(['fetchApi']);
+    expect(byFn('assigned')).toEqual(['fetchApi']);
+    expect(byFn('viaNamespace')).toEqual(['api.fetchApi']);
+    expect(byFn('viaThis')).toEqual(['load']);
+    expect(calls.some((c) => c.referenceName.startsWith('await'))).toBe(false);
+    // The reference sits where the callee starts, as for `await f(x)` — not on
+    // the `await`, which the call node starts at.
+    const lines = code.split('\n');
+    const columnOf = (name: string) => {
+      const fn = result.nodes.find((n) => n.name === name)!;
+      return calls.find((c) => c.fromNodeId === fn.id)!.column;
+    };
+    expect(columnOf('awaited')).toBe(lines[0]!.indexOf('fetchApi'));
+    expect(columnOf('viaNamespace')).toBe(lines[2]!.indexOf('api.fetchApi'));
+  });
+
+  it('an awaited generic call to a name a package exports links to nothing in the project (#2586)', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'app', dependencies: { 'idb-keyval': '6.2.1' } }));
+      fs.mkdirSync(path.join(dir, 'src'));
+      // excalidraw's `await get<SavedChats>(key, store)` from idb-keyval, beside
+      // a project class whose static `get` the name alone would match.
+      fs.writeFileSync(path.join(dir, 'src', 'storage.ts'),
+        'import { get } from "idb-keyval";\nexport async function load() { return await get<string>("k"); }\n');
+      fs.writeFileSync(path.join(dir, 'src', 'cache.ts'), 'export class Cache {\n  static get = (s: string) => s;\n}\n');
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const load = cg.getNodesByKind('function').find((n) => n.name === 'load')!;
+        expect(cg.getOutgoingEdges(load.id).filter((e) => e.kind === 'calls')).toEqual([]);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }, 60_000);
+
+  it.each([['user.ts'], ['user.tsx'], ['user.ets']])('an awaited generic call peels every await and skips comments: %s (#2586)', (file) => {
+    const code = [
+      'export async function chainedParen() { return (await fetchApi<User>("/me")).json(); }',
+      'export async function chainedThen() { return await api.get<User>("/me").then(r => r); }',
+      'export async function commented() { return await /* typed */ fetchApi<User>("/me"); }',
+      'export async function lineCommented() { return await // typed\n fetchApi<User>("/me"); }',
+      'export async function doubled() { return await await fetchApi<User>("/me"); }',
+      '',
+    ].join('\n');
+    const result = extractFromSource(file, code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const byFn = (name: string) => {
+      const fn = result.nodes.find((n) => n.name === name)!;
+      return calls.filter((c) => c.fromNodeId === fn.id).map((c) => c.referenceName).sort();
+    };
+    expect(byFn('commented')).toEqual(['fetchApi']);
+    expect(byFn('lineCommented')).toEqual(['fetchApi']);
+    expect(byFn('doubled')).toEqual(['fetchApi']);
+    expect(calls.some((c) => /^await|^\/[*/]/.test(c.referenceName))).toBe(false);
+    // ArkTS keeps its own chain encoding; TS/TSX name the inner callee.
+    if (file !== 'user.ets') {
+      expect(byFn('chainedParen')).toEqual(['fetchApi', 'fetchApi().json']);
+      expect(byFn('chainedThen')).toEqual(['api.get', 'api.get().then']);
+    }
+  });
 });
 
 describe('Arrow Function Export Extraction', () => {
@@ -1590,7 +1670,7 @@ impl From<u32> for Own {
     ).toBe(true);
   });
 
-  it('keeps the owner shape for `self.<method>()` and `self.<field>.<method>()`, and collapses every other receiver (#1585, #1861)', () => {
+  it('keeps the owner shape for `self.<method>()` and `self.<field>.<method>()`, a longer receiver chain whole, and collapses a parenthesized receiver (#1585, #1861, #2836)', () => {
     const code = `
 pub struct Outer { pub inner: Inner, pub deep: Deep }
 impl Outer {
@@ -1609,22 +1689,23 @@ impl Outer {
     const calls = result.unresolvedReferences
       .filter((r) => r.referenceKind === 'calls')
       .map((r) => r.referenceName);
-    // Two shapes keep an owner the resolver can act on: the single-hop field
-    // receiver, whose type it reads off the owner struct (#1585), and the bare
-    // `self` receiver, whose type is the calling method's own owner (#1861).
-    // `self.make().run()` contributes `self.make` — the inner call — and its
-    // OUTER call collapses, because a method's return type is not read here.
+    // The single-hop field receiver keeps its owner, whose type the resolver
+    // reads off the owner struct (#1585), and so does the bare `self`
+    // receiver, whose type is the calling method's own owner (#1861). A
+    // longer chain of fields and method calls is kept whole, a call written
+    // `name()` (#2836): `self.make().run()` contributes `self.make`, the inner
+    // call, and `self.make().run`.
     expect(calls.filter((c) => c.startsWith('self.')).sort()).toEqual([
+      'self.deep.inner.run',
       'self.inner.run',
       'self.make',
+      'self.make().run',
       'self.run',
     ]);
     // A local receiver keeps its name as before…
     expect(calls).toContain('local.run');
-    // …and the deeper chain, the call receiver and the parenthesized receiver
-    // still collapse to the method name. `self.run()` no longer does, so this
-    // is three rather than four.
-    expect(calls.filter((c) => c === 'run')).toHaveLength(3);
+    // …and the parenthesized receiver still collapses to the method name.
+    expect(calls.filter((c) => c === 'run')).toHaveLength(1);
     const outerRun = result.nodes.find((n) => n.qualifiedName === 'Outer::run');
     expect(outerRun).toBeDefined();
     const fieldRef = result.unresolvedReferences.find((r) => r.referenceName === 'self.inner.run');
@@ -5245,6 +5326,64 @@ import 'package:flutter/material.dart';
       expect(vars).toContain('heading');
     });
 
+    /* `{% capture name %}…{% endcapture %}` declares a variable as `assign`
+       does; only assigns were read (#2498). */
+    it.each([
+      ['{% capture captured %}Hello{% endcapture %}', 'captured', 1, 0],
+      ['{%- capture trimmed -%}Hi{%- endcapture -%}', 'trimmed', 1, 0],
+      ['{% capture tight-%}Hi{% endcapture %}', 'tight', 1, 0],
+      ["<p>{% capture 'single' %}Hi{% endcapture %}</p>", 'single', 1, 3],
+      ['{% capture "double" %}Hi{% endcapture %}', 'double', 1, 0],
+      ['{% liquid\n  capture bare\n    echo "Hi"\n  endcapture\n%}', 'bare', 2, 2],
+      ['{% liquid\r\n  capture crlf # a note\r\n  endcapture\r\n%}', 'crlf', 2, 2],
+      ["{%- liquid\n  capture 'quoted_line'\n  endcapture\n-%}", 'quoted_line', 2, 2],
+    ] as const)('reads a capture declaration from %j', (code, name, line, column) => {
+      const result = extractFromSource('sections/card.liquid', code);
+      const variables = result.nodes.filter((n) => n.kind === 'variable');
+      expect(variables.map((n) => [n.name, n.qualifiedName, n.startLine, n.startColumn]))
+        .toEqual([[name, `sections/card.liquid::${name}`, line, column]]);
+      const file = result.nodes.find((n) => n.kind === 'file')!;
+      expect(result.edges).toContainEqual({ source: file.id, target: variables[0]!.id, kind: 'contains' });
+    });
+
+    it('reads no capture from comments, raw regions, prose or a tag without a name', () => {
+      const code = [
+        '{% comment %}{% capture ghost %}x{% endcapture %}{% endcomment %}',
+        '{%- raw -%}{% capture ghost %}x{% endcapture %}{%- endraw -%}',
+        '{% # capture ghost %}',
+        '{% liquid', '  # capture ghost', '  comment', '  capture ghost', '  endcomment', '%}',
+        '{% capture %}x{% endcapture %}',
+        '<p>We capture ghost moments.</p>',
+        '{% assign text = "{% capture ghost %}" %}',
+      ].join('\n');
+      const result = extractFromSource('sections/card.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name)).toEqual(['text']);
+    });
+
+    it('never cuts a capture name short', () => {
+      // Liquid allows `-` and `.` in a name, which the assign rule doesn't read
+      // either; such a name gets no node rather than a wrong one.
+      const code = ['{% capture ghost-name %}x{% endcapture %}', '{% capture ghost.name %}x{% endcapture %}'].join('\n');
+      expect(extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable')).toEqual([]);
+    });
+
+    it('keeps an assign and captures of the same name on one line apart', () => {
+      const code = '{% assign title = 1 %}{% capture title %}one{% endcapture %}{% capture title %}two{% endcapture %}';
+      const variables = extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable');
+      expect(variables.map((n) => [n.name, n.startColumn]))
+        .toEqual([['title', 0], ['title', code.indexOf('{% capture')], ['title', code.lastIndexOf('{% capture')]]);
+      expect(new Set(variables.map((n) => n.id)).size).toBe(3);
+      // The assign keeps the id it had before captures were read.
+      expect(variables[0]!.id).toBe(generateNodeId('sections/card.liquid', 'variable', 'title', 1));
+    });
+
+    it('still reads the tags inside a capture', () => {
+      const code = "{% capture card_html %}{% render 'card' %}{% assign inner = 1 %}{% endcapture %}";
+      const result = extractFromSource('sections/product.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name).sort()).toEqual(['card_html', 'inner']);
+      expect(result.unresolvedReferences.map((r) => r.referenceName)).toEqual(['snippets/card.liquid']);
+    });
+
     it('should extract section inside a {% liquid %} block', () => {
       const code = ['{% liquid', "  section 'header'", '%}'].join('\n');
       const result = extractFromSource('layout/theme.liquid', code);
@@ -5335,6 +5474,40 @@ import 'package:flutter/material.dart';
         .toEqual(['live', 'live', 'after', 'after']);
       expect(result.unresolvedReferences.map((r) => [r.referenceName, r.line]))
         .toEqual([['snippets/live.liquid', 18], ['snippets/after.liquid', 20]]);
+    });
+
+    /* A layout renders a section group, the JSON file `sections/<group>.json`,
+       with the plural tag; only the singular one was read (#2494). */
+    it.each([
+      "{% sections 'header-group' %}",
+      '{%- sections "header-group" -%}',
+      "{% liquid\n  sections 'header-group'\n%}",
+    ])('reads a section group from %j', (code) => {
+      const result = extractFromSource('layout/theme.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'import').map((n) => n.name)).toEqual(['header-group']);
+      expect(result.unresolvedReferences.map((r) => r.referenceName)).toEqual(['sections/header-group.json']);
+    });
+
+    it('keeps a section and a section group of the same name apart', () => {
+      const result = extractFromSource('layout/theme.liquid', "{% section 'header' %}{% sections 'header' %}");
+      expect(result.unresolvedReferences.map((r) => [r.referenceName, r.line, r.column]))
+        .toEqual([['sections/header.liquid', 1, 0], ['sections/header.json', 1, 22]]);
+      expect(result.nodes.filter((n) => n.kind === 'component').map((n) => n.qualifiedName))
+        .toEqual(['layout/theme.liquid::section:header', 'layout/theme.liquid::sections:header']);
+      expect(new Set(result.nodes.map((n) => n.id)).size).toBe(result.nodes.length);
+    });
+
+    it.each(['comment', 'raw'])('indexes no schema written inside %s', (tag) => {
+      // An example schema in a comment is not the section's, and a lone
+      // opening tag in one must not swallow the real schema after it (#2494).
+      const code = [
+        `{% ${tag} %}`, '{% schema %}', '{"name": "Ghost"}', '{% endschema %}', `{% end${tag} %}`,
+        `{%- ${tag} -%}{% schema %}{%- end${tag} -%}`,
+        '{% schema %}', '{"name": "Live"}', '{% endschema %}',
+      ].join('\n');
+      const result = extractFromSource('sections/header.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'constant').map((n) => [n.name, n.startLine]))
+        .toEqual([['Live', 7]]);
     });
 
     it('should extract multiple imports', () => {
@@ -6931,13 +7104,15 @@ describe('Cross-language type/import gate (RN name collisions)', () => {
     // TS name-match — so a TS ref to `TestRunner` crossed web→jvm. The ref here
     // is intentionally NOT imported: a clean relative import would mask the bug
     // by resolving via the import map before the framework strategy can win.
+    // So the TS type is a global, declared in a script `.d.ts`: the one kind of
+    // type a module names without importing it.
     fs.writeFileSync(
       path.join(tempDir, 'package.json'),
       JSON.stringify({ dependencies: { 'react-native': '*' } })
     );
     fs.writeFileSync(
-      path.join(tempDir, 'useTests.ts'),
-      `export type TestRunner = { run: () => void };\n`
+      path.join(tempDir, 'useTests.d.ts'),
+      `type TestRunner = { run: () => void };\n`
     );
     fs.writeFileSync(
       path.join(tempDir, 'basic.tsx'),
@@ -7421,6 +7596,24 @@ describe('Liquid Shopify JSON template section resolution', () => {
     expect(cg.getNodesByKind('variable').some((n) => n.name === 'heading')).toBe(true);
   });
 
+  it('indexes capture declarations as variables that search finds, in or out of a Shopify theme', async () => {
+    // A captured variable could not be found, while an assigned one could (#2498).
+    fs.mkdirSync(path.join(tempDir, '_includes'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, '_includes/card.liquid'), [
+      "{% assign existing = 'ok' %}",
+      '{% capture captured %}Hello{% endcapture %}',
+      '{% liquid', '  capture bare_capture', "    echo 'x'", '  endcapture', '%}',
+    ].join('\n'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+
+    for (const [name, line] of [['existing', 1], ['captured', 2], ['bare_capture', 4]] as const) {
+      const hit = cg.searchNodes(name, { kinds: ['variable'] }).find((r) => r.node.name === name);
+      expect(hit?.node, name).toMatchObject({ filePath: '_includes/card.liquid', language: 'liquid', startLine: line });
+      expect(cg.getIncomingEdges(hit!.node.id)).toContainEqual(expect.objectContaining({ kind: 'contains' }));
+    }
+  });
+
   it('links a Shopify JSON template section `type` to its sections/<type>.liquid', async () => {
     // Shopify OS 2.0 templates are JSON, referencing sections by `type` — not
     // a `{% section %}` Liquid tag — so a section used only from a JSON template
@@ -7667,6 +7860,97 @@ describe('Liquid Shopify JSON template section resolution', () => {
     writeFiles({ 'snippets/price.liquid': later['snippets/price.liquid']! });
     await cg.sync();
     expect(cg.getFileDependencies('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+  }, 60_000);
+
+  // The notice Shopify's theme editor writes at the top of every JSON template
+  // and section group it saves.
+  const editorNotice = [
+    '/*',
+    ' * ------------------------------------------------------------',
+    ' * IMPORTANT: The contents of this file are auto-generated.',
+    ' * ------------------------------------------------------------',
+    ' */',
+  ];
+  const referencesFrom = (file: string): Array<[string | undefined, number | undefined, number | undefined]> => {
+    const fileNode = cg.getNodesInFile(file).find((n) => n.kind === 'file')!;
+    return cg.getOutgoingEdges(fileNode.id)
+      .filter((e) => e.kind === 'references')
+      .map((e): [string | undefined, number | undefined, number | undefined] => [cg.getNode(e.target)?.filePath, e.line, e.column])
+      .sort((a, b) => a[1]! - b[1]!);
+  };
+
+  it.each(['\n', '\r\n'])('links the sections an editor-saved template and section group list, where each `type` is (%j)', async (newline) => {
+    // JSON.parse rejects the editor's comment, so such a file linked none of
+    // its sections, and a file without one linked them at line 1 (#2494).
+    writeFiles({
+      'layout/theme.liquid': `{% sections 'header-group' %}{{ content_for_layout }}\n`,
+      'sections/header-group.json': [
+        ...editorNotice, '{', '  "type": "header",', '  "name": "Header",', '  "sections": {',
+        '    "bar": { "type": "announcement-bar" },', '    "header": {', '      "type": "header"', '    }',
+        '  },', '  "order": ["bar", "header"]', '}',
+      ].join(newline),
+      'sections/announcement-bar.liquid': `<div></div>\n`,
+      'sections/header.liquid': `<header></header>\n`,
+      'sections/main-product.liquid': `<div>{{ product.title }}</div>\n`,
+      'templates/product.json': [
+        ...editorNotice, '{', '  "sections": {', '    "main": {', '      "type": "main-product",',
+        '      "settings": { "note": "https://example.com/*not-a-comment*/ // nor this" }', '    },',
+        '    "again": { "type": "main-product" }', '  },', '  "order": ["main", "again"]', '}',
+      ].join(newline),
+      'templates/index.json': `{\n  "sections": {\n    "main": { "type": "header" }\n  },\n  "order": ["main"]\n}\n`,
+    });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    expect(referencesFrom('templates/product.json')).toEqual([['sections/main-product.liquid', 9, 14]]);
+    expect(referencesFrom('sections/header-group.json')).toEqual([
+      ['sections/announcement-bar.liquid', 10, 21],
+      ['sections/header.liquid', 12, 14],
+    ]);
+    expect(referencesFrom('templates/index.json')).toEqual([['sections/header.liquid', 3, 22]]);
+    expect(referencesFrom('layout/theme.liquid')).toEqual([['sections/header-group.json', 1, 0]]);
+  });
+
+  it('reads a JSON template with trailing commas, which Shopify accepts in theme JSON', () => {
+    const text = '// a note\n{"sections": {"main": {"type": "main-product",}, "hero": {"type": "hero"},}, "order": ["main", "hero",],}';
+    expect(extractFromSource('templates/product.json', text, 'liquid').unresolvedReferences.map((r) => r.referenceName))
+      .toEqual(['sections/main-product.liquid', 'sections/hero.liquid']);
+  });
+
+  it.each([
+    ['a missing brace', '{"sections": {"main": {"type": "main-product"}}'],
+    ['an unclosed comment', '/* saved by the editor {"sections": {"main": {"type": "main-product"}}}'],
+    ['a missing comma', '{"sections": {"main": {"type": "main-product"} "hero": {"type": "hero"}}}'],
+  ])('links nothing from a JSON template with %s', (_case, text) => {
+    expect(extractFromSource('templates/product.json', text, 'liquid').unresolvedReferences).toEqual([]);
+  });
+
+  it("links a layout's section groups inside its own theme, and on to the sections they list", async () => {
+    // `{% sections 'header-group' %}` renders the theme's
+    // sections/header-group.json, whose sections render snippets (#2494).
+    writeFiles({
+      ...severalThemes,
+      'layout/theme.liquid': `{% sections 'header-group' %}{{ content_for_layout }}\n`,
+      'sections/header-group.json': [...editorNotice, jsonTemplate('header')].join('\n'),
+      // This theme has no header group of its own, and the root theme's is not its.
+      'examples/tailwind/layout/theme.liquid': `{% liquid\n  sections 'header-group'\n%}{{ content_for_layout }}\n`,
+    });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const linksOf = (file: string): string[] => cg.getFileDependencies(file).sort();
+    expect(linksOf('layout/theme.liquid')).toEqual(['sections/header-group.json']);
+    expect(linksOf('sections/header-group.json')).toEqual(['sections/header.liquid']);
+    expect(linksOf('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+    expect(linksOf('examples/tailwind/layout/theme.liquid')).toEqual([]);
+
+    // Once the theme has a header group of its own, sync links the layout to it.
+    writeFiles({ 'examples/tailwind/sections/header-group.json': [...editorNotice, jsonTemplate('header')].join('\n') });
+    await cg.sync();
+    expect(linksOf('examples/tailwind/layout/theme.liquid')).toEqual(['examples/tailwind/sections/header-group.json']);
+    expect(linksOf('examples/tailwind/sections/header-group.json')).toEqual(['examples/tailwind/sections/header.liquid']);
   }, 60_000);
 
   it('finds the theme a file is in from the theme folder it sits in', () => {
@@ -13458,6 +13742,300 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     }
   });
 
+  it('Go: a method carries the exportedness of its name, like a function', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-method-exported-'));
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'log.go'),
+        'package log\n\ntype writer struct{}\n\nfunc (w *writer) Close() error { return nil }\n\nfunc (w *writer) flush() {}\n\nfunc Open() *writer { return &writer{} }\n\nfunc helper() {}\n'
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const flag = (name: string) =>
+          cg.getNodesByKind('method').concat(cg.getNodesByKind('function')).find((n) => n.name === name)!.isExported;
+        expect(flag('Close')).toBe(true);
+        expect(flag('flush')).toBe(false);
+        expect(flag('Open')).toBe(true);
+        expect(flag('helper')).toBe(false);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('Go: a call through a package stays on its function, not an exported method of that name', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-package-member-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/app\n\ngo 1.22\n');
+      fs.mkdirSync(path.join(dir, 'applog'));
+      // The method comes first, so a lookup by name meets it before the function.
+      fs.writeFileSync(
+        path.join(dir, 'applog', 'log.go'),
+        'package applog\n\ntype Logger struct{}\n\nfunc (l *Logger) Infof(format string) {}\n\nfunc Infof(format string) {}\n'
+      );
+      fs.mkdirSync(path.join(dir, 'svc'));
+      fs.writeFileSync(
+        path.join(dir, 'svc', 'use.go'),
+        'package svc\n\nimport "example.com/app/applog"\n\nfunc Use(l *applog.Logger) {\n\tapplog.Infof("x")\n\tl.Infof("y")\n}\n'
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const use = cg.getNodesByKind('function').find((n) => n.name === 'Use')!;
+        const calls = cg.getOutgoingEdgesFrom([use.id], ['calls']).map((e) => {
+          const target = cg.getNode(e.target)!;
+          return `${e.line} ${target.kind} ${target.qualifiedName}`;
+        }).sort();
+        expect(calls).toEqual(['6 function Infof', '7 method Logger::Infof']);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('blankCUnbalancedConditionalBranches opens a damaged #if group, one branch kept only when they do not balance, offsets kept', async () => {
+    const { blankCUnbalancedConditionalBranches } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void f(int id)',
+      '{',
+      '    if (id == 1) {',
+      '        a(id);',
+      '    }',
+      '#if defined(USE_V) || \\',
+      '    defined(USE_W)',
+      '    else if (id == 2) { // "{" in a comment',
+      '        b(id);',
+      '    }',
+      '#else',
+      '    else if (id == 3) {',
+      '        c(id);',
+      '    }',
+      '#endif',
+      '#ifdef USE_X',
+      '    d(id);',
+      '#else',
+      '    e(id);',
+      '#endif',
+      '}',
+      '#if 0',
+      'void dead(void) {',
+      '#else',
+      'void live(void) {',
+      '#endif',
+      '}',
+    ].join('\n');
+    const out = blankCUnbalancedConditionalBranches(src);
+    expect(out.length).toBe(src.length);
+    expect(out.split('\n').length).toBe(src.split('\n').length);
+    const lines = out.split('\n');
+    // The `else`-led group's branches each balance, so both stay, read in a
+    // row (`else if (id == 2) {…} else if (id == 3) {…}` is still C); only
+    // its directive lines, continuation included, become spaces.
+    expect(lines[5]).toBe(' '.repeat(src.split('\n')[5]!.length));
+    expect(lines[6]).toBe(' '.repeat(src.split('\n')[6]!.length));
+    expect(lines[7]).toBe('    else if (id == 2) { // "{" in a comment');
+    expect(lines[8]).toBe('        b(id);');
+    expect(lines[10]).toBe('     ');
+    expect(lines[11]).toBe('    else if (id == 3) {');
+    expect(lines[12]).toBe('        c(id);');
+    expect(lines[14]).toBe('      ');
+    // A balanced group is untouched, directives included.
+    expect(lines[15]).toBe('#ifdef USE_X');
+    expect(lines[16]).toBe('    d(id);');
+    expect(lines[18]).toBe('    e(id);');
+    expect(lines[19]).toBe('#endif');
+    // `#if 0` keeps the live branch instead.
+    expect(out).not.toContain('dead');
+    expect(lines[24]).toBe('void live(void) {');
+    // `#if 1` is live as written: its first branch stays, not its `#else`.
+    const on = blankCUnbalancedConditionalBranches(
+      ['void g(int id) {', '  if (id) { a(); }', '#if 1', '  else if (id == 2) { live(); }', '#else', '  else if (id == 3) { dead(); }', '#endif', '}'].join('\n')
+    );
+    expect(on).toContain('else if (id == 2) { live(); }');
+    expect(on).not.toContain('dead');
+    // Arms that close the block above and open their own (`} else if (…) {`)
+    // balance too: under a flag, both builds' arms stay (betaflight's
+    // `#if ENABLE_RESCUE_PLAN` in failsafe.c), so neither one's calls are lost.
+    const arms = blankCUnbalancedConditionalBranches(
+      ['void f(int a) {', '  if (a == 1) {', '    one();', '#if ENABLE_X', '  } else if (a == 2) {', '    two();', '#else', '  } else if (a == 3) {', '    three();', '#endif', '  }', '}'].join('\n')
+    ).split('\n');
+    expect(arms[3]).toBe(' '.repeat('#if ENABLE_X'.length));
+    expect(arms[5]).toBe('    two();');
+    expect(arms[8]).toBe('    three();');
+    // A brace inside a block comment is not code. Lua's loadlib.c opens a
+    // banner with `** {====` inside a multi-line comment and closes it with
+    // `/* }==== */`: the group is whole, and every platform's functions stay.
+    const lua = [
+      '#if defined(LUA_DL_DLOPEN)',
+      'static void *ll_load (const char *path) { return dlopen(path); }',
+      '#elif defined(LUA_DL_DLL)',
+      '/*',
+      '** {======================================================',
+      '** This is an implementation of loadlib for Windows',
+      '** =======================================================',
+      '*/',
+      'static void *ll_load (const char *path) { return LoadLibraryA(path); }',
+      '/* }====================================================== */',
+      '#else',
+      'static void *ll_load (const char *path) { return NULL; }',
+      '#endif',
+    ].join('\n');
+    expect(blankCUnbalancedConditionalBranches(lua)).toBe(lua);
+    // A `\` ending a line inside a block comment still continues the
+    // `#define` (jemalloc's tsd.h): the macro body is not code of the group.
+    const guarded = [
+      '#ifndef GUARD_H',
+      '#define GUARD_H',
+      '#define O(n)\t\t\t\t\\',
+      'static int n##_get(void) {\t\t\\',
+      '\t/*\t\t\t\t\t\\',
+      '\t * a comment inside the body\t\\',
+      '\t */\t\t\t\t\t\\',
+      '\treturn 0;\t\t\t\t\\',
+      '}',
+      'O(a)',
+      '#endif',
+    ].join('\n');
+    expect(blankCUnbalancedConditionalBranches(guarded)).toBe(guarded);
+    // No conditional group at all: identity.
+    const plain = 'int g(void) {\n#define X 1\n    return X;\n}\n';
+    expect(blankCUnbalancedConditionalBranches(plain)).toBe(plain);
+  });
+
+  it('blankCUnbalancedConditionalBranches: two function heads under #ifdef/#else keep the #else head; expression fragments keep their only branch', async () => {
+    const { blankCUnbalancedConditionalBranches } = await import('../src/extraction/languages/c-cpp');
+    // jq's main.c: `umain` for WIN32, `main` otherwise — `main` must survive.
+    const heads = [
+      '#ifdef WIN32',
+      'int umain(int argc, char* argv[]) {',
+      '#else /*}*/',
+      'int main(int argc, char* argv[]) {',
+      '#endif',
+      '  return run(argc, argv);',
+      '}',
+    ].join('\n');
+    const h = blankCUnbalancedConditionalBranches(heads).split('\n');
+    expect(h[1]).toBe(' '.repeat('int umain(int argc, char* argv[]) {'.length));
+    expect(h[3]).toBe('int main(int argc, char* argv[]) {');
+    expect(h[0]).toBe('            ');
+    // `#ifndef` is the inverse: its first branch is the default build.
+    const inv = heads.replace('#ifdef WIN32', '#ifndef POSIX');
+    expect(blankCUnbalancedConditionalBranches(inv).split('\n')[1]).toBe('int umain(int argc, char* argv[]) {');
+    // A directive right under the kept branch's own is a line of that branch:
+    // only the `#if`/`#else` line itself (and its `\` continuations) goes.
+    const withIncludes = [
+      '#if defined(FEATURE) && \\',
+      '    defined(OTHER)',
+      '#include "feature.h"',
+      'int f(int x) {',
+      '#else',
+      '#include "plain.h"',
+      'int g(int x) {',
+      '#endif',
+      '  return x;',
+      '}',
+    ];
+    const inc = blankCUnbalancedConditionalBranches(withIncludes.join('\n')).split('\n');
+    expect(inc[1]).toBe(' '.repeat(withIncludes[1]!.length));
+    expect(inc[2]).toBe(' '.repeat(withIncludes[2]!.length));
+    expect(inc[5]).toBe('#include "plain.h"');
+    expect(inc[6]).toBe('int g(int x) {');
+    // A branch that is a fragment of an `if (…)` condition (STM32 HAL), or
+    // that opens with `} else if` (betaflight cli.c): directives blanked, the
+    // only branch kept, so the statement parses as written for that build.
+    const frag = [
+      'int check(op_t *h1, op_t *h4)',
+      '{',
+      '  if ((h1 == NULL)',
+      '#if defined(STM32G474xx)',
+      '      || (h4 == NULL)',
+      '#endif',
+      '     )',
+      '  {',
+      '    return 1;',
+      '  }',
+      '  if (',
+      '#if !defined(USE_FLASH)',
+      '      isEmpty(h1) ||',
+      '#endif',
+      '      strncasecmp(h1, "rom", 3) == 0) {',
+      '    reboot(1);',
+      '#if defined(USE_FLASH)',
+      '  } else if (isEmpty(h1)) {',
+      '    reboot(2);',
+      '#endif',
+      '  } else {',
+      '    reboot(0);',
+      '  }',
+      '  return 0;',
+      '}',
+    ].join('\n');
+    const f = blankCUnbalancedConditionalBranches(frag).split('\n');
+    expect(f[3]).toBe(' '.repeat('#if defined(STM32G474xx)'.length));
+    expect(f[4]).toBe('      || (h4 == NULL)');
+    expect(f[5]).toBe('      ');
+    expect(f[12]).toBe('      isEmpty(h1) ||');
+    expect(f[17]).toBe('  } else if (isEmpty(h1)) {');
+    expect(f[16]).toBe(' '.repeat('#if defined(USE_FLASH)'.length));
+  });
+
+  it('a #if branch beginning with `else` no longer files the rest of the file under the enclosing function', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-c-ifelse-'));
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'current.c'),
+        [
+          'void currentMeterRead(int id, meter_t *meter)',
+          '{',
+          '    if (id == 1) {',
+          '        adcRead(meter);',
+          '    }',
+          '#ifdef USE_VIRTUAL',
+          '    else if (id == 2) {',
+          '        virtualRead(meter);',
+          '    }',
+          '#endif',
+          '    else {',
+          '        resetMeter(meter);',
+          '    }',
+          '}',
+          '',
+          'static bool markBusy(void)',
+          '{',
+          '    ATOMIC_BLOCK(NVIC_PRIO_MAX) {',
+          '        busy = true;',
+          '    }',
+          '    return true;',
+          '}',
+          '',
+          'int after(void)',
+          '{',
+          '    return 1;',
+          '}',
+          '',
+        ].join('\n')
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'current.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['after', 'currentMeterRead', 'markBusy']);
+        expect(byName.currentMeterRead!.endLine).toBe(14);
+        expect(byName.markBusy!.qualifiedName).toBe('markBusy');
+        expect(byName.markBusy!.endLine).toBe(22);
+        expect(byName.after!.qualifiedName).toBe('after');
+        expect(byName.after!.startLine).toBe(24);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
     const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
     const src = [
@@ -13719,6 +14297,10 @@ describe('Unsupported-language projects report what they skipped (#1502)', () =>
 
   beforeEach(() => {
     tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
   });
 
   it('counts files it could not index, by extension, on the git path', async () => {

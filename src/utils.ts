@@ -30,6 +30,7 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 // ============================================================
@@ -45,6 +46,22 @@ const SENSITIVE_PATHS = new Set([
   '/root', '/boot', '/lib', '/lib64', '/opt',
   'c:\\', 'c:\\windows', 'c:\\windows\\system32',
 ]);
+
+/**
+ * Credential and config folders in the home directory. Unlike the system set,
+ * everything under them is refused too.
+ */
+const SENSITIVE_HOME_DIRS = ['.ssh', '.gnupg', '.aws', '.config'];
+
+/**
+ * How long the real paths of the sensitive home folders are reused. The viewer
+ * re-checks its root on every file it reads, so they are not re-read per check,
+ * but a folder linked somewhere new while the process runs is noticed soon.
+ */
+const SENSITIVE_HOME_TTL_MS = 2_000;
+
+let sensitiveHomeCache: { home: string; expires: number; trees: string[] } | undefined;
+let sensitiveSystemRealPaths: Set<string> | undefined;
 
 /**
  * Config "languages" whose nodes are pure key/value DATA lifted from a config
@@ -66,18 +83,27 @@ export function isConfigLeafNode(node: { kind: string; language?: string }): boo
 }
 
 /**
+ * Whether `child` is `parent` or lies under it, compared exactly as given.
+ *
+ * A root (`C:\`, `\\server\share\`, `/`) already ends with its separator, so
+ * none is added to it. Adding one made `C:\\` the prefix, which no path under
+ * the root starts with, so a project at a drive root indexed nothing (#415).
+ */
+function isSameOrUnder(child: string, parent: string): boolean {
+  if (child === parent) return true;
+  return child.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep);
+}
+
+/**
  * Whether `child` is `parent` itself or sits underneath it. Case-insensitive on
  * Windows — NTFS is case-insensitive, and realpathSync can hand back a different
  * case than the lexical root, which would otherwise false-reject a valid file.
  */
 function isWithinDir(child: string, parent: string): boolean {
-  let c = child;
-  let p = parent;
   if (process.platform === 'win32') {
-    c = c.toLowerCase();
-    p = p.toLowerCase();
+    return isSameOrUnder(child.toLowerCase(), parent.toLowerCase());
   }
-  return c === p || c.startsWith(p + path.sep);
+  return isSameOrUnder(child, parent);
 }
 
 /**
@@ -96,6 +122,16 @@ function isWithinDir(child: string, parent: string): boolean {
 export function lexicalPathWithinRoot(projectRoot: string, filePath: string): string | null {
   const resolved = path.resolve(projectRoot, filePath);
   return isWithinDir(resolved, path.resolve(projectRoot)) ? resolved : null;
+}
+
+/**
+ * Whether a filesystem error means nothing is at the path: ENOENT, or ENOTDIR,
+ * which POSIX reports instead when a folder on the way is a file (Windows
+ * reports ENOENT for both).
+ */
+export function isMissingPathError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
 }
 
 /**
@@ -123,7 +159,8 @@ export function lexicalPathWithinRoot(projectRoot: string, filePath: string): st
  * @param options.allowSymlinkEscape - Follow in-root symlinks out of the root
  *   (indexing read path only); defaults to the strict, leak-safe behavior.
  * @returns The resolved absolute path (realpath when it exists), or null if it
- *   escapes the root
+ *   escapes the root. A path that does not exist yet is judged by its nearest
+ *   existing ancestor, and every path under a root that does not exist is null.
  */
 export function validatePathWithinRoot(
   projectRoot: string,
@@ -143,23 +180,125 @@ export function validatePathWithinRoot(
   //    The indexing read path (allowSymlinkEscape) skips only this rejection so
   //    it stays consistent with the directory walk, which already followed the
   //    in-root symlink to enumerate these files (#935).
+  let realRoot: string;
   try {
-    const realRoot = fs.realpathSync(normalizedRoot);
+    realRoot = fs.realpathSync(normalizedRoot);
+  } catch {
+    return null;
+  }
+
+  try {
     const realResolved = fs.realpathSync(resolved);
     if (options?.allowSymlinkEscape) {
       return realResolved;
     }
     return isWithinDir(realResolved, realRoot) ? realResolved : null;
   } catch (err) {
-    // ENOENT: the path doesn't exist yet (a file about to be written, or an
-    // index entry for a since-deleted file) — no symlink to follow, and the
-    // lexical check already passed, so allow the lexical path. Any other
-    // resolution failure (ELOOP, EACCES, …) is treated as unsafe → reject.
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return resolved;
+    // A missing leaf may still sit below an EXISTING symlink. Resolve the
+    // nearest existing ancestor before allowing a write path: otherwise
+    // `project/.codegraph/ui -> /outside` plus a missing `trails/` directory
+    // passes the lexical check and mkdir follows the symlink out of the root.
+    // A path under a file (ENOTDIR on POSIX) is a missing leaf too.
+    if (!isMissingPathError(err)) return null;
+  }
+
+  let ancestor = path.dirname(resolved);
+  while (isWithinDir(ancestor, normalizedRoot)) {
+    try {
+      const realAncestor = fs.realpathSync(ancestor);
+      if (options?.allowSymlinkEscape || isWithinDir(realAncestor, realRoot)) {
+        return resolved;
+      }
+      return null;
+    } catch (err) {
+      if (!isMissingPathError(err)) return null;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) return null;
+      ancestor = parent;
     }
+  }
+  return null;
+}
+
+/**
+ * A path in the form the sensitive-folder check compares: lower-cased where the
+ * file system ignores case by default (NTFS, APFS), so `~/.SSH` is `~/.ssh`.
+ */
+function foldPathCase(p: string): string {
+  return process.platform === 'win32' || process.platform === 'darwin' ? p.toLowerCase() : p;
+}
+
+/**
+ * The plain spelling of a Win32 namespace path: `\\?\C:\x` and `\\.\C:\x` are
+ * `C:\x`, and `\\?\UNC\host\share` is `\\host\share`. `path.resolve` keeps the
+ * prefix, so a string comparison would never see the folder behind it. Other
+ * namespace paths (a `\\?\Volume{…}\` name, a device) are returned unchanged;
+ * the real path the caller also checks names their folder.
+ */
+function stripWin32NamespacePrefix(p: string): string {
+  if (process.platform !== 'win32') return p;
+  const prefix = /^[\\/]{2}[?.][\\/](UNC[\\/])?/i.exec(p);
+  if (!prefix) return p;
+  const rest = p.slice(prefix[0].length);
+  if (prefix[1]) return `\\\\${rest}`;
+  return /^[a-z]:[\\/]/i.test(rest) ? rest : p;
+}
+
+/**
+ * The folder a path really names: links (symlinks, junctions, a `subst` drive)
+ * followed, and the case and long names stored on disk. Null when it can't be
+ * resolved, most often because it doesn't exist; the lexical check still runs.
+ */
+function nativeRealPath(p: string): string | null {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
     return null;
   }
+}
+
+/**
+ * The system set's own real paths, folded. macOS keeps `/etc`, `/tmp` and
+ * `/var` under `/private`, so a project whose real path is `/private/etc` is
+ * `/etc`. Read once: these folders don't move.
+ */
+function sensitiveSystemPaths(): Set<string> {
+  if (!sensitiveSystemRealPaths) {
+    sensitiveSystemRealPaths = new Set();
+    for (const entry of SENSITIVE_PATHS) {
+      // Only this platform's entries: on Windows `/` would resolve to the root
+      // of the current drive and refuse every project at a drive root.
+      const native = process.platform === 'win32' ? /^[a-z]:\\/.test(entry) : entry.startsWith('/');
+      if (!native) continue;
+      const real = nativeRealPath(entry);
+      if (real) sensitiveSystemRealPaths.add(foldPathCase(real));
+    }
+  }
+  return sensitiveSystemRealPaths;
+}
+
+/**
+ * The sensitive home folders, folded: as spelled under the home directory,
+ * under the home's real path (a linked home), and each folder's own real path
+ * (a `~/.ssh` that is itself a link into a dotfiles checkout).
+ */
+function sensitiveHomeTrees(): string[] {
+  const home = os.homedir();
+  const now = Date.now();
+  if (sensitiveHomeCache && sensitiveHomeCache.home === home && now < sensitiveHomeCache.expires) {
+    return sensitiveHomeCache.trees;
+  }
+  const trees = new Set<string>();
+  const realHome = nativeRealPath(home);
+  for (const dir of SENSITIVE_HOME_DIRS) {
+    const spelled = path.join(home, dir);
+    trees.add(foldPathCase(spelled));
+    if (realHome) trees.add(foldPathCase(path.join(realHome, dir)));
+    const real = nativeRealPath(spelled);
+    if (real) trees.add(foldPathCase(real));
+  }
+  sensitiveHomeCache = { home, expires: now + SENSITIVE_HOME_TTL_MS, trees: [...trees] };
+  return sensitiveHomeCache.trees;
 }
 
 /**
@@ -169,24 +308,42 @@ export function validatePathWithinRoot(
  * a real, existing directory. Used at MCP and API entry points
  * to prevent arbitrary directory access.
  *
+ * The path is checked both as spelled and as the folder it really names, so a
+ * link to `~/.ssh`, a case variant (`~/.SSH`) or a `\\?\` spelling is refused
+ * like the folder itself (#1930). It is kept to one realpath per call, since the
+ * viewer calls this for every file it reads: the sensitive folders' own real
+ * paths are cached and re-read every couple of seconds.
+ *
  * @param dirPath - The path to validate
  * @returns An error message if invalid, or null if valid
  */
 export function validateProjectPath(dirPath: string): string | null {
   const resolved = path.resolve(dirPath);
+  const lexical = path.resolve(stripWin32NamespacePrefix(dirPath));
+  const real = nativeRealPath(lexical);
+  const candidates = [lexical];
+  if (real && real !== lexical) candidates.push(real);
+  const named = (candidate: string): string =>
+    candidate === resolved ? resolved : `${resolved} (resolves to ${candidate})`;
 
   // Block sensitive system directories
-  if (SENSITIVE_PATHS.has(resolved) || SENSITIVE_PATHS.has(resolved.toLowerCase())) {
-    return `Refusing to operate on sensitive system directory: ${resolved}`;
+  const systemPaths = sensitiveSystemPaths();
+  for (const candidate of candidates) {
+    if (
+      SENSITIVE_PATHS.has(candidate) ||
+      SENSITIVE_PATHS.has(candidate.toLowerCase()) ||
+      systemPaths.has(foldPathCase(candidate))
+    ) {
+      return `Refusing to operate on sensitive system directory: ${named(candidate)}`;
+    }
   }
 
   // Also block common sensitive home subdirectories
-  const homeDir = require('os').homedir();
-  const sensitiveHomeDirs = ['.ssh', '.gnupg', '.aws', '.config'];
-  for (const dir of sensitiveHomeDirs) {
-    const sensitivePath = path.join(homeDir, dir);
-    if (resolved === sensitivePath || resolved.startsWith(sensitivePath + path.sep)) {
-      return `Refusing to operate on sensitive directory: ${resolved}`;
+  const homeTrees = sensitiveHomeTrees();
+  for (const candidate of candidates) {
+    const folded = foldPathCase(candidate);
+    if (homeTrees.some((tree) => isSameOrUnder(folded, tree))) {
+      return `Refusing to operate on sensitive directory: ${named(candidate)}`;
     }
   }
 
@@ -229,6 +386,17 @@ export function clamp(value: number, min: number, max: number): number {
  */
 export function normalizePath(filePath: string): string {
   return filePath.replace(/\\/g, '/');
+}
+
+/**
+ * Escape `text` to match itself literally inside a regular expression.
+ * Symbol names are not always plain words: C++'s `operator++` and
+ * `operator()`, Scala's `++`, a Kotlin name in backticks. Pass every name
+ * through this before writing it into a `new RegExp(…)` pattern, or the name
+ * is read as pattern syntax and may not compile at all.
+ */
+export function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**

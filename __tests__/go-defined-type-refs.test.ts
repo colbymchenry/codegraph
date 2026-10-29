@@ -188,8 +188,10 @@ describe('a Go defined type references the types it is defined from', () => {
       // A qualified name keeps its package in the source (`render.Render`,
       // `context.Context`). Not referenced: the predeclared types (string,
       // int, uint8, error, comparable), the type parameters T, K and V, and a
-      // type's own name written bare (stateFn, Tree).
+      // type's own name written bare (stateFn, Tree). The struct Context
+      // references its field's type.
       expect(typeRefs(result)).toEqual([
+        'Context HandlersChain',
         'Generic List',
         'Grid Cell',
         'HandlerFunc Context',

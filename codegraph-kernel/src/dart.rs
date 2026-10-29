@@ -156,6 +156,23 @@ fn next_named<'t>(node: Node<'t>) -> Option<Node<'t>> {
     next
 }
 
+/// dartTypeAliasName (dart.ts) — the name a typedef declares: the last type
+/// name before the `=`, the type parameters or the parameter list. The
+/// legacy form writes its return type first (`typedef Report LegacyMaker(int
+/// n);`), so the first type name is not always it.
+fn type_alias_name<'t>(node: Node<'t>) -> Option<Node<'t>> {
+    let mut name = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "=" | "type_parameters" | "formal_parameter_list" => break,
+            "type_identifier" => name = Some(child),
+            _ => {}
+        }
+    }
+    name
+}
+
 struct Scope {
     row: u32,
     kind: &'static str,
@@ -668,6 +685,14 @@ impl<'t> Walker<'t> {
     /// name field → the method_signature inner unwrap → identifier-ish
     /// child → `<anonymous>` (operators land here).
     fn extract_name(&self, node: Node<'t>) -> String {
+        // resolveName hook (dart.ts): a typedef has no `name` field, and a
+        // legacy one writes its return type before its name (`typedef Report
+        // LegacyMaker(int n);`).
+        if node.kind() == "type_alias" {
+            if let Some(name) = type_alias_name(node) {
+                return self.text(name).to_string();
+            }
+        }
         // resolveName hook (dart.ts:244-260): named ctor/factory → ctor name.
         if let Some((class_name, ctor_name)) = self.ctor_info(node) {
             if ctor_name != class_name {
@@ -1034,10 +1059,74 @@ impl<'t> Walker<'t> {
             return false;
         }
         let docstring = self.docstring_of(node);
-        // `value` field is null (type_alias has no fields) → no refs from
-        // the aliased type; returns false → children re-visited.
-        self.create_node("type_alias", &name, node, Extra { docstring, ..Default::default() });
+        // type_alias has no fields (no `value`): the dart branch reads the
+        // aliased type from the rest of the declaration (#2327). Returns
+        // false → children re-visited (they match nothing type-related).
+        let row = self.create_node("type_alias", &name, node, Extra { docstring, ..Default::default() });
+        if let Some(row) = row {
+            self.type_alias_refs(node, row);
+        }
         false
+    }
+
+    /// pushDartTypeAliasRefs (dart.ts) — a `references` ref from the typedef
+    /// for every type its aliased type names; its annotations are not its
+    /// type, and a type parameter is no type of the project's.
+    fn type_alias_refs(&mut self, node: Node<'t>, from_row: u32) {
+        let name = type_alias_name(node);
+        let scope = self.type_parameter_scope(node, &[]).unwrap_or_default();
+        let mut cursor = node.walk();
+        let kids: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
+        for child in kids {
+            if child.kind() == "annotation" || Some(child) == name {
+                continue;
+            }
+            self.aliased_type_refs(child, from_row, &scope);
+        }
+    }
+
+    /// dartTypeParameterScope (dart.ts) — `scope` and the type parameters
+    /// `node` declares (`Mapper<T>`, `T Function<T>(T a)`), or None when it
+    /// declares none.
+    fn type_parameter_scope(&self, node: Node<'t>, scope: &[&'t str]) -> Option<Vec<&'t str>> {
+        let mut cursor = node.walk();
+        let parameters = node.named_children(&mut cursor).find(|c| c.kind() == "type_parameters")?;
+        let mut inner = scope.to_vec();
+        let mut pc = parameters.walk();
+        for parameter in parameters.named_children(&mut pc) {
+            if parameter.kind() != "type_parameter" {
+                continue;
+            }
+            let mut ic = parameter.walk();
+            let name = parameter.named_children(&mut ic).find(|c| c.kind() == "type_identifier");
+            if let Some(name) = name {
+                inner.push(self.text(name));
+            }
+        }
+        Some(inner)
+    }
+
+    /// pushDartAliasedTypeRefs (dart.ts) — type_refs_dart for a typedef's
+    /// aliased type, where a type parameter in `scope` is no type of its own
+    /// (but `p.T` is the type an import names).
+    fn aliased_type_refs(&mut self, node: Node<'t>, from_row: u32, scope: &[&'t str]) {
+        stack_guard!();
+        if node.kind() == "type_identifier" {
+            let text = self.text(node);
+            let parameter =
+                scope.contains(&text) && !node.prev_sibling().map(|s| s.kind() == ".").unwrap_or(false);
+            if !parameter && self.is_type_name_dart(node) {
+                self.push_ref_at(from_row, text, "references", node);
+            }
+            return;
+        }
+        let inner = self.type_parameter_scope(node, scope);
+        let scope = inner.as_deref().unwrap_or(scope);
+        let mut cursor = node.walk();
+        let kids: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
+        for child in kids {
+            self.aliased_type_refs(child, from_row, scope);
+        }
     }
 
     // --- extractImport (:3170; hook dart.ts extractImport) -----------------

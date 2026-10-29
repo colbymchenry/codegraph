@@ -4,6 +4,18 @@ import { hasFlowPragma } from '../grammars';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 
 /**
+ * Whether a class member is written `static`: its own `static` keyword, never
+ * a member named `static()`. Shared by the TypeScript and JavaScript
+ * extractors, which parse class bodies alike.
+ */
+export function hasStaticModifier(node: SyntaxNode): boolean {
+  for (let i = 0; i < node.childCount; i++) {
+    if (node.child(i)?.type === 'static') return true;
+  }
+  return false;
+}
+
+/**
  * A TS/JS class field (`public_field_definition` / `field_definition`) is a
  * METHOD only when its value is callable — an arrow function, a function
  * expression, or a HOF call wrapping one (`onScroll = throttle(() => {…})`),
@@ -57,6 +69,42 @@ export function blankFlowSyntax(source: string, filePath?: string): string {
     .replace(/\.\.\.(?=\s*[},])/g, '   ');
 }
 
+/** Whether the file writes `export type *` anywhere: most files don't, and skip the rest. */
+const EXPORT_TYPE_STAR_HINT = /export\s+type\s*\*/;
+/**
+ * `export type *` where a statement starts (a line's first word, or after `;`,
+ * `{`, `}` or the end of a block comment), followed by `from` or `as`.
+ */
+const EXPORT_TYPE_STAR = /(^|[;{}]|\*\/)([ \t]*export\s+)type(?=\s*\*\s*(?:from|as)\b)/gm;
+
+/**
+ * TypeScript 5.0's type-only re-export of a whole module, `export type * from
+ * './types'` and `export type * as ns from './types'`, with its `type` blanked
+ * to spaces (offsets survive), so it reads as the `export *` it is to the
+ * graph. The grammar has no rule for it (nor does upstream's): `type` parsed
+ * as an error, so a barrel of re-exports was reported as producing no symbols
+ * and counted by `codegraph status` as a file it could not parse, and the
+ * kernel handed every such file to the wasm parser (#2474). Only a statement
+ * start is blanked, so a mention in a comment or a doc keeps its text. The
+ * import resolver reads the statement as written, `type` included, from the
+ * file itself (`extractReExports`), and so does the import node the statement
+ * makes ({@link blanksExportTypeStar}). Applied before both engines parse (the
+ * kernel's preParse hoist), so they agree.
+ */
+export function blankExportTypeStar(source: string): string {
+  if (!EXPORT_TYPE_STAR_HINT.test(source)) return source;
+  return source.replace(EXPORT_TYPE_STAR, '$1$2    ');
+}
+
+/**
+ * Whether {@link blankExportTypeStar} blanks anything in `source`. Such a
+ * file's re-exports keep their statements as written in the graph, `type`
+ * included (`reExportAsWritten`).
+ */
+export function blanksExportTypeStar(source: string): boolean {
+  return EXPORT_TYPE_STAR_HINT.test(source) && blankExportTypeStar(source) !== source;
+}
+
 /**
  * Whether `node` is declared in a `declare module 'x' { … }` or `declare
  * global { … }` body, which exports it without an `export` keyword.
@@ -94,15 +142,60 @@ function hasExportDeclaration(block: SyntaxNode): boolean {
   return false;
 }
 
+/** A TypeScript declaration file: `.d.ts`, `.d.mts`, `.d.cts`. */
+const DECLARATION_FILE = /\.d\.[cm]?ts$/i;
+
+/**
+ * Whether a bodiless `function_signature` is a function's declaration rather
+ * than an overload of an implementation that follows it, and one a name or
+ * an import reaches.
+ *
+ * TypeScript writes a function without a body in two places. Before the
+ * implementation it overloads (`function f(a: number): void;`, then `function
+ * f(a) {…}`), and there the implementation is the function's node. In an
+ * ambient context nothing follows, and the signature is all the declaration
+ * there is: a `declare function`, a function in a `declare global` body, a
+ * declaration file's own functions, which are ambient with or without
+ * `declare`, and a function a declaration file's `declare module 'x'` body
+ * declares, which an import of `x` reaches (see resolution/ambient-modules).
+ * Without a node, `import { convertToHtml } from 'mammoth'` had nothing to
+ * bind to. Two are left out: a namespace's function is only ever reached
+ * through the namespace (`semver.compare`, `vscode.window.showMessage`), which
+ * the index doesn't model, so on its own it is only a bare name for unrelated
+ * calls to land on; and a `declare module` body in an ordinary module file
+ * augments the package's own module, whose functions the import means.
+ * Mirrored in the kernel (tsjs/mod.rs `is_ambient_function_signature`).
+ */
+export function isAmbientFunctionSignature(node: SyntaxNode, filePath: string): boolean {
+  if (node.type !== 'function_signature') return false;
+  const declarationFile = DECLARATION_FILE.test(filePath);
+  let ambient = false;
+  for (let current = node.parent; current; current = current.parent) {
+    if (current.type === 'internal_module') return false;
+    if (current.type === 'module') {
+      // `declare module 'x'`; `module Foo {}` is a namespace.
+      if (getChildByField(current, 'name')?.type !== 'string') return false;
+      return declarationFile;
+    }
+    if (current.type === 'ambient_declaration') ambient = true;
+  }
+  return ambient || declarationFile;
+}
+
 export const typescriptExtractor: LanguageExtractor = {
-  preParse: blankFlowSyntax,
+  preParse: (source, filePath) => blankExportTypeStar(blankFlowSyntax(source, filePath)),
+  reExportAsWritten: blanksExportTypeStar,
   functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
-  classTypes: ['class_declaration', 'abstract_class_declaration'],
+  isAmbientFunction: isAmbientFunctionSignature,
+  // `class` is a class expression, `register(class Widget extends Base {…})`:
+  // a named one is a class with its members and supertypes (#2499), and an
+  // anonymous one is passed over (TreeSitterExtractor.isClassTypeNode).
+  classTypes: ['class_declaration', 'abstract_class_declaration', 'class'],
   // `method_signature` is the interface/type-literal form of a method; without it
   // an interface's members never enter the graph, so a `.d.ts` platform API has
   // no declaration node for call sites to attach to (#1638). Java/C# don't need
   // an equivalent — their grammars reuse `method_declaration`.
-  methodTypes: ['method_definition', 'public_field_definition', 'method_signature'],
+  methodTypes: ['method_definition', 'public_field_definition', 'method_signature', 'abstract_method_signature'],
   classifyMethodNode: classifyTsClassMember,
   // The interface counterpart of `public_field_definition`. It carries no value,
   // so it is always a property and never needs classifyMethodNode.
@@ -189,13 +282,7 @@ export const typescriptExtractor: LanguageExtractor = {
     }
     return false;
   },
-  isStatic: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
-      if (child?.type === 'static') return true;
-    }
-    return false;
-  },
+  isStatic: hasStaticModifier,
   isConst: (node) => {
     // For lexical_declaration, check if it's 'const' or 'let'
     // For variable_declaration, it's always 'var'

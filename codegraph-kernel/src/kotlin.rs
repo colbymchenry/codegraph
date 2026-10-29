@@ -87,6 +87,28 @@ fn strip_js_ws(s: &str) -> String {
     s.chars().filter(|c| !is_js_space(*c)).collect()
 }
 
+/// A receiver chain the resolver can type (TS `KOTLIN_RECEIVER_CHAIN`):
+/// whitespace stripped, `?.` read as `.`, then `this` or an identifier
+/// followed by one to three `.identifier` segments.
+fn kotlin_receiver_chain(text: &str) -> Option<String> {
+    let chain = strip_js_ws(text).replace("?.", ".");
+    let segments: Vec<&str> = chain.split('.').collect();
+    if segments.len() < 2 || segments.len() > 4 {
+        return None;
+    }
+    let ident = |s: &str| {
+        let b = s.as_bytes();
+        !b.is_empty()
+            && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+            && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    };
+    if segments.iter().all(|s| ident(s)) {
+        Some(chain)
+    } else {
+        None
+    }
+}
+
 /// A property's CODE children: the named child right after the `=` token, a
 /// `property_delegate` (`by lazy { … }`), and an accessor the grammar nested
 /// under the declaration (`val x: Int get() = compute()` — written on ONE line;
@@ -733,7 +755,10 @@ impl<'t> Walker<'t> {
         })
     }
 
-    fn try_visit_hook(&mut self, node: Node<'t>) -> bool {
+    /// The Kotlin visitNode hook: `Some` when it consumed the node, holding the
+    /// initializers it walked as such (`walkInitializer`), which the caller's
+    /// fn-ref scan of the node skips.
+    fn try_visit_hook(&mut self, node: Node<'t>) -> Option<Vec<usize>> {
         // An own-line accessor already walked by its owning property below. The
         // ownership test re-derives the property's kind rather than remembering
         // it: a destructured or local declaration mints no node, so its
@@ -741,10 +766,10 @@ impl<'t> Walker<'t> {
         if matches!(node.kind(), "getter" | "setter") {
             return accessor_owner(node)
                 .and_then(|owner| self.property_kind(owner))
-                .is_some();
+                .map(|_| Vec::new());
         }
         if node.kind() != "property_declaration" {
-            return false;
+            return None;
         }
         let var_decl = (0..node.named_child_count())
             .filter_map(|i| node.named_child(i))
@@ -764,11 +789,11 @@ impl<'t> Walker<'t> {
             for init in property_initializers(node) {
                 self.visit_function_body(init);
             }
-            return true;
+            return Some(Vec::new());
         };
         let name = self.text(name_node).to_string();
         if name.is_empty() {
-            return false;
+            return None;
         }
         let Some(kind) = self.property_kind(node) else {
             // A local — no node is minted, but the initializer is still code.
@@ -778,7 +803,7 @@ impl<'t> Walker<'t> {
             for init in property_initializers(node) {
                 self.visit_function_body(init);
             }
-            return true;
+            return Some(Vec::new());
         };
         // The `type`-field signature read is dead (zero fields) → signature
         // undefined; NO docstring/visibility/isStatic — the modifiers merge in
@@ -790,26 +815,30 @@ impl<'t> Walker<'t> {
         // the idiomatic Android callback field) contributed NO call edge at all.
         // The property also OWNS any accessor written on its own line, which the
         // grammar makes a following SIBLING rather than a child; those bodies
-        // used to attribute to the enclosing class.
+        // used to attribute to the enclosing class. The initializers are
+        // walked as such: the fn-ref scan skips them, or it would take each
+        // function value again for the enclosing file or class.
+        let mut walked = Vec::new();
         if let Some(row) = row {
             self.stack.push(Scope { row, kind, name: name.clone() });
             for init in property_initializers(node) {
                 self.visit_function_body(init);
+                walked.push(init.id());
             }
             for acc in following_accessors(node) {
                 self.visit_function_body(acc);
             }
             self.stack.pop();
         }
-        true
+        Some(walked)
     }
 
     // --- the dispatcher (visitNode, Kotlin-relevant branches) -----------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
         stack_guard!();
-        if self.try_visit_hook(node) {
-            self.scan_fn_ref_subtree(node, 0);
+        if let Some(walked) = self.try_visit_hook(node) {
+            self.scan_fn_ref_subtree(node, 0, &walked);
             return;
         }
 
@@ -856,7 +885,7 @@ impl<'t> Walker<'t> {
             // Hook-declined destructuring: extractField/extractVariable both
             // find no matching children for kotlin — NOTHING minted, RHS
             // invisible; candidates-only scan.
-            self.scan_fn_ref_subtree(node, 0);
+            self.scan_fn_ref_subtree(node, 0, &[]);
             skip_children = true;
         } else if kind == "import_header" {
             self.extract_import(node);
@@ -1257,9 +1286,17 @@ impl<'t> Walker<'t> {
                     } else {
                         method_name.to_string()
                     };
+                } else if let Some(chain) = receiver
+                    .filter(|r| r.kind() == "navigation_expression")
+                    .and_then(|r| kotlin_receiver_chain(self.text(r)))
+                {
+                    // Receiver chain `a.b` / `this.a` / `a?.b`: kept for the
+                    // resolver to type through the properties' declared types.
+                    callee_name = format!("{chain}.{method_name}");
                 } else {
-                    // this_expression / super_expression / 2-hop nav /
-                    // postfix `!!` / parenthesized → bare method name.
+                    // this_expression / super_expression / a longer or
+                    // non-identifier chain / postfix `!!` / parenthesized →
+                    // bare method name.
                     callee_name = method_name.to_string();
                 }
             }
@@ -1574,9 +1611,13 @@ impl<'t> Walker<'t> {
         });
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        // Subtrees the body walker has already been through.
+        if walked.contains(&node.id()) {
             return;
         }
         // Halts at functionTypes (function_declaration) + the fixed list —
@@ -1594,7 +1635,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }

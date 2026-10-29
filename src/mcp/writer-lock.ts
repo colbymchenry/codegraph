@@ -238,7 +238,7 @@ export function writerLockHeldMessage(
   return (
     'CodeGraph writer lock held by ' + who + '. ' +
     'Only one live MCP writer may serve a project (auto-sync / index). ' +
-    'Stop the other server (codegraph daemon stop if a shared daemon, or end the other MCP session), ' +
+    'Stop the other server (if it is the shared daemon, pick it in `codegraph daemon` to stop it; otherwise end the other MCP session), ' +
     'or unset CODEGRAPH_NO_DAEMON so additional clients proxy to the shared daemon. ' +
     'If this is stale, delete ' + pidPath
   );
@@ -258,8 +258,11 @@ export class RebuildInProgressError extends Error {
 }
 
 export function assertNoRebuild(root: string): void {
+  if (isRebuildInProgress(root)) throw new RebuildInProgressError();
+}
+
+/** Whether another live process holds the project's rebuild lock (`codegraph index`). */
+export function isRebuildInProgress(root: string): boolean {
   const lock = readWriterLock(root, 'rebuild.pid');
-  if (lock && lock.pid !== process.pid && isProcessAlive(lock.pid)) {
-    throw new RebuildInProgressError();
-  }
+  return !!lock && lock.pid !== process.pid && isProcessAlive(lock.pid);
 }

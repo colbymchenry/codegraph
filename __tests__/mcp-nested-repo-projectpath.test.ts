@@ -155,6 +155,31 @@ describe('projectPath inside a nested git repository the ancestor index excludes
     expect(text(res)).toContain('parent-only.ts');
   });
 
+  it.runIf(process.platform === 'win32')('serves that linked worktree spelled with a lowercase drive letter too (#2517)', async () => {
+    // VS Code and Cursor pass `d:\…` while git answers `D:\…`: one directory, so
+    // the worktree is still the borrowed-index case, never a repository of its own.
+    const wt = path.join(parent, 'wt');
+    git(parent, 'worktree', 'add', '-q', '-b', 'feature', wt);
+    const lowerWt = wt.charAt(0).toLowerCase() + wt.slice(1);
+    expect(lowerWt).not.toBe(wt);
+    __setLoadCodeGraphForTests(CodeGraph);
+    // The server's default project is the parent; then no default project, so
+    // the index is opened under the caller's spelling.
+    for (const defaultCg of [cg, null]) {
+      if (handler) await handler.closeAll();
+      handler = new ToolHandler(defaultCg);
+      const res = await handler.execute('codegraph_search', { query: 'parentOnly', projectPath: lowerWt });
+      expect(res.isError).toBeUndefined();
+      expect(text(res)).not.toMatch(/isn't indexed/);
+      expect(text(res)).toContain('different git worktree');
+      expect(text(res)).toContain('parent-only.ts');
+
+      const status = await handler.execute('codegraph_status', { projectPath: lowerWt });
+      expect(status.isError).toBeUndefined();
+      expect(text(status)).toContain('different git working tree');
+    }
+  });
+
   it('notices the nested repository joining the index without a restart', async () => {
     handler = new ToolHandler(cg);
     const before = await handler.execute('codegraph_search', { query: 'nestedOnly', projectPath: nested });

@@ -32,6 +32,17 @@ export function cDeclaratorIdentifier(node: SyntaxNode | null): SyntaxNode | nul
   return null;
 }
 
+/**
+ * Whether a C or Objective-C declaration is a constant: a `const` or
+ * `static const` file-scope declaration carries a `type_qualifier` child
+ * reading "const". Extracted as `constant`, plain globals as `variable`. A
+ * `const` inside a pointer declarator (`char *const p`) qualifies the
+ * pointer, and the declaration stays a variable.
+ */
+export function isConstDeclaration(node: SyntaxNode): boolean {
+  return node.namedChildren.some((c: SyntaxNode) => c.type === 'type_qualifier' && c.text === 'const');
+}
+
 /** C and C++ specifiers that define a class-like type, or an enum, when they carry a body (C has no `class_specifier`). */
 const CLASS_LIKE_SPECIFIERS = new Set(['class_specifier', 'struct_specifier', 'union_specifier', 'enum_specifier']);
 
@@ -46,9 +57,9 @@ export function isClassLikeDefinition(node: SyntaxNode): boolean {
 /**
  * The `declaration` a class, struct, union or enum is defined in the type of —
  * `struct Foo { … } foo;` — or null for one written on its own, in a typedef or
- * in a member's type.
+ * in a member's type. Objective-C shares it (objc.ts).
  */
-function definingDeclaration(node: SyntaxNode): SyntaxNode | null {
+export function definingDeclaration(node: SyntaxNode): SyntaxNode | null {
   if (!isClassLikeDefinition(node)) return null;
   const parent = node.parent;
   return parent?.type === 'declaration' && getChildByField(parent, 'type')?.id === node.id ? parent : null;
@@ -60,9 +71,10 @@ function definingDeclaration(node: SyntaxNode): SyntaxNode | null {
  * type of `static struct { … } SPT;` (only `SPT`), so the struct is indexed as
  * `SPT`, the way `typedef struct { … } Name;` is indexed as `Name`. Undefined
  * for a named type, and when the declaration declares no variable (a
- * function's return type). Mirrored in the kernel (ccpp/mod.rs).
+ * function's return type). Mirrored in the kernel (ccpp/mod.rs). Objective-C
+ * shares it (objc.ts), and has no kernel walker.
  */
-function unnamedTypeVariableName(node: SyntaxNode, source: string): string | undefined {
+export function unnamedTypeVariableName(node: SyntaxNode, source: string): string | undefined {
   if (getChildByField(node, 'name')) return undefined;
   const declaration = definingDeclaration(node);
   if (!declaration) return undefined;
@@ -88,15 +100,22 @@ function findDeclaratorQualifiedId(declarator: SyntaxNode): SyntaxNode | undefin
     if (current.type === 'qualified_identifier') return current;
     for (let i = 0; i < current.namedChildCount; i++) {
       const child = current.namedChild(i);
-      // Don't descend into parameters or the trailing return type — their types
-      // (`const std::string&`, `-> std::string`) aren't the function name.
-      if (child && child.type !== 'parameter_list' && child.type !== 'trailing_return_type') {
+      // Don't descend into parameters, the trailing return type or the
+      // clauses after them — `const std::string&`, `-> std::string`,
+      // nlohmann/json's `noexcept(noexcept(JSONSerializer<U>::to_json(…)))`,
+      // `throw(std::bad_alloc)`, `requires std::integral<T>` name no function.
+      if (child && !DECLARATOR_NON_NAME_PARTS.has(child.type)) {
         queue.push(child);
       }
     }
   }
   return undefined;
 }
+
+/** The parts of a function declarator that hold types or expressions, never its name. */
+const DECLARATOR_NON_NAME_PARTS: ReadonlySet<string> = new Set([
+  'parameter_list', 'trailing_return_type', 'noexcept', 'throw_specifier', 'requires_clause',
+]);
 
 /**
  * Single-argument macros are ambiguous without their definition (#1373).
@@ -217,6 +236,29 @@ function cppWrittenClassParts(node: SyntaxNode, source: string): string[] | unde
   return parts.length > 0 && parts.every((p) => /^[A-Za-z_]\w*$/.test(p)) ? parts : undefined;
 }
 
+/**
+ * The name a C++ `qualified_identifier` ends in, past its scopes: the
+ * `template_function` `ReadPrimitive<int32_t, WireFormatLite::TYPE_INT32>` for
+ * `WireFormatLite::ReadPrimitive<int32_t, WireFormatLite::TYPE_INT32>`. Null
+ * when the tree lacks one.
+ */
+function cppQualifiedIdName(qid: SyntaxNode): SyntaxNode | null {
+  let name: SyntaxNode | null = qid;
+  while (name?.type === 'qualified_identifier') name = getChildByField(name, 'name');
+  return name;
+}
+
+/**
+ * A C++ definition's name node, as named: an explicit specialization's
+ * (`template_function`) without its template arguments, so
+ * `ReadPrimitive<int32_t, WireFormatLite::TYPE_INT32>` is `ReadPrimitive`,
+ * the name every call to it writes. Mirrored in the kernel (ccpp/mod.rs).
+ */
+function cppDefinedName(name: SyntaxNode, source: string): string {
+  const own = name.type === 'template_function' ? getChildByField(name, 'name') : null;
+  return getNodeText(own ?? name, source).trim();
+}
+
 function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
   const macroDefined = recoverSingleArgMacroDefinedName(node, source) ?? recoverCppMacroDefinedName(node, source);
   if (macroDefined) return macroDefined;
@@ -224,8 +266,26 @@ function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string
   if (!declarator) return undefined;
   const qid = findDeclaratorQualifiedId(declarator);
   if (!qid) return undefined;
+  const name = cppQualifiedIdName(qid);
+  if (name) return cppDefinedName(name, source);
   const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
   return parts[parts.length - 1];
+}
+
+/**
+ * The name of a C++ function an explicit specialization defines, without its
+ * template arguments: `Swap` for `template <> void Swap<Foo>(Foo& a, Foo& b)`.
+ * Undefined for any other definition. Mirrored in the kernel (ccpp/mod.rs).
+ */
+function cppSpecializedFunctionName(node: SyntaxNode, source: string): string | undefined {
+  if (node.type !== 'function_definition') return undefined;
+  let declarator = getChildByField(node, 'declarator');
+  while (declarator && (declarator.type === 'pointer_declarator' || declarator.type === 'reference_declarator')) {
+    declarator = getChildByField(declarator, 'declarator') || declarator.namedChild(0);
+  }
+  if (declarator?.type !== 'function_declarator') return undefined;
+  const inner = getChildByField(declarator, 'declarator');
+  return inner?.type === 'template_function' ? cppDefinedName(inner, source) : undefined;
 }
 
 function extractCppReceiverType(node: SyntaxNode, source: string): string | undefined {
@@ -233,15 +293,26 @@ function extractCppReceiverType(node: SyntaxNode, source: string): string | unde
   if (!declarator) return undefined;
   const qid = findDeclaratorQualifiedId(declarator);
   if (!qid) return undefined;
-  const parts = getNodeText(qid, source).trim().split('::').filter(Boolean);
-  if (parts.length <= 1) return undefined;
+  // The scopes are what the qualified id writes before its name: a
+  // specialization's arguments (`ReadPrimitive<int32_t,
+  // WireFormatLite::TYPE_INT32>`) are no scope, though they may write `::`.
+  const name = cppQualifiedIdName(qid);
+  let scopes = getNodeText(qid, source).trim().split('::').filter(Boolean).slice(0, -1).join('::');
+  if (name) {
+    scopes = source.slice(qid.startIndex, name.startIndex).trimEnd();
+    // A `::` the parser supplied in recovery writes nothing: Metal's `vertex
+    // VertexOut vertexShader(…)` reads as `VertexOut::vertexShader`.
+    if (!scopes.endsWith('::')) return undefined;
+  }
+  const parts = scopes.split('::').filter(Boolean);
+  if (parts.length === 0) return undefined;
   // An out-of-line template method definition carries the class's template
   // parameter list in the qualifier (`template<typename T> T Box<T>::get()`),
   // but the class node is indexed as bare `Box` — strip `<…>` so the receiver
   // matches it, the same normalization #1043 applies to base-class refs.
   // Multi-line parameter lists otherwise leak whole `<…>` blocks (newlines
   // included) into qualified_name, which can exceed NAME_MAX (#1286).
-  const receiver = stripCppTemplateArgs(parts.slice(0, -1).join('::'));
+  const receiver = stripCppTemplateArgs(parts.join('::'));
   return receiver || undefined;
 }
 
@@ -378,13 +449,7 @@ export const cExtractor: LanguageExtractor = {
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
-  // A `const`/`static const` file-scope declaration carries a `type_qualifier`
-  // child reading "const" — extract those as `constant`, plain globals as
-  // `variable`.
-  isConst: (node) =>
-    node.namedChildren.some(
-      (c: SyntaxNode) => c.type === 'type_qualifier' && c.text === 'const'
-    ),
+  isConst: isConstDeclaration,
   getReturnType: extractCppReturnType,
   resolveTypeAliasKind: (node, _source) => {
     // C typedef: `typedef enum { ... } name;` or `typedef struct { ... } name;`
@@ -1086,12 +1151,20 @@ export function maskCppRawStrings(source: string): { source: string; restore: (b
  *    an operator (`MAKE(a) + 1`) — all rejected. String/char literals inside the
  *    args are skipped so an embedded `)` can't mis-close the balance.
  *
- * C++-only (wired into cppExtractor). A blanked macro inside a block comment is
- * harmless (comments don't parse), and the rare line-leading no-semicolon
- * ALL-CAPS call that isn't markup only loses that one annotation, never a whole
- * class.
+ * C runs it too (redis's `REDIS_NO_SANITIZE("bounds")` above a definition),
+ * with `keepCReturnTypes`: there a macro that wraps the return type of the
+ * function declared after it is no markup, it IS the type — cJSON's
+ * `CJSON_PUBLIC(char *) cJSON_Print(const cJSON *item)`, libgit2's
+ * `GIT_EXTERN(int) git_blob_dup(…);` — and tree-sitter-c reads it as one (a
+ * `macro_type_specifier`). Blanked with its argument, it left `cJSON_Print(…)`
+ * and a block, which parse as a call: the function had no node (#2470). See
+ * isCReturnTypeMacro for how such a macro is told from markup.
+ *
+ * A blanked macro inside a block comment is harmless (comments don't parse),
+ * and the rare line-leading no-semicolon ALL-CAPS call that isn't markup only
+ * loses that one annotation, never a whole class.
  */
-export function blankCppAnnotationMacroCalls(source: string): string {
+export function blankCppAnnotationMacroCalls(source: string, options: { keepCReturnTypes?: boolean } = {}): string {
   if (!/^[ \t]*[A-Z][A-Z0-9_]{2,}\s*\(/m.test(source)) return source;
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
@@ -1100,7 +1173,8 @@ export function blankCppAnnotationMacroCalls(source: string): string {
   let m: RegExpExecArray | null;
   while ((m = re.exec(source)) !== null) {
     const macroStart = m.index + (m[1] ?? '').length; // skip leading indent
-    let i = m.index + m[0].length - 1; // index of the opening '('
+    const open = m.index + m[0].length - 1; // index of the opening '('
+    let i = open;
     let depth = 0;
     let end = -1;
     for (; i < source.length; i++) {
@@ -1127,12 +1201,68 @@ export function blankCppAnnotationMacroCalls(source: string): string {
     // Only markup is followed by the declaration it decorates; a statement call
     // (`;`), init-list item (`,`/`{`), or expression fragment (operator) is not.
     if (!after || !/[A-Za-z_~#]/.test(after)) continue;
+    if (options.keepCReturnTypes && macroStart === m.index && isCReturnTypeMacro(source, m.index, open, end, j)) continue;
     for (let k = macroStart; k < end; k++) {
       if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
     }
     re.lastIndex = end;
   }
   return rawStrings.restore(chars.join(''));
+}
+
+/** A macro argument that reads as a C type: `char *`, `const cJSON *`, `unsigned long`, `git_repository *`. */
+const C_RETURN_TYPE_ARG_RE = /^\s*[A-Za-z_][\w\s*]*$/;
+/** A function declarator's name and the `(` of its parameter list. */
+const C_DECLARATOR_HEAD_RE = /[A-Za-z_]\w*\s*\(/y;
+/**
+ * What may end a function declarator: attributes (`__attribute__((format(printf, 1, 2)))`,
+ * an ALL-CAPS attribute macro, with or without arguments), then the body's `{` or a prototype's `;`.
+ */
+const C_DECLARATOR_TAIL_RE = /\s*(?:(?:__attribute__\s*\(\((?:[^()]|\([^()]*\))*\)\)|[A-Z][A-Z0-9_]*(?![\w$])(?:\s*\((?:[^()]|\([^()]*\))*\))?)\s*)*[{;]/y;
+
+/**
+ * Whether the column-0 macro call `MACRO(…)` starting at `lineStart` (its
+ * argument list from `open` to `end`, the next code at `next`) is the return
+ * type of the function declared right after it, not markup:
+ *  - its one argument reads as a type, so `ATTR_FORMAT(1, 2)` and
+ *    `REDIS_NO_SANITIZE("bounds")` are markup;
+ *  - only the function's declarator follows: a name, its parameter list,
+ *    attributes, then `{` or `;`. Markup is followed by a declaration with a
+ *    type of its own (`ATTR(x) void f(void);`);
+ *  - the line above leaves no declaration open. jemalloc writes the type
+ *    there: `size_t JEMALLOC_NOTHROW\nJEMALLOC_ATTR(pure)\nje_sallocx(…) {`,
+ *    and that macro is the attribute it looks like.
+ * Column 0 is where a file-scope declaration starts; an indented statement
+ * prefix in a body (`FOREACH(n) visit(n);`) is no return type.
+ */
+function isCReturnTypeMacro(source: string, lineStart: number, open: number, end: number, next: number): boolean {
+  if (!C_RETURN_TYPE_ARG_RE.test(source.slice(open + 1, end - 1))) return false;
+  C_DECLARATOR_HEAD_RE.lastIndex = next;
+  const head = C_DECLARATOR_HEAD_RE.exec(source);
+  if (!head) return false;
+  let close = -1;
+  let depth = 0;
+  for (let i = next + head[0].length - 1; i < source.length && close < 0; i++) {
+    const c = source[i];
+    if (c === '(') depth++;
+    else if (c === ')') { if (--depth === 0) close = i; }
+    else if (c === ';' || c === '{' || c === '}') return false;
+  }
+  if (close < 0) return false;
+  C_DECLARATOR_TAIL_RE.lastIndex = close + 1;
+  return C_DECLARATOR_TAIL_RE.test(source) && !opensCDeclaration(source, lineStart);
+}
+
+/**
+ * Whether the line right above `lineStart` leaves a declaration open: its
+ * code ends in a type's last token (`unsigned long`, `char *`, `size_t
+ * JEMALLOC_NOTHROW`). A blank line, a directive, or a comment closes none.
+ */
+function opensCDeclaration(source: string, lineStart: number): boolean {
+  if (lineStart === 0) return false;
+  const from = source.lastIndexOf('\n', lineStart - 2) + 1;
+  const line = source.slice(from, lineStart - 1).replace(/\/\/.*$/, '').trim();
+  return line !== '' && !line.startsWith('#') && /[\w*]$/.test(line);
 }
 
 /**
@@ -1155,17 +1285,44 @@ export function blankCppAnnotationMacroCalls(source: string): string {
  *    (`=`, an operator, `,`, `(`, `?`, `:`, or a `\` macro-definition
  *    continuation) — so an ALL-CAPS operand split onto its own line inside a
  *    multi-line expression (`int x =\n  SOME_CONST\n  | OTHER;`) is left
- *    alone; and
+ *    alone. A preprocessor directive ends at its own line, even one that
+ *    ends in `>`: GLib's `G_BEGIN_DECLS` below `#include <glib.h>`, and
+ *    Objective-C's `NS_ASSUME_NONNULL_BEGIN` below `#import
+ *    <Foundation/Foundation.h>`, are blanked; and
  *  - the NEXT line of code starts like a declaration/scope token
  *    (letter, `_`, `#`, `{`, `}`, or `~`) or the file ends — an operator,
  *    string literal, or `;` continuation rejects the match. Comments in
  *    between are skipped: {fmt}'s `FMT_BEGIN_EXPORT` sits above `// A
  *    generic formatting context …` and then the class it opens.
- * Shared by C and C++ (the idiom is identical in both).
+ * Shared by C and C++ (the idiom is identical in both), and by Objective-C
+ * through OBJC_LONE_MACROS.
  */
 const LONE_MACRO_LINE_RE = /^[ \t]*([A-Z][A-Z0-9_]{3,})[ \t]*(?:\/\/[^\n\r]*|\/\*[^\n\r]*\*\/[ \t]*)?\r?$/;
 const LONE_MACRO_CONTINUATION_END_RE = /[=+\-*/%&|^<>?:,(\\]$/;
-export function blankLoneMacroLines(source: string): string {
+
+/** How a language's code reads around a macro alone on its line. */
+interface LoneMacroRules {
+  /** What the code after the macro may start with. */
+  nextCode: RegExp;
+  /** Whether a macro that is a body's only statement, between `{` and `}`, stays. */
+  keepsSoleStatement: boolean;
+}
+
+const C_LONE_MACROS: LoneMacroRules = { nextCode: /[A-Za-z_#{}~]/, keepsSoleStatement: false };
+
+/**
+ * Objective-C's: the code after the macro may be a directive, like the
+ * `@interface` below `NS_ASSUME_NONNULL_BEGIN` or the `@end` below
+ * `OF_SINGLETON_METHODS`.
+ *
+ * A macro that is a method's whole body, like ObjFW's `{
+ * OF_UNRECOGNIZED_SELECTOR }`, stays: the parser's error there stays inside
+ * that body, but blanking it changed how the parser recovered from an
+ * earlier misread, and OFMutableString.m lost 11 calls in the methods below.
+ */
+export const OBJC_LONE_MACROS: LoneMacroRules = { nextCode: /[A-Za-z_#{}~@]/, keepsSoleStatement: true };
+
+export function blankLoneMacroLines(source: string, rules: LoneMacroRules = C_LONE_MACROS): string {
   if (!/^[ \t]*[A-Z][A-Z0-9_]{3,}[ \t]*\r?$/m.test(source)) return source;
   const lines = source.split('\n');
   const content = (l: string): string => l.replace(/\r$/, '').trim();
@@ -1186,9 +1343,11 @@ export function blankLoneMacroLines(source: string): string {
     // continues nothing either.
     const prevText = prev >= 0 ? content(lines[prev] as string) : '';
     const prevCode = /^(?:\/\/|\/\*|\*)/.test(prevText) ? '' : prevText.replace(/\/\*.*?\*\/|\/\/.*$/g, '').trim();
-    if (prevCode !== '' && !/^template\s*</.test(prevCode) && LONE_MACRO_CONTINUATION_END_RE.test(prevCode)) continue;
+    const directiveEnds = prevCode.startsWith('#') && !prevCode.endsWith('\\');
+    if (prevCode !== '' && !directiveEnds && !/^template\s*</.test(prevCode) && LONE_MACRO_CONTINUATION_END_RE.test(prevCode)) continue;
     const first = firstCodeCharAfter(lines, i + 1);
-    if (first !== undefined && !/[A-Za-z_#{}~]/.test(first)) continue;
+    if (first !== undefined && !rules.nextCode.test(first)) continue;
+    if (rules.keepsSoleStatement && prevCode.endsWith('{') && first === '}') continue;
     const start = line.indexOf(m[1] as string);
     lines[i] =
       line.slice(0, start) + ' '.repeat((m[1] as string).length) + line.slice(start + (m[1] as string).length);
@@ -1553,9 +1712,51 @@ export function flattenMidStatementConditionals(source: string): string {
   return changed ? lines.join('\n') : source;
 }
 
+// Foundation's enum macros and their CoreFoundation forms, with an optional
+// `typedef` before them: `typedef NS_ENUM(NSInteger, SDImageCacheType)`.
+const FOUNDATION_ENUM_MACRO_RE =
+  /\b(?:(typedef)(\s+))?(NS_ENUM|NS_OPTIONS|NS_CLOSED_ENUM|NS_ERROR_ENUM|CF_ENUM|CF_OPTIONS|CF_CLOSED_ENUM)(\s*)\(([^(),]*),(\s*)([A-Za-z_]\w*)(\s*)\)/g;
+
+/**
+ * Rewrite a Foundation enum macro as the enum it declares, in place:
+ * `typedef NS_ENUM(NSInteger, SDImageCacheType) {` becomes
+ * `        enum               SDImageCacheType  {`. The parser reads the
+ * macro as a broken typedef, so the enum and every value in it were missing
+ * (SDWebImage had no enum at all). The `typedef`, the rest of the macro's
+ * name, its parentheses and its first argument (the underlying type, or an
+ * NS_ERROR_ENUM's domain) become spaces, so every offset stays. Matched on
+ * the code with comments, literals and directives masked: the `#define` of
+ * the macro itself is left alone. Shared by Objective-C, C and C++, whose
+ * headers all use the macros.
+ */
+export function rewriteFoundationEnumMacros(source: string): string {
+  if (!/\b(?:NS|CF)_[A-Z_]*(?:ENUM|OPTIONS)\s*\(/.test(source)) return source;
+  let out: string[] | null = null;
+  for (const m of maskCppCode(source).matchAll(FOUNDATION_ENUM_MACRO_RE)) {
+    out ??= source.split('');
+    const blank = (from: number, to: number): void => {
+      for (let k = from; k < to; k++) if (out![k] !== '\n' && out![k] !== '\r') out![k] = ' ';
+    };
+    let at = m.index;
+    if (m[1]) {
+      blank(at, at + m[1].length);
+      at += m[1].length + (m[2] as string).length;
+    }
+    const macro = m[3] as string;
+    out.splice(at, 4, 'e', 'n', 'u', 'm');
+    blank(at + 4, at + macro.length);
+    at += macro.length + (m[4] as string).length;
+    // `(`, the first argument and the `,`.
+    blank(at, at + 1 + (m[5] as string).length + 1);
+    at += 1 + (m[5] as string).length + 1 + (m[6] as string).length + (m[7] as string).length + (m[8] as string).length;
+    blank(at, at + 1); // `)`
+  }
+  return out ? out.join('') : source;
+}
+
 function preParseCppSource(source: string, filePath?: string): string {
   const rawStrings = maskCppRawStrings(source);
-  source = flattenMidStatementConditionals(rewriteCppAccessMacros(rawStrings.source));
+  source = flattenMidStatementConditionals(rewriteCppAccessMacros(rewriteFoundationEnumMacros(rawStrings.source)));
   // blankCLeadingAttrMacros runs AFTER the api-prefix blank so a stacked
   // `FMT_NORETURN FMT_API void f(…)` reduces to the `MACRO Ret name(` shape
   // it matches (the _API token is already spaces by then). The C++ leading
@@ -1720,7 +1921,10 @@ export function blankCStatementMacroCalls(source: string): string {
   const content = (l: string): string => l.replace(/\r$/, '').trim();
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] as string;
-    const m = /^[ \t]+([a-z_][a-z0-9_]*)[ \t]*\(/.exec(line);
+    // Lowercase iterator macros, or an all-caps block macro
+    // (`ATOMIC_BLOCK(NVIC_PRIO_MAX) {`, `PG_FOREACH(reg) {` — betaflight);
+    // a PascalCase name is left alone (a constructor, if the file is C++).
+    const m = /^[ \t]+([a-z_][a-z0-9_]*|[A-Z_][A-Z0-9_]*)[ \t]*\(/.exec(line);
     if (!m || C_STMT_MACRO_KEYWORDS.has(m[1] as string)) continue;
     const open = line.indexOf('(', m[0].length - 1);
     let depth = 0;
@@ -2343,9 +2547,163 @@ export function blankCDesignatedMacroArgs(source: string): string {
   return rawStrings.restore(out.join(''));
 }
 
+/**
+ * Open up a `#if … #elif … #else … #endif` group whose branches are not
+ * self-contained statements. tree-sitter-c keeps EVERY branch of a
+ * conditional group and parses each as a run of block items, so a group is
+ * only harmless when each branch is complete on its own. Three shapes in
+ * real C are not, and each ends in a phantom function (K&R
+ * `if(cond) { … }` reads as an implicit-int function definition named `if`,
+ * and the extractor then files it — and every symbol after it — under the
+ * enclosing function; 265 on a betaflight tree, #1729 follow-up):
+ *
+ *  - a branch that BEGINS with `else` — `} #ifdef X  else if (…) { … } #endif`
+ *    (a conditional arm of an if-chain);
+ *  - a branch that ENDS with a bare `if (…)` / `else if (…)` header whose
+ *    body sits after the `#endif` (the ST HAL's per-device latency tables);
+ *  - a branch whose braces do not balance — a function signature or a `{`
+ *    that differs per configuration, with the body shared.
+ *
+ * The group's directive lines are blanked to spaces (newlines and `\r` kept,
+ * so offsets survive). When every branch's braces and parentheses balance,
+ * all branches stay, read in a row. Otherwise one branch stays verbatim and
+ * the rest become spaces too, which is what the preprocessor would hand a
+ * compiler for that configuration: the `#else` of a feature test, the first
+ * branch of `#ifndef`, the live one of `#if 0` or `#if 1`. Groups whose
+ * branches are whole statements — the vast majority — are untouched. This
+ * pass edits directive lines on purpose, so it runs AFTER
+ * `restoreDirectiveLines` (like the named-variadic pass).
+ * Groups are handled innermost-first; an inner group inside a blanked branch
+ * simply disappears with it.
+ */
+const C_COND_OPEN_RE = /^[ \t]*#[ \t]*(if|ifdef|ifndef)\b[ \t]*(.*)$/;
+const C_COND_NEXT_RE = /^[ \t]*#[ \t]*(elif|else)\b/;
+const C_COND_ENDIF_RE = /^[ \t]*#[ \t]*endif\b/;
+export function blankCUnbalancedConditionalBranches(source: string): string {
+  if (source.indexOf('#') === -1) return source;
+  const lines = source.split('\n');
+  // The same lines with comments and string / char literals as spaces: a `{`
+  // in a block comment over several lines (Lua's `** {======` banners) or a
+  // `#` line inside one is not code. Blanked along with `lines`, so an outer
+  // group reads an inner one as collapsed.
+  const masked = maskCppCommentsAndLiterals(source).split('\n');
+  const stripCr = (l: string): string => (l.endsWith('\r') ? l.slice(0, -1) : l);
+  // Code content of a line.
+  const code = (k: number): string => stripCr(masked[k] as string).trim();
+  const blank = (l: string): string => l.replace(/[^\r]/g, ' ');
+  const blankLine = (k: number): void => {
+    lines[k] = blank(lines[k] as string);
+    masked[k] = blank(masked[k] as string);
+  };
+  // Directive line indices of each open group, innermost last.
+  // `positive`: the group opens on a feature test (`#ifdef X`, `#if defined(X)`,
+  // `#if X`), whose `#else` branch is the default build. `elseAt`: index into
+  // marks of that `#else`, if any. `literal`: `#if 0` or `#if 1`.
+  const stack: Array<{ marks: number[]; dead: boolean; literal: boolean; positive: boolean; elseAt: number }> = [];
+  const directive: boolean[] = [];
+  // Lines that continue the directive above them with a `\`.
+  const continued: boolean[] = [];
+  let changed = false;
+  let continuation = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = stripCr(masked[i] as string);
+    const isDirective: boolean = continuation || /^[ \t]*#/.test(line);
+    directive[i] = isDirective;
+    continued[i] = continuation;
+    const wasContinuation = continuation;
+    // Read on the raw line: a `\` that ends a line splices it even inside a
+    // comment (a multi-line comment in a `#define` body), and masking would
+    // hide it.
+    continuation = isDirective && /\\\s*$/.test(stripCr(lines[i] as string));
+    if (!isDirective || wasContinuation) continue;
+    let m: RegExpExecArray | null;
+    if ((m = C_COND_OPEN_RE.exec(line))) {
+      const cond = (m[2] as string).trim();
+      const dead = m[1] === 'if' && /^0\b/.test(cond);
+      // `#if 1` is the other way round from `#if 0`: its first branch is the live one.
+      const live = m[1] === 'if' && /^1\b/.test(cond);
+      const positive = m[1] === 'ifdef' || (m[1] === 'if' && !dead && !live && !/^!/.test(cond));
+      stack.push({ marks: [i], dead, literal: dead || live, positive, elseAt: -1 });
+      continue;
+    }
+    const top = stack[stack.length - 1];
+    if (!top) continue;
+    if (C_COND_NEXT_RE.test(line)) {
+      if (/^[ \t]*#[ \t]*else\b/.test(line)) top.elseAt = top.marks.length;
+      top.marks.push(i);
+      continue;
+    }
+    if (!C_COND_ENDIF_RE.test(line)) continue;
+    stack.pop();
+    top.marks.push(i);
+    // Which branch survives: never `#if 0`'s; for a feature test with an
+    // `#else`, the `#else` branch — the build without the feature is the one
+    // that defines `main`, not `umain` (jq's `#ifdef WIN32`); otherwise the
+    // first. A kept branch is verbatim; the others become spaces.
+    const keep = top.dead ? 1 : top.positive && top.elseAt > 0 ? top.elseAt : 0;
+    if (keep >= top.marks.length - 1) continue; // `#if 0` with nothing to keep
+    let damaged = false;
+    // Whether each branch's braces and parentheses balance on their own.
+    let balanced = true;
+    for (let b = 0; b < top.marks.length - 1; b++) {
+      const body: string[] = [];
+      for (let k = (top.marks[b] as number) + 1; k < (top.marks[b + 1] as number); k++) {
+        if (directive[k]) continue; // a `\`-continued directive line
+        const c = code(k);
+        if (c) body.push(c);
+      }
+      if (body.length === 0) continue;
+      const first = body[0] as string;
+      const last = body[body.length - 1] as string;
+      let depth = 0;
+      let parens = 0;
+      let dips = false;
+      for (const l of body) {
+        for (const ch of l) {
+          depth += ch === '{' ? 1 : ch === '}' ? -1 : 0;
+          parens += ch === '(' ? 1 : ch === ')' ? -1 : 0;
+          if (depth < 0) dips = true; // closes a block it did not open (`} else if (…) {`)
+        }
+      }
+      if (depth !== 0 || parens !== 0) balanced = false;
+      damaged ||=
+        depth !== 0 ||
+        dips ||
+        /^else\b/.test(first) ||
+        // A fragment of an expression: `|| (h4 == NULL)` inside an `if (…)`,
+        // `isEmpty(s) ||` before the rest of the condition.
+        /^(\|\||&&|,|\)|:|\?)/.test(first) ||
+        /(\|\||&&|,|\(|\?|:)$/.test(last) ||
+        (/^(else[ \t]+)?if[ \t]*\(/.test(last) && /\)$/.test(last));
+    }
+    if (!damaged) continue;
+    // A group on a flag whose branches each balance keeps them all: read in
+    // a row they are still C (`} else if (a) {…} else if (b) {…}`, list
+    // entries, `|| x || y`), and the parser needed only the directive lines
+    // gone. Dropping one would lose real code of a build the project may
+    // well use (betaflight's ENABLE_RESCUE_PLAN arms). A branch that opens or
+    // closes more than it should, or a literal `#if 0` / `#if 1`, keeps one.
+    const keepAll = balanced && !top.literal;
+    for (let b = 0; b < top.marks.length - 1; b++) {
+      const from = top.marks[b] as number;
+      const to = top.marks[b + 1] as number;
+      // The directive line (with its `\`-continuations), then — unless this
+      // is the kept branch — the branch body.
+      // Only its own `\` continuations: a `#define` or `#include` right under
+      // it is a line of the branch, kept with a kept branch.
+      for (let k = from; k < to && (k === from || continued[k]); k++) blankLine(k);
+      if (b === keep || keepAll) continue;
+      for (let k = from + 1; k < to; k++) blankLine(k);
+    }
+    blankLine(i);
+    changed = true;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
 function preParseCSource(source: string): string {
   const rawStrings = maskCppRawStrings(source);
-  source = rawStrings.source;
+  source = rewriteFoundationEnumMacros(rawStrings.source);
   const inner = blankCDesignatedMacroArgs(blankCKernelAnnotations(blankCCplusplusGuardBodies(source)));
   let blanked = blankCLeadingAttrMacros(
     blankLoneMacroLines(
@@ -2362,16 +2720,24 @@ function preParseCSource(source: string): string {
                   )
                 )
               )
-            )
+            ),
+            { keepCReturnTypes: true }
           )
         )
       )
     )
   );
   if (looksLikeCudaSource(blanked)) blanked = blankCudaConstructs(blanked);
-  // The named-variadic `#define` pass runs AFTER the directive restore — it
-  // deliberately edits directive lines (see its doc comment).
-  return rawStrings.restore(blankCNamedVariadicDefineDots(restoreDirectiveLines(source, blanked)));
+  // The named-variadic `#define` pass and the conditional-group collapse run
+  // AFTER the directive restore — they deliberately edit directive lines (see
+  // their doc comments) — and BEFORE the raw-string restore: both are
+  // length-preserving, and the collapse must count braces with raw-string
+  // bodies still masked.
+  return rawStrings.restore(
+    blankCUnbalancedConditionalBranches(
+      blankCNamedVariadicDefineDots(restoreDirectiveLines(source, blanked))
+    )
+  );
 }
 
 /** A constructor prototype carries defaults even when its body is in another file. */
@@ -2425,7 +2791,8 @@ export const cppExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   resolveName: (node, source) =>
-    extractCppQualifiedMethodName(node, source) ?? unnamedTypeVariableName(node, source) ?? cppWrittenClassParts(node, source)?.at(-1),
+    extractCppQualifiedMethodName(node, source) ?? unnamedTypeVariableName(node, source) ?? cppWrittenClassParts(node, source)?.at(-1) ??
+    cppSpecializedFunctionName(node, source),
   getDeclarationWrapper: (node) => definingDeclaration(node) ?? undefined,
   getReceiverType: extractCppReceiverType,
   getClassScope: (node, source) => cppWrittenClassParts(node, source)?.slice(0, -1).join('::') || undefined,

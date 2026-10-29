@@ -43,6 +43,7 @@ import { Language } from '../types';
 import { EXTRACTORS } from './languages';
 import { getParser, loadGrammarsForLanguages } from './grammars';
 import { parseWithinBudget } from './parse-budget';
+import { sfcScriptLanguage } from './sfc-script';
 import type { LanguageExtractor } from './tree-sitter-types';
 
 /* ------------------------------------------------------------- the classes -- */
@@ -348,11 +349,12 @@ function emit(ctx: WalkContext, start: number, end: number, cls: SyntaxTokenClas
  * Single-file components are the only case: a `.svelte`, `.vue` or `.astro`
  * file has no tree-sitter grammar of its own here, but its `<script>` block —
  * where every symbol the engine indexed in that file lives — is ordinary
- * TypeScript or JavaScript. The extractors already delegate exactly this way,
- * so the viewer reads a component's code with the same grammar the graph was
- * built from. The surrounding markup stays unclassified, which under a
- * near-monochrome theme costs the recession on tag names and attribute strings
- * and nothing else.
+ * TypeScript or JavaScript (or TSX, for a Vue `lang="tsx"` block). The
+ * extractors already delegate exactly this way, so the viewer reads a
+ * component's code with the same grammar the graph was built from (it asks
+ * `sfcScriptLanguage`, as the Vue and Svelte extractors do). The surrounding
+ * markup stays unclassified, which under a near-monochrome theme costs the
+ * recession on tag names and attribute strings and nothing else.
  */
 export interface SyntaxRegion {
   start: number;
@@ -361,7 +363,6 @@ export interface SyntaxRegion {
 }
 
 const SCRIPT_BLOCK = /<script(\s[^>]*)?>([\s\S]*?)<\/script>/gi;
-const TS_LANG_ATTR = /lang\s*=\s*["'](ts|typescript)["']/i;
 /** Astro's frontmatter: a `---` fence at the very top of the file. */
 const ASTRO_FRONTMATTER = /^(---\r?\n)([\s\S]*?)\r?\n---/;
 
@@ -392,7 +393,8 @@ export function syntaxRegionsFor(source: string, language: Language): SyntaxRegi
     regions.push({
       start,
       end: start + body.length,
-      language: TS_LANG_ATTR.test(match[1] ?? '') ? 'typescript' : 'javascript',
+      // The grammar the extractor read this block with.
+      language: sfcScriptLanguage(match[1] ?? '', language),
     });
   }
   return regions;

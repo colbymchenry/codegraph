@@ -316,6 +316,24 @@ const CASES: Case[] = [
     expected: '/login → /login',
   },
   {
+    // Nuxt's auto-imported navigateTo, waiting for its page (#2634).
+    name: 'Nuxt (navigateTo)',
+    files: {
+      'package.json': JSON.stringify({ name: 'site', dependencies: { nuxt: '4', vue: '3' } }),
+      'pages/index.vue':
+        '<template>\n  <button @click="signIn">Sign in</button>\n</template>\n' +
+        '<script setup lang="ts">\n' +
+        'function signIn() {\n' +
+        '  return navigateTo("/login")\n' +
+        '}\n' +
+        '</script>\n',
+      'pages/login.vue': '<template>\n  <div>Login</div>\n</template>\n',
+    },
+    route: { file: 'pages/login.vue', before: null },
+    from: 'pages/index.vue',
+    expected: '/login → /login',
+  },
+  {
     name: 'Angular',
     files: {
       'package.json': JSON.stringify({ dependencies: { '@angular/core': '19', '@angular/router': '19' } }),

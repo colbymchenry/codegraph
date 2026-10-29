@@ -1,8 +1,14 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
+import { preParsePascal } from './pascal-preparse';
 
 export const pascalExtractor: LanguageExtractor = {
+  // Blank Delphi syntax the grammar has no rule for, such as an attribute on a
+  // parameter (`const [ref] AValue: Integer`), offsets kept (#2545). Signatures
+  // still read the attribute from the source as written.
+  preParse: preParsePascal,
+  signatureAsWritten: true,
   functionTypes: ['declProc'],
   classTypes: ['declClass'],
   methodTypes: ['declProc'],

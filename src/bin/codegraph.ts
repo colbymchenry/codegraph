@@ -53,7 +53,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
+import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -72,6 +72,7 @@ import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
+import { goPackageReaderFor } from '../graph/go-package';
 import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
 
@@ -377,6 +378,32 @@ function warn(message: string): void {
   console.log(chalk.yellow(getGlyphs().warn) + ' ' + message);
 }
 
+/**
+ * Open a project's index for a command that only reads it: `query`,
+ * `explore`, `node`, the prompt hook and the rest (#2913).
+ *
+ * Opened read-write, the index runs the writer's repairs: migrations, the
+ * rebuild of the indexes and search triggers an interrupted bulk load left
+ * out, and WAL maintenance. While `codegraph index` or a sync writes in
+ * another process, those repairs recreate the indexes its bulk load dropped,
+ * and its next write fails with SQLITE_BUSY_SNAPSHOT, "database is locked".
+ * Read-only, a command leaves all of that to the writer, as `status` does
+ * since #2930; an index an older release built is read as it is (see
+ * QueryBuilder.hasSchema).
+ *
+ * During a rebuild the answer comes from a graph still being built, so the
+ * command says so, on stderr to keep a `--json` answer parseable.
+ */
+async function openIndexToRead(projectPath: string): Promise<import('../index').CodeGraph> {
+  const { default: CodeGraph } = await loadCodeGraph();
+  const cg = await CodeGraph.open(projectPath, { readOnly: true });
+  const { isRebuildInProgress } = await import('../mcp/writer-lock');
+  if (isRebuildInProgress(projectPath)) {
+    console.error(`${chalk.yellow(getGlyphs().warn)} An index rebuild ("codegraph index") is running in another process — this answer comes from the part of the index it has rebuilt so far.`);
+  }
+  return cg;
+}
+
 /** "not found" (+ optional did-you-mean) when no exact symbol matches. */
 function formatSymbolNotFound(symbol: string, fuzzyNames: string[]): string {
   const suggestions = [...new Set(fuzzyNames.filter((n) => n !== symbol))].slice(0, 3);
@@ -549,9 +576,11 @@ async function offerIndexIgnoredRepos(
   opts: { interactive: boolean },
 ): Promise<IndexResult | undefined> {
   let repos: string[];
+  let patterns: string[];
   try {
-    const { findUnindexedIgnoredRepos } = await import('../extraction');
+    const { findUnindexedIgnoredRepos, includeIgnoredPatternFor } = await import('../extraction');
     repos = findUnindexedIgnoredRepos(projectPath);
+    patterns = repos.map(includeIgnoredPatternFor);
   } catch {
     return; // detection is advisory — never let it break the command
   }
@@ -562,7 +591,7 @@ async function offerIndexIgnoredRepos(
   const SHOWN = 6;
   const names = repos.slice(0, SHOWN).map((r) => r.replace(/\/$/, ''));
   const extra = repos.length > SHOWN ? ` (+${formatNumber(repos.length - SHOWN)} more)` : '';
-  const snippet = `{ "includeIgnored": [${repos.map((p) => JSON.stringify(p)).join(', ')}] }`;
+  const snippet = `{ "includeIgnored": [${patterns.map((p) => JSON.stringify(p)).join(', ')}] }`;
 
   clack.log.warn(
     `Your .gitignore excludes ${isOne ? 'a nested git repository' : `${formatNumber(repos.length)} nested git repositories`} here, ` +
@@ -593,7 +622,7 @@ async function offerIndexIgnoredRepos(
   let added: number;
   try {
     const { addIncludeIgnoredPatterns } = await import('../project-config');
-    added = addIncludeIgnoredPatterns(projectPath, repos);
+    added = addIncludeIgnoredPatterns(projectPath, patterns);
   } catch (err) {
     clack.log.error(`Could not update ${PROJECT_CONFIG_FILENAME}: ${err instanceof Error ? err.message : String(err)}`);
     manualHint();
@@ -902,10 +931,12 @@ program
       try {
         // A live MCP daemon keeps SQLite handles open. Verify it by its socket
         // before stopping it so a stale pidfile can never signal another process.
-        const { stopDaemonAt } = await import('../mcp/daemon-registry');
-        const daemonStop = await stopDaemonAt(fs.realpathSync(projectPath), { preserveUnverified: true });
+        // A lock left naming a process that isn't CodeGraph is cleared (#2770).
+        const { stopDaemonAt, daemonStopFailureMessage } = await import('../mcp/daemon-registry');
+        const realRoot = fs.realpathSync(projectPath);
+        const daemonStop = await stopDaemonAt(realRoot, { preserveUnverified: true });
         if (daemonStop.outcome === 'unverified' || daemonStop.outcome === 'still-running') {
-          throw new Error('Could not verify that the active CodeGraph daemon has stopped. Run `codegraph daemon stop` to stop it, then retry `codegraph index`.');
+          throw new Error(await daemonStopFailureMessage(realRoot, daemonStop));
         }
 
         // Keep the writer slot through recreation AND indexing. A reconnecting
@@ -1118,7 +1149,17 @@ program
       }
 
       const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      // Status only reads. Opened read-write, it ran the open-time repairs
+      // meant for the writer: during a rebuild's bulk load it recreated the
+      // secondary indexes the indexer had dropped, and the indexer's next
+      // edge write failed with SQLITE_BUSY_SNAPSHOT, "database is locked"
+      // (#2913). Read-only, it leaves migrations, index repair and WAL
+      // maintenance to the writer.
+      const cg = await CodeGraph.open(projectPath, { readOnly: true });
+      const { isRebuildInProgress } = await import('../mcp/writer-lock');
+      // A `codegraph index` in another process owns the database: the
+      // numbers below are a snapshot of a graph being rebuilt.
+      const rebuildInProgress = isRebuildInProgress(projectPath);
       const stats = cg.getStats();
       const changes = cg.getChangedFiles();
       const backend = cg.getBackend();
@@ -1126,6 +1167,9 @@ program
 
       const buildInfo = cg.getIndexBuildInfo();
       const reindexRecommended = cg.isIndexStale();
+      // Frameworks a sync detected since the last full index (#2516): files
+      // indexed before then were extracted without them.
+      const frameworkChanges = cg.getFrameworkChangesSinceIndex();
       const indexState = cg.getIndexState();
       // Zero on a healthy index; non-zero at rest means a resolution pass was
       // interrupted, so some files' call edges are missing (#1187).
@@ -1160,11 +1204,16 @@ program
           worktreeMismatch: worktreeMismatch
             ? { worktreeRoot: worktreeMismatch.worktreeRoot, indexRoot: worktreeMismatch.indexRoot }
             : null,
+          // True while another process runs `codegraph index` on this
+          // project: the statistics are a snapshot of the rebuild (#2913).
+          rebuildInProgress,
           index: {
             builtWithVersion: buildInfo.version,
             builtWithExtractionVersion: buildInfo.extractionVersion,
             currentExtractionVersion: EXTRACTION_VERSION,
-            reindexRecommended,
+            reindexRecommended: reindexRecommended || frameworkChanges !== null,
+            // { added, removed } frameworks since the last full index, or null.
+            frameworksChangedSinceIndex: frameworkChanges,
             // 'complete' | 'partial' (files silently dropped) | 'indexing'
             // (a run was killed mid-index — the index is truncated) |
             // 'failed' | null (predates the marker).
@@ -1192,14 +1241,18 @@ program
       if (worktreeMismatch) {
         warn(worktreeMismatchWarning(worktreeMismatch));
       }
-      if (indexState === 'indexing') {
+      if (rebuildInProgress) {
+        warn('An index rebuild ("codegraph index") is running in another process — the statistics below are a snapshot of it.');
+      } else if (indexState === 'indexing') {
         warn('The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".');
       } else if (indexState === 'partial') {
         warn('The last index run silently dropped files — the index is partial. Re-run "codegraph index".');
       } else if (indexState === 'failed') {
         warn('The last index run failed — results may be incomplete. Re-run "codegraph index".');
       }
-      if (pendingRefs > 0) {
+      // A running rebuild's references are its own work in progress, not an
+      // interrupted run's.
+      if (pendingRefs > 0 && !rebuildInProgress) {
         warn(`${formatNumber(pendingRefs)} references from an interrupted run are awaiting resolution — some callers/impact edges are missing. Run "codegraph sync" to resolve them.`);
       }
       console.log();
@@ -1212,15 +1265,16 @@ program
       console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
       // Surface the WAL sidecar (#1431): a WAL that dwarfs the DB at rest is
       // the killed-session leak — invisible before this line, it only showed
-      // up as a mysteriously full disk. open() above already kicked off the
-      // automatic heal for the oversized case.
+      // up as a mysteriously full disk. The read-only open above leaves the
+      // heal to the next writer's open, such as a sync (#2913).
       if (stats.walSizeBytes > 0) {
         const { WAL_HEAL_THRESHOLD_BYTES } = await import('../db/index');
         const oversized = stats.walSizeBytes > Math.max(WAL_HEAL_THRESHOLD_BYTES, stats.dbSizeBytes);
         const walLabel = `${(stats.walSizeBytes / 1024 / 1024).toFixed(2)} MB`;
         console.log(`  WAL Size:  ${oversized ? chalk.yellow(walLabel) : walLabel}`);
-        if (oversized) {
-          warn('The write-ahead log is larger than the database — killed sessions left it behind. It is reclaimed automatically on open; if it persists across runs, another live CodeGraph process is holding it.');
+        // A running rebuild's WAL is its own, not a killed session's.
+        if (oversized && !rebuildInProgress) {
+          warn('The write-ahead log is larger than the database — killed sessions left it behind. The next "codegraph sync" reclaims it; if it persists after that, another live CodeGraph process is holding it.');
         }
       }
       // Surface the active SQLite backend (node:sqlite — Node's built-in real
@@ -1257,6 +1311,13 @@ program
       }
       console.log();
 
+      // What follows is advice for an index at rest: sync its pending changes,
+      // re-index an older build. A running rebuild is replacing this one.
+      if (rebuildInProgress) {
+        cg.destroy();
+        return;
+      }
+
       // Pending changes
       const totalChanges = changes.added.length + changes.modified.length + changes.removed.length;
       if (totalChanges > 0) {
@@ -1287,6 +1348,15 @@ program
         info('Run "codegraph index" (full rebuild) or "codegraph sync"');
         console.log();
       }
+      if (frameworkChanges) {
+        const changed = [
+          ...(frameworkChanges.added.length > 0 ? [`added ${frameworkChanges.added.join(', ')}`] : []),
+          ...(frameworkChanges.removed.length > 0 ? [`removed ${frameworkChanges.removed.join(', ')}`] : []),
+        ].join('; ');
+        warn(`Frameworks changed since the last full index (${changed}); files indexed before then were read without the change.`);
+        info('Run "codegraph index" to re-index every file with them');
+        console.log();
+      }
 
       cg.destroy();
     } catch (err) {
@@ -1314,8 +1384,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
 
       const limit = parseInt(options.limit || '10', 10);
       const rawResults = cg.searchNodes(search, {
@@ -1400,8 +1469,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
       const { ToolHandler } = await import('../mcp/tools');
       const handler = new ToolHandler(cg);
 
@@ -1457,8 +1525,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
 
       const result = await cg.buildContext(taskParts.join(' '), {
         format,
@@ -1511,11 +1578,14 @@ program
 
       let input: { prompt?: string; cwd?: string } = {};
       try { input = JSON.parse(raw); } catch { return; }
-      const prompt = String(input.prompt || '');
-      // System-injected task notifications and subagent hand-backs are not
-      // user prompts: exit before any project lookup or explore work (#1832,
-      // #2184).
-      if (isTaskNotification(prompt) || isAgentMessage(prompt)) return;
+      // The desktop app's <system-reminder> blocks are host status, not what
+      // the user typed: gate, pick the project and explore on the rest
+      // (#2635).
+      const prompt = stripSystemReminders(String(input.prompt || ''));
+      // System-injected task notifications, subagent hand-backs and messages
+      // from other sessions are not user prompts, and neither is nothing:
+      // exit before any project lookup or explore work (#1832, #2184, #2635).
+      if (!prompt || isTaskNotification(prompt) || isAgentMessage(prompt) || isCrossSessionMessage(prompt)) return;
 
       // Gate telemetry: how often each tier fires vs. no-ops — counter names
       // only, NEVER prompt content (see TELEMETRY.md). This is the data that
@@ -1559,8 +1629,15 @@ program
         `${lead}\n${projects.map((p) => `  - projectPath: "${p}"`).join('\n')}\n`;
 
       if (plan.exploreRoot) {
-        const { default: CodeGraph } = await loadCodeGraph();
-        const cg = await CodeGraph.open(plan.exploreRoot);
+        // A `codegraph index` in another process is rebuilding this index: it
+        // holds part of the graph until the rebuild ends, and the rebuild
+        // replaces the file, which an open handle blocks on Windows. Inject
+        // nothing, as the MCP tools answer "rebuild in progress" (#2913).
+        const { isRebuildInProgress } = await import('../mcp/writer-lock');
+        if (isRebuildInProgress(plan.exploreRoot)) { gate('noop-rebuild'); return; }
+        // Claude Code runs this hook on its own, on every prompt: read-only, so
+        // it never repairs what an index or sync is in the middle of writing.
+        const cg = await openIndexToRead(plan.exploreRoot);
         try {
           const others = plan.nudgeProjects.length
             ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
@@ -1611,8 +1688,9 @@ program
           // (#1142). Heal it here: on a populated vocab this is one SELECT;
           // the actual backfill is a one-time batched pass whose cost the MCP
           // server's own catch-up sync usually pays first (it runs at every
-          // session start). A distinct noop outcome keeps a dormant vocab
-          // from polluting the noop-unverified recall signal.
+          // session start). It writes through a connection of its own, under
+          // the index lock (#2913). A distinct noop outcome keeps a dormant
+          // vocab from polluting the noop-unverified recall signal.
           const vocabReady = await cg.healSegmentVocabIfEmpty().catch(() => false);
           if (!vocabReady) { gate('noop-vocab-empty'); return; }
           const related = cg.getSegmentMatches(proseWords);
@@ -1683,8 +1761,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
       const { ToolHandler } = await import('../mcp/tools');
       const handler = new ToolHandler(cg);
 
@@ -1755,8 +1832,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
       let files = cg.getFiles();
 
       if (files.length === 0) {
@@ -2328,11 +2404,10 @@ for (const direction of ['callers', 'callees'] as const) {
           process.exit(1);
         }
 
-        const { default: CodeGraph } = await loadCodeGraph();
-        const cg = await CodeGraph.open(projectPath);
+        const cg = await openIndexToRead(projectPath);
         try {
           const limit = parseInt(options.limit || '20', 10);
-          const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+          const { nodes: targets } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
           if (targets.length === 0) {
             info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
             return;
@@ -2452,11 +2527,10 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
       try {
         const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
-        const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+        const { nodes: targets } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
         if (targets.length === 0) {
           info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
           return;
@@ -2593,8 +2667,7 @@ program
         process.exit(0);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
+      const cg = await openIndexToRead(projectPath);
       const maxDepth = parseInt(options.depth || '5', 10);
 
       // Custom filter pattern
@@ -2736,17 +2809,25 @@ program
         ? [opts.location as 'global' | 'local']
         : ['global', 'local'];
       let changed = 0;
+      let failed = 0;
       for (const loc of locs) {
         for (const report of refreshTargets(ALL_TARGETS, loc)) {
+          if (report.status === 'failed') {
+            failed += 1;
+            error(`${report.displayName}: could not refresh — ${report.error}`);
+          }
           for (const p of report.changedPaths) {
             changed += 1;
             console.log(`  ${report.displayName}: refreshed ${p}`);
           }
         }
       }
-      if (changed === 0) {
+      if (changed === 0 && failed === 0) {
         console.log('All configured agent surfaces are already current.');
       }
+      // Non-zero so `codegraph upgrade` tells the user to look; every other
+      // agent was still refreshed.
+      if (failed > 0) process.exitCode = 1;
       return;
     }
 

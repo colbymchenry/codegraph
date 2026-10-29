@@ -26,23 +26,6 @@ export interface ImportInfo {
 }
 
 /**
- * Information about a single variable within a declaration.
- * Returned by a language's extractVariables hook.
- */
-export interface VariableInfo {
-  /** Variable name */
-  name: string;
-  /** Node kind: 'variable' or 'constant' */
-  kind: NodeKind;
-  /** Optional signature string */
-  signature?: string;
-  /** If set, this declarator is actually a function and should be extracted as such */
-  delegateToFunction?: SyntaxNode;
-  /** The AST node to use for positioning (may differ from the declaration node) */
-  positionNode?: SyntaxNode;
-}
-
-/**
  * Context object passed to language hooks that need to call back into the core extractor.
  * Provides a controlled API surface — hooks can create nodes, visit children, and add
  * references without accessing the full TreeSitterExtractor internals.
@@ -56,11 +39,12 @@ export interface ExtractorContext {
   visitFunctionBody(body: SyntaxNode, functionId: string): void;
   /**
    * Walk a declaration's initializer as code the scope on top of the stack
-   * runs, the way a function body is walked. When the hook then reports the
-   * node handled, the function-as-value scan the dispatcher runs over it skips
-   * what was walked here: the walk captured those candidates already.
+   * runs, the way a function body is walked (`functionId` as for
+   * visitFunctionBody). When the hook then reports the node handled, the
+   * function-as-value scan the dispatcher runs over it skips what was walked
+   * here: the walk captured those candidates already.
    */
-  walkInitializer(node: SyntaxNode): void;
+  walkInitializer(node: SyntaxNode, functionId?: string): void;
   /** Add an unresolved reference */
   addUnresolvedReference(ref: UnresolvedReference): void;
   /** Push a node ID onto the scope stack (for containment/qualified name building) */
@@ -96,11 +80,33 @@ export interface LanguageExtractor {
    * language id serves several dialects (C++ also parses `.metal` shaders).
    */
   preParse?: (source: string, filePath?: string) => string;
+  /**
+   * Read `getSignature` from the source as the file has it, not from
+   * `preParse`'s output, when the preParse blanks syntax a reader of the
+   * signature still wants: a Delphi parameter's attribute, `const [ref] AValue`
+   * or `const [MVCFromBody] Person` (#2545). Offsets are the same in both.
+   */
+  signatureAsWritten?: boolean;
+  /**
+   * Whether a re-export's import node (`export … from`) keeps its statement as
+   * the file writes it, not as `preParse` left it, given the source as
+   * written: TypeScript asks for a file whose `export type *` it blanks
+   * (#2474). The kernel route reads the same answer (kernel/index.ts).
+   */
+  reExportAsWritten?: (source: string) => boolean;
 
   // --- Node type mappings ---
 
   /** Node types that represent functions */
   functionTypes: string[];
+  /**
+   * A bodiless function that is the function's whole declaration, not one
+   * overload of an implementation that follows it: TypeScript's
+   * `function_signature` in an ambient context (`declare function f(): void;`,
+   * a declaration file's own or its `declare module` body's), never in a
+   * namespace. Extracted as a function, like a `functionTypes` node.
+   */
+  isAmbientFunction?: (node: SyntaxNode, filePath: string) => boolean;
   /** Node types that represent classes */
   classTypes: string[];
   /** Node types that represent methods */
@@ -121,7 +127,14 @@ export interface LanguageExtractor {
   importTypes: string[];
   /** Node types that represent function calls */
   callTypes: string[];
-  /** Node types that represent variable declarations (const, let, var, etc.) */
+  /**
+   * Node types that represent variable declarations (const, let, var, etc.).
+   * By default the core names each declared variable from the node's direct
+   * `identifier` or `variable_declarator` children (`extractVariable` in
+   * tree-sitter.ts). A grammar that nests the names deeper, like Swift's
+   * `pattern` or Lua's `variable_list`, gets its own branch there; there is no
+   * per-language hook for it.
+   */
   variableTypes: string[];
   /** Node types that represent class fields (extracted as 'field' kind inside class bodies) */
   fieldTypes?: string[];
@@ -190,6 +203,20 @@ export interface LanguageExtractor {
    * line and never documents the declaration below it.
    */
   docstringSkipsTrailingComments?: boolean;
+  /**
+   * Keep in a docstring only the comments that end on the line right above
+   * the declaration, together with the ones written on the lines just before
+   * them: a blank line ends it. That is Go's doc comment, the one go doc
+   * shows, so a section banner or a note a blank line separates from a
+   * declaration documents nothing.
+   */
+  docstringSkipsDetachedComments?: boolean;
+  /**
+   * Leave out of a docstring's text the comment directives Go tools read, like
+   * `//go:embed static`, `//nolint:errcheck` or `//export F`, as go doc does:
+   * a declaration whose only comment is a directive has no doc.
+   */
+  docstringSkipsDirectives?: boolean;
   /**
    * Node types that may stand between a declaration and the decorators written
    * before it without ending the scan for them. Dart writes comments there
@@ -300,12 +327,6 @@ export interface LanguageExtractor {
    * Return null if the node isn't a recognized import form.
    */
   extractImport?: (node: SyntaxNode, source: string) => ImportInfo | null;
-
-  /**
-   * Extract variable declarations from a variable declaration node.
-   * Returns info about each declared variable, allowing the core to create nodes.
-   */
-  extractVariables?: (node: SyntaxNode, source: string) => VariableInfo[];
 
   /**
    * Extract receiver/owner type name from a method declaration.

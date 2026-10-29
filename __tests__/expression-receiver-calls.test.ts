@@ -24,6 +24,13 @@ const files: Record<string, string> = {
     'export class GraphAdapter { async map(req?: string) { return req ?? \'\'; } }\n' +
     'export class Runner { run() { return 1; } }\n' +
     'export class Base { hello() { return 1; } }\n',
+  // A project `push` an element of a field must not reach (`this.listeners[type].push`).
+  'src/stack.ts': 'export interface UndoStack { push: (entry: string) => void; }\n',
+  'src/bus.ts':
+    'export class Bus {\n' +
+    '  private listeners: Record<string, string[]> = {};\n' +
+    '  on(type: string, handler: string) { this.listeners[type].push(handler); }\n' +
+    '}\n',
   'src/use.ts':
     "import { GraphAdapter, Runner, Base } from './adapter';\n" +
     "import { helper } from './helper.js';\n" +
@@ -84,6 +91,10 @@ describe('expression receivers', () => {
     expect(cg.getCallers(node('map', 'adapter.ts').id).map(({ node: n }) => n.name)).toEqual(['typed']);
   });
 
+  it('TS: a method on an element of a field does not bind by its bare name', () => {
+    expect(calleesOf('on', 'bus.ts')).toEqual([]);
+  });
+
   it('Rust: `v.iter().map()` does not bind to a TypeScript class method', () => {
     expect(calleesOf('lens', 'lib.rs')).toEqual([]);
     expect(calleesOf('opt', 'lib.rs')).toEqual([]);
@@ -116,6 +127,9 @@ describe('expression receivers', () => {
       '  f().list.map(g);\n' +
       '  (() => 1).call(null);\n' +
       '  this.a.b.run();\n' +
+      '  this.listeners[type].push(h);\n' +
+      '  this[k].stop();\n' +
+      "  this['svc'].start();\n" +
       '  new Runner().go();\n' +
       '  window.Api.start();\n' +
       '}\n';
@@ -124,7 +138,7 @@ describe('expression receivers', () => {
       .map((r) => r.referenceName);
     expect(refs).toEqual([
       'list().map', 'list', 'x.run', 'y.run', 'x.stop', 'getTarget().install', 'getTarget',
-      'f', 'run', 'go', 'start',
+      'f', 'run', 'this.listeners[].push', 'this.svc.start', 'new Runner().go', 'start',
     ]);
   });
 });

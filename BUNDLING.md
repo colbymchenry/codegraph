@@ -33,6 +33,10 @@ scripts/build-bundle.sh linux-x64            # -> release/codegraph-linux-x64.ta
 scripts/build-bundle.sh win32-x64            # -> release/codegraph-win32-x64.zip
 ```
 
+The Node runtime is the official nodejs.org release named by the script's
+default `NODE_VERSION` (or its second argument). The download is refused
+unless it matches the SHA-256 listed in that release's `SHASUMS256.txt`.
+
 Because dropping better-sqlite3 left **zero native addons**, building a bundle is
 pure file-packaging — **any** target builds on **any** OS (the whole matrix builds
 on one Linux runner). Cross-compilation isn't a concern; only *run-testing* a

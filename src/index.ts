@@ -30,7 +30,7 @@ import {
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
-import { QueryBuilder } from './db/queries';
+import { QueryBuilder, type DeprioritizedPathMatcher } from './db/queries';
 import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
 import {
   isInitialized,
@@ -54,7 +54,7 @@ import {
   ResolutionResult,
 } from './resolution';
 import { hasSynthesisPattern, isJsxChildCandidate } from './resolution/callback-synthesizer';
-import { createImportReader, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels } from './resolution/module-importers';
+import { createImportReader, reopenNameMatchedImports, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels, reopenReferencesThroughChangedDefaults, reopenReferencesThroughDeclaredPackages } from './resolution/module-importers';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
@@ -68,6 +68,7 @@ import { loadDeprioritizePatterns } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
+import { ESM_IMPORT_LANGUAGES } from './resolution/import-resolver';
 import { minRefsForPool } from './resolution/resolver-pool';
 
 // Re-export types for consumers
@@ -148,6 +149,29 @@ export interface IndexOptions {
  *
  * Provides the primary interface for interacting with the code knowledge graph.
  */
+/** project_metadata key for the Python package-root digest (see sync). */
+const PYTHON_ROOTS_METADATA_KEY = 'python_root_fingerprint';
+/** Metadata key: the digest of the workspace packages and path dependencies the index was resolved by. */
+const WORKSPACE_METADATA_KEY = 'js_workspace_fingerprint';
+/** Metadata key: the frameworks (sorted JSON names) the last full index extracted every file with. */
+const FRAMEWORKS_AT_INDEX_KEY = 'frameworks_at_index';
+/**
+ * Metadata key: `{ added, removed }` — the frameworks a sync detected since the
+ * last full index, against {@link FRAMEWORKS_AT_INDEX_KEY}; '' when none.
+ */
+const FRAMEWORKS_SINCE_INDEX_KEY = 'frameworks_since_index';
+
+/** A JSON list of names from metadata, or null when absent or unreadable. */
+function parseNameList(value: string | null): string[] | null {
+  if (!value) return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) && parsed.every((n) => typeof n === 'string') ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
@@ -212,24 +236,47 @@ export class CodeGraph {
     // on the pattern array's identity, which the cache keeps stable.
     let cachedPatterns: string[] | undefined;
     let cachedMatcher: ReturnType<typeof ignore> | undefined;
-    this.queries.setDeprioritizedPathMatcher((filePath: string): boolean => {
+    // The compiled matcher for the patterns `codegraph.json` holds right now,
+    // or null when there are none.
+    const currentMatcher = (): ReturnType<typeof ignore> | null => {
+      const patterns = loadDeprioritizePatterns(this.projectRoot);
+      if (patterns.length === 0) return null;
+      if (patterns !== cachedPatterns) {
+        cachedPatterns = patterns;
+        cachedMatcher = ignore().add(patterns);
+      }
+      return cachedMatcher!;
+    };
+    const matches = (matcher: ReturnType<typeof ignore> | null, filePath: string): boolean => {
+      if (!matcher) return false;
+      const rel = path.isAbsolute(filePath)
+        ? path.relative(this.projectRoot, filePath)
+        : filePath;
+      if (!rel || rel.startsWith('..')) return false;
+      return matcher.ignores(rel.split(path.sep).join('/'));
+    };
+    const deprioritized: DeprioritizedPathMatcher = (filePath: string): boolean => {
       try {
-        const patterns = loadDeprioritizePatterns(this.projectRoot);
-        if (patterns.length === 0) return false;
-        if (patterns !== cachedPatterns) {
-          cachedPatterns = patterns;
-          cachedMatcher = ignore().add(patterns);
-        }
-        const rel = path.isAbsolute(filePath)
-          ? path.relative(this.projectRoot, filePath)
-          : filePath;
-        if (!rel || rel.startsWith('..')) return false;
-        return cachedMatcher!.ignores(rel.split(path.sep).join('/'));
+        return matches(currentMatcher(), filePath);
       } catch {
         // Ranking must never take the search down with it.
         return false;
       }
-    });
+    };
+    // One `stat` for a whole loop of candidates instead of one per candidate
+    // (#2620): a search reads the config once, then asks the frozen matcher.
+    deprioritized.snapshot = () => {
+      let matcher: ReturnType<typeof ignore> | null = null;
+      try { matcher = currentMatcher(); } catch { matcher = null; }
+      return (filePath: string): boolean => {
+        try {
+          return matches(matcher, filePath);
+        } catch {
+          return false;
+        }
+      };
+    };
+    this.queries.setDeprioritizedPathMatcher(deprioritized);
 
     this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
     this.resolver = createResolver(this.projectRoot, this.queries);
@@ -390,9 +437,19 @@ export class CodeGraph {
       throw new Error(`Invalid CodeGraph directory: ${validation.errors.join(', ')}`);
     }
 
-    // Open database
+    // Open database. The secondary indexes an interrupted bulk load dropped are
+    // rebuilt off this thread, and finished before the instance is returned
+    // (#1887): rebuilt in line on a large index, they blocked the thread longer
+    // than the liveness watchdog allows, and every restart was killed the same
+    // way.
     const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
+    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly, deferIndexRecovery: true });
+    try {
+      await db.recoverIndexesOffThread();
+    } catch (err) {
+      db.close();
+      throw err;
+    }
     const queries = new QueryBuilder(db.getDb());
 
     const instance = new CodeGraph(db, queries, resolvedRoot);
@@ -459,9 +516,14 @@ export class CodeGraph {
   }
 
   /**
-   * Open synchronously (without sync)
+   * Open synchronously (without sync).
+   *
+   * `deferIndexRecovery` leaves the secondary indexes an interrupted bulk load
+   * dropped for {@link recoverIndexes} to rebuild off this thread, instead of
+   * rebuilding them here (#1887): for a caller on a watched event loop, which
+   * then awaits {@link recoverIndexes} before it relies on the project.
    */
-  static openSync(projectRoot: string, options: Pick<OpenOptions, 'readOnly'> = {}): CodeGraph {
+  static openSync(projectRoot: string, options: Pick<OpenOptions, 'readOnly'> & { deferIndexRecovery?: boolean } = {}): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if initialized
@@ -477,10 +539,26 @@ export class CodeGraph {
 
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
+    const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly, deferIndexRecovery: options.deferIndexRecovery });
     const queries = new QueryBuilder(db.getDb());
 
     return new CodeGraph(db, queries, resolvedRoot);
+  }
+
+  /**
+   * Rebuild, on a worker thread, the secondary indexes an interrupted bulk
+   * load dropped and `openSync({ deferIndexRecovery: true })` left (#1887).
+   * Resolves at once when nothing is left, which is every open but the first
+   * after such an interruption; rejects when the rebuild fails, and the next
+   * call tries again. Reads stay correct meanwhile, only slower.
+   */
+  recoverIndexes(): Promise<void> {
+    return this.db.recoverIndexesOffThread();
+  }
+
+  /** Whether {@link recoverIndexes} still has indexes to rebuild. */
+  hasPendingIndexRecovery(): boolean {
+    return this.db.hasDeferredIndexRecovery();
   }
 
   /**
@@ -737,6 +815,10 @@ export class CodeGraph {
         // engine produces richer extraction than the one on disk. Only on a
         // real full index — a sync touches a subset, so it must NOT advance the
         // extraction stamp (the bulk would still be stale). See extraction-version.ts.
+        if (result.success) this.stampPythonRootFingerprint();
+        if (result.success) this.stampWorkspaceFingerprint();
+        if (result.success) this.stampIndexedFrameworks();
+
         if (result.success && result.filesIndexed > 0) {
           try {
             this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
@@ -821,7 +903,14 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
-        return this.orchestrator.indexFiles(filePaths);
+        // The files' nodes are new to the resolver: a resolution after this
+        // reloads its caches, the set of node names included, as indexAll and
+        // sync do before they resolve, instead of reading the graph as it was
+        // before (#2829). Awaited, so the write lock is held until the files
+        // are stored, as indexAll and sync hold it: returned unawaited, the
+        // promise left the `try` at once and the `finally` let the lock go as
+        // soon as indexing started, so another process could write meanwhile.
+        return await this.orchestrator.indexFiles(filePaths).finally(() => this.resolver.clearCaches());
       } finally {
         this.fileLock.release();
       }
@@ -834,6 +923,83 @@ export class CodeGraph {
    *
    * Uses a mutex to prevent concurrent indexing operations.
    */
+  /** Indexed Python file paths — the before/after sets a sync diffs. */
+  private pythonFilePaths(): Set<string> {
+    return new Set(this.queries.getAllFilePaths().filter((f) => f.endsWith('.py')));
+  }
+
+  /** Record the Python package-root digest a later sync compares against. */
+  private stampPythonRootFingerprint(fingerprint = this.resolver.getPythonRootFingerprint()): void {
+    try {
+      this.queries.setMetadata(PYTHON_ROOTS_METADATA_KEY, fingerprint);
+    } catch { /* metadata is advisory */ }
+  }
+
+  /** Record the workspace-package digest a later sync compares against (see sync). */
+  private stampWorkspaceFingerprint(fingerprint = this.resolver.getWorkspaceFingerprint()): void {
+    try {
+      this.queries.setMetadata(WORKSPACE_METADATA_KEY, fingerprint);
+    } catch { /* metadata is advisory */ }
+  }
+
+  /** Record the frameworks a full index extracted every file with; none has come or gone since. */
+  private stampIndexedFrameworks(): void {
+    const names = this.orchestrator.getDetectedFrameworkNames();
+    if (names === null) return;
+    try {
+      this.queries.setMetadata(FRAMEWORKS_AT_INDEX_KEY, JSON.stringify([...names].sort()));
+      this.queries.setMetadata(FRAMEWORKS_SINCE_INDEX_KEY, '');
+    } catch { /* metadata is advisory */ }
+  }
+
+  /**
+   * A sync detected frameworks again because what detection read had changed
+   * (#2516): a framework arrived mid-session, like Express in a new
+   * `package.json`, or one left. Files the sync extracted were read with the
+   * new set already. The resolver detects again when its set differs, so
+   * resolution and the passes after it use the new one too. Files indexed
+   * before the change were extracted without it, so the change against the
+   * last full index is recorded for `codegraph status`, which recommends a
+   * re-index: re-extracting every file a framework can touch would mean
+   * re-parsing most of the project inside a watcher's sync.
+   */
+  private followDetectedFrameworks(detected: string[]): void {
+    const now = [...detected].sort();
+    const resolverNow = [...this.resolver.getDetectedFrameworks()].sort();
+    if (now.join('\0') !== resolverNow.join('\0')) this.resolver.initialize();
+    try {
+      const atIndex = parseNameList(this.queries.getMetadata(FRAMEWORKS_AT_INDEX_KEY));
+      if (!atIndex) return; // indexed before this was recorded: nothing to compare with
+      const added = now.filter((name) => !atIndex.includes(name));
+      const removed = atIndex.filter((name) => !now.includes(name));
+      const value = added.length > 0 || removed.length > 0 ? JSON.stringify({ added, removed }) : '';
+      if ((this.queries.getMetadata(FRAMEWORKS_SINCE_INDEX_KEY) ?? '') !== value) {
+        this.queries.setMetadata(FRAMEWORKS_SINCE_INDEX_KEY, value);
+      }
+    } catch { /* metadata is advisory */ }
+  }
+
+  /**
+   * The frameworks a sync detected since the last full index, against the ones
+   * that index extracted every file with (#2516): files indexed before the
+   * change were read without the frameworks added, and with the ones removed,
+   * so a full re-index brings them in line. Null when nothing changed, or for
+   * an index built before this was recorded.
+   */
+  getFrameworkChangesSinceIndex(): { added: string[]; removed: string[] } | null {
+    try {
+      const value = this.queries.getMetadata(FRAMEWORKS_SINCE_INDEX_KEY);
+      if (!value) return null;
+      const parsed = JSON.parse(value) as { added?: unknown; removed?: unknown };
+      const names = (list: unknown): string[] => (Array.isArray(list) ? list.filter((n): n is string => typeof n === 'string') : []);
+      const added = names(parsed.added);
+      const removed = names(parsed.removed);
+      return added.length > 0 || removed.length > 0 ? { added, removed } : null;
+    } catch {
+      return null;
+    }
+  }
+
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
     return this.indexMutex.withLock(async () => {
       const startedAt = Date.now();
@@ -920,6 +1086,7 @@ export class CodeGraph {
         const fullReconcile = !options.paths || options.paths.length === 0;
         const gitState = this.orchestrator.beginGitIndexState(fullReconcile);
 
+        const pythonFilesBefore = this.pythonFilePaths();
         // An interrupted index may have absorbed its changed files before
         // resolution/synthesis. Detect those orphans BEFORE this sync adds refs.
         let refreshSynthesis = this.queries.getMetadata('synthesis_pending') === '1' ||
@@ -941,6 +1108,10 @@ export class CodeGraph {
               this.queries.setMetadata('synthesis_pending', '1');
             }
           });
+
+        // Frameworks detected again because what detection read changed: the
+        // passes below use the new set (#2516).
+        if (result.detectedFrameworks) this.followDetectedFrameworks(result.detectedFrameworks);
 
         // A component a tag in an unchanged file may render: `<Team />` links
         // to the `Team` this sync adds. The gate above reads each changed file
@@ -998,6 +1169,35 @@ export class CodeGraph {
           }
         }
 
+        // Workspace packages and path dependencies (#2456, #2502). A
+        // package.json edit — a member's name, its `main` or `exports`, a
+        // `file:` dependency — moves what an import of the package resolves to
+        // in files it never touched, and no indexed file changes with it. A
+        // full reconcile (`codegraph sync`, a git hook, the watcher's catch-up)
+        // reads the manifests again; when what they declare moved, every
+        // JavaScript-family reference is re-opened, as a moved Python root set
+        // re-opens Python's below, and the orphan sweep resolves them by the
+        // new map exactly as a fresh index would. Package.json edits that leave
+        // the map alone (a version bump, a new registry dependency) cost one
+        // read. The watcher's scoped syncs follow source files only and skip
+        // the read: a monorepo's manifests take a walk of the tree to find.
+        // An index stamped by an older engine has no digest: record one.
+        if (fullReconcile) {
+          const tWorkspace = Date.now();
+          const before = this.queries.getMetadata(WORKSPACE_METADATA_KEY);
+          const now = this.resolver.refreshWorkspacePackages();
+          if (before !== null && before !== now) {
+            let reopened = 0;
+            for (const language of ESM_IMPORT_LANGUAGES) reopened += this.orchestrator.resurrectResolutionEdgesForLanguage(language);
+            refreshSynthesis = true;
+            this.queries.setMetadata('synthesis_pending', '1');
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+              console.error(`[phase-timing] sync-workspace-packages: ${Date.now() - tWorkspace}ms (${reopened} refs re-opened)`);
+            }
+          }
+          if (before !== now) this.stampWorkspaceFingerprint(now);
+        }
+
         // Resolve references if files were updated
         const filesChanged = result.filesAdded > 0 || result.filesModified > 0;
         // The last edge before the failed-ref retry below: the rebind's
@@ -1040,11 +1240,15 @@ export class CodeGraph {
             // (`snippets/price.liquid`) waits under, and the keys a route's
             // lazily loaded module waits under (`module:Team` for
             // `lazy-import:./pages/Team`), as does a reference through an
-            // import binding the module declares under another name
-            // (`module:tag` for `import tagsController from
-            // './tag/tag.controller'`): each resolves through the module, so
-            // an edit can satisfy it as well as an added file. On a sync
-            // where no failed ref matches, this is one indexed lookup.
+            // import binding of the module (`module:tag` for `import
+            // tagsController from './tag/tag.controller'`, `module:context`
+            // for `import { useInvocation } from './context'`, which the
+            // barrel `context/index.ts` forwards) and a direct member
+            // reference through any binding (`module:constants` for
+            // `LIST.includes(x)` after `import { LIST } from './constants'`):
+            // each resolves through the module, so an edit can satisfy it as
+            // well as an added file. On a sync where no failed ref matches,
+            // this is a few indexed lookups.
             const tRetry = Date.now();
             edgesBeforeRetry = this.queries.getMaxEdgeId();
             const retryable = this.queries.getRetryableFailedReferences([...new Set([
@@ -1061,8 +1265,9 @@ export class CodeGraph {
             // to an added file (`@excalidraw/common` to `packages/common/src/
             // index.ts`) waits under its last segment, which that file's keys
             // never give: look its failed imports up by the specifier itself.
-            // An import of the importer's own folder or the one above (`.`,
-            // `..`) waits under no key at all, so each is tried where written.
+            // An import of the importer's own folder or one above it (`.`,
+            // `..`, `../..`) waits under no key at all, so each is tried
+            // where written.
             const addedFiles = new Set(result.addedFilePaths ?? []);
             const resolvesToAdded = (specifier: string, fromFile: string, language: Language): boolean => {
               const file = this.resolver.resolveModuleFile(specifier, fromFile, language);
@@ -1075,11 +1280,16 @@ export class CodeGraph {
               .filter((ref) => ref.filePath !== undefined && ref.language !== undefined &&
                 resolvesToAdded(ref.referenceName, ref.filePath, ref.language));
             const retryRows = new Set(retryable.map((ref) => ref.rowId));
+            // A key a popular import shares (`utils`, `react`, `assert`) is
+            // past the ceiling, and is still looked through for the imports
+            // that could name an added file.
             const importRetry = this.queries.getRetryableFailedImports(
               (result.addedFilePaths ?? []).flatMap(importPathKeys),
               this.queries.getNodeNamesByFiles(result.changedFilePaths, ['namespace', 'module']),
               undefined,
-              resolvedModules
+              resolvedModules,
+              undefined,
+              this.resolver.couldNameAnyOf([...addedFiles])
             );
             for (const ref of [...importRetry, ...folderImports]) {
               if (!retryRows.has(ref.rowId)) {
@@ -1111,7 +1321,9 @@ export class CodeGraph {
             // `index.ts` re-exporting what it imports: what the files importing
             // it bound by name in its absence, or failed, goes back to pending
             // for the sweep below, which binds it through the module as a fresh
-            // index does. (The removal half runs before removed files are deleted.)
+            // index does. So does what an import of a workspace package bound
+            // through another of its files while the entry its manifest names
+            // was missing. (The removal half runs before removed files are deleted.)
             const importReader = createImportReader(this.projectRoot);
             const added = (result.addedFilePaths ?? []).flatMap((filePath) => {
               const file = this.queries.getFileByPath(filePath);
@@ -1121,18 +1333,23 @@ export class CodeGraph {
               const tAdded = Date.now();
               const reopened = reopenReferencesThroughAddedFiles(
                 this.queries, importReader, added, edgesBeforeResolution,
-                (specifier, fromFile, language) => this.resolver.resolveModuleFile(specifier, fromFile, language)
+                (specifier, fromFile, language) => this.resolver.resolveModuleFile(specifier, fromFile, language),
+                (file) => this.resolver.workspacePackageDirOf(file)
               );
               if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-added-module-importers: ${Date.now() - tAdded}ms (${reopened} refs re-opened)`);
             }
 
-            // A failed reference that waits for a module through a barrel —
-            // React Router's `import:@/pages#HomePage`, parked under
-            // `module:pages` — waits for a file below the barrel too
-            // (`pages/Home/index.tsx`), whose own keys name its folder and
-            // stem. Those parked under the keys of the barrels that pass on a
-            // file this sync adds, or one whose definitions it changed, go
-            // back to pending for the sweep; a body-only edit satisfies none.
+            // A reference that reaches a module through a barrel waits for a
+            // file below it: React Router's `import:@/pages#HomePage`, parked
+            // under `module:pages`, for `pages/Home/index.tsx`, whose own keys
+            // name its folder and stem; `import { MatxLoading } from
+            // './components'` for the `MatxLoading.jsx` the barrel passes on
+            // as `default as MatxLoading`, a name that file never declares.
+            // Those that reach a file this sync adds, or one whose definitions
+            // it changed, go back to pending for the sweep: the failed ones,
+            // and the edges bound before this sync resolved anything, which a
+            // name match may have taken elsewhere while the file lacked the
+            // name. A body-only edit satisfies none.
             const tBarrels = Date.now();
             const delta = new Set(result.definitionDelta ?? []);
             const seeds = new Map<string, Language>(added.map((file) => [file.path, file.language]));
@@ -1143,9 +1360,47 @@ export class CodeGraph {
               }
             }
             const throughBarrels = reopenReferencesThroughBarrels(
-              this.queries, importReader, [...seeds].map(([path, language]) => ({ path, language }))
+              this.queries, importReader, [...seeds].map(([path, language]) => ({ path, language })), edgesBeforeResolution
             );
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-barrel-modules: ${Date.now() - tBarrels}ms (${throughBarrels} refs re-opened)`);
+
+            // A declaration file that declares a package itself (`declare
+            // module 'mammoth' { … }`): the files importing the package bound
+            // nothing through it while it was missing or lacked a name.
+            const declared = reopenReferencesThroughDeclaredPackages(
+              this.queries, importReader, this.projectRoot, result.changedFilePaths, edgesBeforeResolution
+            );
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS && declared > 0) console.error(`[phase-timing] sync-declared-packages: ${declared} refs re-opened`);
+
+            // An edited module whose default export moved to another
+            // declaration, or went away, while the old one stayed declared:
+            // `new Y()` after `import Y from './x'` kept the old one, the node
+            // that replaced its target, and no name this sync's files carry
+            // changed. Read off the edges into the edited modules; an edit
+            // that leaves the default alone re-opens nothing.
+            const tDefaults = Date.now();
+            const movedDefaults = this.resolver.changedDefaultExports(modified, result.changedFilePaths, edgesBeforeResolution);
+            const throughDefaults = movedDefaults.length === 0 ? 0
+              : reopenReferencesThroughChangedDefaults(this.queries, importReader, movedDefaults, edgesBeforeResolution);
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-default-exports: ${Date.now() - tDefaults}ms (${movedDefaults.length} defaults moved, ${throughDefaults} refs re-opened)`);
+
+            // An import a name match took while its module did not export the
+            // name, once the binding resolves another way: `import {
+            // EmptyState } from './layouts/shared'` kept a namesake after the
+            // barrel's edit gave it the re-export, which declares nothing. And
+            // a name match into the edited module itself, which the edit can
+            // undo.
+            const tNamed = Date.now();
+            const editedModules = modified.flatMap((filePath) => {
+              const file = this.queries.getFileByPath(filePath);
+              return file ? [{ path: filePath, language: file.language }] : [];
+            });
+            const nameMatched = reopenNameMatchedImports(
+              this.queries, importReader, editedModules, edgesBeforeResolution,
+              (specifier, fromFile, language) => this.resolver.resolveModuleFile(specifier, fromFile, language),
+              (ref) => this.resolver.resolveNow(ref)
+            );
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-name-matched-imports: ${Date.now() - tNamed}ms (${nameMatched} refs re-opened)`);
           } else {
             // No git info — use batched resolution to avoid OOM
             const unresolvedCount = this.queries.getUnresolvedReferencesCount();
@@ -1214,6 +1469,59 @@ export class CodeGraph {
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(`[phase-timing] sync-route-modules: ${Date.now() - tModules}ms (${reopened} refs re-opened)`);
           }
+          }
+
+        // Python module answers this sync may have moved in files it never
+        // touched. If the root set changed (a top-level package appeared, a
+        // build config was edited) any import anywhere may bind differently:
+        // re-open them all. Otherwise only modules or packages appeared or
+        // vanished below the roots, and only the edges into those module
+        // names, out of a changed package, and the failures naming them can
+        // move. The orphan sweep below re-resolves whatever is re-opened
+        // exactly as a full index would. An index stamped by an older engine
+        // has no fingerprint — record one rather than re-resolving on upgrade.
+        {
+          const before = this.queries.getMetadata(PYTHON_ROOTS_METADATA_KEY);
+          const now = this.resolver.getPythonRootFingerprint();
+          if (before !== null && before !== now) {
+            this.resolver.clearCaches();
+            this.orchestrator.resurrectResolutionEdgesForLanguage('python');
+            // Any Python edge may move, so any synthesis built on one may too.
+            refreshSynthesis = true;
+            this.queries.setMetadata('synthesis_pending', '1');
+          } else if (before !== null) {
+            const after = this.pythonFilePaths();
+            const moved = [...after].filter((f) => !pythonFilesBefore.has(f));
+            for (const f of pythonFilesBefore) if (!after.has(f)) moved.push(f);
+            const reopened = new Set<string>();
+            if (moved.length > 0) {
+              this.resolver.clearCaches();
+              for (const f of this.orchestrator.resurrectResolutionEdgesTouching('python', this.resolver.getPythonReopenScope(moved))) reopened.add(f);
+            }
+            // An edited `__init__.py` can add, drop or repoint what its
+            // package binds, which moves what its importers' names resolve to.
+            const editedInits = (result.changedFilePaths ?? []).filter(
+              (f) => pythonFilesBefore.has(f) && after.has(f) && /(?:^|[\\/])__init__\.py$/.test(f)
+            );
+            if (editedInits.length > 0) {
+              this.resolver.clearCaches();
+              for (const f of this.orchestrator.resurrectPythonPackageImporters(this.resolver.getPythonPackageImporters(editedInits))) reopened.add(f);
+            }
+            // Resolve the narrow set now, the way the changed files' own
+            // references were resolved above, rather than leaving a handful of
+            // refs to the orphan sweep and its whole-graph synthesis pass.
+            if (reopened.size > 0) {
+              this.resolver.resolveAndPersist(this.queries.getUnresolvedReferencesByFiles([...reopened]));
+              // Same rule as the changed files above: a moved edge in a file
+              // synthesis read or wrote means synthesis must be rebuilt.
+              if (!refreshSynthesis && [...reopened].some((f) =>
+                this.queries.hasSynthesizedEdgesTouchingFile(f) || this.queries.wasSynthesisInput(f))) {
+                refreshSynthesis = true;
+                this.queries.setMetadata('synthesis_pending', '1');
+              }
+            }
+          }
+          if (before !== now) this.stampPythonRootFingerprint(now);
         }
 
         // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
@@ -1261,6 +1569,32 @@ export class CodeGraph {
           result.pendingRefsProcessed = recovery.stats.total;
           result.pendingRefsResolved = recovery.stats.resolved;
           result.pendingRefsUnresolved = recovery.stats.unresolved;
+        }
+
+        // Python attribute types read from OTHER files — a factory's return, a
+        // base class's `__init__` — change with a body-only edit the definition
+        // delta above cannot see. Re-open the edges whose answer was read from a
+        // touched file, and retry the failed attribute calls in files that
+        // import one; both resolve right here. After the orphan sweep, so the
+        // import edges this sync created (a caller whose `from f import make`
+        // only now resolves) are there to find the importers by.
+        if (process.env.CODEGRAPH_NO_REBIND !== '1') {
+          const touched = [...(result.changedFilePaths ?? []), ...(result.removedFilePaths ?? [])];
+          const touchedPy = touched.filter((p) => /\.pyi?$/.test(p));
+          if (touchedPy.length > 0) {
+            const tTypes = Date.now();
+            const reopenedFiles = this.orchestrator.resurrectTypeDependentEdges(touchedPy, result.changedFilePaths ?? []);
+            // CODEGRAPH_PY_ATTR_RETRY_CEILING overrides the candidate ceiling (tests).
+            const ceiling = Number(process.env.CODEGRAPH_PY_ATTR_RETRY_CEILING ?? '') || 2000;
+            const failed = this.resolver.pythonAttrRetryCandidates(touchedPy, ceiling);
+            const retry = [...this.queries.getUnresolvedReferencesByFiles(reopenedFiles), ...(failed ?? [])];
+            if (retry.length > 0) await this.resolver.resolveAndPersistListYielding(retry);
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+              console.error(
+                `[phase-timing] sync-type-rebind: ${Date.now() - tTypes}ms (${retry.length} refs${failed ? '' : ', failed-ref fan-in over ceiling'})`
+              );
+            }
+          }
         }
 
         if (filesChanged || orphanCount > 0) {
@@ -1971,6 +2305,14 @@ export class CodeGraph {
   }
 
   /**
+   * Which of `names` the index has never seen, by name, path, signature or
+   * docstring — the names explore reports as not in the index (#2462).
+   */
+  getUnseenNames(names: readonly string[]): string[] {
+    return this.queries.getUnseenNames(names);
+  }
+
+  /**
    * The COBOL copybooks a query names (`CVACT01Y`, `MYCOPYBOOK`): each
    * member's indexed copybook file(s) and every `COPY` / `EXEC SQL INCLUDE`
    * statement that includes it. Empty for a query that names none.
@@ -2099,6 +2441,12 @@ export class CodeGraph {
    * usable (already populated — the overwhelmingly common one-SELECT case —
    * or healed here); false when it isn't (empty graph, or another process
    * holds the index lock — that process's own sync heals it).
+   *
+   * A read-only instance, as the hook opens since #2913, writes through a
+   * connection of its own, opened only once it holds the index lock. Every
+   * index and sync holds that lock while it writes, so the repairs a writer's
+   * open runs, and the migration an index from before the table needs, cannot
+   * disturb a bulk load in progress.
    */
   async healSegmentVocabIfEmpty(): Promise<boolean> {
     const empty = (() => {
@@ -2114,7 +2462,16 @@ export class CodeGraph {
       }
       try {
         if (!this.queries.isNameSegmentVocabEmpty()) return true; // raced: healed meanwhile
-        await this.rebuildNameSegmentVocab();
+        if (!this.db.readOnly) {
+          await this.rebuildNameSegmentVocab();
+          return true;
+        }
+        const writer = DatabaseConnection.open(this.db.getPath());
+        try {
+          await this.rebuildNameSegmentVocab(new QueryBuilder(writer.getDb()));
+        } finally {
+          writer.close();
+        }
         return true;
       } finally {
         this.fileLock.release();
@@ -2126,15 +2483,15 @@ export class CodeGraph {
    * Rebuild the segment vocabulary from the current graph, batched and
    * yielding — the upgrade-heal path for indexes built before the vocab table
    * existed. Runs inside the index mutex/lock (sync and
-   * healSegmentVocabIfEmpty hold them).
+   * healSegmentVocabIfEmpty hold them), through `queries`.
    */
-  private async rebuildNameSegmentVocab(): Promise<void> {
+  private async rebuildNameSegmentVocab(queries: QueryBuilder = this.queries): Promise<void> {
     const maybeYield = createYielder();
     const BATCH = 2000;
     for (let offset = 0; ; offset += BATCH) {
-      const names = this.queries.getDistinctNodeNames(BATCH, offset);
+      const names = queries.getDistinctNodeNames(BATCH, offset);
       if (names.length === 0) break;
-      this.queries.insertNameSegmentsBatch(names);
+      queries.insertNameSegmentsBatch(names);
       await maybeYield();
     }
   }
@@ -2168,7 +2525,7 @@ export class CodeGraph {
    * via the `references` edge that framework resolvers emit. Returns
    * null when fewer than 3 valid (non-test) routes exist.
    */
-  getRoutingManifest(limit?: number): {
+  getRoutingManifest(limit?: number, perRoute?: boolean): {
     entries: Array<{
       url: string;
       handler: string;
@@ -2183,7 +2540,7 @@ export class CodeGraph {
     topHandlerFileCount: number;
     totalRoutes: number;
   } | null {
-    return this.queries.getRoutingManifest(limit);
+    return this.queries.getRoutingManifest(limit, perRoute);
   }
 
   // ===========================================================================

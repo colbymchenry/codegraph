@@ -422,11 +422,13 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // R7b (Swift kernel port prep): tree-sitter-swift crate 0.7.3. Built from
   // the CRATE TARBALL's src/ (NOT a tag sha-match: alex-pinkus keeps
   // generated files off main and the 0.7.3-with-generated-files tag ships an
-  // older ABI-14 generation; grammar.json rules are JSON-equal, and the crate
-  // tarball is byte-for-byte what the kernel's cargo build compiles — table
-  // identity by construction). Replaces the ^0.4.0 tree-sitter-wasms build
-  // (ABI 13 → 15). NOT graph-neutral — delta is error-set membership only;
-  // classified list in the swift checklist doc.
+  // older ABI-14 generation; grammar.json rules are JSON-equal, and the
+  // kernel compiles the same tarball's src/ (codegraph-kernel/grammars/swift)
+  // — table identity by construction). Replaces the ^0.4.0 tree-sitter-wasms
+  // build (ABI 13 → 15). NOT graph-neutral — delta is error-set membership
+  // only; classified list in the swift checklist doc. The kernel's copy
+  // carries docs/grammars/tree-sitter-swift.patch (`try!` on Windows); this
+  // wasm doesn't need it — see that doc's .md.
   'swift',
   // R7b (Kotlin kernel port prep): fwcd tree-sitter-kotlin 0.3.8 (tag
   // e1a2d5a), parser.c/scanner.c sha-matched crate↔tag; behavior-IDENTICAL
@@ -461,13 +463,18 @@ function resolveWasmPath(lang: GrammarLanguage): string {
  * SFC languages (svelte/vue/astro) have no grammar of their own — their
  * extractors delegate <script>/frontmatter content to the TS/JS extractor, so
  * those grammars must be loaded even when no plain .ts/.js file is in the index
- * set (e.g. a pure-.astro content site). CFML (.cfc/.cfm) likewise delegates
+ * set (e.g. a pure-.astro content site). A Vue `<script lang="tsx">` is read
+ * with the TSX grammar (#2570), which nothing else loads in a project without
+ * a .tsx or .js file. CFML (.cfc/.cfm) likewise delegates
  * bare-script content, <cfscript> tag bodies, and <cfquery> SQL bodies to the
  * cfscript/cfquery grammars (see injections.scm in tree-sitter-cfml).
  */
 function expandGrammarLanguages(languages: Language[]): Language[] {
   if (languages.some((l) => l === 'svelte' || l === 'vue' || l === 'astro')) {
     languages = [...languages, 'typescript', 'javascript'];
+  }
+  if (languages.includes('vue')) {
+    languages = [...languages, 'tsx'];
   }
   if (languages.some((l) => l === 'cfml')) {
     languages = [...languages, 'cfscript', 'cfquery'];

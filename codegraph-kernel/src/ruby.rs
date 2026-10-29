@@ -17,7 +17,7 @@
 
 use crate::buffers::{
     build_meta, edge_kind_index, node_kind_index, Arena, BoolFlags, EdgeRow, EmitOut, NodeRow,
-    RefRow, StrRef, Tables, FLAG_IS_EXPORTED, FUNCTION_REF_CODE, NONE, NONE_STR,
+    RefRow, StrRef, Tables, FLAG_IS_EXPORTED, FLAG_IS_STATIC, FUNCTION_REF_CODE, NONE, NONE_STR,
     REF_FLAG_FILE_PATH,
 };
 use crate::docstring::preceding_docstring;
@@ -97,6 +97,9 @@ struct Extra {
     docstring: Option<String>,
     signature: Option<String>,
     visibility: Option<u8>,
+    /// The isStatic hook (languages/ruby.ts): set on every def, true for a
+    /// class method (is_class_method).
+    is_static: Option<bool>,
 }
 
 struct ValueScope<'t> {
@@ -283,10 +286,15 @@ impl<'t> Walker<'t> {
         let id_ref = self.arena.put(&id);
         let doc_ref = opt_str(&mut self.arena, extra.docstring.as_deref());
         let sig_ref = opt_str(&mut self.arena, extra.signature.as_deref());
+        // No isExported/isAsync hooks; isStatic only for defs.
+        let mut flags = BoolFlags::default();
+        if let Some(v) = extra.is_static {
+            flags.set(FLAG_IS_STATIC, v);
+        }
         let row = self.tables.push_node(&NodeRow {
             kind: node_kind_index(kind).unwrap(),
             visibility: extra.visibility.unwrap_or(0),
-            flags: BoolFlags::default(), // no isExported/isAsync/isStatic hooks
+            flags,
             start_line,
             end_line,
             start_column: self.col_of(node),
@@ -615,6 +623,7 @@ impl<'t> Walker<'t> {
             docstring: preceding_docstring(node, self.src),
             signature: None, // no getSignature hook
             visibility: Some(self.visibility_of(node)),
+            is_static: Some(is_class_method(node)),
         };
         let Some(row) = self.create_node("function", &name, node, extra) else { return };
         // (ruby ∉ TYPE_ANNOTATION_LANGUAGES; decorators are a structural no-op)
@@ -633,6 +642,7 @@ impl<'t> Walker<'t> {
             docstring: preceding_docstring(node, self.src),
             signature: None,
             visibility: Some(self.visibility_of(node)),
+            is_static: Some(is_class_method(node)),
         };
         let Some(row) = self.create_node("method", &name, node, extra) else { return };
         self.stack.push(Scope { row, kind: "method", name });
@@ -649,6 +659,7 @@ impl<'t> Walker<'t> {
             docstring: preceding_docstring(node, self.src),
             signature: None,
             visibility: Some(self.visibility_of(node)),
+            ..Extra::default()
         };
         let Some(row) = self.create_node("class", &name, node, extra) else { return };
 
@@ -692,7 +703,7 @@ impl<'t> Walker<'t> {
         }
         let name = self.text(left).to_string();
         let signature = right.map(|r| util::init_signature(self.text(r)));
-        self.create_node("variable", &name, node, Extra { docstring, signature, visibility: None });
+        self.create_node("variable", &name, node, Extra { docstring, signature, ..Extra::default() });
     }
 
     /// extractImport — every non-body `call` lands here (importTypes:['call']).
@@ -820,10 +831,12 @@ impl<'t> Walker<'t> {
         };
         self.push_ref(caller, &callee, calls_kind, line, col);
 
-        // Capitalized constant receiver (`Klass.static_call`, `RETRY_MAX.times`)
-        // → an ADDITIONAL references ref at the RECEIVER's position.
-        // (scope_resolution receivers get none — type ≠ constant.)
-        if !skip && receiver.kind() == "constant" {
+        // Capitalized constant receiver (`Klass.static_call`, `RETRY_MAX.times`),
+        // or one written with its namespace (`Billing::ChargeCard.call`,
+        // `::Foo.call` — #2503) → an ADDITIONAL references ref at the
+        // RECEIVER's position, under the receiver as written. A path through
+        // a value (`obj::Thing`, `self.class::LIMIT`) names no constant.
+        if !skip && is_constant_path(receiver) {
             self.push_ref_at(
                 caller,
                 &receiver_name.to_string(),
@@ -1118,6 +1131,35 @@ impl<'t> Walker<'t> {
                 }
             }
         }
+    }
+}
+
+/// A constant, or a `scope_resolution` path of constants (`A::B::C`, a
+/// top-level `::A` / `::A::B`): what Ruby reads as a constant (isRubyConstantPath).
+fn is_constant_path(node: Node) -> bool {
+    match node.kind() {
+        "constant" => true,
+        "scope_resolution" => {
+            node.child_by_field_name("name").map_or(false, |n| n.kind() == "constant")
+                && node.child_by_field_name("scope").map_or(true, is_constant_path)
+        }
+        _ => false,
+    }
+}
+
+/// isRubyClassMethod (languages/ruby.ts): `def self.x` / `def Widget.x` (a
+/// singleton_method), or a `def` inside `class << self`.
+fn is_class_method(node: Node) -> bool {
+    match node.kind() {
+        "singleton_method" => true,
+        "method" => {
+            let mut parent = node.parent();
+            if parent.map_or(false, |p| p.kind() == "body_statement") {
+                parent = parent.and_then(|p| p.parent());
+            }
+            parent.map_or(false, |p| p.kind() == "singleton_class")
+        }
+        _ => false,
     }
 }
 

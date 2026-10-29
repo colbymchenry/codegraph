@@ -7,6 +7,7 @@
 
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
+import { isJsPathImportRef, resolveImportPath } from '../import-resolver';
 import { dependsOn } from './package-deps';
 import { pageComponentRef, resolvePageComponent } from './page-component';
 
@@ -27,13 +28,15 @@ const VUE_COMPILER_MACROS = new Set([
 ]);
 
 /**
- * Nuxt auto-imported composables and utilities
+ * Nuxt auto-imported composables and utilities. `navigateTo` is not one of
+ * them here: `navigateTo('/x')` is a navigation, which Vue Router's resolver
+ * links to the page it opens, and Nuxt owns the call when it can't (see
+ * `nuxtResolver.ownsReference`, #2634).
  */
 const NUXT_AUTO_IMPORTS = new Set([
   // Routing
   'useRoute',
   'useRouter',
-  'navigateTo',
   'abortNavigation',
   // Data fetching
   'useFetch',
@@ -81,6 +84,9 @@ const NUXT_VIRTUAL_MODULES = [
   '#build',
   '#head',
 ];
+
+/** The alias prefixes a Vue app's imports name `src/` by, as Vue CLI and Nuxt set them up. */
+const VUE_ALIAS_PREFIXES = ['@/', '~/'];
 
 export const vueResolver: FrameworkResolver = {
   name: 'vue',
@@ -133,7 +139,34 @@ export const vueResolver: FrameworkResolver = {
       };
     }
 
-    // Pattern 3: Nuxt virtual module imports (#imports, #components, etc.)
+    // A module an import names by path is the file the path names: the import
+    // resolver's to find, through tsconfig paths, workspace packages and the
+    // `@/` and `~/` conventions, and to link. Answering here took that from
+    // it: this linked the first node of the file (a constant it declares, a
+    // component), and `#app/…` the importing file itself, so no importer's
+    // edge reached the module's file node for sync to follow.
+    if (isJsPathImportRef(ref)) {
+      if (moduleFileNode(resolveImportPath(ref.referenceName, ref.filePath, ref.language, context), ref, context)) return null;
+      // What only a Vue app's bundler finds from a plain script: a component
+      // named without `.vue`, or a folder's `index.vue` (`import Layout from
+      // '@/layout'` is `src/layout/index.vue`; the path alone names the
+      // folder). An SFC's own imports already look for those. Linked to the
+      // file, as the import resolver links one.
+      if (ref.language !== 'vue' && VUE_ALIAS_PREFIXES.some((prefix) => ref.referenceName.startsWith(prefix))) {
+        const fileNode = moduleFileNode(resolveImportPath(ref.referenceName, ref.filePath, 'vue', context), ref, context);
+        if (fileNode) {
+          return {
+            original: ref,
+            targetNodeId: fileNode.id,
+            confidence: 0.9,
+            resolvedBy: 'framework',
+          };
+        }
+      }
+    }
+
+    // Pattern 3: Nuxt virtual module imports (#imports, #components, etc.),
+    // which no file of the project is.
     if (ref.referenceKind === 'imports' && ref.referenceName.startsWith('#')) {
       if (NUXT_VIRTUAL_MODULES.some((prefix) => ref.referenceName.startsWith(prefix))) {
         return {
@@ -142,44 +175,6 @@ export const vueResolver: FrameworkResolver = {
           confidence: 1.0,
           resolvedBy: 'framework',
         };
-      }
-    }
-
-    // Pattern 4: @ alias imports (@/components/Foo -> src/components/Foo)
-    if (ref.referenceKind === 'imports' && ref.referenceName.startsWith('@/')) {
-      const aliasPath = ref.referenceName.replace('@/', 'src/');
-      for (const ext of ['', '.ts', '.js', '.vue', '/index.ts', '/index.js', '/index.vue']) {
-        const fullPath = aliasPath + ext;
-        if (context.fileExists(fullPath)) {
-          const nodes = context.getNodesInFile(fullPath);
-          if (nodes.length > 0) {
-            return {
-              original: ref,
-              targetNodeId: nodes[0]!.id,
-              confidence: 0.9,
-              resolvedBy: 'framework',
-            };
-          }
-        }
-      }
-    }
-
-    // Pattern 5: ~ alias imports (~/components/Foo -> src/components/Foo, Nuxt convention)
-    if (ref.referenceKind === 'imports' && ref.referenceName.startsWith('~/')) {
-      const aliasPath = ref.referenceName.replace('~/', 'src/');
-      for (const ext of ['', '.ts', '.js', '.vue', '/index.ts', '/index.js', '/index.vue']) {
-        const fullPath = aliasPath + ext;
-        if (context.fileExists(fullPath)) {
-          const nodes = context.getNodesInFile(fullPath);
-          if (nodes.length > 0) {
-            return {
-              original: ref,
-              targetNodeId: nodes[0]!.id,
-              confidence: 0.9,
-              resolvedBy: 'framework',
-            };
-          }
-        }
       }
     }
 
@@ -218,6 +213,25 @@ export const nuxtResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // A page route names the component its file is.
     return resolvePageComponent(ref, context);
+  },
+
+  /**
+   * Nuxt's auto-imported `navigateTo` (#2634). Vue Router's resolver links a
+   * call to the page it opens; one it can't link — a computed destination, a
+   * path no page serves, an external URL — still calls Nuxt's, never a
+   * project function that shares the name, such as the `navigateTo` elk
+   * declares inside a plugin. A file that declares or imports a `navigateTo`
+   * calls that one, which the other strategies find (an import from `#app`
+   * links nothing, as any package's does).
+   */
+  ownsReference(ref: UnresolvedRef, context: ResolutionContext): boolean {
+    return (
+      ref.referenceKind === 'calls' &&
+      ref.referenceName === 'navigateTo' &&
+      VUE_SCRIPT_LANGUAGES.has(ref.language) &&
+      !declaresOwnFunction(ref, context) &&
+      !context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === ref.referenceName)
+    );
   },
 
   extract(filePath: string, _content: string) {
@@ -302,6 +316,11 @@ export const nuxtResolver: FrameworkResolver = {
     return { nodes, references };
   },
 };
+
+/** The file node of `file`, a path an import resolved to — none for a folder, an unindexed file or the importing file itself. */
+function moduleFileNode(file: string | null, ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  return file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
+}
 
 /** Does the reference's own file declare a function (or a const holding one) by that name? */
 function declaresOwnFunction(ref: UnresolvedRef, context: ResolutionContext): boolean {

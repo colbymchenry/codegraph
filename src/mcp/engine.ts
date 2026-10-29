@@ -16,6 +16,8 @@ import type CodeGraph from '../index';
 import { resolveServerRoot } from '../directory';
 import { ToolHandler } from './tools';
 import { WslSharedIndexError } from '../db/wsl-shared-index';
+import { DatabaseOpenError, isDatabaseOpenFailure } from '../db/open-error';
+import type { NodeSqliteUnavailableError } from '../db/node-sqlite';
 import { assertNoRebuild, releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
 import { QueryPool, resolvePoolSize } from './query-pool';
 import { endFreshnessMeasurements } from './index-freshness';
@@ -32,6 +34,15 @@ const loadCodeGraph = (): typeof import('../index').default =>
 
 /** How often the per-tool-call retry may re-run the sub-project down-scan. */
 const RETRY_SUBSCAN_TTL_MS = 5_000;
+
+/**
+ * Why the default project failed to open, when a tool call should say so
+ * rather than "no project loaded": the Windows/WSL shared index (#995), or an
+ * index that exists but SQLite could not open, or no node:sqlite at all.
+ */
+function reportableOpenFailure(err: unknown): WslSharedIndexError | DatabaseOpenError | NodeSqliteUnavailableError | null {
+  return err instanceof WslSharedIndexError || isDatabaseOpenFailure(err) ? err : null;
+}
 
 export interface MCPEngineOptions {
   /** Serve existing index contents without syncing, watching, or claiming a writer slot. */
@@ -246,15 +257,26 @@ export class MCPEngine {
         this.cg = null;
       }
       assertNoRebuild(resolvedRoot);
-      this.cg = loadCodeGraph().openSync(resolvedRoot, { readOnly: this.opts.readOnly });
+      // Indexes an interrupted bulk load dropped are rebuilt off this thread
+      // (#1887); the catch-up and tool calls wait for them.
+      this.cg = loadCodeGraph().openSync(resolvedRoot, { readOnly: this.opts.readOnly, deferIndexRecovery: true });
       this.projectPath = resolvedRoot;
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
       this.catchUpSync();
-      this.maybeStartPool(resolvedRoot);
+      // The pool's workers open the project themselves: start them on a
+      // rebuilt one, not racing the rebuild for its write lock.
+      const opened = this.cg;
+      if (opened?.hasPendingIndexRecovery()) {
+        void opened.recoverIndexes().catch(() => { /* reported by the tool call waiting on it */ }).then(() => {
+          if (this.cg === opened) this.maybeStartPool(resolvedRoot);
+        });
+      } else {
+        this.maybeStartPool(resolvedRoot);
+      }
     } catch (err) {
       // Still failing — caller will try again on the next tool call.
-      this.toolHandler.setDefaultOpenFailure(err instanceof WslSharedIndexError ? err : null);
+      this.toolHandler.setDefaultOpenFailure(reportableOpenFailure(err));
     }
   }
 
@@ -385,7 +407,7 @@ export class MCPEngine {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[CodeGraph MCP] Failed to open project at ${resolvedRoot}: ${msg}\n`);
       // The agent otherwise hears only "no project loaded" (#995).
-      this.toolHandler.setDefaultOpenFailure(err instanceof WslSharedIndexError ? err : null);
+      this.toolHandler.setDefaultOpenFailure(reportableOpenFailure(err));
     }
   }
 

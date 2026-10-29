@@ -37,7 +37,8 @@ const KERNEL_PATH = path.join(
 );
 const kernelBuilt = fs.existsSync(KERNEL_PATH);
 
-describe.skipIf(!kernelBuilt)('kernel buffer-transport storage (#1541)', () => {
+// CODEGRAPH_KERNEL=0 turns the kernel off: these assert what it does.
+describe.skipIf(!kernelBuilt || process.env.CODEGRAPH_KERNEL === '0')('kernel buffer-transport storage (#1541)', () => {
   let dir: string;
   let cg: CodeGraph;
 

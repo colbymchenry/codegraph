@@ -417,6 +417,11 @@ export class CfmlExtractor {
       case 'cf_function_tag':
         if (declScope) this.extractFunctionTag(node, parentClassName ? containerId : undefined, containerId, parentClassName);
         return;
+      case 'cf_selfclose_tag':
+        // `<cfinclude template="…">`, wherever it is written (#2651). Its
+        // attributes are still walked below for `#hash#` expressions.
+        if (this.selfCloseTagName(node) === 'include') this.extractIncludeTag(node, containerId);
+        break;
       case 'cf_tag': {
         const name = this.cfTagName(node);
         if (name === 'interface' && declScope && !parentClassName) {
@@ -560,6 +565,60 @@ export class CfmlExtractor {
   }
 
   /**
+   * A void tag's name, lowercased, without the `cf` prefix (`<cfInclude …>` →
+   * `include`). The grammar keeps no node for it: it is the text after `<cf`.
+   */
+  private selfCloseTagName(tag: SyntaxNode): string | undefined {
+    const match = /^<cf([A-Za-z_]\w*)/i.exec(this.source.slice(tag.startIndex, tag.startIndex + 64));
+    return match?.[1]?.toLowerCase();
+  }
+
+  /**
+   * `<cfinclude template="formlistshared.cfm">` (#2651) includes the template
+   * as cfscript's `include "formlistshared.cfm";` does, so it is extracted the
+   * same way: an import node in the scope it sits in (the function, the
+   * component, or the file of a template) and an `imports` reference from
+   * that scope, which the resolver links to the file. A template built at
+   * runtime (`template="#dir#/x.cfm"`) names no file the index can link.
+   */
+  private extractIncludeTag(tag: SyntaxNode, scopeId: string): void {
+    const valueNode = this.tagAttrValueNode(tag, 'template', true);
+    const template = valueNode ? this.source.substring(valueNode.startIndex, valueNode.endIndex).trim() : '';
+    if (!template) return;
+    // Qualified like the generic extractor's import nodes: under the scope's
+    // own name, without the file path (`baseform::formlistshared.cfm`).
+    const scope = this.nodes.find((n) => n.id === scopeId);
+    const prefix = !scope || scope.kind === 'file' ? '' : scope.kind === 'method' ? scope.qualifiedName : scope.name;
+    const line = tag.startPosition.row + 1;
+    const column = tag.startPosition.column;
+    const id = this.nodeIds.generate(this.filePath, 'import', template, line, column);
+    this.nodes.push({
+      id,
+      kind: 'import',
+      name: template,
+      qualifiedName: prefix ? `${prefix}::${template}` : template,
+      filePath: this.filePath,
+      language: this.language,
+      startLine: line,
+      endLine: tag.endPosition.row + 1,
+      startColumn: column,
+      endColumn: tag.endPosition.column,
+      signature: this.source.substring(tag.startIndex, tag.endIndex).trim(),
+      updatedAt: Date.now(),
+    });
+    this.edges.push({ source: scopeId, target: id, kind: 'contains' });
+    this.unresolvedReferences.push({
+      fromNodeId: scopeId,
+      referenceName: template,
+      referenceKind: 'imports',
+      filePath: this.filePath,
+      line,
+      column,
+      language: this.language,
+    });
+  }
+
+  /**
    * Delegate a `<cfscript>...</cfscript>` tag body to the cfscript grammar.
    * With `parentClassName` set (the block sits at component scope), functions
    * declared at the script's top level are the component's methods
@@ -640,8 +699,32 @@ export class CfmlExtractor {
       }
       this.unresolvedReferences.push(ref);
     }
-    for (const error of result.errors) {
-      if (error.line) error.line += startLine;
+    this.addBlockErrors(result.errors, scriptTag, 'cfscript', startLine);
+  }
+
+  /**
+   * Record a delegated block's errors as the file's (#2654). The block's own
+   * extraction warns "parse produced no symbols … contributes nothing to the
+   * graph" when its code has a syntax error and declares nothing — which a
+   * `<cfquery>` body never does, so any SQL its grammar can't read earned it.
+   * That is about the block, not the file, whose symbols come from the tag
+   * walk: it is recorded as a block of the file that failed to parse, by its
+   * tag and line, under its own code, so `init` and `status` don't report the
+   * file as one that contributes nothing. Other errors pass through.
+   */
+  private addBlockErrors(errors: ExtractionError[], tag: SyntaxNode, tagName: 'cfscript' | 'cfquery', lineOffset: number): void {
+    for (const error of errors) {
+      if (error.severity === 'warning' && error.code === 'parse_error') {
+        const line = tag.startPosition.row + 1;
+        this.errors.push({
+          message: `${this.filePath}: <${tagName}> at line ${line} has a syntax error — the rest of the file is indexed, but calls inside that block may be missing from the graph`,
+          line,
+          severity: 'warning',
+          code: 'partial_parse',
+        });
+        continue;
+      }
+      if (error.line) error.line += lineOffset;
       this.errors.push(error);
     }
   }
@@ -674,10 +757,7 @@ export class CfmlExtractor {
       if ((!ref.fromNodeId || ref.fromNodeId === innerFileNodeId) && parentId) ref.fromNodeId = parentId;
       this.unresolvedReferences.push(ref);
     }
-    for (const error of result.errors) {
-      if (error.line) error.line += startLine;
-      this.errors.push(error);
-    }
+    this.addBlockErrors(result.errors, queryTag, 'cfquery', startLine);
   }
 
   /** Read a `cf_attribute`'s value by name from a tag node's direct `cf_attribute`/`cf_tag_attributes` children. */
@@ -691,9 +771,10 @@ export class CfmlExtractor {
   /**
    * The `attribute_value` node of a tag attribute — `undefined` when the tag
    * has no such attribute, `null` when its value isn't plain text (empty, or
-   * a `#hash#` expression).
+   * a `#hash#` expression). With `wholeValue`, also `null` when only part of
+   * the value is plain text (`template="#dir#/x.cfm"`).
    */
-  private tagAttrValueNode(tag: SyntaxNode, attrName: string): SyntaxNode | null | undefined {
+  private tagAttrValueNode(tag: SyntaxNode, attrName: string, wholeValue = false): SyntaxNode | null | undefined {
     const attrs: SyntaxNode[] = [];
     for (let i = 0; i < tag.namedChildCount; i++) {
       const child = tag.namedChild(i);
@@ -716,6 +797,7 @@ export class CfmlExtractor {
       const valueWrapper = attr.namedChildren.find(
         (c: SyntaxNode) => c.type === 'quoted_cf_attribute_value' || c.type === 'cf_attribute_value'
       );
+      if (wholeValue && valueWrapper?.namedChildCount !== 1) return null;
       return valueWrapper?.namedChildren.find((c: SyntaxNode) => c.type === 'attribute_value') ?? null;
     }
     return undefined;

@@ -84,6 +84,18 @@ const EXHAUSTION_REASON =
   'OS watch/file limit exhausted; auto-sync disabled. Run `codegraph sync` ' +
   '(or install git sync hooks) to refresh the graph after changes.';
 
+/** The project folder itself went away while watched (see armGoneCheck). */
+const ROOT_GONE_REASON =
+  'The project folder was deleted or moved away while watched; auto-sync disabled. ' +
+  'Run `codegraph sync` once it is back to refresh the graph.';
+
+/**
+ * How long after a watched folder first reports itself gone (see
+ * armGoneCheck) its stream is checked. Short, because the stream spins until
+ * it is closed; a delay at all, so a burst costs one check.
+ */
+const GONE_CHECK_DELAY_MS = 200;
+
 /**
  * Actionable, NON-fatal warning for Linux inotify watch-count exhaustion.
  * Unlike {@link EXHAUSTION_REASON} this does not disable the watcher — the
@@ -129,6 +141,22 @@ function isInotifyWatchExhaustion(err: unknown): boolean {
  */
 function supportsRecursiveWatch(): boolean {
   return process.platform === 'darwin' || process.platform === 'win32';
+}
+
+function isDirectory(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function realpathOrNull(p: string): string | null {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -306,6 +334,8 @@ export class FileWatcher {
   private watchedRealDirs = new Map<string, string>();
   private treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The pending check per stream (keyed by its directory) that it is gone; see armGoneCheck. */
+  private goneChecks = new Map<string, ReturnType<typeof setTimeout>>();
   /**
    * True when the pending set does NOT exactly describe the change (a
    * directory removal's children are unknown from the event, #1285) — the
@@ -589,7 +619,14 @@ export class FileWatcher {
       this.scheduleTreeRefresh();
       return;
     }
-    const full = path.join(dir, String(filename));
+    const name = String(filename);
+    // Names are relative to the watched folder. An absolute one is the folder
+    // itself, reported gone (see armGoneCheck); this is all a normal event pays.
+    if (path.isAbsolute(name)) {
+      this.armGoneCheck(dir);
+      return;
+    }
+    const full = path.join(dir, name);
     const rel = normalizePath(path.relative(this.projectRoot, full));
     if (!rel || rel === '.') {
       this.scheduleTreeRefresh();
@@ -740,8 +777,49 @@ export class FileWatcher {
     this.scheduleSync();
   }
 
+  /**
+   * On Windows, libuv reports a watched folder that is being deleted by the
+   * folder's own absolute path (`\\?\D:\…`) and re-arms the read, which fails
+   * the same way at once: thousands of events a second until the stream is
+   * closed, holding a core for good. A directory link in the project whose
+   * target outside it is deleted does exactly that (#2487). The project
+   * folder itself can't be deleted while its index is open there, but gets
+   * the same guard.
+   *
+   * The first such event on a stream arms ONE check a moment later; the rest
+   * of the burst finds it armed. The check closes a linked folder's stream
+   * when the link no longer leads to the folder it watched (deleted, or
+   * pointed elsewhere) and re-reads the tree: its full sync drops what the
+   * folder held, and a link that leads somewhere live is watched anew. A
+   * project folder that is gone degrades the watcher, closing every stream.
+   */
+  private armGoneCheck(dir: string): void {
+    if (this.stopped || this.goneChecks.has(dir)) return;
+    const isRoot = dir === this.projectRoot;
+    if (!isRoot && !this.dirWatchers.has(dir)) return; // its stream is already closed
+    const timer = setTimeout(() => {
+      this.goneChecks.delete(dir);
+      if (this.stopped) return;
+      if (isRoot) {
+        if (!isDirectory(this.projectRoot)) this.degrade(ROOT_GONE_REASON, { projectRoot: this.projectRoot });
+        return;
+      }
+      if (realpathOrNull(dir) === this.watchedRealDirs.get(dir)) return;
+      logDebug('Watched link no longer leads to its folder; closing its stream', { dir });
+      this.unwatchDir(dir);
+      this.scheduleTreeRefresh();
+    }, GONE_CHECK_DELAY_MS);
+    timer.unref?.();
+    this.goneChecks.set(dir, timer);
+  }
+
   /** Close and forget the watch for a directory that errored/was removed. */
   private unwatchDir(dir: string): void {
+    const check = this.goneChecks.get(dir);
+    if (check) {
+      clearTimeout(check);
+      this.goneChecks.delete(dir);
+    }
     const w = this.dirWatchers.get(dir);
     if (w) {
       try {
@@ -863,6 +941,8 @@ export class FileWatcher {
     this.stopped = true;
     if (this.treeRefreshTimer) clearTimeout(this.treeRefreshTimer);
     this.treeRefreshTimer = null;
+    for (const check of this.goneChecks.values()) clearTimeout(check);
+    this.goneChecks.clear();
     this.knownDirs.clear();
     this.watchedRealDirs.clear();
     this.recoveringFromLock = false;

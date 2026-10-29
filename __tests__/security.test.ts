@@ -12,9 +12,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath, validatePathWithinRoot } from '../src/utils';
+import { FileLock, validateProjectPath, validatePathWithinRoot, lexicalPathWithinRoot } from '../src/utils';
 import CodeGraph from '../src/index';
-import { ToolHandler, tools } from '../src/mcp/tools';
+import { ToolHandler, tools, __setLoadCodeGraphForTests } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
 import { DatabaseConnection, getDatabasePath } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
@@ -193,6 +193,40 @@ describe('Path Traversal Prevention', () => {
   });
 });
 
+// #415: a root that already ends with its separator (a Windows drive root such
+// as a `Z:\` network drive or a `subst` drive, a UNC share root, POSIX `/`) got
+// a second one appended, so no path under it counted as inside it, and a
+// project there indexed no files. Path math, plus read-only realpaths of `C:\`.
+describe('Path containment at a filesystem root (#415)', () => {
+  it('counts a file under the filesystem root as inside it', () => {
+    const root = path.parse(process.cwd()).root; // `/`, or this drive's root on Windows
+    expect(lexicalPathWithinRoot(root, 'a.ts')).toBe(path.join(root, 'a.ts'));
+    expect(lexicalPathWithinRoot(root, path.join('src', 'b.ts'))).toBe(path.join(root, 'src', 'b.ts'));
+  });
+
+  it.runIf(process.platform === 'win32')('counts a file under a drive root or a share root as inside it', () => {
+    // Neither the drive nor the share has to exist: this is path math only.
+    expect(lexicalPathWithinRoot('Q:\\', 'a.ts')).toBe('Q:\\a.ts');
+    expect(lexicalPathWithinRoot('q:\\', 'src\\b.ts')).toBe('q:\\src\\b.ts');
+    expect(lexicalPathWithinRoot('\\\\server\\share\\', 'a.ts')).toBe('\\\\server\\share\\a.ts');
+    // Another drive or another share is still outside.
+    expect(lexicalPathWithinRoot('Q:\\', 'C:\\Windows\\win.ini')).toBeNull();
+    expect(lexicalPathWithinRoot('\\\\server\\share\\', '\\\\server\\other\\a.ts')).toBeNull();
+  });
+
+  it.runIf(process.platform === 'win32' && fs.existsSync('C:\\Windows'))(
+    'lets the realpath check through for a folder under a drive root',
+    () => {
+      expect(validatePathWithinRoot('C:\\', 'Windows')?.toLowerCase()).toBe('c:\\windows');
+      // A path that doesn't exist yet is judged by its nearest existing
+      // ancestor, which here is the drive root itself.
+      expect(validatePathWithinRoot('C:\\', 'codegraph-no-such-dir-415\\a.ts')).toBe(
+        'C:\\codegraph-no-such-dir-415\\a.ts'
+      );
+    }
+  );
+});
+
 describe('Symlink escape prevention (#527)', () => {
   // An in-repo symlink whose logical path is inside the project root but whose
   // REAL target escapes the root must never be served. validatePathWithinRoot
@@ -244,6 +278,57 @@ describe('Symlink escape prevention (#527)', () => {
     expect(validatePathWithinRoot(root, 'escapedir/secret.txt')).toBeNull();
   });
 
+  it('rejects a missing leaf below an out-of-root directory symlink', () => {
+    if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
+    expect(validatePathWithinRoot(root, 'escapedir/not-created-yet/file.txt')).toBeNull();
+  });
+
+  // A directory link that needs no privilege on Windows (a junction), so the
+  // cases below run there without Developer Mode; a symlink elsewhere. Each
+  // test removes its own link, so nothing recursive ever walks through one.
+  const dirLink = (linkPath: string, target: string): void =>
+    fs.symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+
+  it.runIf(process.platform === 'win32')('rejects a missing leaf below an out-of-root directory junction', () => {
+    const junction = path.join(root, 'escapejunction');
+    dirLink(junction, path.join(outside, 'pkg'));
+    try {
+      expect(validatePathWithinRoot(root, 'escapejunction/not-created-yet/file.txt')).toBeNull();
+    } finally {
+      fs.unlinkSync(junction);
+    }
+  });
+
+  it('still allows a missing leaf below a directory link that stays WITHIN the root', () => {
+    fs.mkdirSync(path.join(root, 'src', 'realdir'));
+    const inLink = path.join(root, 'src', 'linkdir');
+    dirLink(inLink, path.join(root, 'src', 'realdir'));
+    try {
+      expect(validatePathWithinRoot(root, 'src/linkdir/new/file.ts')).toBe(
+        path.join(root, 'src', 'linkdir', 'new', 'file.ts')
+      );
+    } finally {
+      fs.unlinkSync(inLink);
+    }
+  });
+
+  // POSIX reports ENOTDIR, not ENOENT, for a path under a FILE (a folder git
+  // still lists that is now a file, #2904). It is a missing leaf like any other:
+  // allowed inside the root, still refused below a link out of it.
+  it('judges a path under an existing file like any missing leaf', () => {
+    expect(validatePathWithinRoot(root, 'src/in.ts/child.ts')).toBe(path.join(root, 'src', 'in.ts', 'child.ts'));
+    expect(validatePathWithinRoot(root, 'src/in.ts/child.ts', { allowSymlinkEscape: true })).not.toBeNull();
+  });
+
+  it('rejects a path under an in-repo symlink to an out-of-root FILE', () => {
+    if (!link(path.join(root, 'escape'), path.join(outside, 'pkg', 'secret.txt'))) return;
+    expect(validatePathWithinRoot(root, 'escape/child.txt')).toBeNull();
+  });
+
+  it('rejects every path under a root that does not exist', () => {
+    expect(validatePathWithinRoot(path.join(root, 'gone'), 'src/in.ts')).toBeNull();
+  });
+
   it('still allows an in-repo symlink that stays WITHIN the root (no over-blocking)', () => {
     if (!link(path.join(root, 'src', 'inlink.ts'), path.join(root, 'src', 'in.ts'))) return;
     expect(validatePathWithinRoot(root, 'src/inlink.ts')).not.toBeNull();
@@ -261,6 +346,18 @@ describe('Symlink escape prevention (#527)', () => {
   it('allowSymlinkEscape follows a path through an in-repo out-of-root DIR symlink (indexing read)', () => {
     if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
     expect(validatePathWithinRoot(root, 'escapedir/secret.txt', { allowSymlinkEscape: true })).not.toBeNull();
+  });
+
+  it('allowSymlinkEscape still allows a missing leaf through an out-of-root DIR link (indexing read)', () => {
+    const escapeLink = path.join(root, 'escapedir');
+    dirLink(escapeLink, path.join(outside, 'pkg'));
+    try {
+      expect(
+        validatePathWithinRoot(root, 'escapedir/not-created-yet/file.txt', { allowSymlinkEscape: true })
+      ).not.toBeNull();
+    } finally {
+      fs.unlinkSync(escapeLink);
+    }
   });
 
   it('allowSymlinkEscape STILL rejects a lexical ../ traversal (guard not waived)', () => {
@@ -343,6 +440,192 @@ describe('validateProjectPath — sensitive directory blocking', () => {
       expect(validateProjectPath('C:\\WINDOWS\\System32')).toMatch(/sensitive system directory/i);
     }
   );
+});
+
+/**
+ * A directory link any user can make: a junction on Windows (no privilege or
+ * Developer Mode needed), a symlink elsewhere.
+ */
+function linkDir(target: string, link: string): void {
+  fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+}
+
+/** Point `os.homedir()` at `home`: it reads USERPROFILE on Windows, HOME elsewhere. */
+function setHome(home: string | undefined, profile: string | undefined = home): void {
+  if (home === undefined) delete process.env.HOME;
+  else process.env.HOME = home;
+  if (profile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = profile;
+}
+
+/**
+ * A temp folder holding a private home with its own `.ssh` and `.config`, and
+ * the links a case makes. Links are removed before the tree, so the cleanup
+ * can never walk into a link's target.
+ */
+function sensitiveFixture() {
+  const state = {
+    tmp: '',
+    home: '',
+    links: [] as string[],
+    savedHome: undefined as string | undefined,
+    savedProfile: undefined as string | undefined,
+  };
+  beforeEach(() => {
+    state.tmp = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-sensitive-')));
+    state.home = path.join(state.tmp, 'home');
+    fs.mkdirSync(path.join(state.home, '.ssh'), { recursive: true });
+    fs.mkdirSync(path.join(state.home, '.config', 'nvim'), { recursive: true });
+    fs.mkdirSync(path.join(state.tmp, 'project'));
+    fs.mkdirSync(path.join(state.tmp, 'elsewhere'));
+    state.links = [];
+    state.savedHome = process.env.HOME;
+    state.savedProfile = process.env.USERPROFILE;
+    setHome(state.home);
+  });
+  afterEach(() => {
+    setHome(state.savedHome, state.savedProfile);
+    for (const link of state.links.reverse()) fs.unlinkSync(link);
+    fs.rmSync(state.tmp, { recursive: true, force: true });
+  });
+  const link = (target: string, at: string): string => {
+    linkDir(target, at);
+    state.links.push(at);
+    return at;
+  };
+  return { state, link };
+}
+
+// #1930: the guard compared the path as typed, so a link to a sensitive folder,
+// a case variant of one (Windows, macOS) or a `\\?\` spelling (Windows) passed.
+describe('validateProjectPath — the folder a path really names (#1930)', () => {
+  const { state, link } = sensitiveFixture();
+
+  it('refuses a link to a sensitive home folder, and the folders under it', () => {
+    const elsewhere = path.join(state.tmp, 'elsewhere');
+    const ssh = link(path.join(state.home, '.ssh'), path.join(elsewhere, 'ssh'));
+    const config = link(path.join(state.home, '.config'), path.join(elsewhere, 'config'));
+
+    expect(validateProjectPath(ssh)).toMatch(/sensitive directory/i);
+    expect(validateProjectPath(config)).toMatch(/sensitive directory/i);
+    expect(validateProjectPath(path.join(config, 'nvim'))).toMatch(/sensitive directory/i);
+    // The refusal names the folder the link leads to.
+    expect(validateProjectPath(ssh)).toContain(path.join(state.home, '.ssh'));
+    // A link to an ordinary folder is still a fine project root.
+    const project = link(path.join(state.tmp, 'project'), path.join(elsewhere, 'project'));
+    expect(validateProjectPath(project)).toBeNull();
+  });
+
+  it('refuses a sensitive home folder that is itself a link, and links to it', () => {
+    // ~/.ssh kept in a dotfiles checkout and linked into the home.
+    const dotfiles = path.join(state.tmp, 'dotfiles', 'ssh');
+    fs.mkdirSync(dotfiles, { recursive: true });
+    fs.rmdirSync(path.join(state.home, '.ssh'));
+    link(dotfiles, path.join(state.home, '.ssh'));
+
+    expect(validateProjectPath(dotfiles)).toMatch(/sensitive directory/i);
+    const viaLink = link(path.join(state.home, '.ssh'), path.join(state.tmp, 'elsewhere', 'ssh'));
+    expect(validateProjectPath(viaLink)).toMatch(/sensitive directory/i);
+  });
+
+  it("refuses a linked home's sensitive folders by their real path", () => {
+    const realHome = path.join(state.tmp, 'real-home');
+    fs.mkdirSync(path.join(realHome, '.aws'), { recursive: true });
+    const linkedHome = link(realHome, path.join(state.tmp, 'linked-home'));
+    setHome(linkedHome);
+
+    expect(validateProjectPath(path.join(realHome, '.aws'))).toMatch(/sensitive directory/i);
+    expect(validateProjectPath(path.join(linkedHome, '.aws'))).toMatch(/sensitive directory/i);
+  });
+
+  it.runIf(process.platform === 'win32' || process.platform === 'darwin')(
+    'refuses a case variant of a sensitive home folder (case-insensitive file systems)',
+    () => {
+      expect(validateProjectPath(path.join(state.home, '.SSH'))).toMatch(/sensitive directory/i);
+      expect(validateProjectPath(path.join(state.home, '.Config', 'nvim'))).toMatch(/sensitive directory/i);
+      expect(validateProjectPath(path.join(state.home.toUpperCase(), '.config'))).toMatch(
+        /sensitive directory/i
+      );
+    }
+  );
+
+  it.runIf(process.platform === 'win32')('refuses \\\\?\\ and \\\\.\\ spellings of a sensitive folder', () => {
+    for (const spelled of [
+      `\\\\?\\${path.join(state.home, '.ssh')}`,
+      `\\\\.\\${path.join(state.home, '.config')}`,
+      `//?/${path.join(state.home, '.ssh').replace(/\\/g, '/')}`,
+    ]) {
+      expect(validateProjectPath(spelled), spelled).toMatch(/sensitive directory/i);
+    }
+    for (const spelled of ['\\\\?\\C:\\Windows', '\\\\.\\C:\\Windows', '\\\\?\\c:\\windows\\system32', '\\\\?\\C:\\']) {
+      expect(validateProjectPath(spelled), spelled).toMatch(/sensitive system directory/i);
+    }
+    // The prefix on an ordinary folder changes nothing.
+    expect(validateProjectPath(`\\\\?\\${path.join(state.tmp, 'project')}`)).toBeNull();
+  });
+
+  it.runIf(process.platform === 'win32' && fs.existsSync('C:\\Windows'))(
+    'refuses a junction to a Windows system folder',
+    () => {
+      const windows = link('C:\\Windows', path.join(state.tmp, 'elsewhere', 'windows'));
+      expect(validateProjectPath(windows)).toMatch(/sensitive system directory/i);
+    }
+  );
+
+  // On macOS `/etc` is itself a link to `/private/etc`, so this also checks that
+  // the system folders are compared by their own real paths.
+  it.runIf(process.platform !== 'win32')('refuses a symlink to a system folder', () => {
+    const etc = link('/etc', path.join(state.tmp, 'elsewhere', 'etc'));
+    expect(validateProjectPath(etc)).toMatch(/sensitive system directory/i);
+  });
+
+  it.runIf(process.platform === 'darwin')('refuses /private/etc, the folder /etc names on macOS', () => {
+    expect(validateProjectPath('/private/etc')).toMatch(/sensitive system directory/i);
+  });
+});
+
+// #1930 through the MCP entry point, against a real index of the folder.
+describe('MCP projectPath into a sensitive folder (#1930)', () => {
+  const { state, link } = sensitiveFixture();
+  let handler: ToolHandler;
+
+  beforeEach(async () => {
+    const config = path.join(state.home, '.config');
+    fs.mkdirSync(path.join(config, 'tool'));
+    fs.writeFileSync(
+      path.join(config, 'tool', 'secrets.ts'),
+      "export function readToken(): string { return 'FAKE-TOKEN-1930'; }\n"
+    );
+    const indexed = await CodeGraph.init(config, { index: true });
+    indexed.close();
+    // Without the seam an unrefused path fails to load the engine here instead
+    // of opening the folder's index, which would hide a leak.
+    __setLoadCodeGraphForTests(CodeGraph);
+    handler = new ToolHandler(null);
+  });
+
+  afterEach(async () => {
+    await handler.closeAll();
+    __setLoadCodeGraphForTests(null);
+  });
+
+  it('refuses a link to the folder, and a missing folder under it', async () => {
+    const config = path.join(state.home, '.config');
+    const viaLink = link(config, path.join(state.tmp, 'elsewhere', 'config'));
+    // A path that doesn't exist skips the up-front check and walks up to the
+    // folder's own index, so the root the walk lands on is checked too.
+    for (const projectPath of [viaLink, path.join(config, 'no-such-dir'), path.join(viaLink, 'no-such-dir')]) {
+      const result = await handler.execute('codegraph_node', {
+        symbol: 'readToken',
+        includeCode: true,
+        projectPath,
+      });
+      const text = result.content.map((c) => c.text).join('\n');
+      expect(result.isError, projectPath).toBe(true);
+      expect(text, projectPath).toMatch(/sensitive directory/i);
+      expect(text, projectPath).not.toContain('FAKE-TOKEN-1930');
+    }
+  });
 });
 
 describe('MCP Input Validation', () => {

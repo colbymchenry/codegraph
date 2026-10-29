@@ -375,19 +375,89 @@ export function clearCppTypeAliasMemos(context: ResolutionContext): void {
 
 /** Add the parameter names of the `template <…>` header that ends right where a declaration starts. */
 function collectTemplateHeader(lines: readonly string[], startLine: number, startColumn: number, names: Set<string>): void {
-  const before = [...lines.slice(Math.max(0, startLine - 4), startLine - 1), (lines[startLine - 1] ?? '').slice(0, startColumn)].join('\n');
+  // (A header can take several lines: fmt's `join` spends four on its parameters' defaults.)
+  const before = [...lines.slice(Math.max(0, startLine - 9), startLine - 1), (lines[startLine - 1] ?? '').slice(0, startColumn)].join('\n');
   const at = before.lastIndexOf('template');
   // Specifiers, attributes and macros may come between the header and where
   // the declaration starts: protobuf's `template <typename T, typename...
   // Args>` / `PROTOBUF_NDEBUG_INLINE static T* Create(…)`.
   const header = at < 0 ? null : /^template\s*<([\s\S]*)>(?:\s*(?:\[\[[^\]]*\]\]|(?:static|inline|constexpr|consteval|virtual|explicit|friend|extern)\b|[A-Z][A-Z0-9]*_[A-Z0-9_]*\b(?:\s*\([^()]*\))?))*\s*$/.exec(before.slice(at));
   if (!header) return;
-  for (const item of splitTopLevel(header[1]!)) {
-    // `typename T = int`, `template <typename> class Policy`, `typename... Ts`, `int N`.
-    const declared = stripCppTemplateArguments(item).split('=')[0]!;
-    const name = /([A-Za-z_]\w*)\s*$/.exec(declared)?.[1];
-    if (name && name !== 'typename' && name !== 'class') names.add(name);
+  for (const item of splitTopLevel(header[1]!)) addTemplateParameter(item, names);
+}
+
+/** Add the name one parameter of a `template <…>` header declares. */
+function addTemplateParameter(item: string, names: Set<string>): void {
+  // `typename T = int`, `template <typename> class Policy`, `typename... Ts`, `int N`.
+  const declared = stripCppTemplateArguments(item).split('=')[0]!;
+  const name = /([A-Za-z_]\w*)\s*$/.exec(declared)?.[1];
+  if (name && name !== 'typename' && name !== 'class') names.add(name);
+}
+
+/** How far a `template <…>` header may run; one that runs longer is not read. */
+const MAX_TEMPLATE_HEADER = 1000;
+
+/** The `>` closing the template parameter list opened at `open`, or -1 when a `;` or a brace comes first. */
+function templateHeaderEnd(text: string, open: number): number {
+  let depth = 0;
+  let parens = 0;
+  for (let i = open; i < text.length && i < open + MAX_TEMPLATE_HEADER; i++) {
+    const c = text[i]!;
+    if (c === '(' || c === '[') parens++;
+    else if (c === ')' || c === ']') parens = Math.max(0, parens - 1);
+    // `N > 0` in a default argument is written in parentheses.
+    else if (parens > 0) continue;
+    else if (c === '<') depth++;
+    else if (c === '>') {
+      if (--depth === 0) return i;
+    } else if (c === ';' || c === '{' || c === '}') return -1;
   }
+  return -1;
+}
+
+/**
+ * The declarators of the `typedef` whose keyword ends at `from`, up to its
+ * `;`: those after the body of a type it defines (`typedef struct {…} X;`).
+ */
+function typedefDeclarators(text: string, from: number): string {
+  let depth = 0;
+  let start = from;
+  for (let i = from; i < text.length && i < from + 4 * MAX_TEMPLATE_HEADER; i++) {
+    const c = text[i]!;
+    if (c === '{') depth++;
+    else if (c === '}') {
+      if (--depth < 0) return '';
+      if (depth === 0) start = i + 1;
+    } else if (c === ';' && depth === 0) return text.slice(start, i);
+  }
+  return '';
+}
+
+/**
+ * The names C++ source text declares as template parameters — every
+ * `template <…>` header's, `Traits` of `typename Traits = buffer_traits` —
+ * or as aliases: `using X = …;`, `typedef … X;`, `typedef struct {…} X;`,
+ * `typedef void (*X)(int);`. Function and macro bodies count, though the
+ * index has no node for what they declare.
+ */
+export function cppTypeNamesDeclared(text: string): Set<string> {
+  const names = new Set<string>();
+  for (const m of text.matchAll(/\btemplate\s*</g)) {
+    const open = m.index! + m[0].length - 1;
+    const close = templateHeaderEnd(text, open);
+    if (close > open) for (const item of splitTopLevel(text.slice(open + 1, close))) addTemplateParameter(item, names);
+  }
+  for (const m of text.matchAll(/\busing\s+([A-Za-z_]\w*)\s*(?:\[\[[^\]]*\]\]\s*)?=(?!=)/g)) names.add(m[1]!);
+  for (const m of text.matchAll(/\btypedef\b/g)) {
+    for (const declarator of splitTopLevel(typedefDeclarators(text, m.index! + m[0].length))) {
+      // `(*Handler)` of a pointer to a function or member; else the last name,
+      // past a function type's parameters and an array's bounds.
+      const name = /\(\s*(?:[A-Za-z_]\w*\s*::\s*)*[*&^]+\s*(?:const\s+)?([A-Za-z_]\w*)\s*\)/.exec(declarator)?.[1] ??
+        /([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*$/.exec(declarator.replace(/\([^()]*\)\s*(?:const\s*)?$/, ''))?.[1];
+      if (name) names.add(name);
+    }
+  }
+  return names;
 }
 
 /**
@@ -599,8 +669,10 @@ export function cppClassNamed(
   if (typeof found !== 'object') return null;
   if ('cls' in found) return found;
   if ('ambiguous' in found) {
-    // An alias each `#if` arm declares differently: the first declaration.
-    const [first] = [...found.ambiguous].sort((a, b) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine);
+    // An alias each `#if` arm declares differently: the first declaration, by
+    // file in code-unit order (localeCompare follows the host's locale).
+    const [first] = [...found.ambiguous].sort((a, b) =>
+      (a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0) || a.startLine - b.startLine);
     return next === name.names.length ? { alias: first! } : null;
   }
   const alias = found.alias;

@@ -83,7 +83,10 @@ describe('writer lock (#1740)', () => {
       const msg = writerLockHeldMessage(r.existing, r.pidPath);
       expect(msg).toMatch(/writer lock held/i);
       expect(msg).toMatch(/CODEGRAPH_NO_DAEMON/);
-      expect(msg).toMatch(/daemon stop/);
+      // `codegraph daemon` is the picker that stops the shared daemon; the CLI
+      // rejects `codegraph daemon stop` (#2770).
+      expect(msg).toContain('pick it in `codegraph daemon`');
+      expect(msg).not.toMatch(/daemon stop/);
     }
   });
 
