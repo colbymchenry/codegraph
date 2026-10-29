@@ -155,6 +155,19 @@ describe('projectPath inside a nested git repository the ancestor index excludes
     expect(text(res)).toContain('parent-only.ts');
   });
 
+  it('gives the same #155 notice when projectPath names a file in that worktree (#2982)', async () => {
+    const wt = path.join(parent, 'wt');
+    git(parent, 'worktree', 'add', '-q', '-b', 'feature', wt);
+    handler = new ToolHandler(cg);
+    const res = await handler.execute('codegraph_search', {
+      query: 'parentOnly',
+      projectPath: path.join(wt, 'src', 'sub.ts'),
+    });
+    expect(res.isError).toBeUndefined();
+    expect(text(res)).toContain('different git worktree');
+    expect(text(res)).toContain('parent-only.ts');
+  });
+
   it.runIf(process.platform === 'win32')('serves that linked worktree spelled with a lowercase drive letter too (#2517)', async () => {
     // VS Code and Cursor pass `d:\…` while git answers `D:\…`: one directory, so
     // the worktree is still the borrowed-index case, never a repository of its own.
