@@ -2617,6 +2617,37 @@ program
     }
   });
 
+// The matcher for `affected --filter <glob>`, tested against the
+// project-relative, forward-slash paths the index stores (#1273).
+//
+// - No slash (`*_test.go`, `test_*.py`): the file name, at any depth.
+// - A slash (`e2e/*.spec.ts`, `tests/**/*.py`): the path from any folder
+//   boundary, so `e2e/*.spec.ts` also matches `apps/web/e2e/login.spec.ts`
+//   (an implicit leading `**/`), as the filter always has.
+// - A leading `/` or `./`: from the project root only.
+// - A trailing `/` (`tests/`): everything under that folder.
+//
+// The whole name must match: `tests/*.py` no longer takes `tests/x.py.bak`,
+// nor `e2e/*.spec.ts` an `xe2e/` folder, and `tests/**/*.py` now takes
+// `tests/x.py` (`**` matches zero folders). Dotfiles count. picomatch is
+// loaded here, not at startup, since only this command needs it.
+async function affectedFilterMatcher(pattern: string): Promise<(filePath: string) => boolean> {
+  const { default: picomatch } = await import('picomatch');
+  // `windows: false`: the stored paths always use `/`, so the glob reads the
+  // same on every platform (picomatch otherwise follows the host OS).
+  const options = { dot: true, windows: false };
+  let glob = pattern.trim();
+  if (glob.endsWith('/')) glob += '**';
+  if (!glob.includes('/')) {
+    const matchName = picomatch(glob, options);
+    return (filePath) => matchName(path.posix.basename(filePath));
+  }
+  const anchored = /^\.?\//.test(glob);
+  glob = glob.replace(/^\.?\/+/, '');
+  if (!anchored && !glob.startsWith('**/')) glob = `**/${glob}`;
+  return picomatch(glob, options);
+}
+
 /**
  * codegraph affected [files...]
  *
@@ -2633,7 +2664,7 @@ program
   .option('-p, --path <path>', 'Project path')
   .option('--stdin', 'Read file list from stdin (one per line)')
   .option('-d, --depth <number>', 'Max dependency traversal depth', '5')
-  .option('-f, --filter <glob>', 'Custom glob filter for test files (e.g. "e2e/*.spec.ts")')
+  .option('-f, --filter <glob>', 'Glob for the files that count as tests, matched against the whole name: "*_test.go" matches the file name at any depth, "e2e/*.spec.ts" that folder at any depth, "/tests/**/*.py" from the project root only')
   .option('-j, --json', 'Output as JSON')
   .option('-q, --quiet', 'Only output file paths, no decoration')
   .action(async (fileArgs: string[], options: { path?: string; stdin?: boolean; depth?: string; filter?: string; json?: boolean; quiet?: boolean }) => {
@@ -2667,20 +2698,20 @@ program
         process.exit(0);
       }
 
+      // Custom filter pattern, compiled before the index is opened so a bad
+      // pattern fails fast.
+      let customFilter: ((filePath: string) => boolean) | null = null;
+      if (options.filter) {
+        try {
+          customFilter = await affectedFilterMatcher(options.filter);
+        } catch (err) {
+          error(`Invalid --filter pattern "${options.filter}": ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
+      }
+
       const cg = await openIndexToRead(projectPath);
       const maxDepth = parseInt(options.depth || '5', 10);
-
-      // Custom filter pattern
-      let customFilter: RegExp | null = null;
-      if (options.filter) {
-        // Convert glob to regex: ** → .+, * → [^/]*, . → \.
-        const regex = options.filter
-          .replace(/[+[\]{}()^$|\\]/g, '\\$&')
-          .replace(/\./g, '\\.')
-          .replace(/\*\*/g, '.+')
-          .replace(/\*/g, '[^/]*');
-        customFilter = new RegExp(regex);
-      }
 
       // One notion of "a test" for the whole tool (#1507): the CLI used to keep
       // its own six regexes here, which knew `.test.` and `/tests/` but not Go's
@@ -2688,7 +2719,7 @@ program
       // `affected` reported "no tests" for whole ecosystems while `search` and
       // the MCP tools counted those very files as tests.
       function isTestFile(filePath: string): boolean {
-        if (customFilter) return customFilter.test(filePath);
+        if (customFilter) return customFilter(filePath);
         return isTestPath(filePath);
       }
 
