@@ -1912,6 +1912,66 @@ export const tools: ToolDefinition[] = [
  * explore's `['query']` becomes `['query', 'projectPath']`, and a tool with no
  * `required` list (status/files) gains `['projectPath']`.
  */
+/** A path's first folder, or '' for a file at the project root. */
+function topLevelFolder(filePath: string): string {
+  const slash = filePath.indexOf('/');
+  return slash > 0 ? filePath.slice(0, slash) : '';
+}
+
+/**
+ * The order in which codegraph_node's multi-definition answer fills its
+ * capped list (#1657): the first definition in each language, then the first
+ * in each top-level folder within a language, then the rest, each tier in the
+ * order given. The index lists a name's definitions by path, so forty under an
+ * early-sorting folder used to take every slot, and a late folder's or another
+ * language's definition showed up nowhere. A set within one language and
+ * folder keeps its order.
+ */
+export function definitionCapOrder(nodes: readonly Node[]): Node[] {
+  const languages = new Set<string>();
+  const folders = new Set<string>();
+  const languageFirsts: Node[] = [];
+  const folderFirsts: Node[] = [];
+  const rest: Node[] = [];
+  for (const n of nodes) {
+    const folder = `${n.language}\0${topLevelFolder(n.filePath)}`;
+    const newFolder = !folders.has(folder);
+    folders.add(folder);
+    if (!languages.has(n.language)) {
+      languages.add(n.language);
+      languageFirsts.push(n);
+    } else if (newFolder) {
+      folderFirsts.push(n);
+    } else {
+      rest.push(n);
+    }
+  }
+  return [...languageFirsts, ...folderFirsts, ...rest];
+}
+
+/**
+ * What a capped definition list left out, by language and top-level folder,
+ * largest first: "35 typescript in client/, 2 python at the project root".
+ */
+export function describeOmittedDefinitions(nodes: readonly Node[]): string {
+  const groups = new Map<string, { language: string; folder: string; count: number }>();
+  for (const n of nodes) {
+    const folder = topLevelFolder(n.filePath);
+    const key = `${n.language}\0${folder}`;
+    const group = groups.get(key);
+    if (group) group.count++;
+    else groups.set(key, { language: n.language, folder, count: 1 });
+  }
+  const MAX_NAMED = 6;
+  const ranked = [...groups.values()].sort((a, b) => b.count - a.count);
+  const parts = ranked
+    .slice(0, MAX_NAMED)
+    .map((g) => `${g.count} ${g.language} ${g.folder ? `in ${g.folder}/` : 'at the project root'}`);
+  const elsewhere = ranked.slice(MAX_NAMED).reduce((sum, g) => sum + g.count, 0);
+  if (elsewhere > 0) parts.push(`${elsewhere} elsewhere`);
+  return parts.join(', ');
+}
+
 function withRequiredProjectPath(defs: ToolDefinition[]): ToolDefinition[] {
   return defs.map((tool) => {
     if (!tool.inputSchema.properties.projectPath) return tool;
@@ -7941,12 +8001,49 @@ export class ToolHandler {
     // FULL bodies as fit a char budget (the agent gets the one it needs in this
     // one call, no follow-up parameter to learn), and list any remainder by
     // file:line so a large overload set can't overflow the per-tool cap.
+    //
+    // The index lists a name's definitions by path, so forty under an
+    // early-sorting folder used to take every body and list slot, and the only
+    // one in a late folder or another language showed up nowhere, past a bare
+    // "+N more" (#1657). Now a language with no body gets one on top of the
+    // overloads that fit, and the list's slots go first to each language and
+    // top-level folder (`definitionCapOrder`); an overflow names the languages
+    // and folders it leaves out. Overloads that fit before still render, and
+    // what is shown keeps index order, so a set that fits every cap reads
+    // exactly as before.
     const header = `**${matches.length} definitions named "${symbol}"**`;
+    const indexOrder = new Map(matches.map((n, i) => [n, i] as const));
+    const inIndexOrder = <T>(items: T[], nodeOf: (item: T) => Node): T[] =>
+      [...items].sort((a, b) => indexOrder.get(nodeOf(a))! - indexOrder.get(nodeOf(b))!);
+    const isGenerated = cg.generatedFilePredicate(matches.map((n) => n.filePath));
+    // Generated stubs stay behind every hand-written definition (findSymbolMatches).
+    const capOrderOf = (nodes: Node[]): Node[] => [
+      ...definitionCapOrder(nodes.filter((n) => !isGenerated(n.filePath))),
+      ...definitionCapOrder(nodes.filter((n) => isGenerated(n.filePath))),
+    ];
+    const listLine = (n: Node) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`;
+    const omittedLine = (omitted: Node[]) => `- … +${omitted.length} more: ${describeOmittedDefinitions(omitted)}`;
     if (!includeCode) {
-      const list = matches.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`);
-      return this.textResult(this.truncateOutput(
-        [header, '', 'Re-query with `includeCode: true` to get every body in one call — no need to pick one first.', '', ...list].join('\n'),
-      ));
+      const prefix = [header, '', 'Re-query with `includeCode: true` to get every body in one call — no need to pick one first.', ''];
+      const prefixChars = prefix.join('\n').length + 1;
+      let list = matches.map(listLine);
+      if (prefixChars + list.join('\n').length > MAX_OUTPUT_LENGTH) {
+        // Too long for the output cap, which would cut the tail off unnamed:
+        // fill what fits in cap order, keeping room to name the rest.
+        const OMITTED_LINE_RESERVE = 1000;
+        const budget = MAX_OUTPUT_LENGTH - prefixChars - OMITTED_LINE_RESERVE;
+        const capOrder = capOrderOf(matches);
+        const shown: Node[] = [];
+        let listChars = 0;
+        for (const n of capOrder) {
+          const lineChars = listLine(n).length + 1;
+          if (listChars + lineChars > budget) break;
+          shown.push(n);
+          listChars += lineChars;
+        }
+        list = [...inIndexOrder(shown, (n) => n).map(listLine), omittedLine(capOrder.slice(shown.length))];
+      }
+      return this.textResult(this.truncateOutput([...prefix, ...list].join('\n')));
     }
 
     const BODY_BUDGET = 12000; // leaves room under MAX_OUTPUT_LENGTH for the header + list
@@ -7955,42 +8052,63 @@ export class ToolHandler {
     // render in full rather than relegating the one the agent wanted to a
     // bodiless list. Only a set of many LARGE bodies hits the char budget first.
     const HARD_CAP = 16;
-    const rendered: string[] = [];
-    const listed: Node[] = [];
+    type Body = { node: Node; section: string };
+    let rendered: Body[] = [];
+    let notRendered: Node[] = [];
     let used = 0;
     for (const n of matches) {
-      if (rendered.length >= HARD_CAP) { listed.push(n); continue; }
+      if (rendered.length >= HARD_CAP) { notRendered.push(n); continue; }
       const section = await this.renderNodeSection(cg, n, true);
       // Always emit the first; emit the rest only while within the char budget.
       if (rendered.length === 0 || used + section.length <= BODY_BUDGET) {
-        rendered.push(section);
+        rendered.push({ node: n, section });
         used += section.length;
       } else {
-        listed.push(n);
+        notRendered.push(n);
       }
     }
 
-    const out: string[] = [
-      header,
-      `Returning ${rendered.length} in full${listed.length ? `; ${listed.length} more listed below` : ''} — pick the one you need (no Read required).`,
-      '',
-      rendered.join('\n\n---\n\n'),
-    ];
-    if (listed.length) {
-      const LIST_CAP = 20;
-      const shownList = listed.slice(0, LIST_CAP);
-      out.push(
+    const LIST_CAP = 20;
+    const compose = (bodies: Body[], rest: Node[]): string => {
+      const restInCapOrder = capOrderOf(rest);
+      const listed = inIndexOrder(restInCapOrder.slice(0, LIST_CAP), (n) => n);
+      const omitted = restInCapOrder.slice(LIST_CAP);
+      const out: string[] = [
+        header,
+        `Returning ${bodies.length} in full${rest.length ? `; ${rest.length} more listed below` : ''} — pick the one you need (no Read required).`,
         '',
-        '**Other definitions**',
-        ...shownList.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`),
-      );
-      if (listed.length > LIST_CAP) out.push(`- … +${listed.length - LIST_CAP} more`);
-      out.push(
-        '',
-        `> Need one of these in full? Call codegraph_node again with \`file\` (e.g. \`"${listed[0]!.filePath.split('/').pop()}"\`) or \`line\` — do NOT Read it.`,
-      );
+        inIndexOrder(bodies, (b) => b.node).map((b) => b.section).join('\n\n---\n\n'),
+      ];
+      if (listed.length) {
+        out.push(
+          '',
+          '**Other definitions**',
+          ...listed.map(listLine),
+        );
+        if (omitted.length) out.push(omittedLine(omitted));
+        out.push(
+          '',
+          `> Need one of these in full? Call codegraph_node again with \`file\` (e.g. \`"${listed[0]!.filePath.split('/').pop()}"\`) or \`line\` — do NOT Read it.`,
+        );
+      }
+      return out.join('\n');
+    };
+
+    // Each language still without a body gets its first hand-written
+    // definition rendered on top, while the whole answer stays under the
+    // output cap; one that doesn't fit keeps its early line in the list.
+    const languagesWithBody = new Set(rendered.map((b) => b.node.language));
+    for (const n of [...notRendered]) {
+      if (languagesWithBody.has(n.language) || isGenerated(n.filePath)) continue;
+      languagesWithBody.add(n.language);
+      const bodies = [...rendered, { node: n, section: await this.renderNodeSection(cg, n, true) }];
+      const rest = notRendered.filter((m) => m !== n);
+      if (compose(bodies, rest).length <= MAX_OUTPUT_LENGTH) {
+        rendered = bodies;
+        notRendered = rest;
+      }
     }
-    return this.textResult(this.truncateOutput(out.join('\n')));
+    return this.textResult(this.truncateOutput(compose(rendered, notRendered)));
   }
 
   /**
