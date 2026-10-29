@@ -989,11 +989,14 @@ export class CodeGraph {
   }
 
   /**
-   * The frameworks a sync detected since the last full index, against the ones
-   * that index extracted every file with (#2516): files indexed before the
-   * change were read without the frameworks added, and with the ones removed,
-   * so a full re-index brings them in line. Null when nothing changed, or for
-   * an index built before this was recorded.
+   * The frameworks that came or went since the last full index (#2516): files
+   * indexed before the change were read without the frameworks added, and with
+   * the ones removed, so a full re-index brings them in line. Null when nothing
+   * changed; an index built before a half of this was recorded gives nothing
+   * for that half.
+   *
+   * The first half is what a sync detected against the frameworks the index
+   * extracted every file with.
    *
    * A sync that only finds a manifest changed (`express` or `@sveltejs/kit`
    * added to `package.json`, no source file edited) extracts nothing, so it

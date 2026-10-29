@@ -1167,8 +1167,9 @@ program
 
       const buildInfo = cg.getIndexBuildInfo();
       const reindexRecommended = cg.isIndexStale();
-      // Frameworks a sync detected since the last full index (#2516): files
-      // indexed before then were extracted without them.
+      // Frameworks that came or went since the last full index (#2516), as a
+      // sync recorded them or as detected now: files indexed before then were
+      // read without the change.
       const frameworkChanges = cg.getFrameworkChangesSinceIndex();
       const indexState = cg.getIndexState();
       // Zero on a healthy index; non-zero at rest means a resolution pass was
