@@ -19811,6 +19811,123 @@ function resolveOnJavaType(
   return null;
 }
 
+/** `Type.FIELD`, `Outer.Inner.FIELD`, `pkg.Type.FIELD`: a value a type holds, as a call's receiver. */
+const JAVA_STATIC_FIELD_RECEIVER = /^((?:[a-z_$][\w$]*\.)*(?:[A-Z][\w$]*\.)*[A-Z][\w$]*)\.([A-Za-z_$][\w$]*)$/;
+
+/**
+ * The static field `name` of Java type `owner`, its own or one it inherits
+ * from the types it extends or implements (an interface's constant), a few
+ * levels up. An enum's constant counts.
+ */
+function javaStaticField(owner: Node, name: string, context: ResolutionContext): Node | undefined {
+  const seen = new Set<string>([owner.id]);
+  let frontier = [owner];
+  for (let depth = 0; depth < 5 && frontier.length > 0; depth++) {
+    const next: Node[] = [];
+    for (const type of frontier) {
+      const own = context
+        .getNodesByQualifiedName(`${type.qualifiedName}::${name}`)
+        .find((n) => n.filePath === type.filePath && (n.kind === 'field' || n.kind === 'constant' || n.kind === 'enum_member'));
+      if (own) return own;
+      for (const sup of declaredSupertypes(type, context)) {
+        const written = javaTypeName(sup);
+        const ref = written ? javaTypeRef(written, type.filePath, context) : null;
+        const tail = written?.split('.').pop() ?? '';
+        const decls = ref?.decl ? [ref.decl]
+          : ref ? jvmTypeDecls(tail.split('::').pop()!, context).filter((d) => d.qualifiedName === ref.name || d.qualifiedName.endsWith(`::${ref.name}`))
+          : [];
+        for (const decl of decls) {
+          if (seen.has(decl.id)) continue;
+          seen.add(decl.id);
+          next.push(decl);
+        }
+      }
+    }
+    frontier = next;
+  }
+  return undefined;
+}
+
+/**
+ * Java's `Type.FIELD.m()` — `Consts.HELPER.go()`, `Outer.Inner.SHARED.run()`,
+ * `ProjectInterpolators.LOCAL.getInterpolation(t)`, `Color.RED.hex()`: a call
+ * on a value a type holds in a static field, an interface's constant or an
+ * enum's constant. The field is the type's own or one it inherits, and its
+ * value is typed by its own declaration, read with its own file's imports: the
+ * method an anonymous class it is initialized with declares (a `CREATOR`'s
+ * `createFromParcel`), else the class a `new X(…)` initializer builds, else
+ * the declared type's. A Kotlin object's `INSTANCE` and a class's
+ * `Companion`, as Java writes them, are the type itself. Null — no edge — for
+ * a field of a type from outside the project (`Intent.ACTION_VIEW.equals(…)`)
+ * or a value of one; undefined when the receiver is no type's field (a local,
+ * a nested type), for the strategies below.
+ */
+function matchJavaStaticFieldCall(
+  receiver: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null | undefined {
+  const m = JAVA_STATIC_FIELD_RECEIVER.exec(receiver);
+  if (!m) return undefined;
+  const [, ownerWritten, fieldName] = m;
+  const head = ownerWritten!.split('.')[0]!;
+  // A local or a field of that name holds a value, not a type.
+  if (/^[A-Z]/.test(head) && (inferLocalReceiverType(head, ref, context) || inferJavaFieldReceiverType(head, ref, context))) return undefined;
+  const written = javaTypeName(ownerWritten!);
+  if (!written) return undefined;
+  const ownerType = javaTypeRef(written, ref.filePath, context);
+  if (!ownerType) return null;
+  const owners = ownerType.decl ? [ownerType.decl]
+    : jvmTypeDecls(ownerType.name.split('::').pop()!, context).filter((d) =>
+      (d.qualifiedName === ownerType.name || d.qualifiedName.endsWith(`::${ownerType.name}`)) && isJavaTypeNameable(d, ref.filePath, context));
+  const owner = owners.length === 1 ? owners[0]! : owners.find((d) => d.filePath === ref.filePath);
+  if (!owner) return undefined;
+  const found = (n: Node | undefined): ResolvedRef | null =>
+    n ? { original: ref, targetNodeId: n.id, confidence: 0.9, resolvedBy: 'instance-method' } : null;
+  const methodOf = (typeQn: string, file: string): Node | undefined =>
+    context.getNodesByQualifiedName(`${typeQn}::${methodName}`).find((n) => n.kind === 'method' && n.filePath === file);
+  if (owner.language === 'kotlin' && (fieldName === 'INSTANCE' || fieldName === 'Companion')) {
+    return found(methodOf(owner.qualifiedName, owner.filePath));
+  }
+  // `Outer.Inner.m()` is a static call on a nested type, not on a field.
+  if (context.getNodesByQualifiedName(`${owner.qualifiedName}::${fieldName}`).some((n) => JVM_DECLARED_TYPE_KINDS.has(n.kind))) return undefined;
+  const field = javaStaticField(owner, fieldName!, context);
+  if (!field || field.language !== 'java') return undefined;
+  if (field.kind === 'enum_member') {
+    // A constant's own body overrides first (`PLUS { int apply(…) }`), then the enum's method.
+    const enumQn = field.qualifiedName.slice(0, field.qualifiedName.lastIndexOf('::'));
+    const enumDecl = context.getNodesByQualifiedName(enumQn).find((n) => n.filePath === field.filePath && JVM_DECLARED_TYPE_KINDS.has(n.kind));
+    const segments = enumQn.split('::');
+    const chain = segments.length > 1 && /^[a-z]/.test(segments[0]!) ? segments.slice(1).join('::') : enumQn;
+    return found(methodOf(field.qualifiedName, field.filePath) ?? methodOf(enumQn, field.filePath)) ??
+      (enumDecl ? resolveOnJavaType({ name: chain, decl: enumDecl }, methodName, ref, context) : null);
+  }
+  // An anonymous class the field is initialized with: its own method.
+  const anonMethod = context
+    .getNodesInFile(field.filePath)
+    .filter((n) => n.kind === 'class' && n.qualifiedName.startsWith(`${field.qualifiedName}::<`) && n.name.includes('$anon@'))
+    .map((anon) => methodOf(anon.qualifiedName, field.filePath))
+    .find((n) => n !== undefined);
+  if (anonMethod) return found(anonMethod);
+  // A `new X(…)` initializer builds X, the declared type's subtype at most.
+  const lines = context.getFileLines?.(field.filePath) ?? context.readFile(field.filePath)?.split(/\r?\n/) ?? [];
+  const declText = lines.slice(field.startLine - 1, Math.min(lines.length, (field.endLine ?? field.startLine))).join('\n');
+  const built = new RegExp(`\\b${field.name.replace(/\$/g, '\\$')}\\s*=\\s*new\\s+((?:[\\w$]+\\s*\\.\\s*)*[\\w$]+)\\s*(?:<[^()]*>)?\\s*\\(`).exec(declText)?.[1]?.replace(/\s+/g, '');
+  if (built) {
+    const builtName = javaTypeName(built);
+    const builtType = builtName ? javaTypeRef(builtName, field.filePath, context) : null;
+    if (builtType) {
+      const viaBuilt = resolveOnJavaType(builtType, methodName, ref, context);
+      if (viaBuilt) return viaBuilt;
+    }
+  }
+  const declared = fieldSignatureType(field);
+  if (!declared) return null;
+  const declaredType = javaTypeRef(declared, field.filePath, context);
+  return declaredType ? resolveOnJavaType(declaredType, methodName, ref, context) : null;
+}
+
 /**
  * Java: the declared type of a receiver the field lookup reaches — a field
  * (`mRepo`, `this.mRepo`, `Outer.this.mRepo`) or a chain of up to three
@@ -22333,6 +22450,13 @@ export function matchMethodCall(
     const typed = nmTimedT('mc-rusttyped', ref, () => matchRustTypedReceiverCall(objectOrClass!, methodName!, ref, context));
     if (typed !== undefined && (typed === null || !('unread' in typed))) return typed;
     if (typed !== undefined) rustBindingLine = typed.unread;
+  }
+
+  // A Java call on a value a type holds in a static field, `Consts.HELPER.go()`:
+  // typed by the field's declaration, or no edge for a library type's field.
+  if (ref.language === 'java' && dotMatch) {
+    const onField = nmTimedT('mc-javastaticfield', ref, () => matchJavaStaticFieldCall(objectOrClass!, methodName!, ref, context));
+    if (onField !== undefined) return onField;
   }
 
   // Infer the receiver's type from its local declaration/initializer in the
