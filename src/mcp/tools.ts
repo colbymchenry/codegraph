@@ -36,7 +36,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { isTestFile, normalizeNameToken, splitAtCjkSwitches, isQueryNameToken } from '../search/query-utils';
 import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol, qualifiedSymbolMatches } from '../graph/symbol-lookup';
 import { goPackageReaderFor } from '../graph/go-package';
 import {
@@ -1079,15 +1079,18 @@ export function elidedBodyNote(filePath: string, name: string, from: number, to:
 /**
  * The symbol-shaped tokens of an explore query, the way its named-symbol
  * seeding reads them: split on spaces, commas and brackets, a source-file
- * extension dropped (`Program.cs` names `Program`), at least 3 characters,
- * plain or qualified identifiers only, deduped, at most 16.
+ * extension dropped (`Program.cs` names `Program`), cut where Han, kana or
+ * Hangul meets another script (`NavMeshAgent类型`), plain or qualified names
+ * in any script of at least 3 characters, or 2 in Han, kana or Hangul
+ * (`入口`, `로그인`), deduped, at most 16.
  */
 export function exploreQueryTokens(query: string): string[] {
   const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
   return [...new Set(
     query.split(/[\s,()[\]]+/)
       .map((t) => t.replace(FILE_EXT, '').trim())
-      .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
+      .flatMap(splitAtCjkSwitches)
+      .filter(isQueryNameToken)
   )].slice(0, 16);
 }
 

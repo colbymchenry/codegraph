@@ -142,6 +142,90 @@ export function getStemVariants(term: string): string[] {
 }
 
 /**
+ * A Han, Hiragana, Katakana or Hangul character: scripts that write a word in
+ * one or two characters and put no space between words. By script extension,
+ * so the marks they share, like Japanese's prolonged sound mark `ー` and the
+ * iteration mark `々`, count with the word they sit in.
+ */
+const CJK_CHAR = /[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Hangul}]/u;
+const LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
+const COMBINING_MARK = /\p{M}/u;
+const NON_ASCII = /[^\x00-\x7F]/;
+
+/** Does `text` hold a Han, kana or Hangul character? */
+export function hasCjk(text: string): boolean {
+  return CJK_CHAR.test(text);
+}
+
+/**
+ * `text` cut where a Han, kana or Hangul letter meets a letter or digit of
+ * another script: `NavMeshAgent类型` → `NavMeshAgent`, `类型` (#1262). Chinese
+ * and Japanese put no space between a name and the words around it, so the
+ * script switch is the only boundary such a query has; read as one word, it
+ * searched for `agent类型`, which nothing is called. Any other character, like
+ * `.`, `::` or `_`, ends a run without a cut, so `寻路服务.计算路径` stays whole.
+ */
+export function splitAtCjkSwitches(text: string): string[] {
+  if (!hasCjk(text)) return [text];
+  const parts: string[] = [];
+  let start = 0;
+  let offset = 0;
+  let prevCjk: boolean | null = null;
+  for (const ch of text) {
+    if (LETTER_OR_DIGIT.test(ch)) {
+      const cjk = CJK_CHAR.test(ch);
+      if (prevCjk !== null && cjk !== prevCjk) {
+        parts.push(text.slice(start, offset));
+        start = offset;
+      }
+      prevCjk = cjk;
+    } else if (!COMBINING_MARK.test(ch)) {
+      prevCjk = null;
+    }
+    offset += ch.length;
+  }
+  parts.push(text.slice(start));
+  return parts.filter((part) => part.length > 0);
+}
+
+/**
+ * Is `word` long enough to search for? Two characters in Han, kana or Hangul,
+ * where one or two make a word (`入口`, `寻路`, `로그`); three in any other
+ * script, so short words like English `is` or Russian `на` and `из` stay out.
+ */
+export function meetsQueryWordFloor(word: string): boolean {
+  return hasCjk(word) ? [...word].length >= 2 : word.length >= 3;
+}
+
+/**
+ * Is `token` written like a name, in any script: `Session.request`, `pkg::run`,
+ * `로그인`, `寻路服务`, `寻路服务.计算路径`, `état`? Meets the word floor, so two
+ * characters do in Han, kana or Hangul and three elsewhere (#516, #1262). An
+ * ASCII token reads exactly as the ASCII-only test this replaces read it.
+ */
+export function isQueryNameToken(token: string): boolean {
+  return meetsQueryWordFloor(token)
+    && /^[\p{L}\p{Nl}_$][\p{L}\p{N}\p{M}_$]*(?:(?:::|\.)[\p{L}\p{N}\p{M}_$]+)*$/u.test(token);
+}
+
+/**
+ * `text` with every word that has a non-ASCII letter but no Han, kana or
+ * Hangul blanked to spaces, for the patterns that only know ASCII letters:
+ * their `\b` reads `é` as a gap, so `état` gave `tat` and `ÉtatMachine` gave
+ * `tatMachine`. Such words are taken whole instead. Han, kana and Hangul stay,
+ * as no ASCII pattern matches inside them and their edge rightly ends the
+ * ASCII name beside them (`NavMeshAgent类型`).
+ */
+export function blankNonAsciiWords(text: string): string {
+  if (!NON_ASCII.test(text)) return text;
+  return text.replace(/[\p{L}\p{N}\p{M}]+/gu, (run) =>
+    splitAtCjkSwitches(run)
+      .map((part) => (NON_ASCII.test(part) && !hasCjk(part) ? ' '.repeat(part.length) : part))
+      .join(''),
+  );
+}
+
+/**
  * Extract meaningful search terms from a natural language query.
  * Splits camelCase, PascalCase, snake_case, SCREAMING_SNAKE, and dot.notation
  * into individual tokens before filtering.
@@ -152,16 +236,23 @@ export function getStemVariants(term: string): string[] {
  *
  * Also generates stem variants (e.g., "caching"→"cache", "eviction"→"evict")
  * so FTS prefix matching can find related code symbols.
+ *
+ * Words in any script are kept whole, as FTS stores a name: `로그인`, `寻路服务`,
+ * `état` (#516, #1262). A word in Han, kana or Hangul counts from two
+ * characters, and a run that switches between those and another script is cut
+ * at the switch (see {@link splitAtCjkSwitches}). An ASCII query's terms are
+ * exactly what they were.
  */
 export function extractSearchTerms(query: string, options?: { stems?: boolean }): string[] {
   const includeStems = options?.stems !== false;
   const tokens = new Set<string>();
+  const asciiView = blankNonAsciiWords(query);
 
   // First, extract and preserve compound identifiers before splitting
   // CamelCase: scrapeLoop, UserService, getCallGraph
   const compoundPattern = /\b([a-zA-Z][a-zA-Z0-9]*(?:[A-Z][a-z]+)+|[A-Z][a-z]+(?:[A-Z][a-z]*)+)\b/g;
   let match;
-  while ((match = compoundPattern.exec(query)) !== null) {
+  while ((match = compoundPattern.exec(asciiView)) !== null) {
     if (match[1] && match[1].length >= 3) {
       tokens.add(match[1].toLowerCase()); // preserve full compound: "scrapeloop"
     }
@@ -169,7 +260,7 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
 
   // snake_case: scrape_loop, user_service
   const snakePattern = /\b([a-zA-Z][a-zA-Z0-9]*(?:_[a-zA-Z0-9]+)+)\b/g;
-  while ((match = snakePattern.exec(query)) !== null) {
+  while ((match = snakePattern.exec(asciiView)) !== null) {
     if (match[1] && match[1].length >= 3) {
       tokens.add(match[1].toLowerCase());
     }
@@ -183,12 +274,13 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
   // Replace underscores and dots with spaces (snake_case, dot.notation)
   const normalised = camelSplit.replace(/[_.]+/g, ' ');
 
-  // Split on any non-alphanumeric character
-  const words = normalised.split(/[^a-zA-Z0-9]+/).filter(Boolean);
+  // Split on anything but a letter, digit or combining mark, in any script,
+  // then where Han, kana or Hangul meets another script.
+  const words = normalised.split(/[^\p{L}\p{N}\p{M}]+/u).filter(Boolean).flatMap(splitAtCjkSwitches);
 
   for (const word of words) {
     const lower = word.toLowerCase();
-    if (lower.length < 3) continue;
+    if (!meetsQueryWordFloor(lower)) continue;
     if (STOP_WORDS.has(lower)) continue;
     tokens.add(lower);
   }
@@ -525,9 +617,15 @@ export function kindBonus(kind: Node['kind']): number {
  * `FLAT`. A leading-capital-only word ("Screen", "Zustand") is also treated as
  * a plain word — sentence-start capitalization and proper nouns aren't reliable
  * identifier signals.
+ *
+ * A name in Han, kana or Hangul (`寻路服务`, `ユーザー取得`, `로그인`) has no case
+ * or underscore to show it is one, and Chinese and Japanese prose has no
+ * spaces to set a word apart, so such a token, set apart, counts as a name the
+ * user chose (#516, #1262).
  */
 export function isDistinctiveIdentifier(token: string): boolean {
   if (!token) return false;
+  if (hasCjk(token)) return true;
   // snake_case / SCREAMING_SNAKE, or an embedded digit → a deliberate identifier.
   if (/[_0-9]/.test(token)) return true;
   // An uppercase letter anywhere AFTER the first char → a camelCase/PascalCase

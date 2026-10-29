@@ -34,7 +34,7 @@
 
 import type CodeGraph from '../index';
 import type { Node, Edge } from '../types';
-import { isTestFile } from '../search/query-utils';
+import { isTestFile, splitAtCjkSwitches, isQueryNameToken } from '../search/query-utils';
 
 import { qualifiedSymbolMatches } from './symbol-lookup';
 import { goPackageReaderFor } from './go-package';
@@ -259,14 +259,19 @@ function isPreciseToken(token: string): boolean {
   return /[._$]|::|\//.test(token) || /[a-z][A-Z]/.test(token) || /^[A-Z]/.test(token);
 }
 
-/** The symbol-shaped tokens of a query, deduped and capped. */
+/**
+ * The symbol-shaped tokens of a query, deduped and capped: names in any
+ * script, cut where Han, kana or Hangul meets another script, at least two
+ * characters in those scripts (`入口 末端`) and three elsewhere (#1262).
+ */
 export function flowTokens(query: string): string[] {
   return [
     ...new Set(
       query
         .split(/[\s,()[\]]+/)
         .map((t) => t.replace(FILE_EXT, '').trim())
-        .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
+        .flatMap(splitAtCjkSwitches)
+        .filter(isQueryNameToken)
     ),
   ].slice(0, MAX_TOKENS);
 }
