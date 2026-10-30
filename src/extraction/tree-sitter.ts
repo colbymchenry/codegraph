@@ -8058,10 +8058,13 @@ export class TreeSitterExtractor {
       }
 
       // Python superclass list: `class Flask(Scaffold, Mixin):`
-      // argument_list contains identifier children for each parent class
+      // argument_list contains identifier children for each parent class.
+      // A parameterized base, `class Leaf(Base[str])`, is a `subscript` whose
+      // value names the class; its full text (`Base[str]`) matched nothing.
       if (child.type === 'argument_list' && node.type === 'class_definition') {
-        for (const arg of child.namedChildren) {
-          if (arg.type === 'identifier' || arg.type === 'attribute') {
+        for (const base of child.namedChildren) {
+          const arg = base.type === 'subscript' ? base.childForFieldName('value') : base;
+          if (arg && (arg.type === 'identifier' || arg.type === 'attribute')) {
             const name = getNodeText(arg, this.source);
             this.unresolvedReferences.push({
               fromNodeId: classId,

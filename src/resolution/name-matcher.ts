@@ -413,7 +413,9 @@ function pythonRefClass(name: string, ref: UnresolvedRef, context: ResolutionCon
 function pythonBases(cls: Node, ref: UnresolvedRef, context: ResolutionContext): Node[] {
   const line = context.getFileLines?.(cls.filePath)?.[cls.startLine - 1]
     ?? context.readFile(cls.filePath)?.split('\n')[cls.startLine - 1] ?? '';
-  const bases = line.match(/^\s*class\s+\w+\s*\(([^)]*)\)/)?.[1];
+  let bases = line.match(/^\s*class\s+\w+\s*\(([^)]*)\)/)?.[1];
+  // A parameterized base, `Base[str]` or `Pair[str, Dict[str, int]]`, names its class before the brackets.
+  while (bases && /\[[^[\]]*\]/.test(bases)) bases = bases.replace(/\[[^[\]]*\]/g, '');
   return (bases?.split(',') ?? []).flatMap(name => {
     const base = pythonRefClass(name.trim(), { ...ref, filePath: cls.filePath }, context);
     return base ? [base] : [];
