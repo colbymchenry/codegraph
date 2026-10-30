@@ -22067,9 +22067,15 @@ export function inferLocalReceiverType(
     // which every routine of the file extends in turn (see ownFrom).
     if (ownFrom >= 0) {
       const own = scan(`${key}|${ownFrom}`, ownFrom, callIdx);
-      return own !== null || ownFrom <= startIdx ? own : scan(key, startIdx, ownFrom - 1);
+      const answer = own !== null || ownFrom <= startIdx ? own : scan(key, startIdx, ownFrom - 1);
+      if (answer || ref.language !== 'python') return answer;
+    } else {
+      const scanned = scan(key, startIdx, callIdx);
+      if (scanned || ref.language !== 'python') return scanned;
     }
-    return scan(key, startIdx, callIdx);
+    // A local nothing declares may still be bound from a call whose return
+    // annotation types it (#3038).
+    return pythonLocalCallResultType(scanReceiver, ref, context, lines, startIdx, callIdx);
   }
 
   // Nearest declaration wins: scan backward from the call to the scope start.
@@ -26828,6 +26834,86 @@ function pythonFactoryType(
   }
   for (const f of hit.read) read.add(f);
   return hit.answer;
+}
+
+/** Per context: file + callee → the type the callee's `-> T` names, or null when it says nothing. */
+const PY_CALLEE_RETURN = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/**
+ * The type a python local bound from a call holds — `made = make(q)` where
+ * `make` declares `-> Path` — read from the callee's return annotation
+ * (#3038), the way Go's `r := newRing()` reads `newRing`'s (#2782). Only a
+ * written annotation speaks: a callee the project does not hold, one without
+ * `->`, an `async def`, or an annotation that names no type (a generic, `Any`)
+ * says nothing, and the call keeps its old strategies. A `self.m()` callee is
+ * read on the class the calling method belongs to.
+ */
+function pythonCalleeReturnType(callee: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  let memo = PY_CALLEE_RETURN.get(context);
+  if (!memo) PY_CALLEE_RETURN.set(context, (memo = new Map()));
+  let owner: Node | null = null;
+  const segs = callee.split('.');
+  if (segs.length === 2 && segs[0] === 'self') {
+    for (const cls of pythonFileClasses(ref.filePath, context)) {
+      if (cls.startLine > ref.line || cls.endLine < ref.line) continue;
+      if (!owner || cls.startLine > owner.startLine) owner = cls;
+    }
+  } else if (segs.length > 1) {
+    return null;
+  }
+  const key = `${ref.filePath}\0${owner?.id ?? ''}\0${callee}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  let type: string | null = null;
+  const fn = segs.length === 2
+    ? (owner ? pythonFindMethod(owner, segs[1]!, context, new Set())?.method ?? null : null)
+    : pythonClassNamed(callee, ref.filePath, context, 'function');
+  if (fn && !/^async\s+def\b/.test((pythonLines(context, fn.filePath)?.[fn.startLine - 1] ?? '').trim())) {
+    const returns = /->\s*(.+)$/.exec(fn.signature ?? '');
+    if (returns) {
+      const ann = pythonAnnotationEvidence(returns[1]!);
+      if (ann !== 'runtime' && ann && 'type' in ann) type = normalizeInferredTypeName(ann.type) ?? ann.type;
+    }
+  }
+  if (memo.size >= PY_MEMO_CAP) memo.clear();
+  memo.set(key, type);
+  return type;
+}
+
+/**
+ * The nearest binding of `receiver` in the calling scope, as an
+ * assignment-from-call — `made = make(q)` — whose callee's return annotation
+ * types the local (#3038). The nearest binding decides: one this cannot read
+ * (a constructor call the assignment patterns declined, a bare value, an
+ * `await`, anything after a `.` or `[` of the call's own result) says
+ * nothing, and no older binding is read through it.
+ */
+function pythonLocalCallResultType(
+  receiver: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  lines: string[],
+  fromLine: number,
+  toLine: number,
+): string | null {
+  if (!/^[a-z_]\w*$/.test(receiver) || receiver === 'self' || receiver === 'cls') return null;
+  const bind = new RegExp(`(?:^|;)\\s*${escapeRegExp(receiver)}\\s*=(?!=)\\s*([A-Za-z_][\\w.]*)\\s*\\(`);
+  for (let i = Math.min(toLine, lines.length - 1); i >= fromLine; i--) {
+    const line = lines[i];
+    if (!line || line.length > 10_000) continue;
+    const m = bind.exec(line);
+    if (!m) continue;
+    const callee = m[1]!;
+    // A constructor call is the assignment pattern's to read; reaching here
+    // it declined (a multi-line argument list, say), and the nearest binding
+    // still decides — it just says nothing.
+    if (/^[A-Z]\w*$/.test(callee)) return null;
+    // The call must be the value's whole: `make(q).items` holds an attribute
+    // of the result, not the result.
+    if (/\)\s*[.\[]/.test(line.slice(m.index + m[0].length))) return null;
+    return pythonCalleeReturnType(callee, ref, context);
+  }
+  return null;
 }
 
 function pythonFactoryTypeUncached(
