@@ -72,6 +72,20 @@ export function gitCommonDir(dir: string): string | null {
   }
 }
 
+/**
+ * Absolute, symlink-resolved root of the MAIN working tree of the repository
+ * `dir` belongs to — the checkout the linked worktrees were added from. A
+ * linked worktree and the main checkout share one common dir; for a non-bare
+ * repo that is the main checkout's `.git`, so its parent is the main root.
+ * Null when `dir` isn't in a repo, or the repo is bare (no main working tree).
+ */
+export function gitMainWorktreeRoot(dir: string): string | null {
+  const common = gitCommonDir(dir);
+  if (!common || path.basename(common) !== '.git') return null;
+  const main = path.dirname(common);
+  return gitWorktreeRoot(main) === main ? main : null;
+}
+
 export interface WorktreeIndexMismatch {
   /** The git working tree the command was run from. */
   worktreeRoot: string;
