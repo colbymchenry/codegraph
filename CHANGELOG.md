@@ -27,6 +27,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
 - New `codegraph cycles` command lists the groups of files that import each other in a circle, as text or `--json`, and exits 1 when it finds any, so it works as a pre-commit or CI check (#888). Thanks @jiangyq9 and @goutham80808.
+- `codegraph init --local-only` keeps `.codegraph/` out of git entirely, so nothing of CodeGraph's shows in `git status`, and it works on a project that's already set up, leaving a `.codegraph/.gitignore` you've edited or committed alone (#910). Thanks @jadchene, @jiangyq9, @Wood-Q and @walterf3.
 
 ### Fixes
 

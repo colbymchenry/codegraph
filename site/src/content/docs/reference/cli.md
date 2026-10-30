@@ -7,7 +7,7 @@ description: Every CodeGraph command and the flags it accepts.
 codegraph                         # Run interactive installer
 codegraph install                 # Run installer (explicit)
 codegraph uninstall               # Remove CodeGraph from your agents (inverse of install)
-codegraph init [path]             # Initialize a project + build its graph (one step)
+codegraph init [path]             # Initialize a project + build its graph (--local-only)
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
 codegraph index [path]            # Full re-index from scratch (--force, --quiet, --verbose)
 codegraph sync [path]             # Incremental update (--quiet)
@@ -35,6 +35,8 @@ The MCP server (`codegraph serve --mcp`) is launched automatically by your agent
 ## init, index, and sync
 
 `codegraph init` creates the local `.codegraph/` directory **and** builds the full graph in one step. (The old `-i`/`--index` flag is now a no-op, accepted only so existing scripts don't break.) After that the file watcher keeps the graph current automatically — `index` (a full rebuild from scratch) and `sync` (an incremental update) are only needed when the watcher is disabled or you're scripting against the index outside an agent session.
+
+`.codegraph/` holds a `.gitignore` that keeps the index out of git and is itself meant to be committed, so the rule is shared with your team. If you use CodeGraph on your own, `codegraph init --local-only` makes that file ignore itself too, so nothing shows in `git status`. It also works on a project that's already initialized, without re-indexing. A `.gitignore` you've edited or committed is left as it is.
 
 ## status
 
