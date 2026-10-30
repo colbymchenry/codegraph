@@ -11,6 +11,7 @@ codegraph init [path]             # Initialize a project + build its graph (one 
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
 codegraph index [path]            # Full re-index from scratch (--force, --quiet, --verbose)
 codegraph sync [path]             # Incremental update (--quiet)
+codegraph clone [target]          # Copy another checkout's index into a git worktree (--source, --auto, --force)
 codegraph status [path]           # Show statistics (--json)
 codegraph ui [path]               # Open the browser viewer (not released yet — see below)
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
@@ -34,6 +35,10 @@ The MCP server (`codegraph serve --mcp`) is launched automatically by your agent
 ## init, index, and sync
 
 `codegraph init` creates the local `.codegraph/` directory **and** builds the full graph in one step. (The old `-i`/`--index` flag is now a no-op, accepted only so existing scripts don't break.) After that the file watcher keeps the graph current automatically — `index` (a full rebuild from scratch) and `sync` (an incremental update) are only needed when the watcher is disabled or you're scripting against the index outside an agent session.
+
+## clone
+
+A new git worktree starts without an index. `codegraph clone --auto`, run in the worktree, copies the main checkout's index into it; `--source <path>` copies from any other project instead. The copy is a consistent snapshot, so it is safe while that checkout's daemon is running. It reflects the source's branch, so run `codegraph sync` afterwards to bring it up to date with the worktree. A target that already has an index is left alone unless you pass `--force`.
 
 ## Query commands
 
