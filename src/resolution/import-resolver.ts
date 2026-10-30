@@ -423,6 +423,12 @@ function resolveImportPathUncached(
     return resolveCobolCopybook(importPath, fromFile, context);
   }
 
+  // A shell path from `source` / `.` / `bash x` / `./x` is never a package,
+  // and a shell adds no extension to it (see resolveShellPath).
+  if (language === 'bash') {
+    return resolveShellPath(importPath, fromFile, context);
+  }
+
   // Skip external/npm packages — but pass the context so the
   // bare-specifier heuristic can consult the project's tsconfig
   // alias map first (custom prefixes like `@components/*` would
@@ -458,6 +464,31 @@ function resolveImportPathUncached(
   }
 
   return null;
+}
+
+/**
+ * A path the Bash extractor found in `source`, `.`, `bash x` or `./x`. A shell
+ * never adds an extension, so only the exact file counts.
+ *
+ * A path the extractor anchored to the script's own directory
+ * (`$(dirname "$0")/lib.sh`, a canonical `SCRIPT_DIR`) arrives project-relative
+ * and is taken as-is. A literal `./lib.sh` is relative to wherever the script
+ * is run from, which the graph cannot know. The two places a script is
+ * realistically run from are its own directory and the project root, so it
+ * links only when exactly one of them holds the file: when both do, which one
+ * runs depends on the caller's working directory, and it stays unresolved.
+ */
+function resolveShellPath(importPath: string, fromFile: string, context: ResolutionContext): string | null {
+  if (!importPath.startsWith('./') && !importPath.startsWith('../')) {
+    return context.fileExists(importPath) ? importPath : null;
+  }
+  const found = new Set<string>();
+  for (const cwd of [path.posix.dirname(fromFile.replace(/\\/g, '/')), '']) {
+    const candidate = path.posix.join(cwd, importPath);
+    if (candidate === '..' || candidate.startsWith('../')) continue; // outside the project
+    if (context.fileExists(candidate)) found.add(candidate);
+  }
+  return found.size === 1 ? [...found][0]! : null;
 }
 
 /**

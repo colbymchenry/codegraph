@@ -49,6 +49,38 @@ function graphOf(cg: CodeGraph): { nodes: string[]; edges: string[] } {
 }
 
 describe('Sync Module', () => {
+  describe('Bash sync support', () => {
+    let testDir: string;
+    let cg: CodeGraph;
+
+    beforeEach(() => {
+      testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sync-bash-'));
+      cg = CodeGraph.initSync(testDir);
+    });
+
+    afterEach(() => {
+      if (cg) {
+        cg.destroy();
+      }
+      if (fs.existsSync(testDir)) {
+        fs.rmSync(testDir, { recursive: true, force: true });
+      }
+    });
+
+    it('should sync newly added extensionless Bash shebang scripts', async () => {
+      const binDir = path.join(testDir, 'bin');
+      fs.mkdirSync(binDir, { recursive: true });
+      fs.writeFileSync(path.join(binDir, 'deploy'), '#!/usr/bin/env bash\ndeploy() {\n  echo ok\n}\n');
+
+      const result = await cg.sync();
+      const nodes = cg.getNodesInFile('bin/deploy');
+
+      expect(result.filesAdded).toBe(1);
+      expect(cg.getFile('bin/deploy')?.language).toBe('bash');
+      expect(nodes.some((n) => n.kind === 'function' && n.name === 'deploy')).toBe(true);
+    });
+  });
+
   describe('Sync Functionality', () => {
     let testDir: string;
     let cg: CodeGraph;

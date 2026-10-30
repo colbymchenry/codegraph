@@ -19,6 +19,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- CodeGraph now indexes **Bash** and shell scripts — `.sh`, `.bash`, `.bats` and extensionless scripts whose first line names `bash` or `sh` — with their functions, variables, calls between scripts, the files they `source` or run (including paths built from the script's own directory, like `"$(dirname "$0")/lib.sh"`), and each Bats `@test` as its own symbol with the helpers it `load`s. Thanks @Omar-Elwazeery, @Adam0120 and @danielmevit. (#1203, #1217)
 - `codegraph files --format package` and `codegraph_files` with `format: "package"` now list a project's files by the package that owns them, the nearest `package.json` or `composer.json` above each file that names one, so a monorepo splits into its workspace members with no setup and files nothing claims get a section of their own (#1871). Thanks @LuisAlbertoMK.
 - CodeGraph's MCP server now gives agents and editors its display name and icon, so one that shows them, like the Codex app, lists CodeGraph by name and logo instead of a plain `codegraph`. Thanks @fedosov.
 - `codegraph status` now shows how many of a language's files yielded symbols when that isn't all of them, and warns when none did, so a parser that isn't working no longer looks healthy, and `codegraph status --strict` exits non-zero on that or on an index that's missing, unfinished or out of date, so packaging and CI can gate on it (#1658). Thanks @ferrine.

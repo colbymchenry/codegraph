@@ -23,6 +23,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   tsx: 'tree-sitter-tsx.wasm',
   javascript: 'tree-sitter-javascript.wasm',
   jsx: 'tree-sitter-javascript.wasm',
+  bash: 'tree-sitter-bash.wasm',
   python: 'tree-sitter-python.wasm',
   go: 'tree-sitter-go.wasm',
   rust: 'tree-sitter-rust.wasm',
@@ -73,6 +74,9 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.xsjs': 'javascript',
   '.xsjslib': 'javascript',
   '.jsx': 'jsx',
+  '.sh': 'bash',
+  '.bash': 'bash',
+  '.bats': 'bash',
   '.py': 'python',
   '.pyw': 'python',
   '.go': 'go',
@@ -245,12 +249,14 @@ export function hasMpegTsExtension(filePath: string): boolean {
  *
  * `rootDir` is the project root `filePath` is relative to. A Shopify theme's
  * JSON templates count only when it is given, since telling a theme apart takes
- * a look at the files beside them (see `isShopifyLiquidJson`).
+ * a look at the files beside them (see `isShopifyLiquidJson`) — and so does an
+ * extensionless shell script, whose shebang is read (`isExtensionlessShellScript`).
  */
-export function isSourceFile(filePath: string, overrides?: Record<string, Language>, rootDir?: string): boolean {
+export function isSourceFile(filePath: string, overrides?: Record<string, Language>, rootDir?: string, shebangBudget?: ShebangReadBudget): boolean {
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
   if (isShopifyLiquidJson(filePath, rootDir)) return true; // Shopify OS 2.0 JSON templates / section groups
   if (isErlangAppFile(filePath)) return true; // OTP `.app`/`.app.src` resource files
+  if (isExtensionlessShellScript(filePath, rootDir, shebangBudget)) return true; // `bin/deploy` with a bash/sh shebang
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
   const ext = filePath.slice(dot).toLowerCase();
@@ -318,6 +324,107 @@ export function isShopifyLiquidJson(filePath: string, rootDir?: string): boolean
  */
 export function isErlangAppFile(filePath: string): boolean {
   return /\.app(?:\.src)?$/i.test(filePath);
+}
+
+/**
+ * Extensionless executable scripts can still be Bash. Keep this deliberately
+ * narrow so arbitrary extensionless docs/binaries are not treated as source by
+ * path alone; callers that have content available should pair it with
+ * `hasBashShebang`.
+ */
+export function isPotentialBashShebangPath(filePath: string): boolean {
+  const base = path.basename(filePath);
+  return base.length > 0 && !base.includes('.') && !NEVER_SHELL_BASENAME.test(base);
+}
+
+/**
+ * Extensionless files that are never shell scripts, by name: build files,
+ * container and CI files, and project docs. They are the bulk of a large
+ * repo's extensionless files (the Linux kernel's `Makefile`s and `Kconfig`s),
+ * so naming them keeps the scan from opening each one for a shebang.
+ */
+// Only exact names: `build`, `version` or `setup` are as often a project's own
+// shell script as anything else, so they are not listed. Docs alone take a
+// suffix (`LICENSE-MIT`, `README_zh`).
+const NEVER_SHELL_BASENAME = new RegExp(
+  '^(?:(?:' + [
+    'makefile', 'gnumakefile', 'kconfig', 'kbuild', 'dockerfile', 'containerfile', 'jenkinsfile',
+    'vagrantfile', 'procfile', 'caddyfile', 'justfile', 'gemfile', 'rakefile', 'guardfile', 'podfile',
+    'brewfile', 'pipfile', 'fastfile', 'appfile', 'owners', 'codeowners', 'maintainers',
+  ].join('|') + ')|(?:' + [
+    'readme', 'license', 'licence', 'copying', 'notice', 'authors', 'contributors', 'changelog', 'changes',
+  ].join('|') + ')(?:[-_].*)?)$',
+  'i',
+);
+
+/** True when the first line names bash or POSIX sh as the interpreter. */
+export function hasBashShebang(source: string): boolean {
+  const firstNewline = source.indexOf('\n');
+  const firstLine = (firstNewline >= 0 ? source.slice(0, firstNewline) : source).replace(/\r$/, '');
+  // The interpreter itself, not a later argument named bash/sh
+  // (`#!/usr/bin/env python3 bash`). env's options are not parsed beyond
+  // `-S` / `--`: anything else stays out.
+  return /^#![ \t]*\/(?:[^\s/]+\/)*(?:bash|sh)(?:[ \t]|$)/.test(firstLine)
+    || /^#![ \t]*\/(?:[^\s/]+\/)*env[ \t]+(?:(?:-S|--)[ \t]+)?(?:bash|sh)(?:[ \t]|$)/.test(firstLine);
+}
+
+/** Enough of a file to hold any real shebang line. */
+const SHEBANG_SNIFF_BYTES = 256;
+
+/**
+ * The most extensionless files one scan opens for a shebang. Past it the rest
+ * stay out of the index, and the scan says so. The Linux kernel, the largest
+ * repo measured, opens far fewer once its build files are skipped by name.
+ */
+export const SHEBANG_READ_LIMIT = 10_000;
+
+/** One scan's count of shebang reads, so a scan never makes more than `SHEBANG_READ_LIMIT`. */
+export interface ShebangReadBudget {
+  reads: number;
+  /** Candidates left unread because the limit was reached. */
+  skipped: number;
+}
+
+export function newShebangReadBudget(): ShebangReadBudget {
+  return { reads: 0, skipped: 0 };
+}
+
+/**
+ * An extensionless shell script (`bin/deploy`, `script/bootstrap`): with no
+ * extension to go on, its shebang must name bash or sh. Its first bytes are
+ * read from disk only when `rootDir` is given, as for a Shopify theme's JSON
+ * templates — so a file the path alone cannot place never loads the Bash
+ * grammar, and a README or LICENSE stays out of the index.
+ *
+ * A scan passes its `budget`, and stops reading at `SHEBANG_READ_LIMIT`.
+ * Build files and docs (`NEVER_SHELL_BASENAME`) and empty files are never
+ * opened. Sync and the watcher pass none: they read only the files that changed.
+ */
+export function isExtensionlessShellScript(filePath: string, rootDir?: string, budget?: ShebangReadBudget): boolean {
+  if (rootDir === undefined || !isPotentialBashShebangPath(filePath)) return false;
+  if (budget && budget.reads >= SHEBANG_READ_LIMIT) {
+    budget.skipped++;
+    return false;
+  }
+  const fullPath = path.join(rootDir, filePath);
+  let fd: number | undefined;
+  try {
+    // A regular file only: opening a FIFO for reading would block the scan.
+    // An empty one has no shebang to read.
+    const stat = fs.statSync(fullPath);
+    if (!stat.isFile() || stat.size < 3) return false;
+    if (budget) budget.reads++;
+    fd = fs.openSync(fullPath, 'r');
+    const head = Buffer.alloc(SHEBANG_SNIFF_BYTES);
+    const bytesRead = fs.readSync(fd, head, 0, head.length, 0);
+    return hasBashShebang(head.toString('utf8', 0, bytesRead));
+  } catch {
+    return false; // gone or unreadable
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* already closed */ }
+    }
+  }
 }
 
 /**
@@ -397,6 +504,12 @@ export async function initGrammars(): Promise<void> {
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  // Bash: tree-sitter-wasms ships 0.20.5 (ABI 13), whose scanner fails on a
+  // plain `case … esac` under web-tree-sitter 0.25. Vendored: tree-sitter-bash
+  // 0.25.1 (ABI 15) with docs/grammars/tree-sitter-bash.patch (`coproc`
+  // bodies, `! case`, `<>`, whitespace-only heredoc lines — so CRLF files) —
+  // provenance and rebuild in tree-sitter-bash.md.
+  'bash',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -590,7 +703,8 @@ export function getParser(language: Language): Parser | null {
  * `EXTENSION_MAP`. Omitting it is byte-identical to the zero-config behavior.
  *
  * `rootDir` is the project root `filePath` is relative to, as for
- * `isSourceFile`: a Shopify theme's JSON templates are Liquid only with it.
+ * `isSourceFile`: a Shopify theme's JSON templates are Liquid only with it, and
+ * without `source` an extensionless script is Bash only with it.
  */
 export function detectLanguage(filePath: string, source?: string, overrides?: Record<string, Language>, rootDir?: string): Language {
   // Play `conf/routes` has no grammar — route through the no-symbol path; the
@@ -603,6 +717,10 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   // OTP `.app`/`.app.src` resource files — Erlang terms the grammar parses as
   // top-level expressions (last-dot ext `.src` is too generic for the map).
   if (isErlangAppFile(filePath)) return 'erlang';
+  // An extensionless script is Bash only by its shebang: from `source` when
+  // the caller has it, else read from disk under `rootDir` (grammar preload).
+  if (isPotentialBashShebangPath(filePath) &&
+      (source !== undefined ? hasBashShebang(source) : isExtensionlessShellScript(filePath, rootDir))) return 'bash';
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
   // A Flow-typed `.js` (`// @flow` in its leading comments) parses as TSX:
@@ -916,6 +1034,7 @@ export function getLanguageDisplayName(language: Language): string {
     javascript: 'JavaScript',
     tsx: 'TypeScript (TSX)',
     jsx: 'JavaScript (JSX)',
+    bash: 'Bash / shell',
     python: 'Python',
     go: 'Go',
     rust: 'Rust',
