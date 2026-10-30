@@ -1,5 +1,5 @@
 /**
- * Where a Cangjie reference may land — two shapes that bound it to the
+ * Where a Cangjie reference may land — three shapes that bound it to the
  * wrong node, gated at resolveOne's seam so every strategy obeys them.
  *
  * 1. Extension nodes. An `extend T { … }` whose `T` is declared in another
@@ -12,7 +12,13 @@
  *    nothing when the project only extends the type (the Swift extension
  *    trap; see ./swift-type-visibility).
  *
- * 2. Standard-library method names reached without a receiver type. A call
+ * 2. Enum constructors named like UI components. ArkUI's `Text(…)`,
+ *    `Image(…)`, `Divider()` are framework components, but a project enum may
+ *    declare a `| Text | Image` case: measured on a Telegram port, 5,181 view
+ *    lines bound to four enum cases. A bare call reaches an enum constructor
+ *    of another file only when the calling file names that enum at all.
+ *
+ * 3. Standard-library method names reached without a receiver type. A call
  *    on a value whose type extraction can't name (`foo().add(x)`,
  *    `a.b.c.isEmpty()`) is emitted by its bare method name; when that name is
  *    one of the standard library's (`add`, `toString`, `isEmpty`) and the
@@ -56,6 +62,12 @@ export function gateCangjieTarget(result: ResolvedRef | null, ref: UnresolvedRef
 
   const bare = !ref.referenceName.includes('.');
   if (!bare || (ref.referenceKind !== 'calls' && ref.referenceKind !== 'instantiates')) return result;
+
+  if (target.kind === 'enum_member' && target.filePath !== ref.filePath) {
+    const enumName = ownerOf(target).split('::').pop();
+    const source = context.readFile(ref.filePath) ?? '';
+    return enumName && new RegExp(`\\b${enumName}\\b`).test(source) ? result : null;
+  }
 
   if (target.kind === 'method' && isStdMethodName('cangjie', target.name)) {
     const from = context.getNodeById?.(ref.fromNodeId);

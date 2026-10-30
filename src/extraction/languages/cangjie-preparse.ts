@@ -17,7 +17,8 @@
  *     interface's properties) — the grammar requires the body;
  *   - a fluent chain continued on the next line (`builder` ⏎ `.setX()`), a
  *     statement the grammar cannot start with `.`;
- *   - consecutive members annotated on their own line (`@Test func f()`);
+ *   - consecutive members annotated on their own line (`@Test func f()`,
+ *     `@State var count = 0`);
  *   - grouped imports spanning lines or ending in a comma (`import a.{\n B,\n}`);
  *   - nested block comments `/* … /* … *\/ … *\/`;
  *   - integer suffixes written `0_i32` (read as `0` and an identifier), and
@@ -33,12 +34,15 @@ type Mask = Uint8Array;
 /**
  * What preParse rewrote that the extractor reads back, by the rewritten
  * source: `props` holds the start offsets of body-less `prop`s rewritten to
- * `func`s, emitted back as `property` nodes. preParse is deterministic and
+ * `func`s, emitted back as `property` nodes; `annotations` the names blanked
+ * off a member whose line above could not take them. preParse is deterministic and
  * running it again on its own output rewrites nothing, so entries are only
  * ever added; the map is capped to the most recent sources.
  */
 export interface CangjieRewrites {
   props: ReadonlySet<number>;
+  /** 1-based line → annotation names blanked off a member on that line. */
+  annotations: ReadonlyMap<number, readonly string[]>;
 }
 const REWRITES = new Map<string, CangjieRewrites>();
 const REWRITES_CAP = 32;
@@ -164,9 +168,9 @@ function blank(out: string[], from: number, to: number): void {
   for (let k = from; k < to; k++) if (out[k] !== '\n' && out[k] !== '\r') out[k] = ' ';
 }
 
-/** A line holding a function's annotations before its `func` (brackets already blanked). */
-const SAME_LINE_ANNOTATED_FUNC =
-  /^([ \t]*)((?:@[A-Za-z_]\w*[ \t]+)+)(?=(?:(?:public|private|protected|internal|open|override|static|redef|mut|unsafe|operator|abstract|sealed|const)[ \t]+)*func\b)/;
+/** A line holding a member's annotations before its `func`/`var`/`let`/`prop`/`init` (brackets already blanked). */
+const SAME_LINE_ANNOTATED_MEMBER =
+  /^([ \t]*)((?:@[A-Za-z_]\w*[ \t]+)+)(?=(?:(?:public|private|protected|internal|open|override|static|redef|mut|unsafe|operator|abstract|sealed|const)[ \t]+)*(?:func|var|let|prop|init|main)\b)/;
 
 const PROP_LINE =
   /^([ \t]*)((?:(?:public|private|protected|internal|open|mut|static|override|redef|abstract|sealed|unsafe)[ \t]+)*)prop([ \t]+)([A-Za-z_]\w*)[ \t]*:([^\n{=]*?)[ \t]*$/;
@@ -246,6 +250,7 @@ export function preParseCangjie(source: string): string {
 
   // Line-based rewrites.
   const props = new Set<number>();
+  const annotations = new Map<number, string[]>();
   // The last code character seen, its offset, and whether a blank or
   // comment-only line has come since.
   let lastCodeChar = '';
@@ -294,30 +299,40 @@ export function preParseCangjie(source: string): string {
       lastCodeAt = lineLastAt;
     }
 
-    // `@Test func f()` written on one line: the grammar accepts it once, but
-    // a second such member in the same body ERRORs (and loses the rest of the
-    // class). Move the annotations onto the end of the line above — `} @Test`
-    // / `{ @Test` / a blank line — and pad this one: the same bytes in the
-    // same span, so `func` keeps its byte offset and every later line its
-    // number. The annotation stays a parsed `@Test`, so decorators keep it.
+    // `@Test func f()` / `@State var count = 0` written on one line: the
+    // grammar accepts it once, but a second such member in the same body
+    // ERRORs (and loses the rest of the class). Move the annotations onto the
+    // end of the line above when that line opens or closes a block (`} @Test`,
+    // `{ @Test`) or is blank, and pad this one: the same bytes in the same
+    // span, so `func` keeps its byte offset and every later line its number,
+    // and the annotation stays a parsed `@Test`. After any other line (a run
+    // of `@State var`s) they cannot stand, so they are blanked and recorded
+    // by line for the extractor to put back on the member's decorators.
     if (isCode(firstCode) && source[firstCode] === '@' && lineStart > 0) {
       const current = out.slice(lineStart, lineEnd).join('');
-      const am = SAME_LINE_ANNOTATED_FUNC.exec(current);
+      const am = SAME_LINE_ANNOTATED_MEMBER.exec(current);
       const prevEnd = lineStart - 1; // the newline ending the line above
       let prevLast = prevEnd - 1;
       while (prevLast >= 0 && (source[prevLast] === ' ' || source[prevLast] === '\t' || source[prevLast] === '\r')) prevLast--;
-      // Code, a blank line, or a closed `/* … */` can take them; a `//` comment can't.
-      const prevOk = prevLast < 0 || source[prevLast] === '\n' || mask[prevLast] === 0 ||
+      // A block boundary, a blank line, or a closed `/* … */` can take them.
+      const prevOk = prevLast < 0 || source[prevLast] === '\n' ||
+        (mask[prevLast] === 0 && (source[prevLast] === '{' || source[prevLast] === '}')) ||
         (source[prevLast] === '/' && source[prevLast - 1] === '*' && mask[prevLast] === 2);
-      if (am && prevOk) {
-        const indent = am[1]!.length;
-        const annotations = am[2]!.trimEnd();
-        const span = 1 + indent + am[2]!.length; // newline + indent + annotations
-        const moved = ' ' + annotations + '\n' + ' '.repeat(span - annotations.length - 2);
-        for (let k = 0; k < span; k++) out[prevEnd + k] = moved[k]!;
-      } else if (am) {
-        // Nowhere to move them: drop the annotations rather than the class body.
-        blank(out, lineStart + am[1]!.length, lineStart + am[1]!.length + am[2]!.length);
+      if (am) {
+        const names = am[2]!.match(/@[A-Za-z_]\w*/g)?.map((a) => a.slice(1)) ?? [];
+        const lineNo = source.slice(0, lineStart).split('\n').length;
+        if (prevOk && names.length > 0) {
+          // Two annotations never share a line, so only the first one moves.
+          const indent = am[1]!.length;
+          const moved0 = `@${names[0]}`;
+          const span = 1 + indent + am[2]!.length; // newline + indent + annotations
+          const moved = ' ' + moved0 + '\n' + ' '.repeat(span - moved0.length - 2);
+          for (let k = 0; k < span; k++) out[prevEnd + k] = moved[k]!;
+          if (names.length > 1) annotations.set(lineNo, names.slice(1));
+        } else {
+          blank(out, lineStart + am[1]!.length, lineStart + am[1]!.length + am[2]!.length);
+          if (names.length > 0) annotations.set(lineNo, names);
+        }
       }
     }
 
@@ -354,12 +369,12 @@ export function preParseCangjie(source: string): string {
   }
 
   const result = out.join('');
-  if (props.size > 0) {
+  if (props.size > 0 || annotations.size > 0) {
     if (REWRITES.size >= REWRITES_CAP) {
       const oldest = REWRITES.keys().next().value;
       if (oldest !== undefined) REWRITES.delete(oldest);
     }
-    REWRITES.set(result, { props });
+    REWRITES.set(result, { props, annotations });
   }
   return result;
 }
