@@ -219,7 +219,8 @@ describe('nextjs: end to end', () => {
 
   it('names every page and endpoint, and binds a page to its component and an endpoint to its function', () => {
     expect(cg.getNodesByKind('route').map((r) => r.name).sort()).toEqual(['/', '/login', '/users', '/users/:id', 'GET /api/users', 'POST /api/users']);
-    const home = cg.getOutgoingEdges(route('/').id).find((e) => e.kind === 'calls');
+    // The middleware the route runs first is a `calls` edge too (`nextProxyEdges`).
+    const home = cg.getOutgoingEdges(route('/').id).find((e) => e.kind === 'calls' && (e.metadata as Record<string, unknown>).synthesizedBy !== 'next-proxy');
     expect(cg.getNode(home!.target)?.name).toBe('Home');
     const post = cg.getOutgoingEdges(route('POST /api/users').id).find((e) => e.kind === 'references');
     expect(cg.getNode(post!.target)).toMatchObject({ name: 'POST', kind: 'function', filePath: 'app/api/users/route.ts' });
