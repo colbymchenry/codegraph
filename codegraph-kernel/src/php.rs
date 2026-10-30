@@ -360,7 +360,7 @@ impl<'t> Walker<'t> {
             id: id_ref,
             docstring: doc_ref,
             signature: sig_ref,
-            decorators: NONE_STR, // php attributes never emit decorates refs
+            decorators: NONE_STR, // php attributes go out as decorates refs instead
             type_parameters: NONE_STR,
             return_type: ret_ref,
             extra_json: NONE_STR,
@@ -694,7 +694,7 @@ impl<'t> Walker<'t> {
         };
         let Some(row) = self.create_node("function", &name, node, extra) else { return };
         self.extract_php_type_refs(node, row);
-        // decorators: none.
+        self.extract_attributes(node, row);
         self.stack.push(Scope { row, kind: "function", name });
         if let Some(body) = node.child_by_field_name("body") {
             self.visit_function_body(body);
@@ -714,6 +714,7 @@ impl<'t> Walker<'t> {
         };
         let Some(row) = self.create_node("method", &name, node, extra) else { return };
         self.extract_php_type_refs(node, row);
+        self.extract_attributes(node, row);
         self.stack.push(Scope { row, kind: "method", name });
         // Bodiless (interface/abstract) methods still mint nodes, no walk.
         if let Some(body) = node.child_by_field_name("body") {
@@ -732,8 +733,8 @@ impl<'t> Walker<'t> {
         };
         let Some(row) = self.create_node(kind, &name, node, extra) else { return };
         self.extract_inheritance(node, row);
-        // primary-ctor refs: csharp-only (needs a parameter_list child type);
-        // decorators: none.
+        // primary-ctor refs: csharp-only (needs a parameter_list child type).
+        self.extract_attributes(node, row);
         self.stack.push(Scope { row, kind, name });
         let body = node.child_by_field_name("body").unwrap_or(node);
         for i in 0..body.named_child_count() {
@@ -853,6 +854,32 @@ impl<'t> Walker<'t> {
                     ..Extra::default()
                 },
             );
+        }
+    }
+
+    /// extractDecoratorsFor's php branch: `#[A, B]` is attribute_list →
+    /// attribute_group → attribute, each a `decorates` ref named by the last
+    /// segment of its `name` / `qualified_name` (`ORM\Entity` → `Entity`).
+    fn extract_attributes(&mut self, decl: Node<'t>, decorated_row: u32) {
+        for i in 0..decl.named_child_count() {
+            let Some(list) = decl.named_child(i) else { continue };
+            if list.kind() != "attribute_list" {
+                continue;
+            }
+            for j in 0..list.named_child_count() {
+                let Some(group) = list.named_child(j) else { continue };
+                for k in 0..group.named_child_count() {
+                    let Some(attr) = group.named_child(k) else { continue };
+                    if attr.kind() != "attribute" {
+                        continue;
+                    }
+                    let Some(written) = attr.named_child(0) else { continue };
+                    let name = self.text(written).rsplit('\\').next().unwrap_or("").trim().to_string();
+                    if !name.is_empty() {
+                        self.push_ref_at(decorated_row, &name, edge_kind_index("decorates").unwrap(), attr);
+                    }
+                }
+            }
         }
     }
 

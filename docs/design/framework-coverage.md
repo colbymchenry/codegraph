@@ -110,8 +110,8 @@ table; the resolver half is one `Astro.redirect` reader.
 
 ### 2. Server-rendered frameworks — a redirect is a transition, not just a response
 
-**Fourteen frameworks** have route nodes and no navigation: Django, Flask,
-FastAPI, Express, NestJS, Laravel, Drupal, Rails, Spring, Play, Gin/chi/gorilla,
+**Fifteen frameworks** have route nodes and no navigation: Django, Flask,
+FastAPI, Express, NestJS, Laravel, Drupal, Symfony, Rails, Spring, Play, Gin/chi/gorilla,
 Axum/actix/Rocket, ASP.NET, Vapor.
 
 Be precise about what is missing. `redirect_to`, `HttpResponseRedirect`,

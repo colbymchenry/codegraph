@@ -7252,6 +7252,16 @@ export class TreeSitterExtractor {
           consider(child.namedChild(j));
         }
       }
+      // PHP: attribute_list → attribute_group → attribute (`ORM\Entity` → `Entity`).
+      if (child?.type === 'attribute_list' && this.language === 'php') {
+        for (const attr of child.namedChildren.flatMap((g) => g?.namedChildren ?? [])) {
+          const written = attr?.type === 'attribute' ? attr.namedChild(0) : null;
+          const name = written && getNodeText(written, this.source).split('\\').pop()?.trim();
+          if (!attr || !name) continue;
+          const { row, column } = attr.startPosition;
+          this.unresolvedReferences.push({ fromNodeId: decoratedId, referenceName: name, referenceKind: 'decorates', line: row + 1, column });
+        }
+      }
     }
 
     // 2. Decorators that are PRECEDING siblings of the declaration
