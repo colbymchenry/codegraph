@@ -55,7 +55,6 @@
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^4.0.4",
-    "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^20.19.30",
     "@types/picomatch": "^4.0.2",
     "jsdom": "^25.0.1",
