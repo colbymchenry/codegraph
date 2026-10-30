@@ -5549,6 +5549,28 @@ export class QueryBuilder {
     return pairs;
   }
 
+  /**
+   * The `file\0statement` pairs of the `export … from` statements in
+   * `filePaths` (#2978). Each is an import node named by the module it names,
+   * with the statement as its signature, so a re-export pointed at another
+   * module, taken away, added, or passing other names on changes a pair, and a
+   * plain `import` does not. Same shape as {@link getNodeNamePairsByFiles}.
+   */
+  getReExportStatementsByFiles(filePaths: string[]): Set<string> {
+    const pairs = new Set<string>();
+    if (filePaths.length === 0) return pairs;
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT DISTINCT file_path, signature FROM nodes
+                   WHERE kind = 'import' AND file_path IN (${placeholders}) AND signature LIKE 'export%'`)
+        .all(...chunk) as Array<{ file_path: string; signature: string }>;
+      for (const row of rows) pairs.add(`${row.file_path}\0${row.signature}`);
+    }
+    return pairs;
+  }
+
   // ===========================================================================
   // Statistics
   // ===========================================================================
