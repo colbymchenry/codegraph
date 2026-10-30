@@ -4603,7 +4603,10 @@ function pythonFromImports(filePath: string, context: ResolutionContext): Map<st
   if (hit) return hit;
   const names = new Map<string, string>();
   const text = context.readFile(filePath) ?? '';
-  for (const m of text.matchAll(/^\s*from\s+([\w.]+)\s+import\s+(\([^)]*\)|[^\n#]+)/gm)) {
+  // `cimport` as well as `import`: Cython's from-cimports bind names the same
+  // way (#1819), and `cimport` is not valid Python, so the wider keyword
+  // can't misread a .py file.
+  for (const m of text.matchAll(/^\s*from\s+([\w.]+)\s+(?:cimport|import)\s+(\([^)]*\)|[^\n#]+)/gm)) {
     const module = m[1]!;
     for (const item of m[2]!.replace(/[()]/g, '').split(',')) {
       const bound = /(\w+)\s*$/.exec(item.trim())?.[1];
@@ -24223,8 +24226,10 @@ export function isPythonFromImportModule(ref: UnresolvedRef, context: Resolution
     text = text.replace(/\\\s*$/, ' ') + (lines![next] ?? '');
   }
   const name = text.trimStart();
+  // Cython's `from X cimport y` is the same from-import (#1819). `cimport`
+  // is not valid Python, so accepting it here can't misread a .py line.
   return name.length < text.length && name.startsWith(ref.referenceName) &&
-    /^\s+import\b/.test(name.slice(ref.referenceName.length));
+    /^\s+(?:cimport|import)\b/.test(name.slice(ref.referenceName.length));
 }
 
 /**

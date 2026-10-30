@@ -541,7 +541,7 @@ interface PythonModuleIndex {
   files: Set<string>;
   /** Directories holding an `__init__.py` — regular packages. */
   packageDirs: Set<string>;
-  /** Every directory that holds a `.py` file at any depth — namespace candidates. */
+  /** Every directory that holds a `.py`/`.pyx` file at any depth — namespace candidates. */
   dirs: Set<string>;
   projectRoots: Set<string>;
   /** Local roots, each with the directory whose importers it may answer. */
@@ -555,7 +555,7 @@ interface PythonModuleIndex {
 }
 
 const pythonModuleIndexes = new WeakMap<ResolutionContext, PythonModuleIndex>();
-const PYTHON_MODULE_FILE = /\.py$/;
+const PYTHON_MODULE_FILE = /\.pyx?$/;
 const PYTHON_MODULE_LEVEL_KINDS = new Set<string>(['function', 'class', 'variable', 'constant']);
 /**
  * Directory names that, by near-universal convention, hold code that is not
@@ -735,12 +735,15 @@ function iniTables(content: string): Array<[string, string]> {
 /**
  * The module file at `base` (dir-relative path), in Python's own order: a
  * regular package `base/__init__.py` beats a module `base.py`; a bare
- * directory (a namespace portion) has no file of its own.
+ * directory (a namespace portion) has no file of its own. A Cython
+ * implementation module (`base.pyx`, #1819) beats a same-named `.py` — the
+ * build compiles the `.pyx` — while a `.pxd` is a declaration sidecar, never
+ * the module an import binds to (the way `.d.ts` is skipped for JavaScript).
  */
 function pythonModuleAt(base: string, index: PythonModuleIndex): string | null {
   const init = joinRel(base, '__init__.py');
   if (index.files.has(init)) return init;
-  return index.files.has(`${base}.py`) ? `${base}.py` : null;
+  return index.files.has(`${base}.pyx`) ? `${base}.pyx` : index.files.has(`${base}.py`) ? `${base}.py` : null;
 }
 
 /**
@@ -756,7 +759,7 @@ function pythonModuleUnder(root: string, relPath: string, index: PythonModuleInd
   for (let i = 0; i < parts.length - 1; i++) {
     base = joinRel(base, parts[i]!);
     if (index.files.has(joinRel(base, '__init__.py'))) continue;
-    if (index.files.has(`${base}.py`) || !index.dirs.has(base)) return null;
+    if (index.files.has(`${base}.py`) || index.files.has(`${base}.pyx`) || !index.dirs.has(base)) return null;
   }
   return pythonModuleAt(joinRel(root, relPath), index);
 }

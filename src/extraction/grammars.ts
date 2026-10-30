@@ -75,6 +75,13 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.jsx': 'jsx',
   '.py': 'python',
   '.pyw': 'python',
+  // Cython (.pyx implementation, .pxd declaration, .pxi include) is a Python
+  // superset carried by the python language (the way `.metal`/`.cu` ride
+  // 'cpp'): the Python extractor's preParse rewrites its Cython-only
+  // constructs into the Python shapes the grammar reads (#1819).
+  '.pyx': 'python',
+  '.pxd': 'python',
+  '.pxi': 'python',
   '.go': 'go',
   '.rs': 'rust',
   '.java': 'java',

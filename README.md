@@ -258,7 +258,7 @@ With the index available, the agent answers from one to four `codegraph_explore`
 
 ## Built for speed — the Rust kernel
 
-CodeGraph's parsing engine is a **native Rust kernel**: 20 languages — TypeScript, JavaScript, Java, Python, Go, C, C++, Rust, C#, Ruby, PHP, Swift, Kotlin, Scala, Dart, R, Lua, Luau (Metal and CUDA ride the C++ path) — parse in compiled code with one boundary crossing per file. Every language shipped only after its graphs proved **byte-for-byte identical** to the reference engine on real repositories, from small libraries up to the Linux kernel; platforms without a prebuilt binary and files with syntax errors fall back per-file automatically, same graph either way.
+CodeGraph's parsing engine is a **native Rust kernel**: 20 languages — TypeScript, JavaScript, Java, Python, Go, C, C++, Rust, C#, Ruby, PHP, Swift, Kotlin, Scala, Dart, R, Lua, Luau (Metal and CUDA ride the C++ path; Cython rides the Python path) — parse in compiled code with one boundary crossing per file. Every language shipped only after its graphs proved **byte-for-byte identical** to the reference engine on real repositories, from small libraries up to the Linux kernel; platforms without a prebuilt binary and files with syntax errors fall back per-file automatically, same graph either way.
 
 **And it scales itself to the machine it's on.** Worker pools, parallel resolution, and analysis caches are sized from what the system actually has — real core counts (container/cgroup-aware, so a VPS that grants 2 cores gets sized for 2, not the host's 64), honestly-measured available RAM on macOS and Linux, and the measured cost of *your* project's resolution work:
 
@@ -278,7 +278,7 @@ CodeGraph's parsing engine is a **native Rust kernel**: 20 languages — TypeScr
 | **Full-Text Search** | Find code by name instantly across your entire codebase, powered by FTS5 |
 | **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
 | **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
-| **20+ Languages** | TypeScript, JavaScript, ArkTS, Python, Go, Rust, Java, C#, VB.NET, PHP, Ruby, C, C++, CUDA, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Nix, Erlang, CFML, COBOL, Solidity, Terraform/OpenTofu, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
+| **20+ Languages** | TypeScript, JavaScript, ArkTS, Python, Cython, Go, Rust, Java, C#, VB.NET, PHP, Ruby, C, C++, CUDA, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Nix, Erlang, CFML, COBOL, Solidity, Terraform/OpenTofu, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
 | **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 17 frameworks |
 | **Mixed iOS / React Native / Expo** | Closes cross-language flows that static parsing misses: Swift ↔ ObjC bridging, React Native legacy bridge + TurboModules + Fabric view components, native → JS event emitters, Expo Modules |
 | **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
@@ -818,6 +818,7 @@ command:
 | JavaScript | `.js`, `.jsx`, `.mjs` | Full support |
 | ArkTS (HarmonyOS) | `.ets` | Full support (everything TypeScript has, plus `@Component`/`@ComponentV2` structs with their ArkUI decorators (`@State`/`@Prop`/`@Link`/`@Local`/`@Builder`/…), `build()` view trees — parent→child component edges, chained-attribute links to `@Extend`/`@Styles` functions, `.onClick(this.handler)` event bindings — dynamic-dispatch bridges for state→`build()` re-renders, `@ohos.events.emitter` emit→subscriber pairs (static event keys only), and `router.pushUrl` literal urls → the target page struct; ohpm workspace modules resolve bare `import { X } from "data"` through `oh-package.json5` `file:` dependencies, honoring each module's `main` entry) |
 | Python | `.py` | Full support |
+| Cython | `.pyx`, `.pxd`, `.pxi` | Full support (parsed through the Python grammar: `cimport`/`from … cimport` imports, `cdef`/`cpdef` classes and functions with typed parameters and `nogil`/`except` clauses, `.pxd` declaration files, `ctypedef` aliases and C struct/union/enum declarations, compile-time `DEF`/`IF`/`ELIF`/`ELSE`; `cdef extern` C blocks are skipped) |
 | Go | `.go` | Full support |
 | Rust | `.rs` | Full support |
 | Java | `.java` | Full support |

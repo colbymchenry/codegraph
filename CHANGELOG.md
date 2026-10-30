@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Cython files (`.pyx`, `.pxd`, `.pxi`) are now indexed: `cimport` and `from … cimport` imports, `cdef`/`cpdef` classes and functions with typed parameters and `nogil`/`except` clauses, `.pxd` declaration files, `ctypedef` aliases and C struct/union/enum declarations, and compile-time `DEF`/`IF`/`ELIF`/`ELSE` blocks all land in the graph, with calls and references resolved through the same Python semantics a `.py` file gets. Thanks @stefanozampini for the report. (#1819)
+
 ### Security
 
 - CodeGraph's refusal to use a sensitive folder such as `~/.ssh`, `~/.config`, `/etc` or `C:\Windows` as a project can no longer be sidestepped: a link or junction that leads to one, a differently capitalized name on Windows and macOS, a `\\?\` spelling on Windows, and a path to a missing folder inside one are now refused like the folder itself. Before, any of these let an AI agent's query read the files inside. Thanks @mixxer for finding it.
