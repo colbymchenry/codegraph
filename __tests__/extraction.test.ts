@@ -5337,6 +5337,12 @@ import 'package:flutter/material.dart';
       ['{% liquid\n  capture bare\n    echo "Hi"\n  endcapture\n%}', 'bare', 2, 2],
       ['{% liquid\r\n  capture crlf # a note\r\n  endcapture\r\n%}', 'crlf', 2, 2],
       ["{%- liquid\n  capture 'quoted_line'\n  endcapture\n-%}", 'quoted_line', 2, 2],
+      // A name with `-` in it is one name; the `-` of `-%}` trims whitespace.
+      ['{% capture title-text %}Hi{% endcapture %}', 'title-text', 1, 0],
+      ['{% capture title-text-%}Hi{% endcapture %}', 'title-text', 1, 0],
+      ['{%- capture title-text -%}Hi{%- endcapture -%}', 'title-text', 1, 0],
+      ["{% capture 'hero-alt' %}Hi{% endcapture %}", 'hero-alt', 1, 0],
+      ['{% liquid\n  capture hero-alt\n  endcapture\n%}', 'hero-alt', 2, 2],
     ] as const)('reads a capture declaration from %j', (code, name, line, column) => {
       const result = extractFromSource('sections/card.liquid', code);
       const variables = result.nodes.filter((n) => n.kind === 'variable');
@@ -5360,10 +5366,27 @@ import 'package:flutter/material.dart';
       expect(result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name)).toEqual(['text']);
     });
 
-    it('never cuts a capture name short', () => {
-      // Liquid allows `-` and `.` in a name, which the assign rule doesn't read
-      // either; such a name gets no node rather than a wrong one.
-      const code = ['{% capture ghost-name %}x{% endcapture %}', '{% capture ghost.name %}x{% endcapture %}'].join('\n');
+    it('reads an assign name with `-` in it whole', () => {
+      const code = [
+        "{% assign title-text = 'Sale' %}",
+        '{%- assign page-title=page.title -%}',
+        '{% liquid',
+        '  assign hero-image = section.settings.image',
+        '%}',
+      ].join('\n');
+      const variables = extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable');
+      expect(variables.map((n) => [n.name, n.startLine])).toEqual([['title-text', 1], ['page-title', 2], ['hero-image', 4]]);
+    });
+
+    it('never cuts a name short', () => {
+      // Liquid allows `.` in a name too, which neither rule reads; such a name
+      // gets no node rather than a wrong one.
+      const code = [
+        '{% capture ghost.name %}x{% endcapture %}',
+        '{% capture ghost-name.x %}x{% endcapture %}',
+        '{% assign ghost.name = 1 %}',
+        '{% assign ghost-name.x = 1 %}',
+      ].join('\n');
       expect(extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable')).toEqual([]);
     });
 
