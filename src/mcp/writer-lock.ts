@@ -46,6 +46,48 @@ export interface WriterLockInfo {
   ready?: boolean;
 }
 
+/**
+ * How long a writer may stay at `ready: false` before it is stale (#2918).
+ *
+ * Deliberately far longer than normal catch-up (and the 30 s reader wait in
+ * project-lifecycle.ts), and far shorter than the ~28 h wedged daemon in
+ * #2918. A live pid is not, by itself, proof of a live writer: one that never
+ * reports ready is indistinguishable from a wedged one once this long has
+ * passed. Overridable for tests and very large projects via
+ * `CODEGRAPH_WRITER_READY_TIMEOUT_MS`.
+ */
+export const WRITER_READY_TIMEOUT_MS = 10 * 60 * 1000;
+
+export function resolveWriterReadyTimeoutMs(): number {
+  const raw = Number(process.env.CODEGRAPH_WRITER_READY_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : WRITER_READY_TIMEOUT_MS;
+}
+
+/**
+ * True only for a record that explicitly says `ready: false` and whose
+ * `startedAt` is at least the ready timeout old. `ready: true`, a missing
+ * `startedAt`, and a future `startedAt` are never stale here, so legacy
+ * records without a `ready` field are not reaped by this check.
+ */
+export function isWriterReadyStale(info: WriterLockInfo | null, now = Date.now()): boolean {
+  if (!info || info.ready !== false || !(info.startedAt > 0)) return false;
+  return now - info.startedAt >= resolveWriterReadyTimeoutMs();
+}
+
+/**
+ * Modes that run an MCP writer and publish `ready: true` once its first
+ * catch-up finishes. Only these can go stale by staying at `ready: false`:
+ * `rebuild`, `cleanup` and `handover` also take `writer.pid` (or its sibling
+ * `rebuild.pid`) but never publish readiness, so age alone is not evidence
+ * they are wedged — a full re-index stays `ready: false` for as long as it
+ * runs. Kept narrow on purpose: an unknown mode is never stolen.
+ */
+const READY_PUBLISHING_MODES = new Set(['daemon', 'direct', 'fallback']);
+
+function isReapableNotReadyWriter(info: WriterLockInfo | null): boolean {
+  return !!info && READY_PUBLISHING_MODES.has(info.mode) && isWriterReadyStale(info);
+}
+
 export type WriterAcquireResult =
   | { kind: 'acquired'; pidPath: string; info: WriterLockInfo }
   | { kind: 'taken'; existing: WriterLockInfo | null; pidPath: string };
@@ -71,7 +113,13 @@ export function decodeWriterLockInfo(raw: string): WriterLockInfo | null {
 
 /**
  * Atomically create `writer.pid` (link-into-place, O_EXCL fallback). If held
- * by a dead PID, clear and retry once. Does not steal from a live holder.
+ * by a dead PID, clear and retry once. A live MCP writer that has stayed at
+ * `ready: false` past `WRITER_READY_TIMEOUT_MS` is also stale (#2918) and is
+ * cleared the same pid-verified way, with a stderr line naming its pid and
+ * the lock file. A holder that is ready, or still within the timeout, is
+ * never stolen — no matter how old — and the stale holder is never signalled
+ * (#1978, #2819): only the lock is cleared, so a live process that later
+ * exits still cannot delete the successor's record (see releaseWriterLock).
  */
 export function tryAcquireWriterLock(
   projectRoot: string,
@@ -134,14 +182,22 @@ export function tryAcquireWriterLock(
   }
   if (result.kind === 'taken') {
     const existing = result.existing;
-    if (!existing || existing.pid <= 0 || !isProcessAlive(existing.pid)) {
+    if (!existing || existing.pid <= 0 || !isProcessAlive(existing.pid) || isReapableNotReadyWriter(existing)) {
       // Stale — clear (pid-verified) and retry once.
       try {
         const raw = fs.readFileSync(pidPath, 'utf8');
         const cur = decodeWriterLockInfo(raw);
         if (!cur || cur.pid === existing?.pid) {
-          if (!cur || cur.pid <= 0 || !isProcessAlive(cur.pid)) {
+          if (!cur || cur.pid <= 0 || !isProcessAlive(cur.pid) || isReapableNotReadyWriter(cur)) {
             fs.unlinkSync(pidPath);
+            // Only the lock is cleared — never the holder (#1978, #2819). The
+            // wedged process is left to the user's daemon controls.
+            if (cur && cur.pid !== process.pid && isReapableNotReadyWriter(cur)) {
+              console.error(
+                `CodeGraph writer lock: cleared stale not-ready writer PID ${cur.pid} (${cur.mode}) at ${pidPath} ` +
+                `after ${Math.round((Date.now() - cur.startedAt) / 1000)}s without reporting ready; a new writer may now acquire the lock.`,
+              );
+            }
           }
         }
       } catch { /* ENOENT ok */ }
@@ -235,12 +291,15 @@ export function writerLockHeldMessage(
   const who = existing && existing.pid > 0
     ? `PID ${existing.pid} (${existing.mode || 'unknown'} mode)`
     : 'another process';
+  const notReady = existing && existing.ready === false && existing.startedAt > 0
+    ? ` It started at ${new Date(existing.startedAt).toISOString()} and has not reported ready.`
+    : '';
   return (
     'CodeGraph writer lock held by ' + who + '. ' +
     'Only one live MCP writer may serve a project (auto-sync / index). ' +
     'Stop the other server (if it is the shared daemon, pick it in `codegraph daemon` to stop it; otherwise end the other MCP session), ' +
     'or unset CODEGRAPH_NO_DAEMON so additional clients proxy to the shared daemon. ' +
-    'If this is stale, delete ' + pidPath
+    'If this is stale, delete ' + pidPath + '.' + notReady
   );
 }
 

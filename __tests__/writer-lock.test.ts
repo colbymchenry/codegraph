@@ -12,11 +12,14 @@ import { MCPEngine } from '../src/mcp/engine';
 import {
   decodeWriterLockInfo,
   getWriterPidPath,
+  isWriterReadyStale,
   markWriterReady,
   readWriterLock,
   releaseWriterLock,
+  resolveWriterReadyTimeoutMs,
   tryAcquireWriterLock,
   writerLockHeldMessage,
+  WRITER_READY_TIMEOUT_MS,
 } from '../src/mcp/writer-lock';
 
 describe('writer lock (#1740)', () => {
@@ -138,5 +141,67 @@ describe('writer lock (#1740)', () => {
     );
 
     expect(() => new MCPEngine({ writerLockRoot: root })).toThrow(/writer lock held/i);
+  });
+
+  it('classifies ready:false by age, not by pid liveness alone (#2918)', () => {
+    const now = Date.now();
+    expect(isWriterReadyStale({ pid: 123, mode: 'fallback', startedAt: now - WRITER_READY_TIMEOUT_MS - 1, ready: false }, now)).toBe(true);
+    expect(isWriterReadyStale({ pid: 123, mode: 'fallback', startedAt: now, ready: false }, now)).toBe(false);
+    expect(isWriterReadyStale({ pid: 123, mode: 'fallback', startedAt: now - WRITER_READY_TIMEOUT_MS - 1, ready: true }, now)).toBe(false);
+    expect(isWriterReadyStale({ pid: 123, mode: 'fallback', startedAt: 0, ready: false }, now)).toBe(false);
+    expect(isWriterReadyStale(null, now)).toBe(false);
+  });
+
+  it('honours CODEGRAPH_WRITER_READY_TIMEOUT_MS', () => {
+    const prev = process.env.CODEGRAPH_WRITER_READY_TIMEOUT_MS;
+    process.env.CODEGRAPH_WRITER_READY_TIMEOUT_MS = '1000';
+    try {
+      expect(resolveWriterReadyTimeoutMs()).toBe(1000);
+      expect(isWriterReadyStale({ pid: 1, mode: 'fallback', startedAt: Date.now() - 2000, ready: false })).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.CODEGRAPH_WRITER_READY_TIMEOUT_MS;
+      else process.env.CODEGRAPH_WRITER_READY_TIMEOUT_MS = prev;
+    }
+  });
+
+  it('steals a live writer lock that stayed at ready:false past the timeout (#2918)', () => {
+    const root = makeProject();
+    holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+    if (!holder.pid) throw new Error('Failed to spawn writer-lock holder');
+    fs.writeFileSync(
+      getWriterPidPath(root),
+      JSON.stringify({ pid: holder.pid, mode: 'fallback', startedAt: Date.now() - WRITER_READY_TIMEOUT_MS - 1_000, ready: false }) + '\n',
+      { mode: 0o600 },
+    );
+    const r = tryAcquireWriterLock(root, 'daemon');
+    expect(r.kind).toBe('acquired');
+    if (r.kind === 'acquired') {
+      expect(r.info.pid).toBe(process.pid);
+      expect(r.info.ready).toBe(false);
+    }
+    expect(readWriterLock(root)?.pid).toBe(process.pid);
+    releaseWriterLock(root);
+  });
+
+  it('does not steal a live writer that is still within the ready timeout (#2918)', () => {
+    const root = makeProject();
+    holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+    if (!holder.pid) throw new Error('Failed to spawn writer-lock holder');
+    fs.writeFileSync(
+      getWriterPidPath(root),
+      JSON.stringify({ pid: holder.pid, mode: 'fallback', startedAt: Date.now(), ready: false }) + '\n',
+    );
+    const r = tryAcquireWriterLock(root, 'daemon');
+    expect(r.kind).toBe('taken');
+    if (r.kind === 'taken') expect(r.existing?.pid).toBe(holder.pid);
+  });
+
+  it('held message names a not-ready writer, its pid, and the lock file (#2918)', () => {
+    const root = makeProject();
+    const pidPath = getWriterPidPath(root);
+    const msg = writerLockHeldMessage({ pid: 20632, mode: 'fallback', startedAt: Date.now(), ready: false }, pidPath);
+    expect(msg).toContain('20632');
+    expect(msg).toContain(pidPath);
+    expect(msg).toContain('has not reported ready');
   });
 });
