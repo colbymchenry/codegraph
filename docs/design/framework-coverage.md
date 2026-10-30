@@ -110,9 +110,9 @@ table; the resolver half is one `Astro.redirect` reader.
 
 ### 2. Server-rendered frameworks — a redirect is a transition, not just a response
 
-**Fourteen frameworks** have route nodes and no navigation: Django, Flask,
-FastAPI, Express, NestJS, Laravel, Drupal, Rails, Spring, Play, Gin/chi/gorilla,
-Axum/actix/Rocket, ASP.NET, Vapor.
+**Fifteen frameworks** have route nodes and no navigation: Django, Flask,
+FastAPI, Express, NestJS, Laravel, CodeIgniter 3, Drupal, Rails, Spring, Play,
+Gin/chi/gorilla, Axum/actix/Rocket, ASP.NET, Vapor.
 
 Be precise about what is missing. `redirect_to`, `HttpResponseRedirect`,
 `res.redirect`, PHP's `redirect()` are **already recognised as `response`
@@ -129,6 +129,7 @@ gets no Screens picture at all today:
 | Rails | `redirect_to :dashboard`, `redirect_to users_path` | destinations are named helpers (`*_path`/`*_url`) generated from `routes.rb`, not literals |
 | Django | `redirect('profile')`, `reverse('profile')` | same — a route *name*, like Vue's `{ name }`, which `vue-router.ts` already shows how to index |
 | Laravel | `redirect()->route('home')`, `->view()` | route names again |
+| CodeIgniter 3 | `redirect('users/show')` | a controller path, which `routes.php` or the convention maps to a route |
 | Spring | `"redirect:/x"`, `RedirectView` | a literal inside a string return value |
 | ASP.NET | `RedirectToAction("Index", "Home")` | controller + action pair, not a path — needs the route table's reverse mapping |
 | Flask | `redirect(url_for('profile'))` | nested call; the name is `url_for`'s argument |

@@ -28,6 +28,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - For contributors, the test suite now runs on Vitest 4 and working in this repository needs Node 22.12 or newer; installing and using CodeGraph doesn't change. Thanks @danusha2345.
 - New `codegraph cycles` command lists the groups of files that import each other in a circle, as text or `--json`, and exits 1 when it finds any, so it works as a pre-commit or CI check (#888). Thanks @jiangyq9 and @goutham80808.
 - `codegraph init --local-only` keeps `.codegraph/` out of git entirely, so nothing of CodeGraph's shows in `git status`, and it works on a project that's already set up, leaving a `.codegraph/.gitignore` you've edited or committed alone (#910). Thanks @jadchene, @jiangyq9, @Wood-Q and @walterf3.
+- CodeIgniter 3 projects are now understood: every controller method and `routes.php` entry becomes a route, HMVC modules included, and calls through what `$this->load` loads, like `$this->user_model->find($id)`, link to the method they reach, so `codegraph_explore` can follow a request from its route through the model and into the view. Thanks @darkspock.
 
 ### Fixes
 
