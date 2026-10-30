@@ -553,6 +553,65 @@ function tGraph(nodes: Node[], edges: Edge[]): GraphTraverser {
 }
 
 describe('Traversal edge-completeness & limits (#1086–#1090)', () => {
+  it('findPath keeps shortest-path order without duplicate frontier entries', () => {
+    const nodes = ['A', 'B', 'C', 'D', 'E'].map((id) => tNode(id));
+    const edges: Edge[] = [
+      { source: 'A', target: 'B', kind: 'calls', line: 1 },
+      { source: 'A', target: 'B', kind: 'references', line: 2 },
+      { source: 'A', target: 'C', kind: 'calls', line: 3 },
+      { source: 'B', target: 'D', kind: 'calls', line: 4 },
+      { source: 'C', target: 'D', kind: 'calls', line: 5 },
+      { source: 'D', target: 'E', kind: 'calls', line: 6 },
+    ];
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const batches: string[][] = [];
+    const q = {
+      getNodeById: (id: string) => byId.get(id) ?? null,
+      getNodesByIds: (ids: readonly string[]) => {
+        batches.push([...ids]);
+        expect(new Set(ids).size).toBe(ids.length);
+        return new Map(ids.flatMap((id) => {
+          const node = byId.get(id);
+          return node ? [[id, node] as const] : [];
+        }));
+      },
+      getOutgoingEdges: (source: string) => edges.filter((e) => e.source === source),
+    };
+
+    const path = new GraphTraverser(q as never).findPath('A', 'E');
+    expect(path?.map((step) => step.node.id)).toEqual(['A', 'B', 'D', 'E']);
+    expect(path?.map((step) => step.edge?.line ?? null)).toEqual([null, 1, 4, 6]);
+    expect(batches[0]).toEqual(['B', 'C']);
+  });
+
+  it('findPath keeps one predecessor per node instead of copying the path into the queue', () => {
+    const depth = 400;
+    const nodes = Array.from({ length: depth + 1 }, (_, i) => tNode(`n${i}`));
+    const edges: Edge[] = nodes.slice(1).map((node, i) => ({ source: `n${i}`, target: node.id, kind: 'calls' }));
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const q = {
+      getNodeById: (id: string) => byId.get(id) ?? null,
+      getNodesByIds: (ids: readonly string[]) => new Map(ids.map((id) => [id, byId.get(id)!] as const)),
+      getOutgoingEdges: (source: string) => edges.filter((e) => e.source === source),
+    };
+
+    // Count the elements array iteration walks, so no timing is involved. A
+    // queue entry that copies its path walks 1 + 2 + ... + depth of them.
+    const iterate = Array.prototype[Symbol.iterator];
+    let walked = 0;
+    let found: ReturnType<GraphTraverser['findPath']>;
+    try {
+      Array.prototype[Symbol.iterator] = function* (this: unknown[]) {
+        for (let i = 0; i < this.length; i++) { walked++; yield this[i]; }
+      } as never;
+      found = new GraphTraverser(q as never).findPath('n0', `n${depth}`);
+    } finally {
+      Array.prototype[Symbol.iterator] = iterate;
+    }
+    expect(found).toHaveLength(depth + 1);
+    expect(walked).toBeLessThan(depth * 10);
+  });
+
   it('traverseBFS keeps every parallel edge to the same target (#1090)', () => {
     // A reaches B via both `calls` and `references` — two distinct edges.
     const edges: Edge[] = [
@@ -704,22 +763,21 @@ describe('findPath enqueue-once (#1359)', () => {
     for (const b of layerB) edges.push({ source: b, target: 'end', kind: 'calls' });
     seed(ids, edges);
 
-    // Count actual queue insertions, without timing thresholds or replacing SQLite.
+    // Count target lookups: a node is looked up only when it is first
+    // discovered and enqueued, so a repeat would mean a duplicate queue entry.
+    // No timing thresholds, and SQLite stays real.
     const counts = new Map<string, number>();
-    const push = Array.prototype.push;
+    const queries = cg['queries'];
+    const getNodesByIds = queries.getNodesByIds;
     let result: ReturnType<CodeGraph['findPath']>;
     try {
-      Array.prototype.push = function (...items) {
-        for (const item of items) {
-          if (item && typeof item.nodeId === 'string' && Array.isArray(item.path)) {
-            counts.set(item.nodeId, (counts.get(item.nodeId) ?? 0) + 1);
-          }
-        }
-        return Reflect.apply(push, this, items);
+      queries.getNodesByIds = function (ids) {
+        for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1);
+        return getNodesByIds.call(this, ids);
       };
       result = cg.findPath('start', 'end', ['calls']);
     } finally {
-      Array.prototype.push = push;
+      queries.getNodesByIds = getNodesByIds;
     }
     expect(result?.map((step) => step.node.id)).toEqual(['start', 'a0', 'b0', 'end']);
     expect(result?.slice(1).every((step) => step.edge?.kind === 'calls')).toBe(true);
