@@ -17,7 +17,7 @@
  *    anonymous-class garbage ref + file-level-function methods), static value
  *    reads, php type refs, HOF string/array callables, value-ref targets
  *    (namespaced top-level consts DROPPED), heredoc/nowdoc/interpolation,
- *    attributes shifting node lines without emitting.
+ *    attributes as `decorates` refs.
  *  - TortureModule.module — drupal extension routing + un-namespaced
  *    top-level const value-ref target + hook-docblocked function.
  *  - TortureHtml.php      — leading/interleaved HTML (absolute row positions),
@@ -134,6 +134,27 @@ describe.skipIf(!kernelBuilt)('kernel PHP extraction parity', () => {
     const impl = viaKernel!.unresolvedReferences.find((r) => r.referenceKind === 'implements');
     expect(impl?.referenceName).toBe('SoftDeletes');
     expect(impl?.filePath).toBe('src/W.php');
+  });
+
+  it('attributes on classes, methods and functions are decorates refs on both paths', () => {
+    const src = [
+      '<?php',
+      '#[ORM\\Entity, Package(\'core\')]',
+      'class A {',
+      "    #[Route('/x')] #[\\Symfony\\Component\\Routing\\Attribute\\Route('/y')]",
+      '    public function m() {}',
+      '}',
+      '#[AsCommand(name: \'app:x\')]',
+      'function f() {}',
+      '',
+    ].join('\n');
+    assertParity('src/A.php', src);
+    const viaKernel = tryKernelExtract('src/A.php', src, 'php');
+    const decorates = viaKernel!.unresolvedReferences
+      .filter((r) => r.referenceKind === 'decorates')
+      .map((r) => `${r.line}:${r.referenceName}`)
+      .sort();
+    expect(decorates).toEqual(['2:Entity', '2:Package', '4:Route', '4:Route', '7:AsCommand']);
   });
 
   it('files with parse errors defer to the wasm extractor (recovery is encoding-dependent)', () => {
