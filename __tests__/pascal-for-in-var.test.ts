@@ -175,10 +175,10 @@ end.
     } finally {
       tree.delete();
     }
-    // `P.Value.Clear` keeps the bare method name the extractor gives a chain
-    // on a variable; the anonymous method's call belongs to `Run`.
+    // `P.Value.Clear` is a chain on a loop variable whose type the parse
+    // doesn't keep, so no bare `Clear` is named for it (#2550); the anonymous
+    // method's call belongs to `Run`.
     expect(callsFrom(code, 'Run', 'Forms.pas')).toEqual([
-      'Clear:10',
       'Q.Free:11',
       'TParallel.For:12',
       'X.Reset:14',

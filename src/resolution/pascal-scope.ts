@@ -12,10 +12,21 @@
  * - `{ref}` — the value given to an event (`OnClick := Handler`), a method
  *   pointer;
  * - `{recv}` — a receiver (`GetList` in `GetList.Count`, `B` in `A.B.C`) or
- *   an indexed value, which only a function can be.
+ *   an indexed value, which only a function can be;
+ * - `{args}` — the last link of a chain called with its arguments written
+ *   (`FPanel.Series().Clear(1)`, `TLog.Create.Write('x')`), which runs it (#2550).
  *
  * Written without its arguments, a routine that needs some is a method
- * pointer too, in any of them.
+ * pointer too, in any of them. A chain of more than one link (`{call}.A.B.C`)
+ * is the outer method of a call through members and functions, typed by what
+ * each link is declared to be, never a namesake by its name alone (#2550).
+ *
+ * A value assigned to a target carries the target after an `=`
+ * (`{read=Callback}.FProvider.Value`, `{ref=FOnGet}`, a local's declared type
+ * as `{read=:TGet}`): a target whose declared type is a routine type is given
+ * a method pointer, whatever it is called, and one of any other type a value;
+ * the mode, from the target's name (`OnClick`, `FOnGet`), decides only where
+ * its declaration doesn't say (#2550).
  *
  * The routine's class follows an `@` (`{call@TConsumer}.Before`), because the
  * reference's own node is the file when an implementation matched no
@@ -36,14 +47,14 @@ import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 import { declaredSupertypes } from './name-matcher';
 import { PASCAL_SYSTEM_NAMES } from '../extraction/languages/pascal-system';
 
-type Mode = 'call' | 'read' | 'ref' | 'recv';
+type Mode = 'call' | 'read' | 'ref' | 'recv' | 'args';
 interface Found {
   node: Node;
   resolvedBy: ResolvedRef['resolvedBy'];
   confidence: number;
 }
 
-const PARENLESS = /^\{(call|read|ref|recv)(?:@([^}]+))?\}\.(.+)$/;
+const PARENLESS = /^\{(call|read|ref|recv|args)(?:=([^@}]+))?(?:@([^}]+))?\}\.(.+)$/;
 const CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'interface']);
 /** What a unit declares by name at its top level. */
 const UNIT_KINDS: ReadonlySet<string> = new Set([
@@ -71,30 +82,46 @@ export function isPascalParenlessRef(ref: UnresolvedRef): boolean {
 export function matchPascalParenlessRef(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const m = PARENLESS.exec(ref.referenceName);
   if (!m) return null;
-  const mode = m[1] as Mode;
-  const path = m[3]!.split('.');
+  let mode = m[1] as Mode;
+  const target = m[2];
+  const path = m[4]!.split('.');
   // Most such names read data, often the framework's: a name no Pascal
-  // routine has is settled here, before any lookup in scope.
-  if (routineNames(context)?.has(path[path.length - 1]!.toLowerCase()) === false) return null;
+  // routine has is settled here, before any lookup in scope. Called with its
+  // arguments, a chain may end at data that holds a routine.
+  if (mode !== 'args' && routineNames(context)?.has(path[path.length - 1]!.toLowerCase()) === false) return null;
   let cls: Node | null = null;
-  if (m[2]) {
-    cls = classByQualifiedName(m[2], ref.filePath!, context);
+  if (m[3]) {
+    cls = classByQualifiedName(m[3], ref.filePath!, context);
   } else {
     const routine = context.getNodeById?.(ref.fromNodeId);
     if (routine) cls = classOfRoutine(routine, context);
   }
-  const found = path.length === 1 ? nameInScope(path[0]!, cls, ref, context) : memberThroughPath(path, cls, ref, context);
+  const found = path.length === 1
+    ? nameInScope(path[0]!, cls, ref, context)
+    : memberThroughPath(path, cls, ref, context, mode === 'args');
   if (!found) return null;
-  // Written without arguments, a routine that needs some can only be a
-  // method pointer — save a constructor, whose name then means an inherited
-  // one outside the project (`TObject.Create`) — and so is a procedure read
-  // for a value, and an event's method; any other runs.
-  const needsArgs = needsArguments(found.node);
-  if (needsArgs && routineKeyword(found.node, context) === 'constructor') return null;
-  const pointer = mode === 'ref' || needsArgs || (mode !== 'call' && !yieldsValue(found.node, context));
-  // A statement runs its routine, and a receiver is a routine's value.
-  if (pointer && (mode === 'call' || mode === 'recv')) return null;
-  const edgeKind = pointer ? 'references' : 'calls';
+  let edgeKind: 'calls' | 'references' = 'calls';
+  // Written with its arguments, the routine runs, or the routine the data holds.
+  if (mode !== 'args') {
+    if (target !== undefined) {
+      // Given to a target, a method is a method pointer when the target's
+      // declared type is a routine type, and a value otherwise. A function
+      // whose result is a routine type is called for it.
+      const routineTyped = assignedRoutineType(target, cls, ref, context);
+      if (routineTyped !== undefined) mode = routineTyped ? 'ref' : 'read';
+      if (mode === 'ref' && returnsRoutineType(found.node, context)) mode = 'read';
+    }
+    // Written without arguments, a routine that needs some can only be a
+    // method pointer — save a constructor, whose name then means an inherited
+    // one outside the project (`TObject.Create`) — and so is a procedure read
+    // for a value, and an event's method; any other runs.
+    const needsArgs = needsArguments(found.node);
+    if (needsArgs && routineKeyword(found.node, context) === 'constructor') return null;
+    const pointer = mode === 'ref' || needsArgs || (mode !== 'call' && !yieldsValue(found.node, context));
+    // A statement runs its routine, and a receiver is a routine's value.
+    if (pointer && (mode === 'call' || mode === 'recv')) return null;
+    edgeKind = pointer ? 'references' : 'calls';
+  }
   context.rememberNode?.(found.node);
   return {
     original: ref,
@@ -323,8 +350,9 @@ function nameInScope(name: string, cls: Node | null, ref: UnresolvedRef, context
  * The routine nested in the calling routine, or in one around it, that a
  * bare name there names (`procedure Inner;` between `procedure TFoo.Bar;`
  * and its `begin`, `TFoo::Bar::Inner`): the innermost one declared above the
- * call, the calling routine itself among them. It comes before anything of
- * the class or the unit. Null when none is.
+ * call, the calling routine itself among them, or declared `forward` above
+ * it (see declaredForward). It comes before anything of the class or the
+ * unit. Null when none is.
  */
 function nestedRoutineInScope(lower: string, ref: UnresolvedRef, context: ResolutionContext): Found | null {
   // Most names no nested routine has: settled before any other lookup.
@@ -340,7 +368,8 @@ function nestedRoutineInScope(lower: string, ref: UnresolvedRef, context: Resolu
     let best: Node | null = null;
     let depth = -1;
     for (const n of named) {
-      if (n.filePath !== caller.filePath || n.startLine > ref.line || !isNestedRoutine(n, context)) continue;
+      if (n.filePath !== caller.filePath || !isNestedRoutine(n, context)) continue;
+      if (n.startLine > ref.line && !declaredForward(n, ref.line, context)) continue;
       const outer = ownerOf(n);
       // Nested in the caller, or in a routine the caller is nested in.
       if (chain !== outer && !chain.startsWith(`${outer}::`)) continue;
@@ -353,6 +382,31 @@ function nestedRoutineInScope(lower: string, ref: UnresolvedRef, context: Resolu
   }
   memo.set(key, found);
   return found;
+}
+
+/**
+ * Whether a routine nested in another is declared `forward` above a line
+ * (`procedure Late; forward;`), which puts it in scope there ahead of its
+ * body (#2550): a header of its name, as indented as its own, that ends in
+ * `forward;`, between the line and the header indented less above it, the
+ * routine both are nested in.
+ */
+function declaredForward(routine: Node, line: number, context: ResolutionContext): boolean {
+  const lines = fileLines(routine.filePath, context);
+  const name = routine.name.toLowerCase();
+  for (let i = Math.min(line, lines.length) - 1; i >= 0; i--) {
+    const m = /^(\s*)(?:class\s+)?(?:procedure|function|constructor|destructor)\s+([A-Za-z_]\w*)/i.exec(lines[i]!);
+    if (!m) continue;
+    if (m[1]!.length < routine.startColumn) return false;
+    if (m[1]!.length !== routine.startColumn || m[2]!.toLowerCase() !== name) continue;
+    // Its parameters may go on over a few lines.
+    let text = lines[i]!.replace(/\/\/.*$|\{[^}]*\}|\(\*.*?\*\)/g, ' ');
+    for (let j = i + 1; j < lines.length && j <= i + 4 && (text.split('(').length > text.split(')').length); j++) {
+      text += ' ' + lines[j]!.replace(/\/\/.*$|\{[^}]*\}|\(\*.*?\*\)/g, ' ');
+    }
+    if (/\bforward\s*;/i.test(text)) return true;
+  }
+  return false;
 }
 
 /**
@@ -457,36 +511,70 @@ function declarationInScope(lower: string, cls: Node | null, ref: UnresolvedRef,
   return found;
 }
 
-/** A dotted name: the method its receiver's declared type has. */
-function memberThroughPath(path: string[], cls: Node | null, ref: UnresolvedRef, context: ResolutionContext): Found | null {
-  const head = headOf(path[0]!, cls, ref, context);
-  if (!head) return null;
-  let type: Node | null;
+/**
+ * A dotted name: the method its receiver's declared type has; with
+ * `holdsRoutine`, data that holds a routine too (a chain called with its
+ * arguments, `Owner.Events.FOnChange(Self)`, see isProceduralData).
+ */
+function memberThroughPath(path: string[], cls: Node | null, ref: UnresolvedRef, context: ResolutionContext, holdsRoutine = false): Found | null {
+  const last = memberAtPath(path, cls, ref, context);
+  if (!last) return null;
+  if (!isRoutine(last.node) && !(holdsRoutine && DATA_KINDS.has(last.node.kind) && isProceduralData(last.node, context))) return null;
+  return { node: last.node, resolvedBy: last.unit ? 'import' : 'instance-method', confidence: 0.9 };
+}
+
+/**
+ * What a dotted name's last link is declared as: a member of what the links
+ * before it are declared to be — a field's or a property's type, a
+ * function's result — from its head (see headOf), or, with `unit`, the
+ * routine or variable a unit's name qualifies (`Utils.Helper`). A constructor
+ * called on a class gives an instance of it: one the class declares, or
+ * `Create`, which the project's classes inherit from outside it
+ * (`TLog.Create.Write('x')`, `Logs.TLog.Create().Write('x')`).
+ */
+function memberAtPath(path: string[], cls: Node | null, ref: UnresolvedRef, context: ResolutionContext): { node: Node; unit: boolean } | null {
+  let head = headOf(path[0]!, cls, ref, context);
   let rest = path.slice(1);
+  // A dotted unit name, the longest the links make (`mormot.core.os.GetTickCount64`).
+  for (let k = path.length - 1; !head && k >= 2; k--) {
+    const unitFile = unitFileNamed(path.slice(0, k).join('.').toLowerCase(), ref.filePath!, context);
+    if (unitFile) {
+      head = { type: null, unitFile };
+      rest = path.slice(k);
+    }
+  }
+  if (!head) return null;
+  let type = head.type;
+  let classRef = head.classRef === true;
   if (head.unitFile) {
-    // `UnitName.Routine`, `UnitName.GlobalVar.Method`.
+    // `UnitName.Routine`, `UnitName.GlobalVar.Method`, `UnitName.TFoo.Create.Method`.
     const decl = unitDeclaration(head.unitFile, rest[0]!.toLowerCase(), context, ref.filePath!);
     if (!decl) return null;
-    if (rest.length === 1) return isRoutine(decl) ? { node: decl, resolvedBy: 'import', confidence: 0.9 } : null;
-    type = typeOfMember(decl, context);
+    if (rest.length === 1) return { node: decl, unit: true };
+    classRef = CLASS_KINDS.has(decl.kind);
+    type = classRef ? decl : typeOfMember(decl, context);
     rest = rest.slice(1);
-  } else {
-    type = head.type;
   }
-  for (const link of rest.slice(0, -1)) {
-    const member = type ? memberInHierarchy(type, link.toLowerCase(), context) : null;
+  for (let i = 0; i < rest.length && type; i++) {
+    const lower = rest[i]!.toLowerCase();
+    const member = memberInHierarchy(type, lower, context);
+    if (i === rest.length - 1) return member ? { node: member, unit: false } : null;
+    if (classRef && (member ? routineKeyword(member, context) === 'constructor' : lower === 'create')) {
+      classRef = false;
+      continue;
+    }
     if (!member) return null;
     type = typeOfMember(member, context);
+    classRef = false;
   }
-  const member = type ? memberInHierarchy(type, rest[rest.length - 1]!.toLowerCase(), context) : null;
-  return member && isRoutine(member) ? { node: member, resolvedBy: 'instance-method', confidence: 0.9 } : null;
+  return null;
 }
 
 /**
  * What a dotted name's first link is: a value of a known class (a local's
- * declared type, written `:TFoo`), a class itself, or a unit.
+ * declared type, written `:TFoo`), a class itself (`classRef`), or a unit.
  */
-function headOf(name: string, cls: Node | null, ref: UnresolvedRef, context: ResolutionContext): { type: Node | null; unitFile?: string } | null {
+function headOf(name: string, cls: Node | null, ref: UnresolvedRef, context: ResolutionContext): { type: Node | null; classRef?: boolean; unitFile?: string } | null {
   if (name.startsWith(':')) return { type: classNamed(name.slice(1), ref.filePath!, context) };
   const lower = name.toLowerCase();
   if (lower === 'self') return cls ? { type: cls } : null;
@@ -497,9 +585,34 @@ function headOf(name: string, cls: Node | null, ref: UnresolvedRef, context: Res
   const decl = ownUnitDeclaration(ref.filePath!, lower, context) ??
     usedUnitFiles(ref.filePath!, context).reduceRight<Node | undefined>(
       (hit, file) => hit ?? unitDeclaration(file, lower, context, ref.filePath!), undefined);
-  if (decl) return { type: CLASS_KINDS.has(decl.kind) ? decl : typeOfMember(decl, context) };
+  if (decl) return CLASS_KINDS.has(decl.kind) ? { type: decl, classRef: true } : { type: typeOfMember(decl, context) };
   const unitFile = unitFileNamed(lower, ref.filePath!, context);
   return unitFile ? { type: null, unitFile } : null;
+}
+
+/**
+ * Whether the target a value is assigned to is declared with a routine type
+ * (see the file comment): the field, property or variable a name reaches in
+ * scope, or through a receiver (`FEvents.OnGet`, `Self.Callback`), or the
+ * declared type of a local (`:TGet`, `:procedure` for one written out).
+ * Undefined when the declaration, or what its type is, can't be read.
+ */
+function assignedRoutineType(target: string, cls: Node | null, ref: UnresolvedRef, context: ResolutionContext): boolean | undefined {
+  const links = target.split('.');
+  if (links.length === 1 && links[0]!.startsWith(':')) return routineTypeVerdict(links[0]!.slice(1), context, 0);
+  const node = links.length === 1
+    ? declarationInScope(links[0]!.toLowerCase(), cls, ref, context)?.node
+    : memberAtPath(links, cls, ref, context)?.node;
+  if (!node || !DATA_KINDS.has(node.kind) || node.kind === 'enum_member') return undefined;
+  const text = declaredTypeText(node, context);
+  return text ? routineTypeVerdict(text, context, 0) : undefined;
+}
+
+/** Whether a function's result is of a routine type (`function MakeHandler: TNotifyEvent`). */
+function returnsRoutineType(routine: Node, context: ResolutionContext): boolean {
+  if (!isRoutine(routine)) return false;
+  const typeName = routine.returnType ?? /:\s*([A-Za-z_][\w.]*)\s*;?\s*$/.exec(routine.signature ?? '')?.[1];
+  return !!typeName && routineTypeVerdict(typeName, context, 0) === true;
 }
 
 // ---------------------------------------------------------------------------
@@ -909,10 +1022,13 @@ function classNamed(typeName: string, fromFile: string, context: ResolutionConte
   };
   let cls = declarationOf(visible(CLASS_KINDS));
   if (!cls && depth < 4) {
-    // A type alias names the class it stands for: `TVTAncestor = TVTAncestorVcl;`.
+    // A type alias names the class it stands for: `TVTAncestor = TVTAncestorVcl;`,
+    // and so do a pointer type and a class reference type, whose values reach
+    // its members (`PVirtualNode = ^TVirtualNode;`, `TSynLogClass = class of
+    // TSynLog;`, #2550).
     for (const alias of visible(ALIAS_KINDS)) {
       const line = (fileLines(alias.filePath, context)[alias.startLine - 1] ?? '').replace(/\/\/.*$|\{[^}]*\}/g, '');
-      const target = /=\s*([A-Za-z_][\w.]*)\s*;/.exec(line)?.[1];
+      const target = /=\s*(?:\^|class\s+of\b)?\s*([A-Za-z_][\w.]*)\s*;/i.exec(line)?.[1];
       if (target && (cls = classNamed(target, alias.filePath, context, depth + 1))) break;
     }
   }
@@ -1016,13 +1132,35 @@ function isProceduralData(node: Node, context: ResolutionContext): boolean {
  * and the names Delphi gives them (`TNotifyEvent`, `TWndMethod`).
  */
 function isProceduralTypeText(text: string, context: ResolutionContext, depth: number): boolean {
+  return routineTypeVerdict(text, context, depth) === true;
+}
+
+/**
+ * Whether a written type is a routine's (see isProceduralTypeText): false
+ * for one of the System unit's value types, and undefined when nothing says,
+ * for a name neither the project declares nor the RTL's names say is a
+ * routine type (`TStringList`) or text that names no type (`array of TFoo`).
+ */
+function routineTypeVerdict(text: string, context: ResolutionContext, depth: number): boolean | undefined {
   if (PROCEDURAL_TYPE.test(text)) return true;
   const typeName = /^(?:type\s+)?([A-Za-z_][\w.]*)/i.exec(text)?.[1]?.split('.').pop()?.toLowerCase();
-  if (!typeName || depth > 3) return false;
+  if (!typeName || depth > 3) return undefined;
   const types = typesNamed(typeName, context);
-  if (types.length === 0) return RTL_PROCEDURAL_TYPES.has(typeName) || /^t\w*(?:event|proc|method|callback)$/.test(typeName);
+  if (types.length === 0) {
+    if (RTL_PROCEDURAL_TYPES.has(typeName) || /^t\w*(?:event|proc|method|callback)$/.test(typeName)) return true;
+    return SYSTEM_VALUE_TYPES.has(typeName) ? false : undefined;
+  }
   return types.some((t) => t.kind === 'type_alias' && isProceduralTypeText(aliasedTypeText(t, context), context, depth + 1));
 }
+
+/** The System unit's value types, lowercased, which hold no routine. */
+const SYSTEM_VALUE_TYPES: ReadonlySet<string> = new Set([
+  'boolean', 'bytebool', 'wordbool', 'longbool', 'integer', 'cardinal', 'shortint', 'smallint', 'longint', 'longword',
+  'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64', 'byte', 'word', 'dword', 'nativeint',
+  'nativeuint', 'single', 'double', 'extended', 'real', 'currency', 'comp', 'char', 'ansichar', 'widechar', 'string',
+  'ansistring', 'widestring', 'unicodestring', 'shortstring', 'rawbytestring', 'utf8string', 'pchar', 'pansichar',
+  'pwidechar', 'pointer', 'variant', 'olevariant', 'tdatetime', 'tdate', 'ttime',
+]);
 
 /**
  * The project's Pascal types a name names, generic ones by the name before

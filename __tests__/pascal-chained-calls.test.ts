@@ -82,6 +82,15 @@ function refsFrom(code: string, qualifiedName: string, kind = 'calls'): string[]
     .sort();
 }
 
+/**
+ * The outer methods of chains through members and calls, which resolution
+ * types link by link (#2550): `{args}.A.B.C` for one written with its
+ * arguments, `{call}.A.B.C` for a statement.
+ */
+function chainsFrom(code: string, qualifiedName: string): string[] {
+  return refsFrom(code, qualifiedName, 'references').filter((r) => /^\{(?:args|call)[@}]/.test(r));
+}
+
 async function withIndex(code: string, check: (cg: CodeGraph) => void): Promise<void> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-pascal-chain-'));
   try {
@@ -109,8 +118,10 @@ function edgesFrom(cg: CodeGraph, sourceName: string): string[] {
 
 describe('Delphi chained calls (#2547)', () => {
   it('records the receiver call and the calls in its arguments', () => {
-    expect(refsFrom(CHAIN_PAS, 'TargetIsTheSame')).toEqual(['IsSame:41', 'MD5FileSized:41', 'TMeta.ExtendedPath:41']);
-    expect(refsFrom(CHAIN_PAS, 'Stmt')).toEqual(['MD5FileSized:46', 'Reset:46', 'TMeta.ExtendedPath:46']);
+    expect(refsFrom(CHAIN_PAS, 'TargetIsTheSame')).toEqual(['MD5FileSized:41', 'TMeta.ExtendedPath:41']);
+    expect(chainsFrom(CHAIN_PAS, 'TargetIsTheSame')).toEqual(['{args}.MD5FileSized.IsSame:41']);
+    expect(refsFrom(CHAIN_PAS, 'Stmt')).toEqual(['MD5FileSized:46', 'TMeta.ExtendedPath:46']);
+    expect(chainsFrom(CHAIN_PAS, 'Stmt')).toEqual(['{call}.MD5FileSized.Reset:46']);
   });
 
   it('links each routine to all three callees the issue names', async () => {
@@ -144,18 +155,19 @@ end;
 
 end.
 `;
-    // `B`, `C` (line 10), `Ready`, `Value` and `Prop` are paren-less links: reads, not calls.
+    // `B`, `C` (line 10), `Ready`, `Value` and `Prop` are paren-less links:
+    // reads, not calls. `C` (line 9) and `Method` end chains, typed link by
+    // link (#2550).
     expect(refsFrom(code, 'Run')).toEqual([
       'A:10',
       'A:9',
-      'C:9',
       'F:11',
       'Find:13',
       'Free:12',
       'GetHandler:14',
       'GetIndex:12',
-      'Method:15',
     ]);
+    expect(chainsFrom(code, 'Run')).toEqual(['{args}.A.B.C:9', '{args}.Obj.Prop.Method:15']);
   });
 
   it('names a fluent chain\'s inner links only where they can be named precisely', () => {
@@ -174,11 +186,19 @@ end;
 
 end.
 `;
-    // The outer `Get` keeps the name a call has always had. `BaseURL` and
-    // `Accept` would be bare names on a chain whose type is unknown, which
-    // match namesakes, so they are left out; `RESTClient.HandleRedirects`
-    // and `Builder.WithName` name their receiver.
-    expect(refsFrom(code, 'Run')).toEqual(['Build:11', 'Builder.WithName:11', 'Get:10', 'Get:9', 'RESTClient.HandleRedirects:10']);
+    // `RESTClient.HandleRedirects` and `Builder.WithName` name their
+    // receiver. Every later link is written as its chain (#2550), which
+    // links only what each link is declared to give, never a namesake of a
+    // bare `Get`, `BaseURL` or `Accept`.
+    expect(refsFrom(code, 'Run')).toEqual(['Builder.WithName:11', 'RESTClient.HandleRedirects:10']);
+    expect(chainsFrom(code, 'Run')).toEqual([
+      '{args}.Client.New.BaseURL.Accept.Get:9',
+      '{args}.Client.New.BaseURL.Accept:9',
+      '{args}.Client.New.BaseURL:9',
+      '{args}.RESTClient.HandleRedirects.Accept.Get:10',
+      '{args}.RESTClient.HandleRedirects.Accept:10',
+      '{call}.Builder.WithName.Build:11',
+    ]);
   });
 
   it('gives a factory its caller and still resolves the chain on what it returns', async () => {

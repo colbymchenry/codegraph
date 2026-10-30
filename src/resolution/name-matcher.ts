@@ -20964,6 +20964,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   KOTLIN_RECEIVER_TYPES.delete(context);
   KOTLIN_HIERARCHIES.delete(context);
   KOTLIN_FRAMES.delete(context);
+  PASCAL_NESTED_LINES.delete(context);
+  PASCAL_POINTEES.delete(context);
+  PASCAL_HEADER_LINES.delete(context);
   clearCppNamespaceMemos(context);
   clearCppRawStringMemos(context);
   CPP_FILE_TYPE_NAMES.delete(context);
@@ -21685,6 +21688,92 @@ function typeParameterBoundIn(typeName: string, decls: Node[], context: Resoluti
   return declared ? null : undefined;
 }
 
+const PASCAL_NESTED_LINES = new WeakMap<ResolutionContext, Map<string, ((i: number) => boolean) | null>>();
+const PASCAL_POINTEES = new WeakMap<ResolutionContext, Map<string, string | null>>();
+const PASCAL_HEADER_LINES = new WeakMap<ResolutionContext, Map<string, number[]>>();
+
+/**
+ * The line (0-based) of the routine header that starts a line at or above
+ * `callIdx` in a Pascal file (`procedure TFoo.Bar;`), where the calling
+ * routine's own declarations begin; 0 when there is none (#2550).
+ */
+function pascalRoutineHeaderIndex(filePath: string, lines: string[], callIdx: number, context: ResolutionContext): number {
+  let memo = PASCAL_HEADER_LINES.get(context);
+  if (!memo) PASCAL_HEADER_LINES.set(context, (memo = new Map()));
+  let headers = memo.get(filePath);
+  if (!headers) {
+    headers = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (/^(?:class\s+)?(?:procedure|function|constructor|destructor|operator)\s+[A-Za-z_]/i.test(lines[i]!)) headers.push(i);
+    }
+    memo.set(filePath, headers);
+  }
+  let lo = 0;
+  let hi = headers.length - 1;
+  let hit = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (headers[mid]! <= callIdx) {
+      hit = headers[mid]!;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return hit;
+}
+
+/**
+ * The type a Pascal pointer or class reference type the project declares
+ * stands for (`PDBObject = ^TDBObject` → `TDBObject`, `TSynLogClass = class
+ * of TSynLog` → `TSynLog`), whose members a value of it reaches, or null for
+ * any other type (#2550).
+ */
+function pascalPointee(typeName: string, context: ResolutionContext): string | null {
+  let memo = PASCAL_POINTEES.get(context);
+  if (!memo) PASCAL_POINTEES.set(context, (memo = new Map()));
+  const lower = typeName.toLowerCase();
+  if (memo.has(lower)) return memo.get(lower)!;
+  let pointee: string | null = null;
+  for (const n of context.getNodesByLowerName(lower)) {
+    if (n.language !== 'pascal' || n.kind !== 'type_alias') continue;
+    const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+    const m = /=\s*(?:\^|class\s+of\b)\s*([A-Za-z_]\w*)/i.exec((lines[n.startLine - 1] ?? '').replace(/\/\/.*$|\{[^}]*\}/g, ' '));
+    if (m) {
+      pointee = m[1]!;
+      break;
+    }
+  }
+  memo.set(lower, pointee);
+  return pointee;
+}
+
+/**
+ * Whether a line (0-based) of a Pascal file is inside a routine nested in
+ * another (`procedure Inner;` between `procedure TFoo.Bar;` and its body)
+ * that a backward scan from `startIdx` (see enclosingScopeStartLine) isn't
+ * inside: what such a routine declares, its parameters and its locals, is
+ * its own, not the routine around it's or a later one's (#2550). Null when
+ * the file has none.
+ */
+function pascalNestedRoutineLines(filePath: string, startIdx: number, context: ResolutionContext): ((i: number) => boolean) | null {
+  let memo = PASCAL_NESTED_LINES.get(context);
+  if (!memo) PASCAL_NESTED_LINES.set(context, (memo = new Map()));
+  const key = `${filePath}|${startIdx}`;
+  if (memo.has(key)) return memo.get(key)!;
+  // A nested routine is a function qualified under the routine it is in.
+  const spans: Array<[number, number]> = [];
+  for (const n of context.getNodesInFile(filePath)) {
+    if (n.kind !== 'function' || n.language !== 'pascal' || !n.qualifiedName.includes('::')) continue;
+    const start = n.startLine - 1;
+    const end = (n.endLine ?? n.startLine) - 1;
+    if (start > startIdx || end < startIdx) spans.push([start, end]);
+  }
+  const inside = spans.length === 0 ? null : (i: number): boolean => spans.some(([start, end]) => i >= start && i <= end);
+  memo.set(key, inside);
+  return inside;
+}
+
 /** 1-based start line of the tightest function/method enclosing the call. */
 function enclosingScopeStartLine(ref: UnresolvedRef, context: ResolutionContext): number {
   let start = 1;
@@ -21828,20 +21917,34 @@ export function inferLocalReceiverType(
   const startIdx = componentScoped
     ? 0
     : Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+  // A Pascal routine nested in another declares its names for itself, and the
+  // calling routine's own declarations name a receiver in a name list too
+  // (`Doc, Doc2: TDocVariantData`), unlike another routine's above it (#2550).
+  const nestedElsewhere = ref.language === 'pascal' ? pascalNestedRoutineLines(ref.filePath, startIdx, context) : null;
+  const ownFrom = ref.language === 'pascal'
+    ? Math.max(startIdx, pascalRoutineHeaderIndex(ref.filePath, lines, callIdx, context))
+    : -1;
+  const withListed = ownFrom >= 0
+    ? memoPatterns(`pascal-listed|${escapedReceiver}`, () =>
+      [...patterns, new RegExp(`\\b${escapedReceiver}\\b(?:\\s*,\\s*[A-Za-z_]\\w*)+\\s*:\\s*([A-Z][\\w]*)`)])
+    : patterns;
 
   // The raw capture behind matchLine's latest non-null answer (see `decl`).
   let lastRaw: string | undefined;
   const matchLine = (i: number): string | null => {
     const line = lines[i];
-    if (!line) return null;
+    if (!line || nestedElsewhere?.(i)) return null;
     // A generated/minified line (one multi-KB statement) is not something a
     // human-written local declaration lives on, and regexing it per ref is
     // pure waste — skip it rather than scan it.
     if (line.length > 10_000) return null;
-    for (const re of patterns) {
+    for (const re of i >= ownFrom ? withListed : patterns) {
       const m = line.match(re);
       if (m && m[1]) {
-        const type = ref.language === 'java' ? javaTypeName(m[1]) : normalizeInferredTypeName(m[1]);
+        let type = ref.language === 'java' ? javaTypeName(m[1]) : normalizeInferredTypeName(m[1]);
+        // Delphi dereferences a pointer for a member (`P.Method` is
+        // `P^.Method`), and a class reference reaches its class's methods.
+        if (type && ref.language === 'pascal') type = pascalPointee(type, context) ?? type;
         if (type) {
           lastRaw = m[1];
           return type;
@@ -21867,12 +21970,45 @@ export function inferLocalReceiverType(
   if (!componentScoped) {
     const states = getInferScanStates(context);
     const key = `${ref.filePath}|${startIdx}|${ref.language}|${scanReceiver}`;
-    const state = states.get(key);
-    if (!state) {
-      for (let i = callIdx; i >= startIdx; i--) {
+    // query(hi) over [lo..hi] under one memo key (see above).
+    const scan = (stateKey: string, lo: number, hi: number): string | null => {
+      const state = states.get(stateKey);
+      if (!state) {
+        for (let i = hi; i >= lo; i--) {
+          const type = matchLine(i);
+          if (type) {
+            states.set(stateKey, { hi, ansIdx: i, ansType: type, ansRaw: lastRaw });
+            if (decl) {
+              decl.raw = lastRaw;
+              decl.line = i + 1;
+            }
+            return type;
+          }
+        }
+        states.set(stateKey, { hi, ansIdx: -1, ansType: null });
+        return null;
+      }
+      if (hi >= state.hi) {
+        for (let i = hi; i > state.hi; i--) {
+          const type = matchLine(i);
+          if (type) {
+            state.ansIdx = i;
+            state.ansType = type;
+            state.ansRaw = lastRaw;
+            break;
+          }
+        }
+        state.hi = hi;
+        if (state.ansIdx < lo) return null;
+        if (decl) {
+          decl.raw = state.ansRaw;
+          decl.line = state.ansIdx + 1;
+        }
+        return state.ansType;
+      }
+      for (let i = hi; i >= lo; i--) {
         const type = matchLine(i);
         if (type) {
-          states.set(key, { hi: callIdx, ansIdx: i, ansType: type, ansRaw: lastRaw });
           if (decl) {
             decl.raw = lastRaw;
             decl.line = i + 1;
@@ -21880,38 +22016,16 @@ export function inferLocalReceiverType(
           return type;
         }
       }
-      states.set(key, { hi: callIdx, ansIdx: -1, ansType: null });
       return null;
+    };
+    // A Pascal routine's own lines, where its name lists count, are scanned
+    // under a key of their own; the lines above it under the shared one,
+    // which every routine of the file extends in turn (see ownFrom).
+    if (ownFrom >= 0) {
+      const own = scan(`${key}|${ownFrom}`, ownFrom, callIdx);
+      return own !== null || ownFrom <= startIdx ? own : scan(key, startIdx, ownFrom - 1);
     }
-    if (callIdx >= state.hi) {
-      for (let i = callIdx; i > state.hi; i--) {
-        const type = matchLine(i);
-        if (type) {
-          state.ansIdx = i;
-          state.ansType = type;
-          state.ansRaw = lastRaw;
-          break;
-        }
-      }
-      state.hi = callIdx;
-      if (state.ansIdx < startIdx) return null;
-      if (decl) {
-        decl.raw = state.ansRaw;
-        decl.line = state.ansIdx + 1;
-      }
-      return state.ansType;
-    }
-    for (let i = callIdx; i >= startIdx; i--) {
-      const type = matchLine(i);
-      if (type) {
-        if (decl) {
-          decl.raw = lastRaw;
-          decl.line = i + 1;
-        }
-        return type;
-      }
-    }
-    return null;
+    return scan(key, startIdx, callIdx);
   }
 
   // Nearest declaration wins: scan backward from the call to the scope start.

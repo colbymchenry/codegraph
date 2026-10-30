@@ -799,6 +799,17 @@ interface PascalTextRoutine {
 type PascalNameMode = 'call' | 'read' | 'ref' | 'recv';
 
 /**
+ * The declared type a Pascal local takes when it is written out as a routine
+ * type (`procedure of object`, `reference to function: Integer`), which no
+ * class stands for: a method given to it is a method pointer (#2550). The
+ * source text reads the same word off such a declaration.
+ */
+const PASCAL_ROUTINE_TYPE = 'procedure';
+
+/** A routine header in Pascal source text, its indentation and its dotted name captured (#2514). */
+const PASCAL_TEXT_HEADER = /^(\s*)(?:class\s+)?(?:procedure|function|constructor|destructor|operator)\s+([A-Za-z_]\w*(?:<[^>]*>)?(?:\.[A-Za-z_]\w*(?:<[^>]*>)?)*)/i;
+
+/**
  * Names Delphi's conventions give to data, never to a routine: a field
  * (`FCount`), a type (`TList`, `EAbort`), a constant (`MAX_PATH`, `CRLF`).
  * A C library's functions keep their own case (`ERR_get_error`).
@@ -9135,10 +9146,16 @@ export class TreeSitterExtractor {
 
   /** The names a parameter, `var` or `const` declaration declares, with the type it gives them (see pascalRoutineLocals). */
   private declarePascalLocal(names: Map<string, string | null>, decl: SyntaxNode): void {
-    const type = this.pascalTypeName(decl.namedChildren.find((c: SyntaxNode) => c.type === 'type' || c.type === 'typeref'));
+    const type = this.pascalLocalTypeName(decl.namedChildren.find((c: SyntaxNode) => c.type === 'type' || c.type === 'typeref'));
     for (const c of decl.namedChildren) {
       if (c.type === 'identifier') names.set(getNodeText(c, this.source).toLowerCase(), type);
     }
+  }
+
+  /** A local's declared type as pascalTypeName names it, or PASCAL_ROUTINE_TYPE for a routine type written out. */
+  private pascalLocalTypeName(type: SyntaxNode | null | undefined): string | null {
+    if (type?.type === 'type' && type.namedChild(0)?.type === 'declProcRef') return PASCAL_ROUTINE_TYPE;
+    return this.pascalTypeName(type);
   }
 
   /**
@@ -9158,7 +9175,7 @@ export class TreeSitterExtractor {
     switch (node.type) {
       case 'varAssignDef':
       case 'varDef': {
-        let type = this.pascalTypeName(node.namedChildren.find((c: SyntaxNode) => c.type === 'typeref' || c.type === 'type'));
+        let type = this.pascalLocalTypeName(node.namedChildren.find((c: SyntaxNode) => c.type === 'typeref' || c.type === 'type'));
         const value = node.parent?.type === 'assignment' ? node.parent.namedChild(node.parent.namedChildCount - 1) : null;
         if (!type && value?.type === 'exprDot') {
           // `var List := TStringList.Create;`
@@ -9231,12 +9248,14 @@ export class TreeSitterExtractor {
           innerCallee = getNodeText(innerFirst, this.source);
         }
         // Gate on the Delphi type-naming convention — `TFoo` classes / `IFoo`
-        // interfaces — so a class-factory chain re-encodes but a capitalized
-        // VARIABLE/parameter chain (Pascal capitalizes locals too: `Curve.X().Y()`,
-        // `Self.X().Y()`) stays bare and keeps its existing bare-name resolution.
-        calleeName = innerCallee && /^[TI][A-Z]/.test(innerCallee)
-          ? `${innerCallee}().${method}`
-          : method;
+        // interfaces — so a class-factory chain re-encodes. Any other chain
+        // (`FPanel.Series().Clear(1)`, `Self.X().Y()`) is typed link by link
+        // (#2550), never left to the outer method's bare name.
+        if (innerCallee && /^[TI][A-Z]/.test(innerCallee)) calleeName = `${innerCallee}().${method}`;
+        else this.pushPascalChainCall(firstChild, 'args', node);
+      } else if (firstChild.namedChild(0)?.type === 'exprDot') {
+        // `FPanel.Series.Clear(1)`, `TLog.Create.Write('x')` (#2550).
+        this.pushPascalChainCall(firstChild, 'args', node);
       } else {
         // Qualified call: Obj.Method(...)
         const identifiers = firstChild.namedChildren.filter(
@@ -9369,7 +9388,10 @@ export class TreeSitterExtractor {
         if (receiver.type === 'exprCall') this.extractPascalReceiverCall(receiver, false);
         else this.extractPascalParenlessCall(receiver);
       } else {
-        calleeName = method; // non-class receiver: a bare method ref (no field-access ref)
+        // A chain through members and functions (`FPanel.Series.BeginUpdate;`)
+        // runs a method of what its links are declared to be, never a
+        // namesake of its last name (#2550).
+        this.pushPascalChainCall(node, 'call', node);
         this.extractPascalReceiverCalls(receiver); // `MD5FileSized(…).Reset;` (#2547)
       }
     } else {
@@ -9390,6 +9412,65 @@ export class TreeSitterExtractor {
         column: node.startPosition.column,
       });
     }
+  }
+
+  /**
+   * The outer method of a Pascal call through a chain of members and
+   * functions (#2550): `FPanel.Series.BeginUpdate;` (`call`, a statement) or
+   * `FPanel.Series().Clear(1)`, `TLog.Create.Write('x')` (`args`, written with
+   * its arguments). Recorded as `{mode@Class}.Head.Link.Method` (see
+   * resolution/pascal-scope), which links the method of what each link is
+   * declared to be or nothing, never a namesake of the last name; a head the
+   * routine declares is written as its declared type (`:TPanel`). In a
+   * `with` body, where a name may be the `with` object's member, only a chain
+   * from `Self` or from a name the routine declares with its type is
+   * recorded (`with PEMRPolyLine(R)^ do E.Canvas.MoveToI(…)`). Nothing is
+   * recorded for a chain with a link that is no name (`Items[0].Series.Clear`).
+   */
+  private pushPascalChainCall(callee: SyntaxNode, mode: 'call' | 'args', at: SyntaxNode): void {
+    if (this.isPascalHeaderName(callee)) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    const scope = this.pascalScopeAt(at.startPosition.row + 1);
+    const links = this.pascalChainLinks(callee);
+    if (!callerId || !scope || !links) return;
+    const local = this.pascalLocalType(links[0]!.toLowerCase(), scope.locals);
+    if (this.pascalWithDepth > 0 && !local && links[0]!.toLowerCase() !== 'self') return;
+    if (local !== undefined) {
+      if (local === null || local === PASCAL_ROUTINE_TYPE) return;
+      links[0] = `:${local}`;
+    }
+    this.unresolvedReferences.push({
+      fromNodeId: callerId,
+      referenceName: `{${mode}${scope.classQn ? `@${scope.classQn}` : ''}}.${links.join('.')}`,
+      referenceKind: 'references',
+      line: at.startPosition.row + 1,
+      column: at.startPosition.column,
+    });
+  }
+
+  /**
+   * The links of a Pascal chain of names and calls, head first, the calls'
+   * arguments and dereferences left out (`Logger.TLog.Create().Write` →
+   * Logger, TLog, Create, Write; `GetPanel(1).Series` → GetPanel, Series;
+   * `a^.Copy` → a, Copy, as Delphi dereferences a pointer for a member
+   * anyway), or null when a link is anything else (an index, a cast in
+   * parentheses, a generic type).
+   */
+  private pascalChainLinks(node: SyntaxNode): string[] | null {
+    const links: string[] = [];
+    let n: SyntaxNode | null = node;
+    while (n?.type === 'exprDot' || n?.type === 'exprCall' ||
+        (n?.type === 'exprUnary' && n.namedChild(n.namedChildCount - 1)?.type === 'kHat')) {
+      if (n.type === 'exprDot') {
+        const last = n.namedChild(n.namedChildCount - 1);
+        if (last?.type !== 'identifier') return null;
+        links.unshift(getNodeText(last, this.source));
+      }
+      n = n.namedChild(0);
+    }
+    if (n?.type !== 'identifier') return null;
+    links.unshift(getNodeText(n, this.source));
+    return links;
   }
 
   /**
@@ -9485,12 +9566,21 @@ export class TreeSitterExtractor {
       if (PASCAL_NOT_ROUTINES.has(lower) || this.pascalLocalType(lower, scope.locals) !== undefined) return;
       if (this.pascalDataNames(scope.classQn).has(lower)) return;
     }
-    const mode: PascalNameMode | null = parent ? this.pascalNameMode(name, parent) : 'recv';
+    let mode: PascalNameMode | null = parent ? this.pascalNameMode(name, parent) : 'recv';
     if (!mode) return;
     // In a `with` body a name may be the `with` object's member, which the
     // object's type would have to say. Only the method an event is given is
     // linked there (`OnClick := ButtonClick`), the form's, as it is written.
     if (this.pascalWithDepth > 0 && (mode !== 'ref' || name.type !== 'identifier')) return;
+    // A value given to an assignment's target carries the target, whose
+    // declared type says whether a method given to it is a method pointer;
+    // the mode its name gives stands where its declaration doesn't (#2550).
+    let target = '';
+    if (parent?.type === 'assignment' && this.pascalWithDepth === 0) {
+      const assigned = this.pascalAssignmentTarget(parent.namedChild(0), scope.locals);
+      if (assigned && 'mode' in assigned) mode = assigned.mode;
+      else if (assigned) target = `=${assigned.target}`;
+    }
     let path: string[];
     if (name.type === 'identifier') {
       path = [getNodeText(name, this.source)];
@@ -9517,7 +9607,7 @@ export class TreeSitterExtractor {
       // A local's declared class stands for it; a pointer type (`PNode`),
       // which no class node declares, can't. A local's member as a receiver
       // is left out: what it reaches is almost always data.
-      if (local === null || mode === 'recv' || /^P[A-Z]/.test(local)) return;
+      if (local === null || local === PASCAL_ROUTINE_TYPE || mode === 'recv' || /^P[A-Z]/.test(local)) return;
       path[0] = `:${local}`;
     } else if (lower !== 'self' && PASCAL_NOT_ROUTINES.has(lower)) {
       return;
@@ -9526,7 +9616,7 @@ export class TreeSitterExtractor {
     // file when the implementation matched no declaration.
     const ref: UnresolvedReference = {
       fromNodeId: callerId,
-      referenceName: `{${mode}${scope.classQn ? `@${scope.classQn}` : ''}}.${path.join('.')}`,
+      referenceName: `{${mode}${target}${scope.classQn ? `@${scope.classQn}` : ''}}.${path.join('.')}`,
       referenceKind: 'references',
       line: name.startPosition.row + 1,
       column: name.startPosition.column,
@@ -9631,47 +9721,83 @@ export class TreeSitterExtractor {
    * `Result`'s type, `var` and `const` sections — and where the unit's own
    * code resumes: after an `end;` that starts its line, which closes a
    * routine, and at `initialization` and `finalization`. An indented header
-   * is a routine nested in the one above, whose class and names it shares.
+   * is a routine nested in the one above, whose class it shares, and whose
+   * names it sees. Where the routine it is nested in goes on — a declaration
+   * section or a body indented less than its header — that routine's names
+   * are back, its own section's with them, and the nested routine's are gone
+   * (#2550).
    */
   private readPascalTextRoutines(): PascalTextRoutine[] {
     const lines = (this.pascalSourceLines ??= this.source.split(/\r?\n/));
-    const header = /^(\s*)(?:class\s+)?(?:procedure|function|constructor|destructor|operator)\s+([A-Za-z_]\w*(?:<[^>]*>)?(?:\.[A-Za-z_]\w*(?:<[^>]*>)?)*)/i;
     const routines: PascalTextRoutine[] = [];
     let outer: PascalTextRoutine | null = null;
+    // The outer routine and the routines nested in it the text is in, with
+    // how far their headers are indented and the names each sees, innermost last.
+    let open: Array<{ indent: number; locals: Map<string, string | null> }> = [];
     for (let i = 0; i < lines.length; i++) {
       const text = lines[i]!;
       if (/^(?:end;|\s*(?:initialization|finalization)\b)/i.test(text)) {
         routines.push({ line: i + 1, classQn: null, routine: null, locals: new Map() });
         outer = null;
+        open = [];
         continue;
       }
-      const m = header.exec(text);
-      if (!m) continue;
-      const nested: boolean = m[1] !== '' && outer !== null;
+      const m = PASCAL_TEXT_HEADER.exec(text);
+      if (!m) {
+        const section = open.length > 1 ? /^(\s*)(var|const|type|label|resourcestring|threadvar|begin|asm)\b/i.exec(text) : null;
+        if (section && section[1]!.length < open[open.length - 1]!.indent) {
+          while (open.length > 1 && open[open.length - 1]!.indent > section[1]!.length) open.pop();
+          const resumed = open[open.length - 1]!;
+          if (/^(?:var|const)$/i.test(section[2]!)) {
+            resumed.locals = new Map(resumed.locals);
+            this.readPascalTextDeclarations(lines, i, text.slice(section[0].length), resumed.locals);
+          }
+          routines.push({ line: i + 1, classQn: outer!.classQn, routine: outer!.routine, locals: resumed.locals });
+        }
+        continue;
+      }
+      const indent = m[1]!.length;
+      const nested: boolean = indent > 0 && outer !== null;
       const parts = m[2]!.replace(/<[^>]*>/g, '').split('.');
       const routine = parts.pop()!.toLowerCase();
-      let decl = text.slice(m.index + m[0].length);
-      for (let j = i + 1; j < lines.length && j <= i + 200 && !/^\s*(?:begin|asm)\b/i.test(lines[j]!) && !header.test(lines[j]!); j++) {
-        decl += '\n' + lines[j];
-      }
-      decl = decl.replace(/\{[^}]*\}|\(\*[\s\S]*?\*\)|\/\/[^\n]*/g, ' ');
-      const locals: Map<string, string | null> = new Map(nested ? outer!.locals : []);
-      const result = /^\s*(?:\([^)]*\))?\s*:\s*([A-Za-z_][\w.]*)/.exec(decl);
+      // A sibling's names, or a deeper routine's, are no longer seen.
+      while (nested && open.length > 1 && open[open.length - 1]!.indent >= indent) open.pop();
+      const locals: Map<string, string | null> = new Map(nested ? open[open.length - 1]!.locals : []);
+      const result = /^\s*(?:\([^)]*\))?\s*:\s*([A-Za-z_][\w.]*)/.exec(
+        this.readPascalTextDeclarations(lines, i, text.slice(m.index + m[0].length), locals));
       locals.set('result', result ? result[1]!.split('.').pop()! : null);
-      for (const d of decl.matchAll(/([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*:(?!=)\s*([A-Za-z_][\w.]*)?/g)) {
-        const type = d[2] ? d[2].split('.').pop()! : null;
-        for (const name of d[1]!.split(',')) locals.set(name.trim().toLowerCase(), type);
-      }
       if (nested) {
         // The outer routine's body follows its nested ones: it keeps the
-        // outer routine's class and name, and sees the names of both.
+        // outer routine's class and name.
         routines.push({ line: i + 1, classQn: outer!.classQn, routine: outer!.routine, locals });
+        open.push({ indent, locals });
       } else {
         outer = { line: i + 1, classQn: parts.length > 0 ? parts.join('::') : null, routine, locals };
         routines.push(outer);
+        open = [{ indent, locals }];
       }
     }
     return routines;
+  }
+
+  /**
+   * The declarations the source text makes from line `from` on, `text` its
+   * part not yet read, up to a body or the next routine header, added to
+   * `locals` (see readPascalTextRoutines). Returns the text read, its
+   * comments blanked.
+   */
+  private readPascalTextDeclarations(lines: string[], from: number, text: string, locals: Map<string, string | null>): string {
+    let decl = text;
+    for (let j = from + 1; j < lines.length && j <= from + 200 && !/^\s*(?:begin|asm)\b/i.test(lines[j]!) && !PASCAL_TEXT_HEADER.test(lines[j]!); j++) {
+      decl += '\n' + lines[j];
+    }
+    decl = decl.replace(/\{[^}]*\}|\(\*[\s\S]*?\*\)|\/\/[^\n]*/g, ' ');
+    for (const d of decl.matchAll(/([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*:(?!=)\s*([A-Za-z_][\w.]*)?/g)) {
+      // A routine type written out (`procedure of object`, `reference to …`).
+      const type = !d[2] ? null : /^(?:procedure|function|reference)$/i.test(d[2]) ? PASCAL_ROUTINE_TYPE : d[2].split('.').pop()!;
+      for (const name of d[1]!.split(',')) locals.set(name.trim().toLowerCase(), type);
+    }
+    return decl;
   }
 
   /**
@@ -9703,7 +9829,10 @@ export class TreeSitterExtractor {
         return op && (op.type === 'kIs' || op.type === 'kAs') && parent.namedChild(0)?.id !== name.id ? null : 'read';
       }
       case 'exprUnary':
-        return parent.child(0)?.type === 'kAt' ? null : 'read';
+        // `@Obj.Method` takes a method's address, a method pointer whatever it
+        // is given to (#2550); `@Handler` is a function value (#756).
+        if (parent.child(0)?.type === 'kAt') return name.type === 'exprDot' ? 'ref' : null;
+        return 'read';
       case 'if':
       case 'ifElse':
       case 'while':
@@ -9720,6 +9849,31 @@ export class TreeSitterExtractor {
       default:
         return null;
     }
+  }
+
+  /**
+   * An assignment's target, for what a method given to it is (#2550): its
+   * name or dotted name (`Callback`, `FEvents.OnGet`, `Self.OnGet`), which
+   * resolution looks up, a local written as its declared type (`:TGet`); the
+   * mode itself for a local declared with a routine type written out (`ref`)
+   * or with a type no name stands for (`read`, an array or a set); null when
+   * the target is no name (`Items[0]`, `TFoo(X).OnGet`).
+   */
+  private pascalAssignmentTarget(
+    target: SyntaxNode | null,
+    textLocals: Map<string, string | null> | null,
+  ): { target: string } | { mode: PascalNameMode } | null {
+    const links = target?.type === 'identifier'
+      ? [getNodeText(target, this.source)]
+      : target?.type === 'exprDot' ? this.pascalIdentifierPath(target) : null;
+    if (!links) return null;
+    const local = this.pascalLocalType(links[0]!.toLowerCase(), textLocals);
+    if (local !== undefined) {
+      if (links.length === 1 && (local === null || local === PASCAL_ROUTINE_TYPE)) return { mode: local ? 'ref' : 'read' };
+      if (local === null || local === PASCAL_ROUTINE_TYPE) return null;
+      links[0] = `:${local}`;
+    }
+    return { target: links.join('.') };
   }
 
   /** The identifiers of a plain dotted name (`FProvider.Value`, `Self.A.B`), or null. */
