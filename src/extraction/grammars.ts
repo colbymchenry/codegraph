@@ -51,6 +51,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  mojo: 'tree-sitter-mojo.wasm',
 };
 
 /**
@@ -142,6 +143,10 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cu': 'cpp',
   '.cuh': 'cpp',
   '.nix': 'nix',
+  // Mojo (Modular). `.mojo` is the standard form; the emoji extension is
+  // the one Modular's own tooling also accepts.
+  '.mojo': 'mojo',
+  '.🔥': 'mojo',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -941,6 +946,7 @@ export function getLanguageDisplayName(language: Language): string {
     objc: 'Objective-C',
     solidity: 'Solidity',
     nix: 'Nix',
+    mojo: 'Mojo',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',
