@@ -629,6 +629,13 @@
       "size": "Large",
       "files": "~1600",
       "question": "In fountain's f_mvc module, how is an incoming HTTP request routed by HttpRequestDistributorImpl to the matching controller method, and how are that method's arguments resolved from the request?"
+    },
+    {
+      "name": "Telegram-HMOS",
+      "repo": "https://github.com/PoivronMax/Telegram-HMOS",
+      "size": "Large",
+      "files": "~7300 (788 .cj + 251 .ets + C/C++ natives)",
+      "question": "In this HarmonyOS Telegram app, when the user confirms their phone number on the Cangjie login page, how does the auth-code request get built and sent to Telegram's servers over MTProto?"
     }
   ]
 }

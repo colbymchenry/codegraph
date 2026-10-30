@@ -1735,14 +1735,14 @@ export class ReferenceResolver {
     // from './barrel'` where the barrel has `export { signIn as login }
     // from './auth'`) intentionally call a name that has no
     // declaration anywhere — only the renamed upstream symbol does.
-    // ArkTS chained-attribute refs carry a leading dot (`.titleStyle`) that
+    // ArkTS and Cangjie chained-attribute refs carry a leading dot (`.titleStyle`) that
     // routes them to the decorator-gated matcher; the symbol itself is
     // indexed under the bare name, so the existence check strips the dot.
     // Nix static path imports (`import ./x.nix`) and JS/TS module paths
     // (`require('./x')`) name a FILE, not a symbol — they bypass the
     // symbol-existence check and resolve via resolveViaImport.
     let existenceName =
-      ref.language === 'arkts' && ref.referenceName.startsWith('.')
+      (ref.language === 'arkts' || ref.language === 'cangjie') && ref.referenceName.startsWith('.')
         ? ref.referenceName.slice(1)
         : ref.referenceName;
     // Erlang refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the

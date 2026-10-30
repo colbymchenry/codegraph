@@ -14740,6 +14740,73 @@ class Page {
     expect(imports).toEqual(['demo.svc.Alpha', 'demo.svc.beta']);
   });
 
+  it('records annotations and chains UI attributes only in view code', () => {
+    const code = `package demo.ui
+
+@Component
+public class CounterPage {
+    @State var count: Int64 = 0
+    @State var items: ArrayList<String> = ArrayList<String>()
+    var plain: Int64 = 0
+
+    /** Title bar. */
+    @Builder func header(): Unit {
+        Text("h").fontSize(20)
+    }
+
+    func inc(): Unit {
+        count += 1
+    }
+
+    func build() {
+        Column {
+            Text("Count")
+                .fontSize(16)
+                .margin(top: 60)
+            Button("Add")
+                .onClick({ _ => this.inc() })
+        }.width(100)
+    }
+
+    func row(): Unit {
+        Row()
+            // a comment between chain lines
+            .width(5)
+            .height(3)
+    }
+}
+
+class NotAComponent {
+    func notView(): Unit {
+        Builder().width(3)
+    }
+}
+`;
+    const result = extractFromSource('src/page.cj', code);
+    expect(result.errors).toEqual([]);
+    const find = (name: string) => result.nodes.find((n) => n.name === name);
+    expect(find('CounterPage')?.decorators).toEqual(['Component']);
+    // Two same-line `@State var`s in a row: the second parses once preParse
+    // moved its annotation up, and both keep it.
+    expect(find('count')?.decorators).toEqual(['State']);
+    expect(find('items')?.decorators).toEqual(['State']);
+    expect(find('plain')?.decorators).toBeUndefined();
+    expect(find('header')?.decorators).toEqual(['Builder']);
+    expect(find('header')?.docstring).toBe('Title bar.');
+
+    const callsOf = (fn: string) =>
+      result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls' && r.fromNodeId === find(fn)!.id)
+        .map((r) => r.referenceName);
+    expect(callsOf('build')).toEqual(expect.arrayContaining(['Column', 'Text', '.fontSize', '.margin', 'Button', '.onClick', 'inc', '.width']));
+    expect(callsOf('header')).toEqual(['Text', '.fontSize']);
+    // Any member of a component builds views; a chain cut by a comment line
+    // keeps its attributes.
+    expect(callsOf('row')).toEqual(['Row', '.width', '.height']);
+    // Outside view code a capitalized chain is an ordinary call.
+    expect(callsOf('notView')).toEqual(['Builder', 'Builder().width']);
+  });
+
   it('marks foreign declarations', () => {
     const code = `package demo.ffi
 

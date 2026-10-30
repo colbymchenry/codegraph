@@ -30689,14 +30689,16 @@ function matchReferenceInner(
   // same-named properties thousands of false callers. Ambiguity rule matches
   // the rest of the file: several same-named helpers → prefer the call-site
   // file, still ambiguous → drop the ref rather than guess.
-  if (ref.language === 'arkts' && ref.referenceName.startsWith('.')) {
+  // Cangjie's ArkUI view code chains attributes the same way (`Text("x")
+  // .fontSize(16)`); its `@Builder` helpers may also be component members.
+  if ((ref.language === 'arkts' || ref.language === 'cangjie') && ref.referenceName.startsWith('.')) {
     const base = ref.referenceName.slice(1);
     const candidates = context
       .getNodesByName(base)
       .filter(
         (n) =>
-          n.language === 'arkts' &&
-          n.kind === 'function' &&
+          n.language === ref.language &&
+          (n.kind === 'function' || (ref.language === 'cangjie' && n.kind === 'method')) &&
           (n.decorators ?? []).some((d) => ARKUI_ATTRIBUTE_DECORATORS.has(d))
       );
     const chosen =

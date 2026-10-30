@@ -2,7 +2,7 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField, getPrecedingDocstring, cleanCommentMarkers } from '../tree-sitter-helpers';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
 import type { Node, NodeKind } from '../../types';
-import { cangjieRewrites, preParseCangjie } from './cangjie-preparse';
+import { cangjieRewrites, preParseCangjie, type CangjieRewrites } from './cangjie-preparse';
 
 /**
  * Cangjie (仓颉) extractor — Cangjie-SIG/tree-sitter-cangjie tag 1.0.5.4
@@ -160,7 +160,7 @@ function headerTrailingDoc(node: SyntaxNode, source: string): string | undefined
   return comments.map((c) => cleanCommentMarkers(getNodeText(c, source))).join('\n').trim() || undefined;
 }
 
-/** Annotations (`@Deprecated`, `@Test`) stand between a declaration and its doc comment. */
+/** Annotations (`@Component`, `@Builder`, `@Test`) stand between a declaration and its doc comment. */
 const DOC_STEP_OVER = ['macroExpression'];
 
 function docOf(node: SyntaxNode, source: string): string | undefined {
@@ -174,13 +174,23 @@ const ANNOTATED_TYPES = new Set([
 ]);
 
 /**
- * A declaration's annotations, by name: `@Deprecated`, `@Test`, `@Entry` …
- * parse as `macroExpression` siblings written before it. Recorded on the
- * node's decorators so they are searchable; `foreign` marks a C declaration.
+ * A declaration's annotations, by name: `@Component`, `@State`, `@Builder`,
+ * `@Deprecated` … all parse as `macroExpression` siblings written before the
+ * declaration (a member's too, once preParse has moved a same-line one).
+ * Recorded on the node's decorators so `@Entry` pages are searchable and the
+ * ArkUI-in-Cangjie passes can key off them; `foreign` marks a C declaration.
  */
+/** The preParse side table of the tree a node belongs to, looked up once per tree. */
+const TREE_REWRITES = new WeakMap<object, CangjieRewrites | undefined>();
+function rewritesOf(node: SyntaxNode): CangjieRewrites | undefined {
+  const tree = node.tree as unknown as object;
+  if (!TREE_REWRITES.has(tree)) TREE_REWRITES.set(tree, cangjieRewrites(node.tree.rootNode.text));
+  return TREE_REWRITES.get(tree);
+}
+
 function annotationsOf(node: SyntaxNode): string[] | undefined {
   if (!ANNOTATED_TYPES.has(node.type)) return undefined;
-  const names: string[] = [];
+  const names: string[] = [...(rewritesOf(node)?.annotations.get(node.startPosition.row + 1) ?? [])];
   let sib = (declarationWrapper(node) ?? node).previousNamedSibling;
   while (sib && (sib.type === 'macroExpression' || COMMENT_TYPES.has(sib.type))) {
     const name = sib.type === 'macroExpression' ? childOfType(sib, 'macroName') : null;
@@ -247,6 +257,31 @@ function importedFqns(node: SyntaxNode, source: string): string[] {
   return fqns.map((f) => f.replace(/\s+/g, ''));
 }
 
+/** Annotations that make a class an ArkUI component (mirrored by the state→build synthesizer). */
+const COMPONENT_ANNOTATIONS = new Set([
+  'Component', 'ComponentV2', 'Entry', 'CustomDialog', 'Reusable', 'HybridComponentEntry',
+]);
+
+/**
+ * Whether `node` is view code, where `Text("x").fontSize(16)` chains UI
+ * attributes onto a component: inside a `build()` or an `@Builder` function,
+ * or any member of an annotated component class (its row/section helpers
+ * build views without either marker).
+ */
+function inViewCode(node: SyntaxNode): boolean {
+  for (let n = node.parent; n; n = n.parent) {
+    if (n.type === 'functionDefinition' &&
+        (childOfType(n, 'funcName')?.text === 'build' || (annotationsOf(n) ?? []).includes('Builder'))) {
+      return true;
+    }
+    if (n.type === 'classDefinition' || n.type === 'structDefinition') {
+      return (annotationsOf(n) ?? []).some((a) => COMPONENT_ANNOTATIONS.has(a));
+    }
+    if (n.type === 'translationUnit') return false;
+  }
+  return false;
+}
+
 /** A call found in a postfix run: the callee name and the node to position it on. */
 export interface CangjieCallee {
   name: string;
@@ -290,6 +325,12 @@ export function isInnerPostfix(node: SyntaxNode): boolean {
  *   getSvc().run()   → `getSvc`, `getSvc().run`      (top-level function head)
  *   a.b.c.d()        → `d`             (deep chains: bare name)
  *   "x".toArray()    → nothing         (a builtin of the literal's type)
+ *   Text("x").fontSize(16) in view code → `Text`, `.fontSize`
+ *
+ * The dot-prefixed `.fontSize` is a chained UI attribute: resolution links it
+ * only to an attribute helper (`@Builder`/`@Extend`/`@Styles`), never to an
+ * unrelated method that shares the name — on an ArkUI app `.width(…)` and
+ * `.margin(…)` sit on nearly every view line.
  */
 export function cangjieCallees(node: SyntaxNode, source: string): CangjieCallee[] {
   const out: CangjieCallee[] = [];
@@ -304,6 +345,14 @@ export function cangjieCallees(node: SyntaxNode, source: string): CangjieCallee[
   // A string literal's method (`"x".toArray()`) is a builtin of String, never
   // a project symbol: that first call emits nothing.
   let literalHead = head.type === 'stringLiteral';
+  // A capitalized component call (`Text(…)`, `Column { … }`) heading a chain
+  // in view code: every call chained onto it is a UI attribute.
+  const uiChain =
+    head.type === 'atomicVariable' &&
+    (suffixes[0]?.type === 'callSuffix' || suffixes[0]?.type === 'trailingLambdaExpression') &&
+    inViewCode(node);
+  let uiChainBroken = false;
+  let afterHeadCall = false;
 
   if (head.type === 'thisSuperExpression') {
     path = [getNodeText(head, source).trim()];
@@ -317,6 +366,7 @@ export function cangjieCallees(node: SyntaxNode, source: string): CangjieCallee[
       // typeArguments (`foo<Int64>(…)`) don't change the callee name.
     }
     if (path.length === 0) opaque = true;
+    if (uiChain && !(path.length === 1 && /^[A-Z]/.test(path[0]!))) uiChainBroken = true;
   } else {
     opaque = true;
   }
@@ -328,6 +378,10 @@ export function cangjieCallees(node: SyntaxNode, source: string): CangjieCallee[
     if (path.length === 1 && SELF_RECEIVERS.has(method) && lastCall === null) return;
     if (literalHead) {
       literalHead = false;
+      return;
+    }
+    if (uiChain && !uiChainBroken && afterHeadCall) {
+      out.push({ name: `.${method}`, node: at });
       return;
     }
     let name: string;
@@ -357,6 +411,7 @@ export function cangjieCallees(node: SyntaxNode, source: string): CangjieCallee[
         break;
       case 'callSuffix':
         emit(s);
+        afterHeadCall = true;
         lastCall = calleeText(path, lastCall);
         path = [];
         opaque = false;
@@ -366,6 +421,7 @@ export function cangjieCallees(node: SyntaxNode, source: string): CangjieCallee[
         // `foo(x) { … }` is the same call as its callSuffix; `foo { … }` is a call.
         if (!prevWasCall) {
           emit(s);
+          afterHeadCall = true;
           lastCall = calleeText(path, lastCall);
           path = [];
           opaque = false;

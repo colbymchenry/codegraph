@@ -245,4 +245,86 @@ describe('Cangjie package/import resolution', () => {
     expect(bridge.map((e) => e.target)).toEqual([impl.id]);
     expect(bridge[0]!.provenance).toBe('heuristic');
   });
+
+  it('gates UI attributes to builder helpers and bridges @State writes to build()', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cangjie-'));
+    // A decoy: a method that merely shares a framework attribute's name.
+    write('src/model/sizes.cj',
+      'package demo.model\n\n' +
+      'public class Sizes {\n' +
+      '    public func width(w: Int64): Int64 { w }\n' +
+      '}\n');
+    write('src/ui/page.cj',
+      'package demo.ui\n\n' +
+      '@Component\n' +
+      'public class CounterPage {\n' +
+      '    @State var count: Int64 = 0\n\n' +
+      '    @Builder func titleStyle(): Unit {}\n\n' +
+      '    func inc(): Unit {\n' +
+      '        count += 1\n' +
+      '    }\n\n' +
+      '    func readOnly(): Int64 {\n' +
+      '        count\n' +
+      '    }\n\n' +
+      '    func build() {\n' +
+      '        Column {\n' +
+      '            Text("n").width(100).titleStyle()\n' +
+      '            Button("+").onClick({ _ => this.inc() })\n' +
+      '        }\n' +
+      '    }\n' +
+      '}\n');
+
+    cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const methods = cg.getNodesByKind('method');
+    const m = (qn: string) => methods.find((n) => n.qualifiedName === qn)!;
+    const build = m('demo.ui::CounterPage::build');
+    const width = m('demo.model::Sizes::width');
+    const titleStyle = m('demo.ui::CounterPage::titleStyle');
+    expect(cg.getIncomingEdges(width.id).filter((e) => e.kind === 'calls')).toHaveLength(0);
+    expect(cg.getOutgoingEdges(build.id).map((e) => e.target)).toContain(titleStyle.id);
+
+    // inc writes @State count → re-renders build(); readOnly only reads it.
+    const toBuild = cg.getIncomingEdges(build.id).filter((e) => e.kind === 'calls').map((e) => e.source);
+    expect(toBuild).toContain(m('demo.ui::CounterPage::inc').id);
+    expect(toBuild).not.toContain(m('demo.ui::CounterPage::readOnly').id);
+  });
+
+  it('never binds a UI component call to a same-named enum case of an unrelated file', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cangjie-'));
+    write('src/svc/kinds.cj',
+      'package demo.svc\n\n' +
+      'public enum HeaderKind {\n' +
+      '    | Text | Media\n' +
+      '}\n');
+    write('src/ui/page.cj',
+      'package demo.ui\n\n' +
+      'import demo.svc.*\n\n' +
+      '@Component\n' +
+      'public class Page {\n' +
+      '    func build() {\n' +
+      '        Text("hello")\n' +
+      '    }\n' +
+      '}\n');
+    write('src/svc/use.cj',
+      'package demo.svc\n\n' +
+      'public func pick(): HeaderKind {\n' +
+      '    Text\n' +
+      '}\n\n' +
+      'public func make(): HeaderKind {\n' +
+      '    Media()\n' +
+      '}\n');
+
+    cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const members = cg.getNodesByKind('enum_member');
+    const media = members.find((n) => n.name === 'Media')!;
+    const text = members.find((n) => n.name === 'Text')!;
+    const build = cg.getNodesByKind('method').find((n) => n.name === 'build')!;
+    expect(cg.getOutgoingEdges(build.id).map((e) => e.target)).not.toContain(text.id);
+    // A file that names the enum still reaches its cases.
+    expect(cg.getIncomingEdges(media.id).filter((e) => e.kind !== 'contains').length).toBeGreaterThan(0);
+  });
 });
