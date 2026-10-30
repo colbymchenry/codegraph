@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **Odin** (`.odin`): procedures and procedure groups, structs, enums, unions, bit fields, constants, imports and the calls between them. A call like `fmt.println` is kept apart from a procedure of your own, because an Odin package is a directory. A few newer Odin constructs, such as fixed-capacity `[dynamic; N]T` arrays, are not yet understood by the grammar and can cost a file some of its symbols. Thanks @ivandrenjanin, who built this, and @RainerXE, who first proposed it. (#1523, #1000)
+
 ### Security
 
 - CodeGraph's refusal to use a sensitive folder such as `~/.ssh`, `~/.config`, `/etc` or `C:\Windows` as a project can no longer be sidestepped: a link or junction that leads to one, a differently capitalized name on Windows and macOS, a `\\?\` spelling on Windows, and a path to a missing folder inside one are now refused like the folder itself. Before, any of these let an AI agent's query read the files inside. Thanks @mixxer for finding it.
