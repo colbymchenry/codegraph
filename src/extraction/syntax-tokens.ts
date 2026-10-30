@@ -362,7 +362,8 @@ export interface SyntaxRegion {
   language: Language;
 }
 
-const SCRIPT_BLOCK = /<script(\s[^>]*)?>([\s\S]*?)<\/script>/gi;
+// A self-closing `<script ... />` has no body and must not run on to the next `</script>`.
+const SCRIPT_BLOCK = /<script(\s[^>]*?)?(?:\/>|>([\s\S]*?)<\/script>)/gi;
 /** Astro's frontmatter: a `---` fence at the very top of the file. */
 const ASTRO_FRONTMATTER = /^(---\r?\n)([\s\S]*?)\r?\n---/;
 

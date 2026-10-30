@@ -10081,6 +10081,66 @@ const value = 42;
     );
     expect(containEdges.length).toBeGreaterThan(0);
   });
+
+  it('should not let a self-closing <script /> swallow the next script (#2989)', () => {
+    const code = `---
+import { formatDate } from '../utils/format';
+const inlineScript = 'window.example = true';
+---
+<script is:inline set:html={inlineScript} />
+<time>{formatDate(new Date())}</time>
+<script>
+  const ready = true;
+  console.log(ready);
+</script>
+`;
+    const result = extractFromSource('Page.astro', code);
+
+    expect(result.errors).toEqual([]);
+    const ready = result.nodes.find((n) => n.name === 'ready');
+    expect(ready).toBeDefined();
+    expect(ready?.startLine).toBe(8);
+    // The markup between the two scripts is still scanned.
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'formatDate' && ref.line === 6
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('should not let a self-closing <style /> hide the markup after it (#2989)', () => {
+    const code = `<style is:global />
+<p>{formatDate(date)}</p>
+<style>.a { color: red; }</style>
+`;
+    const result = extractFromSource('Styled.astro', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'formatDate' && ref.line === 2
+    );
+    expect(call).toBeDefined();
+  });
+
+  it("still reads a call in a self-closing <script />'s attributes (#2989)", () => {
+    // A self-closing tag has no body for the template scan to skip:
+    // `set:html={…}` runs when the page renders, like any attribute expression.
+    const code = `---
+import { serializeJsonLd } from '../lib/jsonld';
+const schema = {};
+---
+<script type="application/ld+json" set:html={serializeJsonLd(schema)} />
+<script>
+  const ready = true;
+</script>
+`;
+    const result = extractFromSource('Schema.astro', code);
+
+    expect(result.errors).toEqual([]);
+    expect(result.nodes.find((n) => n.name === 'ready')?.startLine).toBe(7);
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'serializeJsonLd' && ref.line === 5
+    );
+    expect(call).toBeDefined();
+  });
 });
 
 describe('Instantiates + Decorates edge extraction', () => {

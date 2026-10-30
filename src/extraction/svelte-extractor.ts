@@ -125,12 +125,16 @@ export class SvelteExtractor {
       isTypeScript: boolean;
     }> = [];
 
-    const scriptRegex = /<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/g;
+    // A self-closing `<script ... />` (e.g. a third-party script in
+    // `<svelte:head>`) has no body; match it on its own so it cannot run on to
+    // the next `</script>`.
+    const scriptRegex = /<script(\s[^>]*?)?(?:\/>|>(?<content>[\s\S]*?)<\/script>)/g;
     let match;
 
     while ((match = scriptRegex.exec(this.source)) !== null) {
+      if (match.groups?.content === undefined) continue;
       const attrs = match[1] || '';
-      const content = match.groups?.content || match[2] || '';
+      const content = match.groups.content;
 
       // Detect TypeScript from lang attribute
       const isTypeScript = sfcScriptLanguage(attrs, 'svelte') === 'typescript';
@@ -204,9 +208,12 @@ export class SvelteExtractor {
     const coveredRanges: Array<[number, number]> = [];
 
     // Find all <script>...</script> and <style>...</style> ranges
-    const tagRegex = /<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
+    const tagRegex = /<(script|style)(\s[^>]*?)?(?:\/>|>[\s\S]*?<\/\1>)/g;
     let tagMatch;
     while ((tagMatch = tagRegex.exec(this.source)) !== null) {
+      // A self-closing tag has no body to skip, and its attributes
+      // (`src={assetUrl('/analytics.js')}`) are template expressions.
+      if (tagMatch[0].endsWith('/>')) continue;
       const startLine = (this.source.substring(0, tagMatch.index).match(/\n/g) || []).length;
       const endLine = startLine + (tagMatch[0].match(/\n/g) || []).length;
       coveredRanges.push([startLine, endLine]);
@@ -260,9 +267,11 @@ export class SvelteExtractor {
   private extractTemplateComponents(componentNodeId: string): void {
     // Build ranges covered by <script> and <style> blocks to skip them
     const coveredRanges: Array<[number, number]> = [];
-    const tagRegex = /<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
+    const tagRegex = /<(script|style)(\s[^>]*?)?(?:\/>|>[\s\S]*?<\/\1>)/g;
     let tagMatch;
     while ((tagMatch = tagRegex.exec(this.source)) !== null) {
+      // A self-closing tag has no body to skip.
+      if (tagMatch[0].endsWith('/>')) continue;
       const startLine = (this.source.substring(0, tagMatch.index).match(/\n/g) || []).length;
       const endLine = startLine + (tagMatch[0].match(/\n/g) || []).length;
       coveredRanges.push([startLine, endLine]);
