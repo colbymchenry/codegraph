@@ -4168,7 +4168,7 @@ export class ReferenceResolver {
       if (!type) return null;
       result = { ...result, targetNodeId: type.id };
     }
-    if (isBoundToOutOfRepoImport(ref, this.context)) return null;
+    if (isBoundToOutOfRepoImport(ref, this.context, target)) return null;
     // A Go type embedded through a package (`clientv3.KV`) is that package's.
     // When the package is none of the file's imports as indexed (clientv3
     // imported unaliased as `go.etcd.io/etcd/client/v3`), a type found by its

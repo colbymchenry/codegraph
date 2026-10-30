@@ -4312,7 +4312,7 @@ function resolveStaticMember(
  * instead of removing it, so locality has to be checked too.
  *
  * Answers only when it can be CERTAIN, because a false "yes" deletes a real
- * edge. Two languages qualify, each with an oracle that cannot be wrong:
+ * edge. Three languages qualify, each with an oracle of its own:
  *
  *  - **Rust** — the `use` path is rooted at a standard-library crate
  *    (`std`/`core`/`alloc`/`proc_macro`), which by definition ships outside
@@ -4325,14 +4325,19 @@ function resolveStaticMember(
  *    path aliases and monorepo workspace packages, unless the specifier still
  *    names a project file through the importing app's `baseUrl` or catch-all
  *    `paths` (`import Base from 'components/Base'`).
+ *  - **Python** — `resolveImportPath`, which searches for a module the way
+ *    Python does (see {@link isPythonNameFromOutside}).
  *
- * Everything else returns false and resolves exactly as before. JVM and Python
- * imports notably do NOT go through `resolveImportPath` (they have dedicated
- * FQN/module matchers), so there is no trustworthy oracle to consult here.
+ * Everything else returns false and resolves exactly as before. JVM imports
+ * notably do NOT go through `resolveImportPath` (they have dedicated FQN
+ * matchers), so there is no trustworthy oracle to consult here.
+ *
+ * `target` is what a strategy found, when the caller has it.
  */
 export function isBoundToOutOfRepoImport(
   ref: UnresolvedRef,
-  context: ResolutionContext
+  context: ResolutionContext,
+  target?: Node | null
 ): boolean {
   const name = ref.referenceName;
   if (name.includes('::') || name.includes('.')) return false; // qualified refs resolve by path
@@ -4340,6 +4345,7 @@ export function isBoundToOutOfRepoImport(
   // (A 2015-edition crate-relative path can shadow a stdlib root with a local
   // module of the same name: a `use core::…` with a `mod core;` is the crate's.)
   if (ref.language === 'rust') return isRustNameFromStd(ref, context);
+  if (ref.language === 'python') return isPythonNameFromOutside(ref, target, context);
 
   if (!ESM_IMPORT_LANGUAGES.has(ref.language)) return false;
   for (const imp of context.getImportMappings(ref.filePath, ref.language)) {
@@ -4351,6 +4357,30 @@ export function isBoundToOutOfRepoImport(
       !ambientModuleDeclares(imp.source, imp.exportedName, imp.isDefault, ref, context);
   }
   return false;
+}
+
+/**
+ * Whether every import binding a Python name is of a module Python's search
+ * doesn't find in the project: `class Color(Enum)` after `from enum import
+ * Enum` is not the project's own `Enum`. That search can miss a project module
+ * only on a path the program sets up itself (`sys.path`), so a `target` in a
+ * file the import path names stays, as does one in the referring file, which
+ * may rebind the name (`class Enum(Enum)`). A relative import is the project's.
+ */
+function isPythonNameFromOutside(ref: UnresolvedRef, target: Node | null | undefined, context: ResolutionContext): boolean {
+  if (target?.filePath === ref.filePath) return false;
+  const bindings = context.getImportMappings(ref.filePath, 'python').filter((imp) => imp.localName === ref.referenceName);
+  return bindings.length > 0 && bindings.every((imp) =>
+    !imp.source.startsWith('.') &&
+    resolveImportPath(imp.source, ref.filePath, 'python', context) === null &&
+    !(target && isInPythonModulePath(target.filePath, imp.source)));
+}
+
+/** Whether `file` is the module `dotted` or inside it, under any root: `lib/x/helpers/base.py` for `helpers.base`. */
+function isInPythonModulePath(file: string, dotted: string): boolean {
+  const tail = `/${dotted.replace(/\./g, '/')}`;
+  const at = `/${file}`;
+  return at.includes(`${tail}/`) || at.endsWith(`${tail}.py`) || at.endsWith(`${tail}.pyi`);
 }
 
 /**
