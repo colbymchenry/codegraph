@@ -2147,9 +2147,14 @@ export class QueryBuilder {
     // so treat it as whitespace before the strip step. Otherwise queries
     // like `stage_apply::run` collapse to `stage_applyrun` (the colons
     // are stripped without splitting) and find nothing. See #173.
+    //
+    // The other FTS5 syntax characters separate words too, as they do in
+    // the index, which splits text at anything but letters and digits:
+    // `leaf(entry)` is stored as `leaf` and `entry`. Dropping them glued a
+    // pasted call into one word no symbol has (`leafentry`, #2971).
     const ftsQuery = query
       .replace(/::/g, ' ') // Rust/C++/Ruby qualifier separator
-      .replace(/['"*():^]/g, '') // Remove FTS5 special chars
+      .replace(/['"*():^]/g, ' ') // FTS5 syntax characters separate words
       .split(/\s+/)
       .filter(term => term.length > 0)
       // Strip FTS5 boolean operators to prevent query manipulation
