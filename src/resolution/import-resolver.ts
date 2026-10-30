@@ -132,6 +132,14 @@ interface FileExportIndex {
    * `byName`. `undefined` until first read through {@link exportedByName}.
    */
   clauseAliases?: Map<string, Node>;
+  /**
+   * Exported members of something else in the file (`export const d = { f()
+   * {} }` → `d::f`) by name: no import's first answer, only its last, after
+   * the file's own bindings, export clause and re-exports (#2945). That last
+   * answer is what reaches `d.f` through `export const { f } = d`, whose
+   * binding has no node of its own.
+   */
+  members: Map<string, Node>;
 }
 
 const DEFAULT_BINDING_KINDS = new Set<string>(['function', 'class', 'component', 'constant', 'variable']);
@@ -239,9 +247,9 @@ function statedDefaultExport(filePath: string, idx: FileExportIndex, context: Re
       const to = lineAt(value.nameAt);
       const node = value.declared
         ? named.find((n) => DEFAULT_DECLARATION_KINDS.has(n.kind) && n.startLine >= from && n.startLine <= to)
-        : named
+        : moduleBindingsFirst(filePath, named
             .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
-            .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+            .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn))[0];
       if (node) {
         stated = node;
         break;
@@ -279,14 +287,19 @@ function getFileExportIndex(filePath: string, context: ResolutionContext): FileE
   }
   let idx = perFile.get(filePath);
   if (!idx) {
-    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined };
+    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined, members: new Map() };
     // Python has no export keyword: every module-level def is importable, and
     // the extractor never flags one isExported. Without this a Python named
     // import could only ever resolve through the bare-name matcher.
     const exported = PYTHON_MODULE_FILE.test(filePath)
       ? context.getNodesInFile(filePath).filter((n) => n.isExported || isPythonModuleLevelDef(n))
       : context.getExportedNodesInFile?.(filePath) ?? context.getNodesInFile(filePath).filter((n) => n.isExported);
+    const jsFamily = JS_FAMILY_FILE.test(filePath);
     for (const n of exported) {
+      if (jsFamily && n.qualifiedName !== n.name) {
+        if (!idx.members.has(n.name)) idx.members.set(n.name, n);
+        continue;
+      }
       if (!idx.byName.has(n.name)) idx.byName.set(n.name, n);
       if (idx.defaultComponent === undefined && n.kind === 'component') idx.defaultComponent = n;
       if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class')) idx.defaultFnClass = n;
@@ -294,6 +307,19 @@ function getFileExportIndex(filePath: string, context: ResolutionContext): FileE
     perFile.set(filePath, idx);
   }
   return idx;
+}
+
+/**
+ * `nodes` with the members of something else in their JS/TS file (an
+ * object's method `d::f`) moved behind the module's own bindings. Extraction
+ * marks such a member exported, so it can share a name with what an import,
+ * export clause or default export means (#2945); it stays the last answer
+ * because `const { f } = d` gives the binding `f` no node but `d::f`.
+ */
+function moduleBindingsFirst(filePath: string, nodes: Node[]): Node[] {
+  if (!JS_FAMILY_FILE.test(filePath)) return nodes;
+  const own = nodes.filter((n) => n.qualifiedName === n.name);
+  return own.length === nodes.length ? nodes : [...own, ...nodes.filter((n) => n.qualifiedName !== n.name)];
 }
 
 /** The file's nodes named `name`, in `getNodesInFile` order. */
@@ -337,13 +363,14 @@ function exportedByName(filePath: string, idx: FileExportIndex, name: string, co
     // Bind names introduced by a local export clause to their declarations, so
     // an importer asking for the renamed name gets the real symbol instead of
     // falling through to the name-matcher (which cannot cross the rename).
-    // The declaration is the file's first node of that name, exported or not.
+    // The declaration is the file's first node of that name, exported or not,
+    // a member of something else in it only when nothing else has the name.
     idx.clauseAliases = new Map();
     const content = context.readFile(filePath);
     if (content && content.includes('export')) {
       for (const { exportedName, localName } of extractLocalExportAliases(content)) {
         if (idx.byName.has(exportedName) || idx.clauseAliases.has(exportedName)) continue;
-        const decl = nodesInFileNamed(filePath, localName, context)[0];
+        const decl = moduleBindingsFirst(filePath, nodesInFileNamed(filePath, localName, context))[0];
         if (decl) idx.clauseAliases.set(exportedName, decl);
       }
     }
@@ -4081,9 +4108,9 @@ function findExportedSymbolWalk(
       const next = resolveImportPath(commonJs.source, filePath, language, context);
       if (next) return findExportedSymbol(next, want, language, context, visited, depth + 1);
     } else if (commonJs?.name) {
-      const bound = nodesInFileNamed(filePath, commonJs.name, context)
+      const bound = moduleBindingsFirst(filePath, nodesInFileNamed(filePath, commonJs.name, context)
         .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
-        .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+        .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn))[0];
       if (bound) return bound;
     }
   } else if (want.isNamespace && want.memberName) {
@@ -4112,7 +4139,7 @@ function findExportedSymbolWalk(
 
   // 2. Re-export hit: the file forwards the symbol to another module.
   const reExports = context.getReExports?.(filePath, language) ?? [];
-  if (reExports.length === 0) return undefined;
+  if (reExports.length === 0) return exportedMember(exportIndex, want);
 
   // Look for explicit `export { want } from './other'` (with optional rename) — for
   // `ns.member` through `import * as ns`, the member is the name wanted.
@@ -4167,7 +4194,17 @@ function findExportedSymbolWalk(
     }
   }
 
-  return undefined;
+  return exportedMember(exportIndex, want);
+}
+
+/**
+ * The last answer for a named import: a member of something in the file, as
+ * `export const { f } = d` exports `d::f`, once nothing the file declares or
+ * forwards is the name (#2945).
+ */
+function exportedMember(idx: FileExportIndex, want: { isDefault: boolean; isNamespace: boolean; exportedName: string; memberName: string | null }): Node | undefined {
+  const name = want.isDefault ? null : want.isNamespace ? want.memberName : want.exportedName;
+  return name ? idx.members.get(name) : undefined;
 }
 
 /** Node kinds that own static members reachable as `Container.member`. */
