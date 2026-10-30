@@ -36,7 +36,7 @@ import {
   Location,
   WriteResult,
 } from './types';
-import { atomicWriteFileSync } from './shared';
+import { atomicWriteFileSync, joinText, splitText } from './shared';
 
 class HermesTarget implements AgentTarget {
   readonly id = 'hermes' as const;
@@ -167,25 +167,6 @@ function writeHermesConfig(): { file: WriteResult['files'][number]; notes: strin
 // ---------------------------------------------------------------------------
 // Line-level YAML: just the shapes Hermes and its users write for these keys.
 // ---------------------------------------------------------------------------
-
-interface Text {
-  lines: string[];
-  eol: '\n' | '\r\n';
-}
-
-function splitText(content: string): Text {
-  const first = /\r\n|\r|\n/.exec(content);
-  const lines = content.length === 0 ? [] : content.split(/\r\n|\r|\n/);
-  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
-  return { lines, eol: first?.[0] === '\r\n' ? '\r\n' : '\n' };
-}
-
-/** The lines joined with the file's own line break, ending with one; no trailing blank lines. */
-function joinText(text: Text): string {
-  const lines = [...text.lines];
-  while (lines.length > 0 && (lines[lines.length - 1] ?? '').trim() === '') lines.pop();
-  return lines.length === 0 ? '' : lines.join(text.eol) + text.eol;
-}
 
 function indentOf(line: string): number {
   return /^ */.exec(line)![0].length;

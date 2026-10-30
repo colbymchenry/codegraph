@@ -9,6 +9,7 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import {
   CODEGRAPH_INSTRUCTIONS_BLOCK,
@@ -27,6 +28,29 @@ export function getMcpServerConfig(): { type: string; command: string; args: str
     command: 'codegraph',
     args: ['serve', '--mcp'],
   };
+}
+
+/**
+ * The same server as a bare `{ command, args }`, for agents whose documented
+ * stdio entry has no `type` key.
+ */
+export function getStdioServerConfig(): { command: string; args: string[] } {
+  const { command, args } = getMcpServerConfig();
+  return { command, args };
+}
+
+/**
+ * The folder an agent's `*_HOME`-style variable names, or `fallback` when it
+ * is unset or blank. A leading `~` is the user's home and a relative path is
+ * taken from the working directory, so the installer writes where the agent
+ * reads. Installing to the fallback while the agent reads the override is a
+ * silent no-op: the files are written, and nothing ever looks at them (#1627).
+ */
+export function configDirFromEnv(name: string, fallback: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) return fallback;
+  const inHome = value === '~' || value.startsWith('~/') || value.startsWith('~\\');
+  return path.resolve(inHome ? path.join(os.homedir(), value.slice(1)) : value);
 }
 
 /**
@@ -184,7 +208,7 @@ export function removeFileUnlessLinked(filePath: string, emptied: string): void 
  * write is a replacement, not an edit, and without this the user's
  * config would be gone. No-op when the file is absent or parses fine.
  */
-function backupUnparseableJson(filePath: string): void {
+export function backupUnparseableJson(filePath: string): void {
   if (!fs.existsSync(filePath)) return;
   try {
     JSON.parse(fs.readFileSync(filePath, 'utf-8'));
@@ -236,6 +260,26 @@ export function jsonDeepEqual(a: unknown, b: unknown): boolean {
   if (ak.length !== bk.length) return false;
   if (!ak.every((k, i) => k === bk[i])) return false;
   return ak.every((k) => jsonDeepEqual(ao[k], bo[k]));
+}
+
+/** A text file as lines, without their line breaks, and the line break it uses. */
+export interface TextLines {
+  lines: string[];
+  eol: '\n' | '\r\n';
+}
+
+export function splitText(content: string): TextLines {
+  const first = /\r\n|\r|\n/.exec(content);
+  const lines = content.length === 0 ? [] : content.split(/\r\n|\r|\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  return { lines, eol: first?.[0] === '\r\n' ? '\r\n' : '\n' };
+}
+
+/** The lines joined with the file's own line break, ending with one; no trailing blank lines. */
+export function joinText(text: TextLines): string {
+  const lines = [...text.lines];
+  while (lines.length > 0 && (lines[lines.length - 1] ?? '').trim() === '') lines.pop();
+  return lines.length === 0 ? '' : lines.join(text.eol) + text.eol;
 }
 
 /** One marker-delimited block: `start` is the start marker's offset, `end` is just past the end marker. */
@@ -411,6 +455,11 @@ export function upsertInstructionsEntry(file: string): { path: string; action: '
     CODEGRAPH_SECTION_END,
   );
   return { path: file, action: action === 'appended' ? 'updated' : action };
+}
+
+/** Inverse of `upsertInstructionsEntry`: strip the CodeGraph block from `file`, if it has one. */
+export function removeInstructionsEntry(file: string): { path: string; action: 'removed' | 'not-found' | 'kept' } {
+  return { path: file, action: removeMarkedSection(file, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END) };
 }
 
 /**

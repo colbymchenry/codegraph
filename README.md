@@ -6,7 +6,7 @@ Already installed? Run `codegraph upgrade`
 
 Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 
-### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Antigravity, Kiro, and GitHub Copilot with Semantic Code Intelligence
+### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Antigravity, Kiro, GitHub Copilot, and more with Semantic Code Intelligence
 
 **The fastest complete code graph · surgical context · built for how agents actually work · 100% local**
 
@@ -36,6 +36,15 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 [![Antigravity](https://img.shields.io/badge/Antigravity-supported-blueviolet.svg)](#supported-agents)
 [![Kiro](https://img.shields.io/badge/Kiro-supported-blueviolet.svg)](#supported-agents)
 [![GitHub Copilot](https://img.shields.io/badge/GitHub_Copilot-supported-blueviolet.svg)](#supported-agents)
+[![IBM Bob](https://img.shields.io/badge/IBM_Bob-supported-blueviolet.svg)](#supported-agents)
+[![Factory Droid](https://img.shields.io/badge/Factory_Droid-supported-blueviolet.svg)](#supported-agents)
+[![Windsurf](https://img.shields.io/badge/Windsurf-supported-blueviolet.svg)](#supported-agents)
+[![Qwen Code](https://img.shields.io/badge/Qwen_Code-supported-blueviolet.svg)](#supported-agents)
+[![DeepSeek Harness](https://img.shields.io/badge/DeepSeek_Harness-supported-blueviolet.svg)](#supported-agents)
+[![Grok Build](https://img.shields.io/badge/Grok_Build-supported-blueviolet.svg)](#supported-agents)
+[![Kimi Code](https://img.shields.io/badge/Kimi_Code-supported-blueviolet.svg)](#supported-agents)
+[![Qoder](https://img.shields.io/badge/Qoder-supported-blueviolet.svg)](#supported-agents)
+[![Pi](https://img.shields.io/badge/Pi-supported-blueviolet.svg)](#supported-agents)
 
 <br>
 
@@ -106,7 +115,7 @@ In a **new terminal**, run the installer to connect CodeGraph to the agents you 
 codegraph install
 ```
 
-<sub>Detects and auto-configures Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and GitHub Copilot (VS Code, Copilot CLI, JetBrains IDEs) — wiring the CodeGraph MCP server into each. **This is the step that connects CodeGraph to your agent;** installing the CLI in step 1 does not do it on its own. It only wires up your agent — it does **not** index any code; building each project's graph is the separate `codegraph init` in step 3. (Shortcut: `npx @colbymchenry/codegraph` downloads and runs this in one go.)</sub>
+<sub>Detects and auto-configures Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot (VS Code, Copilot CLI, JetBrains IDEs), IBM Bob, Factory Droid, Windsurf, Qwen Code, DeepSeek Harness, Grok Build, Kimi Code, Qoder CLI, and Pi — wiring the CodeGraph MCP server into each. **This is the step that connects CodeGraph to your agent;** installing the CLI in step 1 does not do it on its own. It only wires up your agent — it does **not** index any code; building each project's graph is the separate `codegraph init` in step 3. (Shortcut: `npx @colbymchenry/codegraph` downloads and runs this in one go.)</sub>
 
 ### 3. Initialize each project
 
@@ -392,11 +401,11 @@ npx @colbymchenry/codegraph
 ```
 
 The installer will:
-- Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**, **GitHub Copilot** (VS Code, Copilot CLI, JetBrains IDEs)
+- Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**, **GitHub Copilot** (VS Code, Copilot CLI, JetBrains IDEs), **IBM Bob**, **Factory Droid**, **Windsurf**, **Qwen Code**, **DeepSeek Harness**, **Grok Build**, **Kimi Code**, **Qoder CLI**, and **Pi**
 - Prompt to install `codegraph` on your PATH (so agents can launch the MCP server)
 - Ask whether configs apply to all your projects or just this one
-- Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`) — that's how subagents and non-MCP agents learn the `codegraph explore` command, since the MCP server's own guidance only reaches the main agent. Removed cleanly by `codegraph uninstall`.
-- Set up auto-allow permissions when Claude Code is one of the targets
+- Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `QWEN.md`) — that's how subagents and non-MCP agents learn the `codegraph explore` command, since the MCP server's own guidance only reaches the main agent. Removed cleanly by `codegraph uninstall`.
+- Set up auto-allow permissions when Claude Code or Qwen Code is one of the targets
 
 The installer **wires up your agents only — it does not index your code.** After it finishes, build each project's graph yourself with `codegraph init` (step 3). One global `codegraph install` covers every project; you run `codegraph init` once per project.
 
@@ -418,12 +427,12 @@ codegraph install --print-config copilot-vscode      # same, for Copilot in VS C
 | `--location` | `global`, `local` | prompt |
 | `--yes` | (boolean) | prompt every step |
 | `--init` | (boolean) run `codegraph init` in the current directory after wiring agents | — |
-| `--no-permissions` | (boolean) skip Claude auto-allow list | permissions on |
+| `--no-permissions` | (boolean) skip the auto-allow list (Claude Code, Qwen Code) | permissions on |
 | `--print-config <id>` | dump snippet for one agent and exit | — |
 
 ### 2. Restart Your Agent
 
-Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro / VS Code, the Copilot CLI, or your JetBrains IDE for GitHub Copilot) for the MCP server to load.
+Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro / VS Code, the Copilot CLI, or your JetBrains IDE for GitHub Copilot / IBM Bob / Factory Droid / Windsurf / Qwen Code / DeepSeek Harness / Grok Build / Kimi Code / Qoder CLI / Pi) for the MCP server to load.
 
 ### 3. Initialize Projects
 
@@ -799,10 +808,11 @@ See [Get Started](#get-started) for the one-line install commands.
 
 The interactive installer auto-detects and configures each of these — wiring up
 the MCP server, which delivers its own usage guidance. For Claude Code, Codex
-CLI, Gemini CLI and opencode it also writes a short marker-fenced CodeGraph
-section into the agent's instructions file (`CLAUDE.md` / `AGENTS.md` /
-`GEMINI.md`), so subagents and non-MCP agents learn the `codegraph explore`
-command:
+CLI, Gemini CLI, opencode, Factory Droid, Qwen Code, DeepSeek Harness, Grok
+Build, Kimi Code and Pi it also writes a short marker-fenced CodeGraph section
+into the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md` /
+`QWEN.md`, or `rules/codegraph.md` for Grok Build), so subagents and non-MCP
+agents learn the `codegraph explore` command:
 
 - **Claude Code**
 - **Cursor**
@@ -813,6 +823,15 @@ command:
 - **Antigravity IDE**
 - **Kiro**
 - **GitHub Copilot** — Copilot Chat in VS Code (`copilot-vscode`), the Copilot CLI (`copilot-cli`), and the Copilot plugin in JetBrains IDEs (`copilot-jetbrains`)
+- **IBM Bob** (`bob`) — Bob IDE and Bob Shell: `~/.bob/settings/mcp.json`, or `.bob/mcp.json` in a project
+- **Factory Droid** (`droid`) — `~/.factory/mcp.json`, or `.factory/mcp.json`, which is meant to be committed; Droid reloads the file on its own
+- **Windsurf** (`windsurf`) — global only: `~/.codeium/windsurf/mcp_config.json`, which Devin, Windsurf's new name, imports by default
+- **Qwen Code** (`qwen`) — `settings.json` in `$QWEN_HOME` (default `~/.qwen`) or `.qwen/`, keeping any comments in it
+- **DeepSeek Harness** (`dsh`) — global only: one entry in `$DSH_HOME/cordis.patch.yml` (default `~/.dsh`) covers every profile
+- **Grok Build** (`grok`) — `$GROK_HOME/config.toml` (default `~/.grok`), or `.grok/config.toml`, which Grok uses only in a trusted folder
+- **Kimi Code** (`kimi`) — `$KIMI_CODE_HOME/mcp.json` (default `~/.kimi-code`), or `.kimi-code/mcp.json`, which Kimi Code uses only in a trusted folder
+- **Qoder CLI** (`qoder`) — `$QODER_CONFIG_DIR/settings.json` (default `~/.qoder`), or `.qoder/settings.local.json`; in the Qoder IDE, add the server under Settings > MCP
+- **Pi** (`pi`) — `mcp.json` in Pi's agent directory (default `~/.pi/agent`), or `.pi/mcp.json`, which Pi reads once you trust the project; `exposure: "direct"` keeps `codegraph_explore` on the model's tool list
 
 ## Supported Languages
 
@@ -919,7 +938,7 @@ MIT
 
 <div align="center">
 
-**Made for AI coding agents — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and GitHub Copilot**
+**Made for AI coding agents — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot, IBM Bob, Factory Droid, Windsurf, Qwen Code, DeepSeek Harness, Grok Build, Kimi Code, Qoder CLI, and Pi**
 
 [Report Bug](https://github.com/colbymchenry/codegraph/issues) · [Request Feature](https://github.com/colbymchenry/codegraph/issues)
 
