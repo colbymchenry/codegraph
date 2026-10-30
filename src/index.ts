@@ -1526,7 +1526,8 @@ export class CodeGraph {
         // as a full index resolves.
         //
         // `definitionDelta` is empty for a body-only edit, so the overwhelmingly
-        // common sync pays one branch. CODEGRAPH_NO_REBIND=1 disables it.
+        // common sync pays one branch. CODEGRAPH_NO_REBIND=1 disables it, and
+        // the failed-ref re-open that follows the rebind with it.
         if (result.definitionDelta && process.env.CODEGRAPH_NO_REBIND !== '1') {
           const tRebind = Date.now();
           const rebound = this.orchestrator.resurrectStaleResolutionEdges(
@@ -1534,9 +1535,19 @@ export class CodeGraph {
             result.changedFilePaths ?? [],
             edgesBeforeRetry
           );
+          // And the failed refs under those names: a call that failed only
+          // because two definitions shared its name (`x.go()` with `go` in two
+          // classes) resolves once one of them is gone. The retry above looks
+          // failed refs up by the names the changed files carry now, which a
+          // deleted file or a name renamed away no longer has, and a sync that
+          // only deletes files skips it. The sweep below resolves what this
+          // re-opens.
+          const reopenedFailed = this.queries.reopenFailedReferences(
+            this.queries.getRetryableFailedReferences(result.definitionDelta).flatMap((ref) => (ref.rowId === undefined ? [] : [ref.rowId]))
+          );
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(
-              `[phase-timing] sync-rebind: ${Date.now() - tRebind}ms (${result.definitionDelta.length} changed names, ${rebound} edges re-opened)`
+              `[phase-timing] sync-rebind: ${Date.now() - tRebind}ms (${result.definitionDelta.length} changed names, ${rebound} edges and ${reopenedFailed} failed refs re-opened)`
             );
           }
         }
