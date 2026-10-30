@@ -12,7 +12,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport 
 import { applyAliases, aliasAndBaseUrlCandidates } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport, workspaceImportTargets, type WorkspaceImportTargets } from './workspace-packages';
-import { stripCommentsForRegex } from './strip-comments';
+import { stripCommentsForRegex, templateLiteralTextAt } from './strip-comments';
 import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
 import { ambientModuleDeclares, findAmbientModuleExport, findAmbientModuleFile, inBlock, isInModuleBlock, namespaceBlocks, type NamespaceBlock } from './ambient-modules';
@@ -207,8 +207,12 @@ function readDefaultExport(code: string, at: number): { name: string; nameAt: nu
  * template whose `${…}` holds another template, or a regex with a backtick,
  * sets a masker out of step, and it blanked the real statement after it
  * (outline's 2,900-line styled-components `Styles.ts`). A statement must
- * name a node of the file instead — one a template only writes as text
- * names none — and of several statements, one that does wins.
+ * name a node of the file instead, and of several statements, one that does
+ * wins. A line of a template's text is no statement either, though it can
+ * name one: a code generator's `export default App` names the file's own
+ * `App` (#2968). So a head inside template text is skipped, when a scan that
+ * follows `${…}` nesting and regex literals closes every template; one that
+ * doesn't vouches for nothing, and every head counts.
  */
 function statedDefaultExport(filePath: string, idx: FileExportIndex, context: ResolutionContext): StatedDefault {
   if (idx.statedDefault !== undefined) return idx.statedDefault;
@@ -217,8 +221,10 @@ function statedDefaultExport(filePath: string, idx: FileExportIndex, context: Re
   if (source && /\bexport\s+default\b/.test(source)) {
     const code = stripCommentsForRegex(source, 'typescript');
     const lineAt = makeLineAt(code, 1);
+    const inTemplateText = templateLiteralTextAt(source);
     EXPORT_DEFAULT_HEAD.lastIndex = 0;
     for (let m = EXPORT_DEFAULT_HEAD.exec(code); m !== null; m = EXPORT_DEFAULT_HEAD.exec(code)) {
+      if (inTemplateText?.(m.index)) continue;
       const value = readDefaultExport(code, m.index + m[0].length);
       if (value === 'anonymous') {
         stated ??= 'anonymous';

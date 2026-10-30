@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { stripCommentsForRegex } from '../src/resolution/strip-comments';
+import { stripCommentsForRegex, templateLiteralTextAt } from '../src/resolution/strip-comments';
 
 describe('stripCommentsForRegex', () => {
   it('python: strips line comments', () => {
@@ -130,5 +130,40 @@ real = 1
     const src = "x = 1  # path('/fake/', View)\nreal = 2";
     const out = stripCommentsForRegex(src, 'python');
     expect(out.length).toBe(src.length);
+  });
+});
+
+describe('templateLiteralTextAt', () => {
+  /** Whether the first `marker` in `src` is template text; null when the scan gives up. */
+  function inText(src: string, marker: string): boolean | null {
+    const at = templateLiteralTextAt(src);
+    return at === null ? null : at(src.indexOf(marker));
+  }
+
+  it('tells a template text from the code around it and in its interpolations', () => {
+    const src = 'const a = `TEXT ${CODE} MORE`;\nAFTER';
+    expect(inText(src, 'TEXT')).toBe(true);
+    expect(inText(src, 'CODE')).toBe(false);
+    expect(inText(src, 'MORE')).toBe(true);
+    expect(inText(src, 'AFTER')).toBe(false);
+  });
+
+  it('follows a template nested in an interpolation', () => {
+    expect(inText('const a = `x ${`inner`} y\nTAIL\n`;', 'TAIL')).toBe(true);
+  });
+
+  it('skips a regex that holds a backtick or a brace', () => {
+    expect(inText('const re = /[`]/g;\nAFTER', 'AFTER')).toBe(false);
+    expect(inText('const s = `h-${t.replace(/[}`]/g, "")} TAIL`;\nAFTER', 'TAIL')).toBe(true);
+    expect(inText('const s = `h-${t.replace(/[}`]/g, "")} TAIL`;\nAFTER', 'AFTER')).toBe(false);
+  });
+
+  it('skips comments and strings that hold a backtick, and divides after a value', () => {
+    const src = '// a ` b\nconst s = "`" + \'`\';\n/* ` */\nconst h = (a + b) / 2 + "`";\nAFTER';
+    expect(inText(src, 'AFTER')).toBe(false);
+  });
+
+  it('gives up when a template never closes', () => {
+    expect(inText('if (ok) /`/.test(s)\nAFTER', 'AFTER')).toBeNull();
   });
 });

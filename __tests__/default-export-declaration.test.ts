@@ -206,6 +206,90 @@ export default class AnimatedColor {
   return [new AnimatedColor("red"), new Color("blue")]
 }
 `,
+  // An `export default` line written in a template literal is text, not the
+  // module's statement (#2968). A code generator's template names the file's
+  // own `App`, above the real default — the issue's own example first.
+  'src/gen/issue.ts': `export function App() { return 1; }
+export function Main() { return 2; }
+export const template = \`
+export default App
+\`;
+export default Main;
+`,
+  // Returned by a function, behind a template nested in an interpolation.
+  'src/gen/render.ts': `export function App() { return 1 }
+export function Main() { return 2 }
+export function render() {
+  return \`intro \${\`nested\`}
+export default App
+\`
+}
+export default Main
+`,
+  // Passed at module scope, where no declaration encloses it, and a class field.
+  'src/gen/write.ts': `import { writeFileSync } from "fs"
+export function App() { return 1 }
+export function Main() { return 2 }
+writeFileSync("out.ts", \`
+export default App
+\`)
+export class Emitter {
+  sample = \`
+export default App
+\`
+}
+export default Main
+`,
+  // A template's anonymous default made the expression default below it
+  // anonymous too, which keeps every guess away.
+  'src/gen/model.ts': `export class Model {
+  save() {
+    return 1
+  }
+}
+export const usage = \`
+export default class extends Model {}
+\`
+export default observable(Model)
+function observable<T>(target: T): T {
+  return target
+}
+`,
+  // No template text: a regex and a string that hold a backtick, and a
+  // division after a parenthesis.
+  'src/gen/plain.ts': `export function App() { return 1 }
+export function Main() { return 2 }
+const tick = /[\`]/g
+const half = (App() + Main()) / 2 + "\`"
+export default Main
+`,
+  // A regex right after `if (…)` reads as a division, so its backtick opens a
+  // literal the scan never closes: then the scan vouches for nothing, and the
+  // statement still counts.
+  'src/gen/unbalanced.ts': `export function App() { return 1 }
+export function Main() { return 2 }
+export function check(s: string, ok: boolean) {
+  if (ok) /\`/.test(s)
+  return s
+}
+export default Main
+`,
+  'src/gen/use.ts': `import Issue from "./issue"
+import Render from "./render"
+import Write from "./write"
+import Persisted from "./model"
+import Plain from "./plain"
+import Unbalanced from "./unbalanced"
+
+export function generate() {
+  Issue()
+  Render()
+  Write()
+  new Persisted()
+  Plain()
+  Unbalanced()
+}
+`,
   'src/use.tsx': `import handler from "./api/vans"
 import Store from "./store"
 import headingToSlug from "./slug"
@@ -331,5 +415,38 @@ describe('a default import of a module that exports something above its default'
 
   it('still finds the class behind an expression default', () => {
     expect(consumed()).toContain('src/service.ts:run');
+  });
+});
+
+describe('an `export default` line inside a template literal', () => {
+  /** `file:name` of every node `generate` calls or instantiates. */
+  function generated(): string[] {
+    const generate = cg.getNodesInFile('src/gen/use.ts').find((n) => n.name === 'generate')!;
+    return cg
+      .getOutgoingEdges(generate.id)
+      .filter((e) => e.kind === 'calls' || e.kind === 'instantiates')
+      .map((e) => cg.getNode(e.target)!)
+      .map((n) => `${n.filePath}:${n.name}`)
+      .sort();
+  }
+
+  it('is text, so the real statement below it names the default', () => {
+    const targets = generated();
+    for (const file of ['issue', 'render', 'write']) {
+      expect(targets).toContain(`src/gen/${file}.ts:Main`);
+      expect(targets).not.toContain(`src/gen/${file}.ts:App`);
+    }
+  });
+
+  it('does not make an expression default anonymous', () => {
+    expect(generated()).toContain('src/gen/model.ts:Model');
+  });
+
+  it('leaves regexes, strings and division alone, and a scan it cannot finish', () => {
+    const targets = generated();
+    expect(targets).toContain('src/gen/plain.ts:Main');
+    expect(targets).toContain('src/gen/unbalanced.ts:Main');
+    expect(targets).not.toContain('src/gen/plain.ts:App');
+    expect(targets).not.toContain('src/gen/unbalanced.ts:App');
   });
 });

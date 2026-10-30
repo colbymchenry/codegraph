@@ -82,6 +82,93 @@ export function blankStringContents(text: string, regexLiterals?: number[]): str
   return out.join('');
 }
 
+/** A keyword after which a `/` opens a regex literal, at the end of the text before it. */
+const REGEX_AFTER_KEYWORD = /(?:^|[^\w$])(?:return|throw|case|yield|await|else|do|typeof|void|delete|new|in|of|instanceof)$/;
+
+/**
+ * Whether the `/` at `at` opens a regex literal: it does where an expression
+ * starts, and divides after a value — a `)`, `]`, string, name or number.
+ */
+function slashOpensRegex(src: string, at: number): boolean {
+  let j = at - 1;
+  while (j >= 0 && (src[j] === ' ' || src[j] === '\t' || src[j] === '\n' || src[j] === '\r')) j--;
+  if (j < 0) return true;
+  const before = src[j]!;
+  if (before === ')' || before === ']' || before === '"' || before === "'" || before === '`') return false;
+  if (/[\w$]/.test(before)) return REGEX_AFTER_KEYWORD.test(src.slice(Math.max(0, j - 10), j + 1));
+  return true;
+}
+
+/**
+ * Where JS/TS template-literal text lies in `src`: a test of whether offset
+ * `at` falls in a template's literal text — not its `${…}` code — or null when
+ * a template never closes, so the scan vouches for nothing. Offsets match
+ * {@link stripCommentsForRegex}'s output, which keeps them.
+ *
+ * Unlike {@link blankStringContents} it follows `${…}` nesting (a template in
+ * an interpolation, a brace in a regex there) and skips comments, strings and
+ * regex literals, which may hold a backtick (`/[`]/`).
+ */
+export function templateLiteralTextAt(src: string): ((at: number) => boolean) | null {
+  /** Template text spans, `[start, end)` pairs in order. */
+  const spans: number[] = [];
+  /** Innermost last: an open template's current text start, or an open `${…}`'s unclosed braces. */
+  const open: Array<{ text: number } | { braces: number }> = [];
+  const n = src.length;
+  for (let i = 0; i < n; i++) {
+    const c = src[i];
+    const top = open[open.length - 1];
+    if (top && 'text' in top) {
+      if (c === '\\') i++;
+      else if (c === '`') {
+        spans.push(top.text, i);
+        open.pop();
+      } else if (c === '$' && src[i + 1] === '{') {
+        spans.push(top.text, i);
+        open.push({ braces: 0 });
+        i++;
+      }
+      continue;
+    }
+    if (c === '`') open.push({ text: i + 1 });
+    else if (c === '"' || c === "'") {
+      for (i++; i < n && src[i] !== c && src[i] !== '\n'; i++) if (src[i] === '\\') i++;
+    } else if (c === '/' && src[i + 1] === '/') {
+      while (i < n && src[i] !== '\n') i++;
+    } else if (c === '/' && src[i + 1] === '*') {
+      const close = src.indexOf('*/', i + 2);
+      i = close < 0 ? n : close + 1;
+    } else if (c === '/' && slashOpensRegex(src, i)) {
+      let inClass = false;
+      for (let j = i + 1; j < n && src[j] !== '\n'; j++) {
+        if (src[j] === '\\') j++;
+        else if (src[j] === '[') inClass = true;
+        else if (src[j] === ']') inClass = false;
+        else if (src[j] === '/' && !inClass) {
+          i = j;
+          break;
+        }
+      }
+    } else if (top && c === '{') top.braces++;
+    else if (top && c === '}' && top.braces-- === 0) {
+      open.pop();
+      (open[open.length - 1] as { text: number }).text = i + 1;
+    }
+  }
+  if (open.length > 0) return null;
+  return (at) => {
+    // The first span ending after `at`, then whether it starts at or before it.
+    let lo = 0;
+    let hi = spans.length / 2;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (spans[2 * mid + 1]! <= at) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo < spans.length / 2 && spans[2 * lo]! <= at;
+  };
+}
+
 export type CommentLang =
   | 'python'
   | 'javascript'
