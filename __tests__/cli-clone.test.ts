@@ -97,6 +97,23 @@ describe('codegraph clone', () => {
     expect(() => probe(target)).toThrow(/no such table/);
   });
 
+  it('leaves a codegraph.db that is not a readable index alone without --force', () => {
+    fs.mkdirSync(path.join(target, '.codegraph'));
+    fs.writeFileSync(dbPath(target), 'not a database');
+    const r = run(tempDir, ['--source', source, target]);
+    expect(r.status).toBe(0);
+    expect(r.out).toContain('--force');
+    expect(fs.readFileSync(dbPath(target), 'utf-8')).toBe('not a database');
+  });
+
+  it('refuses to clone into the home directory without --force', () => {
+    const home = os.homedir();
+    const r = run(tempDir, ['--source', source, home]);
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('Refusing to clone');
+    expect(fs.existsSync(dbPath(home))).toBe(false);
+  });
+
   it('--force replaces an existing index and drops its stale -wal/-shm', () => {
     CodeGraph.initSync(target).close();
     // Leave a WAL behind in the target whose commit SQLite would replay over the copy.
