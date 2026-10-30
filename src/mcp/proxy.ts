@@ -26,6 +26,7 @@ import { EARLY_PPID } from './early-ppid';
 import { supervisionLostReason } from './ppid-watchdog';
 import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
+import { treatStdoutFailureAsShutdown } from './stdout-teardown';
 import { CodeGraphPackageVersion, isOlderRelease } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
@@ -443,6 +444,10 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   // instead of a clean close; destroying the stream stops a hung fd from
   // busy-spinning the event loop (#799).
   treatStdinFailureAsShutdown(shutdown);
+  // A host can also stop reading our output while it keeps stdin open and
+  // stays alive: shut down the same way, which closes only this session's
+  // daemon connection and stops its own engines (#2991).
+  treatStdoutFailureAsShutdown(shutdown);
   startPpidWatchdogNoSocket(shutdown);
   // Backstop for a launch abandoned before any of the above can see it: killed
   // launcher + held-open pipes + reparent that beat the EARLY_PPID capture

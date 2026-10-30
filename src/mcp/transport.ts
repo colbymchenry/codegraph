@@ -16,6 +16,7 @@
 
 import * as readline from 'readline';
 import type { Socket } from 'net';
+import { treatStdoutFailureAsShutdown } from './stdout-teardown';
 
 /**
  * JSON-RPC 2.0 Request
@@ -312,6 +313,9 @@ export class StdioTransport extends LineBasedJsonRpcTransport {
     };
     this.rl.on('close', onStreamEnd);
     process.stdin.on('error', onStreamEnd);
+    // A host that stops reading our output, with stdin still open, gets the
+    // same shutdown rather than the fatal handler's exit 1 (#2991).
+    treatStdoutFailureAsShutdown(onStreamEnd);
   }
 
   stop(): void {
