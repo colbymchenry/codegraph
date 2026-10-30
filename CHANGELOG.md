@@ -334,6 +334,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Kotlin, a `fun interface` is now indexed as an interface with its methods, rather than as a broken function that could also lose the declaration after it. Thanks @danusha2345.
 - In Kotlin, a `private val` or `private var` property, and the members of a `private` class or object, no longer take calls from other files. Thanks @danusha2345.
 - In Kotlin, a call on a library type you import, like Jetpack Compose's `Modifier.pad()`, now links to the extension your project declares on that type when the calling file can see it. Thanks @danusha2345.
+- In Kotlin, an extension whose receiver uses an import alias now links from calls to the same imported type, even through a different alias, without linking aliases for other types.
 - In Kotlin, when two packages declare a class of the same name, a call on a value of that type now links to the one the file imports, and so does a Java call on such a class. Thanks @arttttt. (#1942)
 - In Kotlin and Java, a call through an import of a class written in the other language now links to that class, rather than to a same-named class in another package or to nothing. Thanks @mixxer.
 - In Kotlin Multiplatform, a call through an import now reaches what the caller compiles against: the `expect` from common code, the platform's `actual` from Java or platform code. Thanks @inth3shadows and @johnhldiver-beep. (#3033)
