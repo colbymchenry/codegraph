@@ -47,15 +47,14 @@ leaves behind, and asserts the seam: nothing outside `lib/adapter.js` may reach 
 package is **prepared, not published** — `ui/package.json` carries `"private": true` deliberately,
 and `scripts/pack-npm.sh` only packs a tarball when `CODEGRAPH_PACK_UI=1`.
 
-Tests run as **two vitest projects** (`vitest.workspace.mts`): `engine` (node) and `ui` (jsdom, the
+Tests run as **two Vitest projects** (`test.projects` in `vitest.config.mts`): `engine` (node) and `ui` (jsdom, the
 Svelte plugin, `resolve.conditions: ['browser']`) for the single `__tests__/ui-package.test.ts`.
 `npm test` still runs both. The split is not cosmetic — `browser` is a package-resolution
 condition, and applied globally it hands the engine's suites the browser builds of
 `web-tree-sitter` and friends. The root config (`vitest.config.mts`, `.mts` because the plugin is
-ESM-only and the repo is CJS) is the shared base; note that a workspace project **concatenates**
-the base's `include` with its own, which is why the `ui` project does not `extends` it.
+ESM-only and the repo is CJS) is the shared base; note that a project with `extends: true` **concatenates** the base's `include` with its own, which is why the `ui` project sets `extends: false`.
 
-Node engines: `>=20.0.0 <25.0.0`. There is a hard exit on Node 25.x and below 20 (see `src/bin/node-version-check.ts`).
+Node engines: `>=20.0.0 <25.0.0`. There is a hard exit on Node 25.x and below 20 (see `src/bin/node-version-check.ts`). That range is what users run. Working in this repo needs Node 22.12 or newer: `devEngines` makes `npm ci` and `npm run` stop on anything older, for Vite 7 and Vitest 4.
 
 ## Architecture
 
