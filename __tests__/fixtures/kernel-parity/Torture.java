@@ -31,6 +31,7 @@ public class TortureService extends BaseService implements Runnable, AutoCloseab
     }
   };
   private final Runnable fieldMethodRef = TortureService::compute;
+  private static final List<Runnable> FIELD_TABLE = List.of(TortureService::compute);
 
   /** Ctor javadoc. */
   public TortureService(List<String> names) {
@@ -79,6 +80,27 @@ public class TortureService extends BaseService implements Runnable, AutoCloseab
     }
   }
 
+  enum Step {
+    NEXT(1) {
+      @Override
+      int apply(int at) {
+        return clamp(at + size);
+      }
+    },
+    BACK(-1) {
+      @Override
+      int apply(int at) { return at + size; }
+    };
+
+    final int size;
+
+    Step(int size) { this.size = size; }
+
+    abstract int apply(int at);
+
+    static int clamp(int at) { return Math.max(0, at); }
+  }
+
   interface Listener {
     void onChange(TortureService svc);
   }
@@ -108,4 +130,19 @@ interface Shape extends Comparable<Shape>, Cloneable {
 
 @interface Marker {
   String value() default "";
+}
+
+class DottedAnon {
+  Api.Listener listener = new Api.Listener<String>() {
+    public void on() {}
+  };
+  Object plain = new java.util.concurrent.Callable<Integer>() {
+    public Integer call() { return 1; }
+  };
+}
+interface TortureConsts {
+  int MAX = 10;
+  Helper HELPER = new Helper();
+  String NAME = "x", OTHER = "y";
+  Runnable TASK = new Runnable() { public void run() { go(); } };
 }

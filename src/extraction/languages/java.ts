@@ -1,6 +1,7 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
+import { IMPLICIT_RECORD_ACCESSOR_DOC } from '../../types';
 
 /**
  * Tree-sitter-java node types for a method's `type` (return) field that can
@@ -250,10 +251,74 @@ function synthesizeLombokMembers(classNode: SyntaxNode, ctx: ExtractorContext): 
   }
 }
 
+// ---------------------------------------------------------------------------
+// Record component members
+// ---------------------------------------------------------------------------
+// A record header `record Point(int x, int y)` declares, per component, a
+// private final field and a public accessor `x()` — neither appears in the
+// body, so without them `p.x()` resolves to nothing and a component's type
+// can't type a receiver. Each is anchored on the component's name token (a
+// leaf, like the Lombok members). The canonical constructor is not
+// synthesized: `new Point(…)` already links to the record via `instantiates`.
+// Varargs components (`String... rest`) are skipped.
+function synthesizeRecordComponents(recordNode: SyntaxNode, ctx: ExtractorContext): void {
+  const params = getChildByField(recordNode, 'parameters');
+  if (!params) return;
+  const recordId = ctx.nodeStack[ctx.nodeStack.length - 1];
+  const recordQN = ctx.nodes.find((n) => n.id === recordId)?.qualifiedName;
+  const takenMethods = new Set<string>();
+  const takenFields = new Set<string>();
+  if (recordQN) {
+    for (const n of ctx.nodes) {
+      if (n.filePath === ctx.filePath && n.qualifiedName === `${recordQN}::${n.name}`) {
+        if (n.kind === 'method' || n.kind === 'function') takenMethods.add(n.name);
+        else if (n.kind === 'field' || n.kind === 'variable' || n.kind === 'constant' || n.kind === 'property') {
+          takenFields.add(n.name);
+        }
+      }
+    }
+  }
+  for (const param of params.namedChildren) {
+    if (param.type !== 'formal_parameter') continue;
+    const nameNode = getChildByField(param, 'name');
+    const typeNode = getChildByField(param, 'type');
+    if (!nameNode || !typeNode) continue;
+    const name = getNodeText(nameNode, ctx.source).trim();
+    const typeText = getNodeText(typeNode, ctx.source).trim();
+    if (!name) continue;
+    if (!takenFields.has(name)) {
+      takenFields.add(name);
+      ctx.createNode('field', name, nameNode, {
+        visibility: 'private',
+        isStatic: false,
+        signature: `${typeText} ${name}`,
+      });
+    }
+    if (!takenMethods.has(name)) {
+      takenMethods.add(name);
+      ctx.createNode('method', name, nameNode, {
+        visibility: 'public',
+        isStatic: false,
+        signature: `${typeText} ${name}()`,
+        docstring: IMPLICIT_RECORD_ACCESSOR_DOC,
+        returnType: normalizeJavaType(typeNode, ctx.source),
+      });
+    }
+  }
+}
+
+function synthesizeJavaMembers(classNode: SyntaxNode, ctx: ExtractorContext): void {
+  if (classNode.type === 'record_declaration') synthesizeRecordComponents(classNode, ctx);
+  synthesizeLombokMembers(classNode, ctx);
+}
+
 export const javaExtractor: LanguageExtractor = {
   functionTypes: [],
-  classTypes: ['class_declaration'],
-  methodTypes: ['method_declaration', 'constructor_declaration'],
+  // `record_declaration` (Java 16+) is a class: its body holds methods,
+  // constructors, static fields and nested types like any class body.
+  classTypes: ['class_declaration', 'record_declaration'],
+  // `compact_constructor_declaration` is a record's `Point { … }` constructor.
+  methodTypes: ['method_declaration', 'constructor_declaration', 'compact_constructor_declaration'],
   // `annotation_type_declaration` is `@interface Foo { … }` — an annotation
   // definition. Without it, annotation types (`@SerializedName`, `@GetMapping`,
   // JPA/Spring annotations) aren't nodes, so the `@Foo` usages that DO get
@@ -266,13 +331,14 @@ export const javaExtractor: LanguageExtractor = {
   importTypes: ['import_declaration'],
   callTypes: ['method_invocation'],
   variableTypes: ['local_variable_declaration'],
-  fieldTypes: ['field_declaration'],
+  // An interface's constants (`Helper HELPER = new Helper();`) are fields too.
+  fieldTypes: ['field_declaration', 'constant_declaration'],
   nameField: 'name',
   bodyField: 'body',
   paramsField: 'parameters',
   returnField: 'type',
   getReturnType: extractJavaReturnType,
-  synthesizeMembers: synthesizeLombokMembers,
+  synthesizeMembers: synthesizeJavaMembers,
   getSignature: (node, source) => {
     const params = getChildByField(node, 'parameters');
     const returnType = getChildByField(node, 'type');
@@ -293,6 +359,8 @@ export const javaExtractor: LanguageExtractor = {
     return undefined;
   },
   isStatic: (node) => {
+    // An interface constant is implicitly `public static final`.
+    if (node.type === 'constant_declaration') return true;
     for (let i = 0; i < node.childCount; i++) {
       const child = node.child(i);
       if (child?.type === 'modifiers' && child.text.includes('static')) {
@@ -305,6 +373,7 @@ export const javaExtractor: LanguageExtractor = {
   // shared config). Drives `constant` kind so value-reference edges target it;
   // instance / `final`-only / `static`-only fields stay mutable `field`s.
   isConst: (node) => {
+    if (node.type === 'constant_declaration') return true;
     for (let i = 0; i < node.childCount; i++) {
       const child = node.child(i);
       if (child?.type === 'modifiers') {

@@ -20,9 +20,9 @@ import { defineWorkspace } from 'vitest/config';
  * browser builds of `web-tree-sitter` and friends, and the failures that
  * causes look nothing like their cause.
  *
- * The engine project `extends` the shared base, so the env vars and Node guard
- * in `vitest.config.mts` still apply to every engine test. The ui project does
- * not — see the note on it.
+ * The engine project `extends` the shared base, so the env vars, Node guard and
+ * home-dir sandbox in `vitest.config.mts` still apply to every engine test. The
+ * ui project does not — see the note on it.
  */
 export default defineWorkspace([
   {

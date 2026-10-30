@@ -50,7 +50,7 @@ import {
 } from '../types';
 
 const CODEGEN_DECL_RE =
-  /codegenNativeComponent\s*(?:<[^>]+>)?\s*\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]/g;
+  /\b(codegenNativeComponent|requireNativeComponent)\s*(?:<[^>]+>)?\s*\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]/g;
 
 /**
  * Legacy Paper view manager macros — older RN libs (still very common,
@@ -95,7 +95,9 @@ function deriveComponentNameFromManager(className: string): string {
  * spec signal.
  */
 function isFabricSpec(source: string): boolean {
-  return source.includes('codegenNativeComponent');
+  // A Paper-era module names its native view the same way:
+  // segmented-control's `module.exports = requireNativeComponent('RNCSegmentedControl')`.
+  return source.includes('codegenNativeComponent') || source.includes('requireNativeComponent');
 }
 
 /**
@@ -299,7 +301,8 @@ function extractFabricNodes(filePath: string, source: string): Node[] {
   CODEGEN_DECL_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = CODEGEN_DECL_RE.exec(source)) !== null) {
-    const componentName = m[1]!;
+    const declaredWith = m[1]!;
+    const componentName = m[2]!;
     const before = source.slice(0, m.index);
     const startLine = before.split('\n').length;
     const startColumn = before.length - before.lastIndexOf('\n') - 1;
@@ -314,15 +317,14 @@ function extractFabricNodes(filePath: string, source: string): Node[] {
       name: componentName,
       qualifiedName: `${filePath}::${componentName}`,
       filePath,
-      // The spec file is .ts or .tsx; use the file's apparent language
-      // by extension. Trim to a known Language value.
-      language: filePath.endsWith('.tsx') ? 'tsx' : 'typescript',
+      // The spec file's language by extension (a Paper module is often Flow `.js`).
+      language: filePath.endsWith('.tsx') ? 'tsx' : /\.[cm]?ts$/.test(filePath) ? 'typescript' : filePath.endsWith('.jsx') ? 'jsx' : 'javascript',
       startLine,
       endLine: startLine,
       startColumn,
-      endColumn: startColumn + 'codegenNativeComponent'.length,
-      docstring: `Fabric/Codegen native component '${componentName}'`,
-      signature: `codegenNativeComponent<NativeProps>('${componentName}')`,
+      endColumn: startColumn + declaredWith.length,
+      docstring: declaredWith === 'codegenNativeComponent' ? `Fabric/Codegen native component '${componentName}'` : `Native component '${componentName}' (requireNativeComponent)`,
+      signature: declaredWith === 'codegenNativeComponent' ? `codegenNativeComponent<NativeProps>('${componentName}')` : `requireNativeComponent('${componentName}')`,
       isExported: true,
       updatedAt: now,
     });
@@ -363,7 +365,7 @@ function extractFabricNodes(filePath: string, source: string): Node[] {
 
 export const fabricViewResolver: FrameworkResolver = {
   name: 'fabric-view',
-  languages: ['typescript', 'tsx', 'objc', 'java', 'kotlin'],
+  languages: ['typescript', 'tsx', 'javascript', 'jsx', 'objc', 'java', 'kotlin'],
 
   detect(context) {
     // Root package.json is the common case. The indexer only tracks
@@ -392,7 +394,7 @@ export const fabricViewResolver: FrameworkResolver = {
     // Pick the right extractor by file language. The framework registry
     // already filters by `languages` so we only see relevant files.
     let nodes: Node[] = [];
-    if (filePath.endsWith('.ts') || filePath.endsWith('.tsx')) {
+    if (/\.(?:[cm]?[jt]s|[jt]sx)$/.test(filePath)) {
       nodes = extractFabricNodes(filePath, source);
     } else if (filePath.endsWith('.m') || filePath.endsWith('.mm')) {
       nodes = extractLegacyViewManagerNodes(filePath, source);

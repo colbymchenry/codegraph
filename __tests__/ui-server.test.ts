@@ -12,7 +12,7 @@
  * name in undici, and forging it is the whole point of half these cases.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import * as http from 'http';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -21,12 +21,14 @@ import {
   browserOpenCommand,
   cacheControlFor,
   contentTypeFor,
+  describeBindFailure,
   isAllowedHost,
   isAllowedOrigin,
   isSafeRequestPath,
   PathRefusalError,
   resolveProjectFile,
   resolveStaticAsset,
+  shouldTryNextPort,
   startUiServer,
   type UiServerHandle,
 } from '../src/ui-server';
@@ -67,6 +69,31 @@ function request(
     req.on('error', reject);
     req.end();
   });
+}
+
+/** A failed `listen()` as node reports it. */
+function bindError(code: string, port: number): NodeJS.ErrnoException {
+  return Object.assign(new Error(`listen ${code}: 127.0.0.1:${port}`), { code, syscall: 'listen' });
+}
+
+/**
+ * Make `listen()` on `refused` fail with EACCES, the way Windows refuses a port
+ * another program holds exclusively or one inside a reserved range, without
+ * needing either on the machine running the test (#2299). Every other port is
+ * a real bind.
+ */
+function refuseListenOn(...refused: number[]): { mockRestore(): void } {
+  const realListen = http.Server.prototype.listen;
+  return vi
+    .spyOn(http.Server.prototype, 'listen')
+    .mockImplementation(function (this: http.Server, ...args: unknown[]) {
+      const port = args[0];
+      if (typeof port === 'number' && refused.includes(port)) {
+        process.nextTick(() => this.emit('error', bindError('EACCES', port)));
+        return this;
+      }
+      return (realListen as (...a: unknown[]) => http.Server).apply(this, args);
+    });
 }
 
 describe('codegraph ui server', () => {
@@ -196,6 +223,50 @@ describe('codegraph ui server', () => {
         ).rejects.toThrow(/already in use/i);
       } finally {
         await new Promise<void>((resolve) => blocker.close(() => resolve()));
+      }
+    });
+
+    /**
+     * #2299: on Windows a port another program holds exclusively, or one in a
+     * reserved range, fails with EACCES rather than EADDRINUSE, and the walk
+     * used to stop there. Port N is really taken, N+1 is refused, so the server
+     * has to land beyond both. N+1 is an ephemeral port, above 1023, so this
+     * holds on every platform.
+     */
+    it('falls back past a port refused with EACCES', async () => {
+      const blocker = http.createServer(() => {});
+      await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+      const taken = (blocker.address() as { port: number }).port;
+      const refusal = refuseListenOn(taken + 1);
+
+      try {
+        const second = await startUiServer({ projectRoot, viewerDir, port: taken });
+        try {
+          expect(second.port).toBeGreaterThan(taken + 1);
+          // …and it actually works on the port it landed on.
+          const res = await request(second.port, '/');
+          expect(res.status).toBe(200);
+        } finally {
+          await second.close();
+        }
+      } finally {
+        refusal.mockRestore();
+        await new Promise<void>((resolve) => blocker.close(() => resolve()));
+      }
+    });
+
+    it('blames a refused pinned port on what refused it, not on privileged ports', async () => {
+      // The port from the report: nowhere near 1024.
+      const refusal = refuseListenOn(49912);
+      try {
+        const failure = startUiServer({ projectRoot, viewerDir, port: 49912, portFallback: false });
+        await expect(failure).rejects.toThrow(/49912/);
+        const message = await failure.catch((err: Error) => err.message);
+        expect(message).not.toMatch(/below 1024|elevated privileges/);
+        expect(message).not.toMatch(/already in use/);
+        expect(message).toMatch(/refused/);
+      } finally {
+        refusal.mockRestore();
       }
     });
   });
@@ -422,10 +493,39 @@ describe('resolveProjectFile — the source read chokepoint', () => {
     );
   });
 
+  /** A `file=` value as the API receives it: decoded once by the URL parser. */
+  const fromQuery = (encoded: string): string => new URLSearchParams(`file=${encoded}`).get('file') ?? '';
+
   it('refuses traversal out of the project', () => {
-    for (const escape of ['../secret.txt', 'src/../../secret.txt', '..%2fsecret.txt']) {
+    for (const escape of [
+      '../secret.txt',
+      'src/../../secret.txt',
+      fromQuery('..%2fsecret.txt'),
+      fromQuery('src%2F..%2F..%2Fsecret.txt'),
+    ]) {
       expect(() => resolveProjectFile(projectRoot, escape), escape).toThrow(PathRefusalError);
     }
+  });
+
+  // #2009: the path is never decoded a second time, so a `%` in a file's name
+  // is part of the name. Decoding again refused `100%.ts` and read `a b.ts`
+  // in place of `a%20b.ts`. A literal `%2f` stays a name, not a separator.
+  it('reads a file whose name contains % as that file', () => {
+    const names = ['a%20b.ts', 'a b.ts', '100%.ts', '..%2fsecret.txt'];
+    for (const name of names) fs.writeFileSync(path.join(projectRoot, 'src', name), `// ${name}\n`);
+    try {
+      for (const name of names) {
+        expect(resolveProjectFile(projectRoot, `src/${name}`), name).toBe(
+          fs.realpathSync(path.join(projectRoot, 'src', name))
+        );
+      }
+    } finally {
+      for (const name of names) fs.rmSync(path.join(projectRoot, 'src', name), { force: true });
+    }
+  });
+
+  it.runIf(process.platform === 'win32')('still refuses a backslash on Windows', () => {
+    expect(() => resolveProjectFile(projectRoot, 'src\\auth.ts')).toThrow(PathRefusalError);
   });
 
   it('refuses an absolute path', () => {
@@ -440,7 +540,8 @@ describe('resolveProjectFile — the source read chokepoint', () => {
   });
 
   it('refuses a NUL byte', () => {
-    expect(() => resolveProjectFile(projectRoot, 'src/auth.ts%00.png')).toThrow(PathRefusalError);
+    expect(() => resolveProjectFile(projectRoot, 'src/auth.ts\u0000.png')).toThrow(PathRefusalError);
+    expect(() => resolveProjectFile(projectRoot, fromQuery('src/auth.ts%00.png'))).toThrow(PathRefusalError);
   });
 
   // `/etc` resolves to a non-existent `C:\etc` on Windows, so the sensitive-path
@@ -448,6 +549,28 @@ describe('resolveProjectFile — the source read chokepoint', () => {
   it.runIf(process.platform !== 'win32')('refuses a sensitive system directory as the root', () => {
     expect(() => resolveProjectFile('/etc', 'passwd')).toThrow(PathRefusalError);
     expect(() => resolveProjectFile('/', 'etc/passwd')).toThrow(PathRefusalError);
+  });
+
+  // #1930: the root is checked as the folder it really names, so a root that
+  // is a link (a junction on Windows) to a sensitive folder is refused too.
+  it('refuses a root that is a link to a sensitive home folder', () => {
+    const home = path.join(tempDir, 'home');
+    fs.mkdirSync(path.join(home, '.ssh'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.ssh', 'id_ed25519'), 'FAKE-KEY\n');
+    const root = path.join(tempDir, 'ssh-link');
+    fs.symlinkSync(path.join(home, '.ssh'), root, process.platform === 'win32' ? 'junction' : 'dir');
+    const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    try {
+      expect(() => resolveProjectFile(root, 'id_ed25519')).toThrow(/sensitive directory/i);
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      fs.unlinkSync(root);
+    }
   });
 
   it.runIf(process.platform !== 'win32')('refuses a symlink pointing out of the project (#527)', () => {
@@ -535,6 +658,93 @@ describe('security helpers', () => {
   it('cacheControlFor pins hashed assets and never index.html', () => {
     expect(cacheControlFor(path.join('assets', 'index-abc.js'))).toContain('immutable');
     expect(cacheControlFor('index.html')).toBe('no-store');
+  });
+});
+
+/**
+ * What a bind failure means depends on the platform (#2299): Windows has no
+ * privileged ports and refuses a taken or reserved one with EACCES, while
+ * elsewhere EACCES below 1024 is the privileged-port rule. The platform is a
+ * parameter, so every host checks every platform's answer.
+ */
+describe('port fallback on each platform', () => {
+  const LIST_RESERVED = 'netsh int ipv4 show excludedportrange protocol=tcp';
+
+  it('moves past a port in use everywhere, and past EACCES on Windows at any port', () => {
+    for (const platform of ['win32', 'linux', 'darwin'] as const) {
+      expect(shouldTryNextPort('EADDRINUSE', 80, platform), platform).toBe(true);
+      expect(shouldTryNextPort('EADDRINUSE', 4747, platform), platform).toBe(true);
+    }
+    expect(shouldTryNextPort('EACCES', 49912, 'win32')).toBe(true);
+    // Windows has no privileged-port rule: a low port is held, not forbidden.
+    expect(shouldTryNextPort('EACCES', 80, 'win32')).toBe(true);
+  });
+
+  it('stops at EACCES below 1024 elsewhere, where the next port needs the same privilege', () => {
+    expect(shouldTryNextPort('EACCES', 80, 'linux')).toBe(false);
+    expect(shouldTryNextPort('EACCES', 1023, 'darwin')).toBe(false);
+    // From 1024 up the refusal is about that port, and the next may be allowed.
+    expect(shouldTryNextPort('EACCES', 1024, 'linux')).toBe(true);
+    expect(shouldTryNextPort('EACCES', 4747, 'darwin')).toBe(true);
+  });
+
+  it('never moves past any other failure', () => {
+    for (const platform of ['win32', 'linux'] as const) {
+      expect(shouldTryNextPort('EADDRNOTAVAIL', 4747, platform), platform).toBe(false);
+      expect(shouldTryNextPort('EPERM', 4747, platform), platform).toBe(false);
+      expect(shouldTryNextPort(undefined, 4747, platform), platform).toBe(false);
+    }
+  });
+
+  it('says why Windows refused a pinned port, without the POSIX privileged-port story', () => {
+    for (const port of [49912, 80]) {
+      const message = describeBindFailure(bindError('EACCES', port), port, { port, fallback: false }, 'win32').message;
+      expect(message).toMatch(
+        new RegExp(`^Windows refused port ${port}: another program holds it, or it is in a reserved range`)
+      );
+      expect(message).toContain(LIST_RESERVED);
+      expect(message).toContain('omit --port');
+      expect(message).not.toMatch(/below 1024|elevated privileges/);
+    }
+  });
+
+  it('keeps the privileged-port explanation off Windows, and only below 1024', () => {
+    for (const fallback of [false, true]) {
+      const message = describeBindFailure(bindError('EACCES', 80), 80, { port: 80, fallback }, 'linux').message;
+      expect(message).toBe(
+        'Not allowed to listen on port 80. Ports below 1024 usually need elevated privileges — pick a higher one with --port.'
+      );
+    }
+    const high = describeBindFailure(bindError('EACCES', 4747), 4747, { port: 4747, fallback: false }, 'darwin').message;
+    expect(high).toMatch(/^Not allowed to listen on port 4747: the system refused permission\./);
+    expect(high).not.toMatch(/below 1024|elevated privileges|Windows|netsh/);
+  });
+
+  it('says a walk that ran out met refusals, not only ports in use', () => {
+    const walk = { port: 4747, fallback: true };
+    const inUse = bindError('EADDRINUSE', 4766);
+    const refused = bindError('EACCES', 4766);
+
+    // Nothing refused: the message it always gave.
+    expect(describeBindFailure(inUse, 4766, walk, 'win32').message).toBe(
+      'Ports 4747–4766 are all in use. Free one, or pick another with --port.'
+    );
+    const windows = describeBindFailure(refused, 4766, walk, 'win32').message;
+    expect(windows).toMatch(/^Ports 4747–4766 are all in use or reserved/);
+    expect(windows).toContain(LIST_RESERVED);
+    // An earlier port was refused even though the last one was only in use.
+    expect(describeBindFailure(inUse, 4766, walk, 'win32', true).message).toBe(windows);
+    const posix = describeBindFailure(refused, 4766, walk, 'linux').message;
+    expect(posix).toMatch(/^Ports 4747–4766 are all in use or not allowed\./);
+    expect(posix).not.toMatch(/reserved|netsh/);
+  });
+
+  it('leaves the pinned in-use message and other failures as they were', () => {
+    expect(
+      describeBindFailure(bindError('EADDRINUSE', 8080), 8080, { port: 8080, fallback: false }, 'win32').message
+    ).toBe('Port 8080 is already in use. Pick another with --port, or omit --port to let CodeGraph find a free one.');
+    const other = bindError('EADDRNOTAVAIL', 4747);
+    expect(describeBindFailure(other, 4747, { port: 4747, fallback: true }, 'linux')).toBe(other);
   });
 });
 

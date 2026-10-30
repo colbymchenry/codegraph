@@ -11,17 +11,20 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 DB=codegraph-telemetry
-MIGRATION=../telemetry-worker/migrations/0001_init.sql
+MIGRATIONS=../telemetry-worker/migrations
 
-if [[ ! -f "$MIGRATION" ]]; then
-  echo "seed: cannot find $MIGRATION — run this from a full checkout" >&2
+if [[ ! -f "$MIGRATIONS/0001_init.sql" ]]; then
+  echo "seed: cannot find $MIGRATIONS — run this from a full checkout" >&2
   exit 1
 fi
 
-# The migration is plain CREATE TABLE, so a second run fails on "table already
-# exists". That is the expected steady state here, hence the swallowed output —
-# the fixture load below is the step whose failure actually matters.
-npx wrangler d1 execute "$DB" --local --file="$MIGRATION" >/dev/null 2>&1
+# Applied in order, each as a plain file. A second run fails every one of them
+# ("table already exists", "duplicate column") — the expected steady state here,
+# hence the swallowed output. The fixture load below is the step whose failure
+# actually matters, and it fails loudly if a migration is missing.
+for migration in "$MIGRATIONS"/*.sql; do
+  npx wrangler d1 execute "$DB" --local --file="$migration" >/dev/null 2>&1
+done
 
 if ! npx wrangler d1 execute "$DB" --local --file=scripts/fixture.sql >/dev/null; then
   echo "seed: loading scripts/fixture.sql failed" >&2

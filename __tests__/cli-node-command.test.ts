@@ -64,6 +64,28 @@ describe('codegraph node — argument handling (#1044)', () => {
     expect(stdout).toContain('export function util');
   });
 
+  // #1831: `codegraph node "src/util.ts:1-2"` — the way an agent pastes a file
+  // reference — answered `No indexed file matches`, worded identically to a
+  // genuine miss, for a file that IS indexed.
+  it('a path-like positional with a line suffix reads the file (#1831)', () => {
+    // Vacuity guard: the same path without the suffix does resolve.
+    const plain = runNode(tempDir, ['src/util.ts']);
+    expect(plain.code).toBe(0);
+    expect(plain.stdout).toContain('export function util');
+
+    for (const suffixed of ['src/util.ts:1', 'src/util.ts:1-1', 'src/util.ts#L1', 'src/util.ts#L1-L1']) {
+      const { stdout, code } = runNode(tempDir, [suffixed]);
+      expect(code).toBe(0);
+      expect(stdout).not.toMatch(/No indexed file matches/i);
+      expect(stdout).toContain('export function util');
+    }
+  });
+
+  it('a genuinely missing path still reports a miss, suffix or not (#1831)', () => {
+    const { stdout } = runNode(tempDir, ['src/nope.ts:1-2']);
+    expect(stdout).toMatch(/No indexed file matches/i);
+  });
+
   it('a bare symbol positional still routes to symbol mode', () => {
     const { stdout, code } = runNode(tempDir, ['util']);
     expect(code).toBe(0);

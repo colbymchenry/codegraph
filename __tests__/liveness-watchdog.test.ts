@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -16,6 +16,13 @@ describe('config parsing', () => {
     expect(parseWatchdogTimeoutMs('0')).toBe(DEFAULT_WATCHDOG_TIMEOUT_MS);
     expect(parseWatchdogTimeoutMs('-5')).toBe(DEFAULT_WATCHDOG_TIMEOUT_MS);
     expect(parseWatchdogTimeoutMs('1500')).toBe(1500);
+  });
+
+  it('parseWatchdogTimeoutMs caps at the largest delay a timer can hold (#1966)', () => {
+    // Node runs a setTimeout delay above 2^31-1 ms after 1 ms instead.
+    expect(parseWatchdogTimeoutMs('2147483647')).toBe(2147483647);
+    expect(parseWatchdogTimeoutMs('2147483648')).toBe(2147483647);
+    expect(parseWatchdogTimeoutMs('3000000000')).toBe(2147483647);
   });
 
   it('deriveCheckIntervalMs stays within [50, 2000] and scales with the timeout', () => {
@@ -90,6 +97,15 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
     expect(r.signal === 'SIGKILL' || (r.signal === null && r.code !== 0 && r.code !== null)).toBe(true);
   }
 
+  it('leaves a healthy process alone when the timeout is set past what a timer can hold (#1966)', async () => {
+    const r = await runChild(
+      { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '3000000000' },
+      'setTimeout(() => process.exit(0), 1000);',
+      8000
+    );
+    expect(r).toEqual({ code: 0, signal: null });
+  }, 12000);
+
   it('SIGKILLs a process whose main thread wedges in a sync loop', async () => {
     const r = await runChild(
       { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '500' },
@@ -124,6 +140,19 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
   // when the watched DB files keep advancing (a slow synchronous SQLite
   // statement on degraded storage). ---
 
+  // The dirs holding each case's watched file, removed after it.
+  const progressDirs: string[] = [];
+  afterEach(() => {
+    for (const dir of progressDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** A fresh path for a case's watchdog to watch, in its own temp dir. */
+  function progressFile(): string {
+    const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cg-wd-'));
+    progressDirs.push(dir);
+    return path.join(dir, 'db-wal');
+  }
+
   /** Grow `file` every 150ms for `forMs`; resolves when done. */
   function growFile(file: string, forMs: number): Promise<void> {
     return new Promise((resolve) => {
@@ -133,7 +162,7 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
   }
 
   it('does NOT kill a blocked loop while the watched files advance (slow store, not a wedge)', async () => {
-    const tmp = path.join(fs.mkdtempSync(path.join(require('os').tmpdir(), 'cg-wd-')), 'db-wal');
+    const tmp = progressFile();
     fs.writeFileSync(tmp, 'seed');
     // Base timeout 500ms; the loop blocks for 2.5s (5 timeouts, under the 10×
     // cap) while the test process grows the watched file. Old behavior: killed
@@ -152,7 +181,7 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
   }, 15000);
 
   it('still kills a blocked loop when the watched files do NOT advance (a true wedge)', async () => {
-    const tmp = path.join(fs.mkdtempSync(path.join(require('os').tmpdir(), 'cg-wd-')), 'db-wal');
+    const tmp = progressFile();
     fs.writeFileSync(tmp, 'seed');
     // Same blocked loop, nobody grows the file: the base timeout kills it long
     // before its own exit(5) at 2.5s.
@@ -166,7 +195,7 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
   }, 15000);
 
   it('kills at the hard cap even with ongoing file activity (bounded deferral)', async () => {
-    const tmp = path.join(fs.mkdtempSync(path.join(require('os').tmpdir(), 'cg-wd-')), 'db-wal');
+    const tmp = progressFile();
     fs.writeFileSync(tmp, 'seed');
     // Base timeout 300ms ⇒ cap 3s. The loop blocks for 8s with continuous file
     // growth: deferral carries it past 300ms but the cap kills it around ~3s,

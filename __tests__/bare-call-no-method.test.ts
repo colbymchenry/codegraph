@@ -130,6 +130,45 @@ describe('a receiver-less JS/TS call never binds to a method (#1714)', () => {
     expect(names).toContain('test');
   });
 
+  it('reads typed, defaulted parameter lists in linear time', async () => {
+    // A helper with many `name: T = value` parameters made the parameter scan
+    // backtrack through every way to split each type from its default — tens
+    // of seconds per called name on vscode's markersModel.test.ts, which
+    // stalled a whole resolution batch.
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1714-'));
+    fs.writeFileSync(
+      path.join(tempDir, 'harness.ts'),
+      'export function suite(name: string, fn: () => void) { fn(); }\nexport function resolve(p: string) { return p; }\n'
+    );
+    const params = Array.from({ length: 14 }, (_, i) => `p${i}: number = ${i} + ${i}`).join(', ');
+    fs.writeFileSync(
+      path.join(tempDir, 'markers.test.ts'),
+      [
+        `function aMarker(${params}, related?: string[]): number {`,
+        '  return p0;',
+        '}',
+        'function settle(value: number = 1, resolve: Handler = noop) {',
+        '  resolve(value);',
+        '}',
+        'suite("markers", () => {',
+        '  aMarker(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);',
+        '  settle();',
+        '});',
+        '',
+      ].join('\n')
+    );
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+    const harness = cg.getNodesByKind('function').filter((n) => n.filePath === 'harness.ts');
+    const suiteFn = harness.find((n) => n.name === 'suite')!;
+    const resolveFn = harness.find((n) => n.name === 'resolve')!;
+    const settle = cg.getNodesByKind('function').find((n) => n.name === 'settle')!;
+    // `suite` is bound nowhere in the test file, so it still resolves across files.
+    expect(cg.getIncomingEdges(suiteFn.id).some((e) => e.kind === 'calls')).toBe(true);
+    // `resolve` is a defaulted parameter of `settle` — a local binding.
+    expect(cg.getOutgoingEdges(settle.id).filter((e) => e.kind === 'calls').map((e) => e.target)).not.toContain(resolveFn.id);
+  }, 30_000);
+
   it('keeps `other.serialize()` — a call through a receiver', async () => {
     const callees = await callsFromMethod(
       [

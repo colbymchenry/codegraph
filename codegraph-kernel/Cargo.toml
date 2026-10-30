@@ -41,11 +41,10 @@ tree-sitter-ruby = "=0.23.1"
 # php: the walker calls LANGUAGE_PHP (the full HTML-interleaving variant the
 # wasm ships) — NEVER LANGUAGE_PHP_ONLY, which errors on leading HTML.
 tree-sitter-php = "=0.24.2"
-# swift: the vendored wasm is built from THIS crate's tarball src/ (the tag's
-# checked-in parser.c is an older ABI-14 generation that can never sha-match;
-# grammar.json rules are JSON-equal — swift checklist header). parser.c is
-# ~20MB generated — expect slow compiles.
-tree-sitter-swift = "=0.7.3"
+# swift: NOT a crate dep — the kernel compiles tree-sitter-swift 0.7.3's
+# tarball src/ itself (grammars/swift, build.rs), with a one-line scanner fix
+# the crate's own build lacks on Windows (`try!`; docs/grammars/
+# tree-sitter-swift.md). The vendored wasm is built from the same tarball.
 # r: the vendored wasm IS r-lib v1.2.0 and this crate's tarball ships both
 # generated artifacts sha-identical to the tag (parser.c 6221657347…,
 # scanner.c 1209d11076… — r checklist §Grammar prep). ABI 14 (the tag
@@ -59,7 +58,7 @@ tree-sitter-r = "=1.2.0"
 tree-sitter-luau = "=1.2.0"
 
 # tree-sitter-language: the version-agnostic LanguageFn shim for the vendored
-# kotlin grammar C (see build.rs — no kotlin crate dep is possible).
+# grammar C (kotlin, lua, scala, dart, swift — see build.rs).
 tree-sitter-language = "0.1"
 
 # Stack-bounds queries for the walker stack guard (src/stack.rs, #1581):

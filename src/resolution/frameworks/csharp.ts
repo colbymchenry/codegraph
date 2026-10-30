@@ -7,10 +7,14 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { pickByNameAndKind } from './name-heuristic';
 
 export const aspnetResolver: FrameworkResolver = {
   name: 'aspnet',
   languages: ['csharp'],
+  // A Razor page's `@model CheckoutModel` names the PageModel in the
+  // code-behind beside it (`Checkout.cshtml.cs`); these rules look there first.
+  resolveLanguages: ['csharp', 'razor'],
 
   detect(context: ResolutionContext): boolean {
     // Check for .csproj files with ASP.NET references
@@ -67,7 +71,7 @@ export const aspnetResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Controller references
     if (ref.referenceName.endsWith('Controller')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, CONTROLLER_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, CONTROLLER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -80,7 +84,7 @@ export const aspnetResolver: FrameworkResolver = {
 
     // Pattern 2: Service references (dependency injection)
     if (ref.referenceName.endsWith('Service') || ref.referenceName.startsWith('I') && ref.referenceName.length > 1) {
-      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);
+      const result = resolveByNameAndKind(ref, SERVICE_KINDS, SERVICE_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -93,7 +97,7 @@ export const aspnetResolver: FrameworkResolver = {
 
     // Pattern 3: Repository references
     if (ref.referenceName.endsWith('Repository')) {
-      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, REPO_DIRS, context);
+      const result = resolveByNameAndKind(ref, SERVICE_KINDS, REPO_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -106,7 +110,7 @@ export const aspnetResolver: FrameworkResolver = {
 
     // Pattern 4: Model/Entity references
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, MODEL_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, MODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -119,7 +123,7 @@ export const aspnetResolver: FrameworkResolver = {
 
     // Pattern 5: ViewModel references
     if (ref.referenceName.endsWith('ViewModel') || ref.referenceName.endsWith('Dto')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, VIEWMODEL_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, VIEWMODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -191,7 +195,9 @@ export const aspnetResolver: FrameworkResolver = {
     // Minimal APIs: app.MapGet("/path", handler)
     const minimalRegex = /\.Map(Get|Post|Put|Patch|Delete)\s*\(\s*"([^"]+)"\s*,\s*([^,)]+)/g;
     while ((match = minimalRegex.exec(safe)) !== null) {
-      const [, verb, routePath, handlerExpr] = match;
+      const [, verb, rawPath, handlerExpr] = match;
+      // `app.MapGet("api/todos", …)` serves `/api/todos`.
+      const routePath = joinCsPath('', rawPath!);
       const method = verb!.toUpperCase();
       const line = safe.slice(0, match.index).split('\n').length;
 
@@ -272,45 +278,118 @@ export const aspnetResolver: FrameworkResolver = {
       });
     }
 
+    // FastEndpoints: an endpoint class (`: Endpoint<TReq, TRes>`,
+    // `EndpointWithoutRequest`, `Ep.Req<…>.Res<…>`) declares its verb and path in
+    // `Configure()` — `Get("/Contributors")`, `Post(CreateContributorRequest.Route)`
+    // — and handles the request in its own `HandleAsync` / `ExecuteAsync`. A
+    // constant path (`X.Route`, usually in the request's own file) is read in
+    // postExtract; until then the route is named by the expression.
+    const endpointClass = /\bclass\s+([A-Za-z_]\w*)[^{;]*?:\s*(?:FastEndpoints\.)?(?:Endpoint(?:WithoutRequest|WithoutResponse)?\b|Ep\.)/g;
+    while ((match = endpointClass.exec(safe)) !== null) {
+      const body = safe.slice(match.index);
+      const configure = /\bvoid\s+Configure\s*\(\s*\)\s*\{/.exec(body);
+      if (!configure) continue;
+      const handler = /\b(HandleAsync|ExecuteAsync)\s*\(/.exec(body)?.[1];
+      const verbRegex = /\b(Get|Post|Put|Patch|Delete)\s*\(\s*([^;]*?)\s*\)\s*;/g;
+      verbRegex.lastIndex = configure.index;
+      const configureEnd = configure.index + 3000;
+      let verb: RegExpExecArray | null;
+      while ((verb = verbRegex.exec(body)) !== null && verb.index < configureEnd) {
+        const method = verb[1]!.toUpperCase();
+        const args = verb[2]!;
+        // `$"/{nameof(Project)}s"` is `/Projects`.
+        const literals = [...args.matchAll(/"([^"]+)"/g)].map((l) => joinCsPath('', l[1]!.replace(/\{\s*nameof\s*\(\s*(\w+)\s*\)\s*\}/g, '$1')));
+        const constant = /^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/.exec(args);
+        const targets = literals.length > 0 ? literals.map((p) => ({ name: p, key: p })) : constant ? [{ name: `${constant[1]}.${constant[2]}`, key: `const:${constant[1]}.${constant[2]}` }] : [];
+        const line = safe.slice(0, match.index + verb.index).split('\n').length;
+        for (const t of targets) {
+          const id = `route:${filePath}:${line}:${method}:${t.name}`;
+          nodes.push({
+            id, kind: 'route', name: `${method} ${t.name}`,
+            qualifiedName: `${filePath}::fastendpoint:${method}:${t.key}`,
+            filePath, startLine: line, endLine: line, startColumn: 0, endColumn: 0, language: 'csharp', updatedAt: now,
+          });
+          if (handler) references.push({ fromNodeId: id, referenceName: handler, referenceKind: 'references', line, column: 0, filePath, language: 'csharp' });
+        }
+        // A second verb call (`Get(...); Post(...)`) is a second route; stop at Configure's end.
+        if (/\n\s*\}\s*\n/.test(body.slice(configure.index, verb.index))) break;
+      }
+    }
+
     return { nodes, references };
   },
 
-  /**
-   * The endpoint-group prefix convention, read once from the app: the
-   * `MapGroup($"/api/{groupName}")` that registers every `IEndpointGroup`
-   * (or `EndpointGroupBase`) under a head — `/api/` — before the class name.
-   * A group route extracted as `POST /TodoItems` becomes `POST /api/TodoItems`;
-   * a class with its own `RoutePrefix` literal already has its path. Idempotent:
-   * `qualifiedName` keeps the group and the sub-path.
-   */
+  /** Route names only the whole repository can give: FastEndpoints constant paths, endpoint-group prefixes. */
   postExtract(context: ResolutionContext): Node[] {
-    let head: string | null = null;
-    let looked = 0;
-    for (const file of context.getAllFiles()) {
-      if (!file.endsWith('.cs')) continue;
-      const content = context.readFile(file);
-      if (!content || !content.includes('MapGroup')) continue;
-      if (++looked > 400) break;
-      const m = /\$"([^"{]*)\{\s*(?:groupName|type\.Name|name|prefix)\s*\}"/.exec(content) ?? /MapGroup\(\s*\$"([^"{]*)\{/.exec(content);
+    return [...fastEndpointConstantRoutes(context), ...endpointGroupRoutes(context)];
+  },
+};
+
+/**
+ * A FastEndpoints route named by a constant (`Post(CreateContributorRequest.Route)`)
+ * gets the constant's value: `public const string Route = "/Contributors";` in
+ * that class, wherever it is declared. Idempotent — the qualified name keeps the
+ * expression.
+ */
+function fastEndpointConstantRoutes(context: ResolutionContext): Node[] {
+  const updates: Node[] = [];
+  for (const route of context.getNodesByKind('route')) {
+    if (route.language !== 'csharp') continue;
+    const q = /::fastendpoint:([A-Z]+):const:([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/.exec(route.qualifiedName);
+    if (!q) continue;
+    const [, method, owner, field] = q;
+    let value: string | null = null;
+    for (const decl of context.getNodesByName(owner!)) {
+      if (decl.language !== 'csharp' || (decl.kind !== 'class' && decl.kind !== 'struct')) continue;
+      const text = context.readFile(decl.filePath) ?? '';
+      const m = new RegExp(`\\b(?:const\\s+string|static\\s+readonly\\s+string|static\\s+string)\\s+${field}\\s*=\\s*"([^"]+)"`).exec(text);
       if (m) {
-        head = m[1]!;
+        value = m[1]!;
         break;
       }
     }
-    if (!head || head === '/' || head === '') return [];
-    const updates: Node[] = [];
-    for (const route of context.getNodesByKind('route')) {
-      if (route.language !== 'csharp') continue;
-      const q = /::group:([A-Za-z_]\w*):([A-Z]+):(.*)$/.exec(route.qualifiedName);
-      if (!q) continue;
-      const content = context.readFile(route.filePath);
-      if (content && /\bRoutePrefix\s*(?:=>|=)\s*"/.test(content)) continue;
-      const name = `${q[2]} ${joinCsPath(head.replace(/\/+$/, '') + '/' + q[1], q[3]!)}`;
-      if (name !== route.name) updates.push({ ...route, name });
+    if (!value) continue;
+    const name = `${method} ${joinCsPath('', value)}`;
+    if (name !== route.name) updates.push({ ...route, name });
+  }
+  return updates;
+}
+
+/**
+ * The endpoint-group prefix convention, read once from the app: the
+ * `MapGroup($"/api/{groupName}")` that registers every `IEndpointGroup`
+ * (or `EndpointGroupBase`) under a head — `/api/` — before the class name.
+ * A group route extracted as `POST /TodoItems` becomes `POST /api/TodoItems`;
+ * a class with its own `RoutePrefix` literal already has its path. Idempotent:
+ * `qualifiedName` keeps the group and the sub-path.
+ */
+function endpointGroupRoutes(context: ResolutionContext): Node[] {
+  let head: string | null = null;
+  let looked = 0;
+  for (const file of context.getAllFiles()) {
+    if (!file.endsWith('.cs')) continue;
+    const content = context.readFile(file);
+    if (!content || !content.includes('MapGroup')) continue;
+    if (++looked > 400) break;
+    const m = /\$"([^"{]*)\{\s*(?:groupName|type\.Name|name|prefix)\s*\}"/.exec(content) ?? /MapGroup\(\s*\$"([^"{]*)\{/.exec(content);
+    if (m) {
+      head = m[1]!;
+      break;
     }
-    return updates;
-  },
-};
+  }
+  if (!head || head === '/' || head === '') return [];
+  const updates: Node[] = [];
+  for (const route of context.getNodesByKind('route')) {
+    if (route.language !== 'csharp') continue;
+    const q = /::group:([A-Za-z_]\w*):([A-Z]+):(.*)$/.exec(route.qualifiedName);
+    if (!q) continue;
+    const content = context.readFile(route.filePath);
+    if (content && /\bRoutePrefix\s*(?:=>|=)\s*"/.test(content)) continue;
+    const name = `${q[2]} ${joinCsPath(head.replace(/\/+$/, '') + '/' + q[1], q[3]!)}`;
+    if (name !== route.name) updates.push({ ...route, name });
+  }
+  return updates;
+}
 
 /** Join a class-level [Route] prefix and an action's path into one normalized `/path`. */
 function joinCsPath(prefix: string, sub: string): string {
@@ -335,28 +414,12 @@ const VIEWMODEL_DIRS = ['/ViewModels/', '/ViewModel/', '/DTOs/', '/Dto/'];
 const CLASS_KINDS = new Set(['class']);
 const SERVICE_KINDS = new Set(['class', 'interface']);
 
-/**
- * Resolve a symbol by name using indexed queries instead of scanning all files.
- */
+/** A framework name heuristic's pick (see name-heuristic.ts), preferring these folders. */
 function resolveByNameAndKind(
-  name: string,
+  ref: UnresolvedRef,
   kinds: Set<string>,
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  const candidates = context.getNodesByName(name);
-  if (candidates.length === 0) return null;
-
-  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
-  if (kindFiltered.length === 0) return null;
-
-  // Prefer candidates in framework-conventional directories
-  const preferred = kindFiltered.filter((n) =>
-    preferredDirPatterns.some((d) => n.filePath.includes(d))
-  );
-
-  if (preferred.length > 0) return preferred[0]!.id;
-
-  // Fall back to any match
-  return kindFiltered[0]!.id;
+  return pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context);
 }

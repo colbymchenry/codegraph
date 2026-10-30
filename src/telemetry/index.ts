@@ -121,6 +121,52 @@ interface EventLine {
 }
 type BufferLine = CountLine | EventLine;
 
+const countKey = (l: CountLine): string => [l.d, l.k, l.n, l.cn ?? '', l.cv ?? ''].join('\u0000');
+
+/**
+ * One count line per (day, kind, name, client), calls and errors summed; lifecycle
+ * events pass through in order. Each process aggregates in memory but appends its
+ * own lines on exit, so without this a machine running a short-lived `codegraph`
+ * process a thousand times a day queued — and uploaded — a thousand `count: 1`
+ * lines for the one counter the server wanted.
+ */
+function coalesceLines(lines: BufferLine[]): BufferLine[] {
+  const counts = new Map<string, CountLine>();
+  const out: BufferLine[] = [];
+  for (const line of lines) {
+    if ('ev' in line) {
+      out.push(line);
+      continue;
+    }
+    const key = countKey(line);
+    const seen = counts.get(key);
+    if (seen) {
+      seen.c += line.c;
+      seen.e += line.e;
+    } else {
+      const copy = { ...line };
+      counts.set(key, copy);
+      out.push(copy);
+    }
+  }
+  return out;
+}
+
+/** Parses JSONL buffer text, skipping blank, corrupt and other-schema lines. */
+function parseLines(text: string): BufferLine[] {
+  const lines: BufferLine[] = [];
+  for (const raw of text.split('\n')) {
+    if (!raw.trim()) continue;
+    try {
+      const parsed = JSON.parse(raw) as BufferLine;
+      if (parsed && typeof parsed === 'object' && parsed.v === SCHEMA_VERSION) lines.push(parsed);
+    } catch {
+      /* skip corrupt line */
+    }
+  }
+  return lines;
+}
+
 export interface TelemetryOptions {
   /** Global state dir; defaults to ~/.codegraph. Tests inject a temp dir. */
   dir?: string;
@@ -246,18 +292,17 @@ export class Telemetry {
   /** Recheck shared consent, then increment in memory; no network or writes. */
   recordUsage(kind: UsageKind, name: string, ok: boolean, client?: ClientInfo): void {
     if (!this.isEnabled()) return;
-    const day = this.utcDay();
+    const fresh: CountLine = { v: SCHEMA_VERSION, d: this.utcDay(), k: kind, n: name.slice(0, 64), c: 1, e: ok ? 0 : 1 };
     const cn = client?.name?.slice(0, 64);
     const cv = client?.version?.slice(0, 32);
-    const key = [day, kind, name, cn ?? '', cv ?? ''].join('\u0000');
+    if (cn) fresh.cn = cn;
+    if (cv) fresh.cv = cv;
+    const key = countKey(fresh);
     const line = this.counts.get(key);
     if (line) {
       line.c += 1;
       if (!ok) line.e += 1;
     } else {
-      const fresh: CountLine = { v: SCHEMA_VERSION, d: day, k: kind, n: name.slice(0, 64), c: 1, e: ok ? 0 : 1 };
-      if (cn) fresh.cn = cn;
-      if (cv) fresh.cv = cv;
       this.counts.set(key, fresh);
     }
     this.ensureExitHook();
@@ -293,7 +338,9 @@ export class Telemetry {
       let identity = this.getStatus().machineId;
       const claim = this.claimQueue();
       if (!claim) return;
-      const { claimPath, lines } = claim;
+      const { claimPath } = claim;
+      // A queue written by an older version can hold many lines per counter.
+      const lines = coalesceLines(claim.lines);
       const today = this.utcDay();
       const sendable: BufferLine[] = [];
       const keep: BufferLine[] = [];
@@ -434,12 +481,14 @@ export class Telemetry {
     if (!this.canUseIdentity(identity)) return;
     try {
       fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-      const payload = lines.map((l) => JSON.stringify(l)).join('\n') + '\n';
-      // Cap the buffer: drop oldest lines first (telemetry is best-effort —
-      // bounded disk use beats completeness).
+      // Merge into what is already queued rather than appending beside it, so the
+      // queue holds one line per counter however many processes wrote to it.
       let existing = '';
       try { existing = fs.readFileSync(this.queuePath, 'utf8'); } catch { /* no queue yet */ }
-      let combined = existing + payload;
+      const merged = coalesceLines([...parseLines(existing), ...lines]);
+      // Cap the buffer: drop oldest lines first (telemetry is best-effort —
+      // bounded disk use beats completeness).
+      let combined = merged.map((l) => JSON.stringify(l)).join('\n') + '\n';
       if (combined.length > MAX_BUFFER_BYTES) {
         combined = combined.slice(combined.length - MAX_BUFFER_BYTES);
         combined = combined.slice(combined.indexOf('\n') + 1); // drop the partial first line
@@ -462,17 +511,9 @@ export class Telemetry {
     } catch {
       return null; // no queue, or another process just claimed it
     }
-    const lines: BufferLine[] = [];
+    let lines: BufferLine[] = [];
     try {
-      for (const raw of fs.readFileSync(claimPath, 'utf8').split('\n')) {
-        if (!raw.trim()) continue;
-        try {
-          const parsed = JSON.parse(raw) as BufferLine;
-          if (parsed && typeof parsed === 'object' && parsed.v === SCHEMA_VERSION) lines.push(parsed);
-        } catch {
-          /* skip corrupt line */
-        }
-      }
+      lines = parseLines(fs.readFileSync(claimPath, 'utf8'));
     } catch {
       /* unreadable claim — treat as empty; file removed by caller */
     }
@@ -491,7 +532,10 @@ export class Telemetry {
           if (fs.statSync(full).mtimeMs < cutoff) {
             const content = fs.readFileSync(full, 'utf8');
             fs.rmSync(full, { force: true });
-            if (content.trim() && this.canUseIdentity(identity)) fs.appendFileSync(this.queuePath, content.endsWith('\n') ? content : content + '\n');
+            // Through appendLines, so recovered lines are merged and capped like any
+            // other write — a raw append here once let the queue grow without bound.
+            const recovered = parseLines(content);
+            if (recovered.length > 0) this.appendLines(recovered, identity);
           }
         } catch {
           /* fail silent */

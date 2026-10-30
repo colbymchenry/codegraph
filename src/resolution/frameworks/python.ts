@@ -8,6 +8,7 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolutionContext, FrameworkExtractionResult } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { resolveImportPath } from '../import-resolver';
+import { pickByNameAndKind } from './name-heuristic';
 
 export const djangoResolver: FrameworkResolver = {
   name: 'django',
@@ -25,15 +26,15 @@ export const djangoResolver: FrameworkResolver = {
 
   resolve(ref, context) {
     if (ref.referenceName.endsWith('Model') || /^[A-Z][a-z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, MODEL_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, MODEL_DIRS, context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.8, resolvedBy: 'framework' };
     }
     if (ref.referenceName.endsWith('View') || ref.referenceName.endsWith('ViewSet')) {
-      const result = resolveByNameAndKind(ref.referenceName, VIEW_KINDS, VIEW_DIRS, context);
+      const result = resolveByNameAndKind(ref, VIEW_KINDS, VIEW_DIRS, context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.8, resolvedBy: 'framework' };
     }
     if (ref.referenceName.endsWith('Form')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, FORM_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, FORM_DIRS, context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.8, resolvedBy: 'framework' };
     }
     // ORM dynamic dispatch: QuerySet._fetch_all (and siblings) call
@@ -202,7 +203,7 @@ export const flaskResolver: FrameworkResolver = {
 
   resolve(ref, context) {
     if (ref.referenceName.endsWith('_bp') || ref.referenceName.endsWith('_blueprint')) {
-      const result = resolveByNameAndKind(ref.referenceName, VARIABLE_KINDS, [], context);
+      const result = resolveByNameAndKind(ref, VARIABLE_KINDS, [], context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.8, resolvedBy: 'framework' };
     }
     return null;
@@ -223,9 +224,10 @@ export const flaskResolver: FrameworkResolver = {
       language: 'python',
     });
     const restful = extractFlaskRestful(filePath, safe);
+    const rules = extractFlaskUrlRules(filePath, safe);
     return {
-      nodes: [...decorator.nodes, ...restful.nodes],
-      references: [...decorator.references, ...restful.references],
+      nodes: [...decorator.nodes, ...restful.nodes, ...rules.nodes],
+      references: [...decorator.references, ...restful.references, ...rules.references],
     };
   },
 };
@@ -264,11 +266,11 @@ export const fastapiResolver: FrameworkResolver = {
 
   resolve(ref, context) {
     if (ref.referenceName.endsWith('_router') || ref.referenceName === 'router') {
-      const result = resolveByNameAndKind(ref.referenceName, VARIABLE_KINDS, ROUTER_DIRS, context);
+      const result = resolveByNameAndKind(ref, VARIABLE_KINDS, ROUTER_DIRS, context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.8, resolvedBy: 'framework' };
     }
     if (ref.referenceName.startsWith('get_') || ref.referenceName.startsWith('Depends')) {
-      const result = resolveByNameAndKind(ref.referenceName, FUNCTION_KINDS, DEP_DIRS, context);
+      const result = resolveByNameAndKind(ref, FUNCTION_KINDS, DEP_DIRS, context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.75, resolvedBy: 'framework' };
     }
     return null;
@@ -537,6 +539,96 @@ function extractFlaskRestful(filePath: string, safe: string): FrameworkExtractio
   return { nodes, references };
 }
 
+/**
+ * Flask's imperative registration: `bp.add_url_rule('/path', 'name',
+ * view_func=View.as_view('name'), methods=[…])`, and a project's own wrapper
+ * around it — any call handing a list of path strings and a `view_func=`
+ * over, like flaskbb's `register_view(auth, routes=["/login"],
+ * view_func=Login.as_view("login"))`. A class-based view (`X.as_view(…)`)
+ * serves whatever verbs it defines, so its route is ANY unless `methods=`
+ * says; a plain function defaults to GET, as Flask does.
+ */
+function extractFlaskUrlRules(filePath: string, safe: string): FrameworkExtractionResult {
+  const nodes: Node[] = [];
+  const references: UnresolvedRef[] = [];
+  const now = Date.now();
+  const seen = new Set<string>();
+  const opener = /(\.add_url_rule|\b[A-Za-z_]\w*)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = opener.exec(safe)) !== null) {
+    const open = m.index + m[0].length;
+    const args = balancedArgs(safe, open);
+    if (args === null || !/\bview_func\s*=|\.add_url_rule/.test(m[1]! + args)) continue;
+    const isRule = m[1] === '.add_url_rule';
+    let paths: string[] = [];
+    if (isRule) {
+      const first = /^\s*(?:rule\s*=\s*)?(['"])([^'"]*)\1/.exec(args);
+      if (first) paths = [first[2]!];
+    } else {
+      const list = /(?:^|,)\s*(?:routes|rules|urls|paths)?\s*=?\s*\[((?:\s*(['"])[^'"]*\2\s*,?)+)\]/.exec(args);
+      if (list) paths = (list[1]!.match(/(['"])([^'"]*)\1/g) ?? []).map((q) => q.slice(1, -1));
+    }
+    paths = paths.filter((p) => p.startsWith('/'));
+    if (paths.length === 0) continue;
+    // `view_func=X` / `view_func=X.as_view(…)`, or add_url_rule's third positional argument.
+    const expr = /\bview_func\s*=\s*([A-Za-z_][\w.]*)/.exec(args)?.[1] ??
+      (isRule ? /^\s*(['"])[^'"]*\1\s*,\s*(?:(['"])[^'"]*\2|None)\s*,\s*([A-Za-z_][\w.]*)/.exec(args)?.[3] : undefined);
+    if (!expr) continue;
+    const classView = expr.endsWith('.as_view');
+    const target = classView ? expr.slice(0, -'.as_view'.length) : expr;
+    const listed = /\bmethods\s*=\s*[[(]([^\])]*)[\])]/.exec(args)?.[1];
+    const methods = listed
+      ? (listed.match(/['"](\w+)['"]/g) ?? []).map((q) => q.slice(1, -1).toUpperCase())
+      : [classView ? 'ANY' : 'GET'];
+    const line = safe.slice(0, m.index).split('\n').length;
+    const name = target.split('.').pop()!;
+    for (const routePath of paths) {
+      for (const method of methods) {
+        const id = `route:${filePath}:${line}:${method}:${routePath}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        nodes.push({
+          id,
+          kind: 'route',
+          name: `${method} ${routePath}`,
+          qualifiedName: `${filePath}::${method}:${routePath}`,
+          filePath,
+          startLine: line,
+          endLine: line,
+          startColumn: 0,
+          endColumn: 0,
+          language: 'python',
+          updatedAt: now,
+        });
+        references.push({ fromNodeId: id, referenceName: name, referenceKind: 'references', line, column: 0, filePath, language: 'python' });
+      }
+    }
+    opener.lastIndex = open + args.length;
+  }
+  return { nodes, references };
+}
+
+/** The text between an opening `(` at `open` and its matching `)`, or null. Strings are skipped. */
+function balancedArgs(text: string, open: number): string | null {
+  let depth = 1;
+  let quote = '';
+  for (let i = open; i < text.length && i < open + 4000; i++) {
+    const ch = text[i]!;
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      depth--;
+      if (depth === 0) return text.slice(open, i);
+    }
+  }
+  return null;
+}
+
 // Directory patterns
 const MODEL_DIRS = ['models', 'app/models', 'src/models'];
 const VIEW_DIRS = ['views', 'app/views', 'src/views', 'api/views'];
@@ -549,29 +641,12 @@ const VIEW_KINDS = new Set(['class', 'function']);
 const VARIABLE_KINDS = new Set(['variable']);
 const FUNCTION_KINDS = new Set(['function']);
 
-/**
- * Resolve a symbol by name using indexed queries instead of scanning all files.
- */
+/** A framework name heuristic's pick (see name-heuristic.ts), preferring these folders. */
 function resolveByNameAndKind(
-  name: string,
+  ref: UnresolvedRef,
   kinds: Set<string>,
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  const candidates = context.getNodesByName(name);
-  if (candidates.length === 0) return null;
-
-  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
-  if (kindFiltered.length === 0) return null;
-
-  // Prefer candidates in framework-conventional directories
-  if (preferredDirPatterns.length > 0) {
-    const preferred = kindFiltered.filter((n) =>
-      preferredDirPatterns.some((d) => n.filePath.includes(d))
-    );
-    if (preferred.length > 0) return preferred[0]!.id;
-  }
-
-  // Fall back to any match
-  return kindFiltered[0]!.id;
+  return pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context);
 }

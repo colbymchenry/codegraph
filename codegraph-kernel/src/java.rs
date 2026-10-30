@@ -23,7 +23,11 @@ use tree_sitter::{Node, Parser};
 const MAX_VALUE_REF_NODES: usize = 20_000;
 
 fn is_method_type(kind: &str) -> bool {
-    matches!(kind, "method_declaration" | "constructor_declaration")
+    matches!(kind, "method_declaration" | "constructor_declaration" | "compact_constructor_declaration")
+}
+/// classTypes (languages/java.ts): a `record` is a class.
+fn is_class_type(kind: &str) -> bool {
+    matches!(kind, "class_declaration" | "record_declaration")
 }
 fn is_interface_type(kind: &str) -> bool {
     matches!(kind, "interface_declaration" | "annotation_type_declaration")
@@ -124,6 +128,7 @@ pub struct Walker<'t> {
     file_path: &'t str,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     nodes_meta: Vec<NodeMeta>,
@@ -157,6 +162,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         file_path,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         nodes_meta: Vec::new(),
@@ -265,7 +271,7 @@ impl<'t> Walker<'t> {
     fn inside_class_like(&self) -> bool {
         self.stack
             .last()
-            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module"))
+            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module" | "enum_member"))
             .unwrap_or(false)
     }
 
@@ -300,7 +306,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
         let end_line = node.end_position().row as u32 + 1; // no resolveBody for java
 
         let qualified = {
@@ -422,6 +429,10 @@ impl<'t> Walker<'t> {
     }
 
     fn is_static(&self, node: Node) -> bool {
+        // An interface constant is implicitly `public static final`.
+        if node.kind() == "constant_declaration" {
+            return true;
+        }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 if child.kind() == "modifiers" && self.text(child).contains("static") {
@@ -434,6 +445,9 @@ impl<'t> Walker<'t> {
 
     /// javaExtractor.isConst: `static final` field → constant.
     fn is_const(&self, node: Node) -> bool {
+        if node.kind() == "constant_declaration" {
+            return true;
+        }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 if child.kind() == "modifiers" {
@@ -491,7 +505,7 @@ impl<'t> Walker<'t> {
 
         self.maybe_capture_fn_refs(node);
 
-        if kind == "class_declaration" {
+        if is_class_type(kind) {
             self.extract_class(node);
             skip_children = true;
         } else if is_method_type(kind) {
@@ -503,13 +517,15 @@ impl<'t> Walker<'t> {
         } else if kind == "enum_declaration" {
             self.extract_enum(node);
             skip_children = true;
-        } else if kind == "field_declaration" && self.inside_class_like() {
-            self.extract_field(node);
-            self.scan_fn_ref_subtree(node, 0);
+        } else if (kind == "field_declaration" || kind == "constant_declaration") && self.inside_class_like() {
+            // The initializers extract_field walked under their fields took
+            // their own candidates; the scan covers the rest.
+            let walked = self.extract_field(node);
+            self.scan_fn_ref_subtree(node, 0, &walked);
             skip_children = true;
         } else if kind == "local_variable_declaration" && !self.inside_class_like() {
             self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0);
+            self.scan_fn_ref_subtree(node, 0, &[]);
             skip_children = true;
         } else if kind == "import_declaration" {
             self.extract_import(node);
@@ -557,7 +573,7 @@ impl<'t> Walker<'t> {
         // Static-member / value-read (`Type.CONST`) — self-gates on field_access.
         self.extract_static_member_ref(node);
 
-        if kind == "class_declaration" {
+        if is_class_type(kind) {
             self.extract_class(node);
             return;
         }
@@ -598,7 +614,11 @@ impl<'t> Walker<'t> {
                 self.visit_node(c);
             }
         }
-        // Lombok member synthesis (#912) — class still on the stack.
+        // synthesizeJavaMembers — class still on the stack: record
+        // components first, then Lombok (#912).
+        if node.kind() == "record_declaration" {
+            self.synthesize_record_components(node, row);
+        }
         self.synthesize_lombok_members(node, row);
         self.stack.pop();
     }
@@ -692,7 +712,8 @@ impl<'t> Walker<'t> {
         for i in 0..body.named_child_count() {
             let Some(child) = body.named_child(i) else { continue };
             if child.kind() == "enum_constant" {
-                self.extract_enum_members(child);
+                let member = self.extract_enum_members(child);
+                self.visit_enum_constant_body(child, member);
             } else {
                 self.visit_node(child);
             }
@@ -700,16 +721,33 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    fn extract_enum_members(&mut self, node: Node<'t>) {
-        if let Some(name_node) = node.child_by_field_name("name") {
-            let name = self.text(name_node).to_string();
-            self.create_node("enum_member", &name, node, Extra::default());
-        }
+    fn extract_enum_members(&mut self, node: Node<'t>) -> Option<(u32, String)> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = self.text(name_node).to_string();
+        let row = self.create_node("enum_member", &name, node, Extra::default())?;
         // (identifier-children / leaf fallbacks are other grammars' shapes)
+        Some((row, name))
     }
 
-    /// extractField — each declarator becomes a field/constant node.
-    fn extract_field(&mut self, node: Node<'t>) {
+    /// `PLUS { int apply(…) { … } }`: a constant's own class_body declares
+    /// members of its own, scoped under the constant.
+    fn visit_enum_constant_body(&mut self, node: Node<'t>, member: Option<(u32, String)>) {
+        let Some((row, name)) = member else { return };
+        let Some(body) = (0..node.named_child_count()).filter_map(|i| node.named_child(i)).find(|c| c.kind() == "class_body") else { return };
+        self.stack.push(Scope { row, kind: "enum_member", name });
+        for i in 0..body.named_child_count() {
+            if let Some(c) = body.named_child(i) {
+                self.visit_node(c);
+            }
+        }
+        self.stack.pop();
+    }
+
+    /// extractField — each declarator becomes a field/constant node. Returns
+    /// the initializers walked under their fields, for the declaration scan to
+    /// skip.
+    fn extract_field(&mut self, node: Node<'t>) -> Vec<usize> {
+        let mut walked = Vec::new();
         let docstring = preceding_docstring(node, self.src);
         let visibility = self.visibility_of(node);
         let is_static = Some(self.is_static(node));
@@ -768,6 +806,7 @@ impl<'t> Walker<'t> {
                         self.stack.push(Scope { row, kind: field_kind, name: name.clone() });
                         self.visit_function_body(value);
                         self.stack.pop();
+                        walked.push(value.id());
                     }
                 }
             }
@@ -787,6 +826,7 @@ impl<'t> Walker<'t> {
                 );
             }
         }
+        walked
     }
 
     /// extractVariable's generic fallback (top-level locals — rare in Java).
@@ -926,8 +966,21 @@ impl<'t> Walker<'t> {
             .or_else(|| node.child_by_field_name("type"))
             .or_else(|| node.child_by_field_name("name"))
             .or_else(|| node.named_child(0));
-        let mut type_name = type_node.map(|t| self.text(t).to_string()).unwrap_or_else(|| "Object".to_string());
-        type_name = strip_generic_and_qualifier(&type_name);
+        let raw = type_node.map(|t| self.text(t).to_string()).unwrap_or_else(|| "Object".to_string());
+        // The supertype as written (`Api.Listener` for `new Api.Listener() {…}`),
+        // type arguments cut from the first `<` past index 0, trimmed — the
+        // `extends` ref's name. The anon class's own name keeps the last segment.
+        let mut written = raw.clone();
+        if let Some(lt) = written.find('<') {
+            if lt > 0 {
+                written.truncate(lt);
+            }
+        }
+        let mut written = written.trim().to_string();
+        if written.is_empty() {
+            written = "Object".to_string();
+        }
+        let mut type_name = strip_generic_and_qualifier(&raw);
         if type_name.is_empty() {
             type_name = "Object".to_string();
         }
@@ -942,7 +995,7 @@ impl<'t> Walker<'t> {
             Some(t) => (t.start_position().row as u32, self.col_of(t)),
             None => (node.start_position().row as u32, self.col_of(node)),
         };
-        self.push_ref(row, &type_name, edge_kind_index("extends").unwrap(), line, column);
+        self.push_ref(row, &written, edge_kind_index("extends").unwrap(), line, column);
 
         self.stack.push(Scope { row, kind: "class", name: anon_name });
         for i in 0..body.named_child_count() {
@@ -1009,7 +1062,7 @@ impl<'t> Walker<'t> {
                         None => child.named_child(0).into_iter().collect(),
                     };
                     for target in targets {
-                        let name = self.text(target).to_string();
+                        let name = self.supertype_name(target);
                         self.push_ref_at(class_row, &name, extends_kind, target);
                     }
                 }
@@ -1022,13 +1075,27 @@ impl<'t> Walker<'t> {
                         None => (0..child.named_child_count()).filter_map(|j| child.named_child(j)).collect(),
                     };
                     for iface in targets {
-                        let name = self.text(iface).to_string();
+                        let name = self.supertype_name(iface);
                         self.push_ref_at(class_row, &name, implements_kind, iface);
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// supertypeName — a parameterized supertype (`generic_type`) by the name
+    /// before its type arguments: `Store` for `implements Store<String>`.
+    fn supertype_name(&self, node: Node<'t>) -> String {
+        if node.kind() == "generic_type" {
+            let named = (0..node.named_child_count())
+                .filter_map(|j| node.named_child(j))
+                .find(|c| c.kind() != "type_arguments");
+            if let Some(named) = named {
+                return self.text(named).to_string();
+            }
+        }
+        self.text(node).to_string()
     }
 
     /// extractDecoratorsFor — Java annotations live inside `modifiers`.
@@ -1212,9 +1279,13 @@ impl<'t> Walker<'t> {
         }
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        // Subtrees the body walker has already been through.
+        if walked.contains(&node.id()) {
             return;
         }
         // (functionTypes is empty for Java; lambda_expression halts the scan)
@@ -1224,7 +1295,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }
@@ -1375,6 +1446,82 @@ impl<'t> Walker<'t> {
         names
     }
 
+    /// Members already declared directly in a class (exact `classQN::name`
+    /// matches), split into the method and field namespaces.
+    fn declared_member_names(&self, class_row: u32) -> (HashSet<String>, HashSet<String>) {
+        let class_qn = self.nodes_meta[class_row as usize].qualified_name.clone();
+        let mut taken_methods: HashSet<String> = HashSet::new();
+        let mut taken_fields: HashSet<String> = HashSet::new();
+        for m in &self.nodes_meta {
+            if m.qualified_name == format!("{class_qn}::{}", m.name) {
+                match m.kind {
+                    "method" | "function" => {
+                        taken_methods.insert(m.name.clone());
+                    }
+                    "field" | "variable" | "constant" | "property" => {
+                        taken_fields.insert(m.name.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (taken_methods, taken_fields)
+    }
+
+    /// synthesizeRecordComponents (languages/java.ts): per record component a
+    /// private field and a public accessor, anchored on the component's name.
+    fn synthesize_record_components(&mut self, record_node: Node<'t>, record_row: u32) {
+        let Some(params) = record_node.child_by_field_name("parameters") else { return };
+        let (mut taken_methods, mut taken_fields) = self.declared_member_names(record_row);
+        for i in 0..params.named_child_count() {
+            let Some(param) = params.named_child(i) else { continue };
+            if param.kind() != "formal_parameter" {
+                continue;
+            }
+            let (Some(name_node), Some(type_node)) =
+                (param.child_by_field_name("name"), param.child_by_field_name("type"))
+            else {
+                continue;
+            };
+            let name = self.text(name_node).trim().to_string();
+            let type_text = self.text(type_node).trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            if !taken_fields.contains(&name) {
+                taken_fields.insert(name.clone());
+                self.create_node(
+                    "field",
+                    &name,
+                    name_node,
+                    Extra {
+                        visibility: Some(2),
+                        is_static: Some(false),
+                        signature: Some(format!("{type_text} {name}")),
+                        ..Extra::default()
+                    },
+                );
+            }
+            if !taken_methods.contains(&name) {
+                taken_methods.insert(name.clone());
+                let return_type = self.normalize_java_type(Some(type_node));
+                self.create_node(
+                    "method",
+                    &name,
+                    name_node,
+                    Extra {
+                        visibility: Some(1),
+                        is_static: Some(false),
+                        signature: Some(format!("{type_text} {name}()")),
+                        docstring: Some("Implicit record component accessor".to_string()),
+                        return_type,
+                        ..Extra::default()
+                    },
+                );
+            }
+        }
+    }
+
     fn synthesize_lombok_members(&mut self, class_node: Node<'t>, class_row: u32) {
         let class_anns = self.lombok_annotation_names(class_node);
         let class_getter = class_anns.contains("Getter");
@@ -1405,23 +1552,8 @@ impl<'t> Walker<'t> {
         }
 
         // Members the source already declares (exact `classQN::name` matches).
-        let class_qn = self.nodes_meta[class_row as usize].qualified_name.clone();
         let class_name = self.nodes_meta[class_row as usize].name.clone();
-        let mut taken_methods: HashSet<String> = HashSet::new();
-        let mut taken_fields: HashSet<String> = HashSet::new();
-        for m in &self.nodes_meta {
-            if m.qualified_name == format!("{class_qn}::{}", m.name) {
-                match m.kind {
-                    "method" | "function" => {
-                        taken_methods.insert(m.name.clone());
-                    }
-                    "field" | "variable" | "constant" | "property" => {
-                        taken_fields.insert(m.name.clone());
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let (mut taken_methods, taken_fields) = self.declared_member_names(class_row);
 
         let class_name_node = class_node.child_by_field_name("name").unwrap_or(class_node);
 

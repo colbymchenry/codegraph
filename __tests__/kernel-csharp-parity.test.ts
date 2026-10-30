@@ -8,11 +8,12 @@
  *
  *  - Torture.cs        — block namespace + nested/second-namespace quirks,
  *    base_list shapes, records, properties (incl. the bare-identifier
- *    signature loss and never-walked accessor bodies), fields/constants,
+ *    signature loss; accessor bodies and initializers walked as the
+ *    property), fields/constants (initializers walked as the field),
  *    events/operators/indexer/destructor (no nodes, calls → class), ctor
  *    initializer hole, explicit interface impl, local functions, the call
  *    zoo (raw member-access texts, chained re-encode, `(myDel)(x)` conv,
- *    `nameof`), instantiation shapes (incl. invisible `new()`/`new {}`/
+ *    `nameof`), instantiation shapes (incl. invisible body `new()`/`new {}`/
  *    arrays), static value reads, C# type refs, fn-ref candidates
  *    (`+=` subscription, `this.X` bare-name form, initializer lists),
  *    value-ref targets + local shadow prune, preprocessor passthrough.
@@ -166,6 +167,49 @@ describe.skipIf(!kernelBuilt)('kernel C# extraction parity', () => {
       name: 'bodiless struct mints no node; bodiless record still does',
       source: 'public record Empty;\n',
       minNodes: 2,
+    },
+    {
+      // Accessor bodies, `=> expr` and `= initializer` are walked as the
+      // property (calls, instantiations, static reads, fn-ref candidates).
+      name: 'property bodies and initializers are walked as the property',
+      source: [
+        'public class C {',
+        '  void H(int v) { }',
+        '  public Action P { get { return Make(H); } set { Register(H); } }',
+        '  public int Q => Run(H);',
+        '  public Action R { get; } = Wrap(H);',
+        '  public int S { get => Calc.Max; init => Store(new Widget()); }',
+        '}',
+        '',
+      ].join('\n'),
+      minNodes: 7,
+    },
+    {
+      // Each field declarator and each property `= initializer` is walked
+      // with its member on the stack — lambdas included — and its fn-ref
+      // candidates (varinit too) are the member's, captured once. A
+      // target-typed `new()` there instantiates the declared type; attribute
+      // arguments stay with the class's candidates-only scan.
+      name: 'field and property initializers are walked as the member',
+      source: [
+        'public class C {',
+        '  static void H() { }',
+        '  private readonly ILogger _log = LogManager.GetLogger(typeof(C));',
+        '  int a = 1, b = Calc.Max(2);',
+        '  private static readonly List<Action> Table = new() { H };',
+        '  private Widget? _w = new(1) { Size = Make() };',
+        '  private global::Ns.Box<int> _g = new(), _h = (new());',
+        '  private (int, int) _t = new();',
+        '  Action g = () => Register(H);',
+        '  Del d = H;',
+        '  public Widget P { get; } = new();',
+        '  public Action R { get; } = Wrap(H);',
+        '  public string S { get; } = Defaults.Name;',
+        '  [Attr(Make(H))] public int T { get; set; } = 3;',
+        '}',
+        '',
+      ].join('\n'),
+      minNodes: 17,
     },
   ];
 

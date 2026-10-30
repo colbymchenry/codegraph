@@ -838,7 +838,10 @@ describe('Java end-to-end — field-injected bean trace (issue #389)', () => {
 
 describe('JVM FQN imports — end-to-end', () => {
   let tmpDir: string | undefined;
+  let cg: CodeGraph | undefined;
   afterEach(() => {
+    cg?.close();
+    cg = undefined;
     if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
     tmpDir = undefined;
   });
@@ -856,7 +859,7 @@ describe('JVM FQN imports — end-to-end', () => {
       'package com.example.app\n\nimport com.example.Bar\n\nclass App {\n  fun run() { Bar().greet() }\n}\n'
     );
 
-    const cg = CodeGraph.initSync(tmpDir);
+    cg = CodeGraph.initSync(tmpDir);
     await cg.indexAll();
 
     const bar = cg.getNodesByKind('class').find((n) => n.qualifiedName === 'com.example::Bar');
@@ -872,8 +875,6 @@ describe('JVM FQN imports — end-to-end', () => {
       .getIncomingEdges(bar!.id)
       .find((e) => e.kind === 'imports');
     expect(reachesBar, 'an imports edge should resolve to Bar via FQN').toBeDefined();
-
-    cg.close();
   });
 
   it('resolves a Kotlin top-level function import', async () => {
@@ -887,7 +888,7 @@ describe('JVM FQN imports — end-to-end', () => {
       'package com.example.app\n\nimport com.example.util\n\nfun main() { util() }\n'
     );
 
-    const cg = CodeGraph.initSync(tmpDir);
+    cg = CodeGraph.initSync(tmpDir);
     await cg.indexAll();
 
     const util = cg.getNodesByKind('function').find((n) => n.qualifiedName === 'com.example::util');
@@ -908,7 +909,7 @@ describe('JVM FQN imports — end-to-end', () => {
       'package com.example.app\n\nimport com.example.JavaBar\n\nfun main() { JavaBar().greet() }\n'
     );
 
-    const cg = CodeGraph.initSync(tmpDir);
+    cg = CodeGraph.initSync(tmpDir);
     await cg.indexAll();
 
     const javaBar = cg.getNodesByKind('class').find((n) => n.qualifiedName === 'com.example::JavaBar');
@@ -940,7 +941,7 @@ describe('JVM FQN imports — end-to-end', () => {
       'package app\n\nimport com.example.beta.Bar\n\nfun b() { Bar().who() }\n'
     );
 
-    const cg = CodeGraph.initSync(tmpDir);
+    cg = CodeGraph.initSync(tmpDir);
     await cg.indexAll();
 
     const alphaBar = cg.getNodesByKind('class').find((n) => n.qualifiedName === 'com.example.alpha::Bar');
@@ -1438,6 +1439,214 @@ describe('Terraform follow-ups: remote-state bridge, provider alias, moved block
         cg.getOutgoingEdges(rootFile!.id).find((e) => e.target === renamed!.id),
         'moved block → live resource edge'
       ).toBeDefined();
+    } finally {
+      cg.close();
+    }
+  });
+});
+
+describe('Play end-to-end — Class.method resolves to a member of that class', () => {
+  let tmpDir: string;
+  afterEach(() => {
+    if (tmpDir && fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const targetOf = (cg: CodeGraph, fromName: string, calleeName: string): string | undefined => {
+    const from = cg.getNodesByKind('method').find((n) => n.name === fromName);
+    expect(from).toBeDefined();
+    const edge = cg
+      .getOutgoingEdges(from!.id)
+      .filter((e) => e.kind === 'calls' || e.kind === 'references')
+      .map((e) => cg.getNode(e.target))
+      .find((t) => t?.name === calleeName);
+    return edge?.qualifiedName;
+  };
+
+  it('picks the named nested class member, not the first same-named method in its file', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-play-member-'));
+    fs.mkdirSync(path.join(tmpDir, 'conf'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'app/controllers'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'app/util'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'conf/routes'), 'GET  /  controllers.Application.index\n');
+    fs.writeFileSync(path.join(tmpDir, 'app/controllers/Application.java'), [
+      'package controllers;',
+      'public class Application {',
+      '  public static class Helper {',
+      '    public static String index() { return "helper"; }',
+      '  }',
+      '  public static String index() { return "app"; }',
+      '}',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDir, 'app/util/Http.java'), [
+      'package util;',
+      'public class Http {',
+      '  public static class Cookie {',
+      '    public static String parse(String s) { return s; }',
+      '  }',
+      '  public static class MediaType {',
+      '    public static String parse(String s) { return s; }',
+      '  }',
+      '}',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDir, 'app/util/Scheme.scala'), [
+      'package util',
+      'object Scheme {',
+      '  def parse(s: String): String = s',
+      '}',
+      'object AuthorityPort {',
+      '  def parse(s: String): String = s',
+      '}',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDir, 'app/util/Caller.java'), [
+      'package util;',
+      'public class Caller {',
+      '  public String javaCall() { return MediaType.parse("x"); }',
+      '  public String javaCookie() { return Cookie.parse("x"); }',
+      '}',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDir, 'app/util/ScalaCaller.scala'), [
+      'package util',
+      'class ScalaCaller {',
+      '  def scalaCall(): String = AuthorityPort.parse("x")',
+      '  def scalaScheme(): String = Scheme.parse("x")',
+      '}',
+    ].join('\n'));
+
+    const cg = await CodeGraph.init(tmpDir, { index: true });
+    try {
+      expect(targetOf(cg, 'javaCall', 'parse')).toBe('util::Http::MediaType::parse');
+      expect(targetOf(cg, 'javaCookie', 'parse')).toBe('util::Http::Cookie::parse');
+      expect(targetOf(cg, 'scalaCall', 'parse')).toBe('AuthorityPort::parse');
+      expect(targetOf(cg, 'scalaScheme', 'parse')).toBe('Scheme::parse');
+
+      const route = cg.getNodesByKind('route').find((n) => n.name === 'GET /');
+      expect(route).toBeDefined();
+      const handlers = cg.getOutgoingEdges(route!.id).map((e) => cg.getNode(e.target)?.qualifiedName);
+      expect(handlers).toContain('controllers::Application::index');
+      expect(handlers).not.toContain('controllers::Application::Helper::index');
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('prefers the caller\'s own language, and reaches a member the class inherits', async () => {
+    // Play declares `RequestAuthority` twice: a Scala case class with a
+    // companion object, and a Java class. Each language's call means its own.
+    // A route still reaches a handler the controller inherits.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-play-lang-'));
+    fs.mkdirSync(path.join(tmpDir, 'conf'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'app/controllers'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'app/scalaapi'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'app/javaapi'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'conf/routes'), 'GET  /assets/*file  controllers.Assets.versioned(path = "/public", file: Asset)\n');
+    fs.writeFileSync(path.join(tmpDir, 'app/controllers/Assets.scala'), [
+      'package controllers',
+      'class Assets(meta: String) extends AssetsBuilder(meta)',
+      'class AssetsBuilder(meta: String) {',
+      '  def versioned(path: String, file: String): String = path + file',
+      '}',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDir, 'app/scalaapi/RequestAuthority.scala'), [
+      'package scalaapi',
+      'final case class RequestAuthority(host: String)',
+      'object RequestAuthority {',
+      '  def parse(s: String): RequestAuthority = RequestAuthority(s)',
+      '}',
+      'class ScalaUser {',
+      '  def scalaParse(): RequestAuthority = RequestAuthority.parse("y")',
+      '}',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDir, 'app/javaapi/RequestAuthority.java'), [
+      'package javaapi;',
+      'public class RequestAuthority {',
+      '  public static RequestAuthority parse(String s) { return null; }',
+      '}',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDir, 'app/javaapi/JavaUser.java'), [
+      'package javaapi;',
+      'public class JavaUser {',
+      '  RequestAuthority javaParse() { return RequestAuthority.parse("x"); }',
+      '}',
+    ].join('\n'));
+
+    const cg = await CodeGraph.init(tmpDir, { index: true });
+    try {
+      expect(targetOf(cg, 'scalaParse', 'parse')).toBe('RequestAuthority::parse');
+      expect(targetOf(cg, 'javaParse', 'parse')).toBe('javaapi::RequestAuthority::parse');
+
+      const route = cg.getNodesByKind('route').find((n) => n.name === 'GET /assets/*file');
+      expect(route).toBeDefined();
+      const handlers = cg.getOutgoingEdges(route!.id).map((e) => cg.getNode(e.target)?.qualifiedName);
+      expect(handlers).toContain('AssetsBuilder::versioned');
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('takes the overload the call fits, a same-named object in the caller\'s file, and a Java interface\'s static method', async () => {
+    // CMAK keeps one `object GroupMetadataManager` per Kafka version, and its
+    // `TopicConfigs.validate` has a one- and a two-argument overload. Play's
+    // `play.LoggerConfigurator` is a Java interface beside a Scala object.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-play-pick-'));
+    fs.mkdirSync(path.join(tmpDir, 'conf'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'conf/routes'), 'GET  /  controllers.Home.index\n');
+    const write = (rel: string, lines: string[]) => {
+      fs.mkdirSync(path.dirname(path.join(tmpDir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(tmpDir, rel), lines.join('\n'));
+    };
+    write('app/kafka/Configs.scala', [
+      'package kafka',
+      'object Configs {',
+      '  def validate(props: String): Unit = ()',
+      '  def validate(version: Int, props: String): Unit = ()',
+      '}',
+      'class Admin {',
+      '  def check(): Unit = Configs.validate(1, "p")',
+      '}',
+    ]);
+    for (const v of ['one', 'two']) {
+      write(`app/kafka/${v}/Manager.scala`, [
+        `package kafka.${v}`,
+        'object Manager {',
+        '  def readKey(s: String): String = s',
+        '}',
+        'class Reader {',
+        `  def read_${v}(): String = Manager.readKey("x")`,
+        '}',
+      ]);
+    }
+    write('app/play/LoggerConfigurator.java', [
+      'package play;',
+      'public interface LoggerConfigurator {',
+      '  static String generateProperties(String s) { return s; }',
+      '}',
+    ]);
+    write('app/play/api/LoggerConfigurator.scala', [
+      'package play.api',
+      'object LoggerConfigurator {',
+      '  def generateProperties(s: String): String = s',
+      '}',
+    ]);
+    write('app/japi/JavaLogger.java', [
+      'package japi;',
+      'import play.LoggerConfigurator;',
+      'public class JavaLogger {',
+      '  String props() { return LoggerConfigurator.generateProperties("x"); }',
+      '}',
+    ]);
+
+    const cg = await CodeGraph.init(tmpDir, { index: true });
+    try {
+      const target = (fromName: string, calleeName: string) => {
+        const from = cg.getNodesByKind('method').find((n) => n.name === fromName);
+        expect(from).toBeDefined();
+        return cg.getOutgoingEdges(from!.id).filter((e) => e.kind === 'calls')
+          .map((e) => cg.getNode(e.target)).find((t) => t?.name === calleeName);
+      };
+      expect(target('check', 'validate')?.startLine).toBe(4);
+      expect(target('read_one', 'readKey')?.filePath).toBe('app/kafka/one/Manager.scala');
+      expect(target('read_two', 'readKey')?.filePath).toBe('app/kafka/two/Manager.scala');
+      expect(targetOf(cg, 'props', 'generateProperties')).toBe('play::LoggerConfigurator::generateProperties');
     } finally {
       cg.close();
     }

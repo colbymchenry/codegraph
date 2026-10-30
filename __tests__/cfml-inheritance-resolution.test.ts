@@ -90,6 +90,40 @@ describe('CFML component-path inheritance resolution (#1152)', () => {
     expect(edges.filter((e) => e.src === 'Main')).toHaveLength(0);
   });
 
+  it('passes over a test suite that mirrors the component path (#2650)', async () => {
+    // `contenscms` is a server mapping onto `contens/`, so only `core`
+    // corroborates either file: the component and the TestBox spec named
+    // after it tied, and a tie yields no edge.
+    write('contens/core/basecore.cfc', `component {\n  function load() { return 1; }\n}\n`);
+    write('tests/testbox/tests/specs/unit/core/basecore.cfc', `component extends="testbox.system.BaseSpec" {}\n`);
+    write('contens/model/page.cfc', `component extends="contenscms.core.basecore" {}\n`);
+    write('contens/model/tagpage.cfc', `<cfcomponent extends="contenscms.core.basecore">\n<cffunction name="run"><cfreturn 1></cffunction>\n</cfcomponent>\n`);
+    // A test that names the component means the component too.
+    write('tests/testbox/tests/specs/unit/model/fakecore.cfc', `component extends="contenscms.core.basecore" {}\n`);
+    const edges = await load();
+    expect(has(edges, 'page', 'basecore', 'contens/core/basecore.cfc')).toBe(true);
+    expect(has(edges, 'tagpage', 'basecore', 'contens/core/basecore.cfc')).toBe(true);
+    expect(has(edges, 'fakecore', 'basecore', 'contens/core/basecore.cfc')).toBe(true);
+    expect(edges.filter((e) => e.tgtFile.startsWith('tests/'))).toHaveLength(0);
+  });
+
+  it('never resolves production code into a test suite, even on a closer path (#2650)', async () => {
+    write('contens/core/basecore.cfc', `component {}\n`);
+    // The mirror repeats `contenscms/core`, so it corroborates more segments.
+    write('tests/unit/contenscms/core/basecore.cfc', `component {}\n`);
+    write('contens/model/page.cfc', `component extends="contenscms.core.basecore" {}\n`);
+    // Only a test suite holds `contenscms.core.queue`: no edge from production code.
+    write('tests/specs/core/queue/worker.cfc', `component {}\n`);
+    write('contens/model/job.cfc', `component extends="contenscms.core.queue.worker" {}\n`);
+    // A test naming the suite's own path still reaches it.
+    write('tests/specs/core/queue/workerTest.cfc', `component extends="tests.specs.core.queue.worker" {}\n`);
+    const edges = await load();
+    expect(has(edges, 'page', 'basecore', 'contens/core/basecore.cfc')).toBe(true);
+    expect(edges.filter((e) => e.src === 'page')).toHaveLength(1);
+    expect(edges.filter((e) => e.src === 'job')).toHaveLength(0);
+    expect(has(edges, 'workerTest', 'worker', 'tests/specs/core/queue/worker.cfc')).toBe(true);
+  });
+
   it('resolves a relative path against the referencing file (the FW/1 shape)', async () => {
     write('examples/base.cfc', `component {\n  function shared() { return 1; }\n}\n`);
     write('examples/sub/app.cfc', `component extends="../base" {}\n`);
@@ -128,5 +162,21 @@ describe('CFML component-path inheritance resolution (#1152)', () => {
     write('svc/Caller.cfc', `component {\n  function go() { return variables.dsn.getName(); }\n}\n`);
     const edges = await load();
     expect(edges.filter((e) => e.src === 'Caller' || e.src === 'go')).toHaveLength(0);
+  });
+
+  it('resolves a one-folder path to a component at the project root (a framework\'s own repo, #2652)', async () => {
+    // Wheels' own source: `wheels` is the mapping onto the root, so
+    // `wheels.Model` is Model.cfc there, with no folder to corroborate.
+    write('Model.cfc', `component {}\n`);
+    write('models/User.cfc', `component extends="wheels.Model" {}\n`);
+    // A longer path names folders the root component isn't in.
+    write('Util.cfc', `component {}\n`);
+    write('models/Helper.cfc', `component extends="coldbox.system.Util" {}\n`);
+    // An app's own Controller sits in folders the path doesn't name.
+    write('app/controllers/Controller.cfc', `component {}\n`);
+    write('app/controllers/Main.cfc', `component extends="wheels.Controller" {}\n`);
+    const edges = await load();
+    expect(has(edges, 'User', 'Model', 'Model.cfc')).toBe(true);
+    expect(edges.filter((e) => e.src === 'Helper' || e.src === 'Main')).toHaveLength(0);
   });
 });

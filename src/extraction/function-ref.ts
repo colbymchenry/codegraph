@@ -25,9 +25,10 @@
  *
  * Deliberately NOT covered (resolving the *dispatch* — `o->cb(x)` → the
  * registered function — needs data-flow through struct fields; a wrong edge
- * is worse than none): indirect-call resolution and `obj.method` member
- * values where `obj` isn't `this`/`self` (the receiver's type is statically
- * unknowable without local data-flow).
+ * is worse than none): indirect-call resolution. Member values where the
+ * receiver isn't `this`/`self` (`pool.submit(obj.method)`, `Submit(c.store.Fetch)`)
+ * retain their receiver (#1820), so resolution can use type/import scope
+ * before considering a unique method name.
  */
 
 import type { Node as SyntaxNode } from 'web-tree-sitter';
@@ -51,7 +52,8 @@ export interface FnRefCandidate {
    * referenced cross-file WITHOUT imports (global namespace), so the gate
    * can't see them — the strong positional prior (a string argument to
    * `usort`/`array_map`/…) plus resolution's unique-or-drop rule carry the
-   * precision instead.
+   * precision instead. Python/Go member values also skip the name gate,
+   * retaining their receiver for scoped resolution.
    */
   skipGate?: boolean;
 }
@@ -231,6 +233,7 @@ const GO_SPEC: FnRefSpec = {
     ['literal_element', null],
     ['expression_list', null],
   ]),
+  special: new Set(['selector_expression']),
 };
 
 const RUST_SPEC: FnRefSpec = {
@@ -352,9 +355,13 @@ const PASCAL_SPEC: FnRefSpec = {
   idTypes: new Set(['identifier']),
   dispatch: new Map<string, CaptureRule>([
     ['exprArgs', { mode: 'args' }],
-    ['assignment', { mode: 'rhs', field: 'rhs' }], // OnClick := Handler
+    ['assignment', { mode: 'rhs', field: 'rhs' }], // OnClick := @Handler
   ]),
   unwrap: new Map<string, string | null>([['exprUnary', 'operand']]), // @Handler
+  // A bare name (`OnClick := Handler`, `Register(Handler)`) is a paren-less
+  // name the extractor records itself, linked by scope (#2514); only the
+  // explicit `@Handler` is a function value here.
+  addressOfOnly: true,
 };
 
 /**
@@ -699,16 +706,23 @@ function normalizeSpecial(
       return [];
     }
 
-    // Swift `#selector(Holder.fire)` → fire. ObjC `@selector(storeImage:)` →
-    // `storeImage:` verbatim (ObjC method nodes keep their selector colons).
+    // Go `c.store.Fetch` (has a `field` child) vs Swift `#selector(...)` /
+    // ObjC `@selector(...)` (no `field` — inner identifier / selector text).
     case 'selector_expression': {
+      const field = getChildByField(node, 'field');
+      if (field) {
+        const name = getNodeText(field, source);
+        const receiver = getChildByField(node, 'operand');
+        const value = receiver ? `${getNodeText(receiver, source)}.${name}` : '';
+        return /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/.test(value)
+          ? [{ name: value, node: field, skipGate: true }] : [];
+      }
       const inner = node.namedChild(0);
       if (!inner) return [];
       if (inner.type === 'identifier' || inner.type === 'simple_identifier') {
         return [{ name: getNodeText(inner, source), node: inner }];
       }
-      // Swift dotted form: rightmost simple_identifier. ObjC keyword selector:
-      // text as-is.
+      // Swift dotted form: rightmost simple_identifier; ObjC keeps selector text.
       const last = lastNamedOfType(node, new Set(['simple_identifier']));
       if (last) return [{ name: getNodeText(last, source), node: last }];
       return [{ name: getNodeText(inner, source).trim(), node: inner }];
@@ -739,14 +753,13 @@ function normalizeSpecial(
       return [];
     }
 
-    // `self.handle_click` (Python) — object must be EXACTLY `self`.
+    // Keep the receiver on Python member values; calls/subscripts are not
+    // statically named receivers and must not collapse to a bare method.
     case 'attribute': {
-      const obj = getChildByField(node, 'object');
       const attr = getChildByField(node, 'attribute');
-      if (obj && attr && obj.type === 'identifier' && getNodeText(obj, source) === 'self') {
-        return [{ name: getNodeText(attr, source), node: attr }];
-      }
-      return [];
+      const name = getNodeText(node, source);
+      return attr && /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/.test(name)
+        ? [{ name, node: attr, skipGate: true }] : [];
     }
 
     // `this.Run0` (C#) — receiver must be EXACTLY `this`. Two grammar shapes:
@@ -859,4 +872,164 @@ function rubyEnclosingCall(node: SyntaxNode): SyntaxNode | null {
     if (cur.type === 'call') return cur;
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Go: a local that shadows the function a value names (#2596)
+// ---------------------------------------------------------------------------
+
+/**
+ * Go nodes that open a scope a local can be declared in: a block, the implicit
+ * block of an `if` / `for` / `switch` / `select` statement, and each clause of
+ * a `switch` or `select`.
+ */
+const GO_SCOPE_TYPES = new Set([
+  'block',
+  'if_statement',
+  'for_statement',
+  'expression_switch_statement',
+  'type_switch_statement',
+  'select_statement',
+  'expression_case',
+  'default_case',
+  'type_case',
+  'communication_case',
+]);
+
+/**
+ * Where a Go function-value candidate sits: the innermost scope node around
+ * it, and the unit it is written in: the function or method declaration, or
+ * for a func literal at file scope (`var h = func(…) {…}`) the outermost
+ * literal, else null. Mirrored in the kernel (go.rs `go_fn_ref_site`).
+ */
+export interface GoFnRefSite {
+  scope: number;
+  unit: SyntaxNode | null;
+}
+
+/** {@link GoFnRefSite} of the value container `node`. */
+export function goFnRefSite(node: SyntaxNode): GoFnRefSite {
+  let scope = -1;
+  let literal: SyntaxNode | null = null;
+  for (let cur: SyntaxNode | null = node; cur; cur = cur.parent) {
+    if (scope < 0 && GO_SCOPE_TYPES.has(cur.type)) scope = cur.id;
+    if (cur.type === 'function_declaration' || cur.type === 'method_declaration') return { scope, unit: cur };
+    if (cur.type === 'func_literal') literal = cur;
+  }
+  return { scope, unit: literal };
+}
+
+/**
+ * The names among `names` that a Go function binds itself, keyed
+ * `<unit id>|<name>`: its func literals' parameters, `:=`, `var` and `const`,
+ * range and type-switch variables, and a select case's received value. Such a
+ * local shadows a package function of the same name for the rest of its
+ * scope, which the resolver reads per use (`isGoLocallyBound`). A name the
+ * function's own receiver, parameters or results bind is left out: those
+ * cover its whole body, so every use is the local and one reference is
+ * enough. Mirrored in the kernel (go.rs `go_local_bindings`).
+ */
+export function goLocalBindings(
+  units: Iterable<SyntaxNode>,
+  names: ReadonlySet<string>,
+  source: string
+): Set<string> {
+  const out = new Set<string>();
+  for (const unit of units) {
+    const bind = (id: SyntaxNode | null | undefined): void => {
+      if (id?.type !== 'identifier') return;
+      const name = getNodeText(id, source);
+      if (names.has(name)) out.add(`${unit.id}|${name}`);
+    };
+    const declares = (n: SyntaxNode): boolean => {
+      for (let i = 0; i < n.childCount; i++) {
+        const c = n.child(i);
+        if (c && !c.isNamed && c.type === ':=') return true;
+      }
+      return false;
+    };
+    const stack: SyntaxNode[] = [unit];
+    while (stack.length > 0) {
+      const n = stack.pop()!;
+      switch (n.type) {
+        case 'short_var_declaration':
+          for (const c of getChildByField(n, 'left')?.namedChildren ?? []) bind(c);
+          break;
+        case 'range_clause':
+        case 'receive_statement':
+          if (declares(n)) for (const c of getChildByField(n, 'left')?.namedChildren ?? []) bind(c);
+          break;
+        case 'type_switch_statement':
+          for (const c of getChildByField(n, 'alias')?.namedChildren ?? []) bind(c);
+          break;
+        case 'var_spec':
+        case 'const_spec':
+        case 'parameter_declaration':
+        case 'variadic_parameter_declaration':
+          for (const c of n.childrenForFieldName('name')) bind(c);
+          break;
+      }
+      for (let i = n.namedChildCount - 1; i >= 0; i--) {
+        const c = n.namedChild(i);
+        if (c) stack.push(c);
+      }
+    }
+    for (const field of ['receiver', 'parameters', 'result']) {
+      const list = getChildByField(unit, field);
+      if (list?.type !== 'parameter_list') continue;
+      for (const p of list.namedChildren) {
+        if (p.type !== 'parameter_declaration' && p.type !== 'variadic_parameter_declaration') continue;
+        for (const c of p.childrenForFieldName('name')) {
+          if (c.type === 'identifier') out.delete(`${unit.id}|${getNodeText(c, source)}`);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * The Go function-value candidates that need one reference per scope instead
+ * of one per function (#2596), each with the id of the scope it sits in. A
+ * function records a value-use of a name once, at its first use; but when the
+ * function also binds that name itself, the first use can be the local while
+ * a later one, in another scope, is the package function. The resolver drops
+ * a use the local shadows, so the later use needs a reference of its own. One
+ * per scope node is enough: within one scope a local declared before the
+ * first use still covers every later use. Only a name a function uses at
+ * least twice is looked up, so a candidate's position is read from the tree
+ * just for those. Mirrored in the kernel (go.rs `go_scoped_fn_ref_scopes`).
+ */
+export function goScopedFnRefScopes<C extends { name: string; fromNodeId: string; goNode?: SyntaxNode }>(
+  candidates: ReadonlyArray<C>,
+  source: string
+): Map<C, number> {
+  const groups = new Map<string, C[]>();
+  for (const c of candidates) {
+    if (!c.goNode || c.name.includes('.')) continue;
+    const key = `${c.fromNodeId}|${c.name}`;
+    const group = groups.get(key);
+    if (group) group.push(c);
+    else groups.set(key, [c]);
+  }
+  const sites = new Map<C, GoFnRefSite>();
+  const units = new Map<number, SyntaxNode>();
+  const names = new Set<string>();
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    for (const c of group) {
+      const site = goFnRefSite(c.goNode!);
+      if (!site.unit) continue;
+      sites.set(c, site);
+      units.set(site.unit.id, site.unit);
+      names.add(c.name);
+    }
+  }
+  const out = new Map<C, number>();
+  if (units.size === 0) return out;
+  const bound = goLocalBindings(units.values(), names, source);
+  for (const [c, site] of sites) {
+    if (bound.has(`${site.unit!.id}|${c.name}`)) out.set(c, site.scope);
+  }
+  return out;
 }

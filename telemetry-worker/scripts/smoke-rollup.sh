@@ -15,6 +15,11 @@
 #     raw events are already purged
 #   * the purge deletes only rows past the window, and leaves machine_days /
 #     machine_first_seen alone
+#   * each machine's first_index_day is its earliest index, and survives the purge
+#   * the cron catches up on a day that saw activity but was never rolled up, and
+#     logs its one summary line
+#   * usage comes from usage_daily; a legacy usage row still in `events` is folded
+#     into it (counts added, row deleted) before the day is rolled up
 #   * /admin/rollup does not exist without ADMIN_TOKEN, and rejects a wrong one
 #
 # Re-runnable: it wipes its own synthetic days first, and they are chosen to sit
@@ -39,10 +44,13 @@ is()   { [ "$2" = "$3" ] && ok "$1" || bad "$1" "$2" "$3"; }
 day_ago() { node -e 'console.log(new Date(Date.now()-process.argv[1]*864e5).toISOString().slice(0,10))' "$1"; }
 
 # Synthetic days. MAIN/RESET sit inside the 90-day retention window but outside the
-# cron's 3-day lookback; OLD sits past the window so the purge takes it.
+# cron's 3-day lookback; OLD sits past the window so the purge takes it. MISSED is
+# never rolled up by hand — the cron has to find it on its own.
 DAY_MAIN=$(day_ago 40)
 DAY_RESET=$(day_ago 41)
+DAY_MISSED=$(day_ago 30)
 DAY_OLD=$(day_ago 200)
+DAY_ANCIENT=$(day_ago 199)   # a usage counter past the window, for the usage purge
 CUTOFF=$(day_ago 90)
 
 # First column of the first row of a query against the LOCAL D1 state.
@@ -91,18 +99,18 @@ shutdown() {
 echo "applying migrations to local D1"
 npx wrangler d1 migrations apply "$DB" --local >/dev/null 2>&1
 
-echo "seeding $DAY_MAIN / $DAY_RESET / $DAY_OLD"
+echo "seeding $DAY_MAIN / $DAY_RESET / $DAY_MISSED / $DAY_OLD"
 node -e '
-const [main, reset, old, seedFile] = process.argv.slice(1);
+const [main, reset, old, missed, ancient, seedFile] = process.argv.slice(1);
 const sq = (v) => `'"'"'${String(v).replace(/'"'"'/g, "'"'"''"'"'")}'"'"'`;
 const M = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222",
            "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444",
-           "99999999-9999-4999-8999-999999999999"];
+           "99999999-9999-4999-8999-999999999999", "55555555-5555-4555-8555-555555555555"];
 const out = [];
 
 // Re-runnable: every table this script touches, scoped to its own synthetic days.
-for (const t of ["events", "daily_event_counts", "daily_dim_counts", "daily_machines", "machine_days"]) {
-  out.push(`DELETE FROM ${t} WHERE day IN (${[main, reset, old].map(sq).join(", ")});`);
+for (const t of ["events", "daily_event_counts", "daily_dim_counts", "daily_machines", "machine_days", "usage_daily"]) {
+  out.push(`DELETE FROM ${t} WHERE day IN (${[main, reset, old, missed, ancient].map(sq).join(", ")});`);
 }
 out.push(`DELETE FROM machine_first_seen WHERE machine_id IN (${M.map(sq).join(", ")});`);
 
@@ -110,7 +118,6 @@ out.push(`DELETE FROM machine_first_seen WHERE machine_id IN (${M.map(sq).join("
 const rows = [
   [main, M[0], "install",      "darwin", "arm64", "1.5.0", 22, 0, {targets:["claude","cursor"], scope:"local", kind:"fresh"}],
   [main, M[0], "index",        "darwin", "arm64", "1.5.0", 22, 0, {languages:["typescript","go"], file_count_bucket:"100-1k", duration_bucket:"10-60s"}],
-  [main, M[0], "usage_rollup", "darwin", "arm64", "1.5.0", 22, 0, {kind:"mcp_tool", name:"codegraph_explore", count:10, error_count:2, client_name:"Claude Code"}],
   [main, M[1], "index",        "darwin", "x64",   "1.5.0", 20, 0, {languages:["typescript"], file_count_bucket:"1k-10k", duration_bucket:"10-60s"}],
   [main, M[1], "usage_rollup", "darwin", "x64",   "1.5.0", 20, 0, {kind:"mcp_tool", name:"codegraph_explore", count:5, error_count:0, client_name:"Cursor"}],
   [main, M[2], "install",      "linux",  "x64",   "1.4.1", 22, 1, {targets:["claude"], scope:"global", kind:"upgrade"}],
@@ -118,6 +125,8 @@ const rows = [
   [reset, M[3], "index",       "darwin", "arm64", "1.5.0", 22, 0, {languages:["python"], file_count_bucket:"<100", duration_bucket:"<10s"}],
   [old,  M[4], "install",      "linux",  "x64",   "1.0.0", 20, 0, {targets:["codex"], scope:"local", kind:"fresh"}],
   [old,  M[4], "index",        "linux",  "x64",   "1.0.0", 20, 0, {languages:["rust"], file_count_bucket:"<100", duration_bucket:"<10s"}],
+  [missed, M[5], "install",    "win32",  "x64",   "1.5.0", 22, 0, {targets:["claude"], scope:"local", kind:"fresh"}],
+  [missed, M[5], "index",      "win32",  "x64",   "1.5.0", 22, 0, {languages:["go"], file_count_bucket:"<100", duration_bucket:"<10s"}],
 ];
 for (const [day, m, event, os, arch, version, node, ci, props] of rows) {
   out.push(`INSERT INTO events (received_at, ts, day, event, machine_id, codegraph_version, os, arch, node_major, ci, schema_version, props)
@@ -125,8 +134,19 @@ for (const [day, m, event, os, arch, version, node, ci, props] of rows) {
             ${sq(version)}, ${sq(os)}, ${sq(arch)}, ${node}, ${ci}, 1, ${sq(JSON.stringify(props))});`);
 }
 
+// Usage for M[0] arrives the way the ingest path writes it now: added into usage_daily.
+// Usage for M[1] (in the rows above) is a LEGACY row in `events`, as stored before
+// migrations/0003 — the rollup has to fold it in before counting.
+out.push(`INSERT INTO usage_daily (day, machine_id, kind, name, client_name, client_version,
+            codegraph_version, os, arch, node_major, count, error_count)
+          VALUES (${[main, M[0], "mcp_tool", "codegraph_explore", "Claude Code", "",
+                     "1.5.0", "darwin", "arm64", "22"].map(sq).join(", ")}, 10, 2);`);
+// A usage counter past the retention window: the purge must take it.
+out.push(`INSERT INTO usage_daily (day, machine_id, kind, name, count, error_count)
+          VALUES (${[ancient, M[4], "cli_command", "index"].map(sq).join(", ")}, 3, 0);`);
+
 // What the ingest path would have written alongside those events.
-for (const [m, day, prod] of [[M[0], main, 1], [M[1], main, 1], [M[2], main, 0], [M[3], reset, 1], [M[4], old, 1]]) {
+for (const [m, day, prod] of [[M[0], main, 1], [M[1], main, 1], [M[2], main, 0], [M[3], reset, 1], [M[4], old, 1], [M[5], missed, 1]]) {
   out.push(`INSERT INTO machine_days (machine_id, day, prod) VALUES (${sq(m)}, ${sq(day)}, ${prod});`);
   out.push(`INSERT INTO machine_first_seen (machine_id, first_day) VALUES (${sq(m)}, ${sq(day)})
               ON CONFLICT (machine_id) DO UPDATE SET first_day = min(machine_first_seen.first_day, excluded.first_day);`);
@@ -137,7 +157,7 @@ out.push(`INSERT INTO daily_dim_counts (day, event, dim, value, count, machines)
             VALUES (${sq(reset)}, ${sq("index")}, ${sq("obsolete_dim")}, ${sq("stale")}, 99, 99);`);
 
 require("fs").writeFileSync(seedFile, out.join("\n"));
-' "$DAY_MAIN" "$DAY_RESET" "$DAY_OLD" "$SEED_SQL"
+' "$DAY_MAIN" "$DAY_RESET" "$DAY_OLD" "$DAY_MISSED" "$DAY_ANCIENT" "$SEED_SQL"
 npx wrangler d1 execute "$DB" --local --file "$SEED_SQL" >/dev/null
 
 # ---------------------------------------------------------------------------
@@ -173,9 +193,16 @@ is "rollup $DAY_MAIN again → 200" 200 "$(roll "day=$DAY_MAIN")"
 is "rollup $DAY_OLD, whose events are still there → 200" 200 "$(roll "day=$DAY_OLD")"
 is "rollup $DAY_RESET with reset → 200" 200 "$(roll "day=$DAY_RESET&reset=1")"
 
-# The cron body: rolls up the last three days and purges everything past the window.
+# The cron body: rolls up the last three days, catches up $DAY_MISSED (active, never
+# rolled up), and purges everything past the window.
 is "cron trigger → 200" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/__scheduled?cron=30+0+*+*+*")"
 sleep 2
+# Its one summary line: written once the purge and every rollup are done, and with
+# nothing this small left for the next night by the time budget.
+is "the cron logs its summary, nothing failed or deferred" "0/0" \
+   "$(grep -ao '{"msg":"nightly rollup".*}' "$LOG" | tail -1 |
+      node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+        const r=JSON.parse(s||"{}");console.log(`${r.failed}/${r.deferred}`);})')"
 
 # Rolling a purged day with reset=1 must NOT blank the rollups it already has: past
 # the window the reset is ignored, so the delete-then-rebuild can't find zero events.
@@ -183,6 +210,12 @@ is "rollup $DAY_OLD after the purge, with reset → 200" 200 "$(roll "day=$DAY_O
 is "…and reports the reset it refused to run" "[\"$DAY_OLD\"]" \
    "$(curl -s -X POST -H "x-admin-token: $TOKEN" "$BASE/admin/rollup?day=$DAY_OLD&reset=1" |
       node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.stringify(JSON.parse(s).reset_ignored)))')"
+
+# first_index_day only ever moves earlier. Give M[1] an index day before $DAY_MAIN,
+# then re-roll $DAY_MAIN (where it indexed again): the earlier day must stand.
+q "update machine_first_seen set first_index_day='$DAY_RESET'
+     where machine_id='22222222-2222-4222-8222-222222222222'" >/dev/null
+is "re-roll $DAY_MAIN over an earlier first index day → 200" 200 "$(roll "day=$DAY_MAIN")"
 
 shutdown
 
@@ -239,9 +272,18 @@ echo "cross-check against the raw events"
 is "machines matches count(distinct machine_id)" \
    "$(q "select count(distinct machine_id) from events where day='$DAY_MAIN' and event='index'")" \
    "$(q "select machines from daily_event_counts where day='$DAY_MAIN' and event='index'")"
-is "usage count matches sum(props.count)" \
-   "$(q "select sum(json_extract(props,'\$.count')) from events where day='$DAY_MAIN' and event='usage_rollup'")" \
+is "usage count matches sum(usage_daily.count)" \
+   "$(q "select sum(count) from usage_daily where day='$DAY_MAIN'")" \
    "$(q "select count from daily_event_counts where day='$DAY_MAIN' and event='usage_rollup'")"
+
+echo
+echo "legacy usage rows"
+is "folded out of events" 0 "$(q "select count(*) from events where day='$DAY_MAIN' and event='usage_rollup'")"
+is "…into usage_daily, counts and client intact" "5|0|Cursor|darwin|x64|20" \
+   "$(q "select count||'|'||error_count||'|'||client_name||'|'||os||'|'||arch||'|'||node_major from usage_daily
+          where day='$DAY_MAIN' and machine_id='22222222-2222-4222-8222-222222222222'")"
+is "…and re-rolling the day adds nothing (no double count)" 15 \
+   "$(q "select sum(count) from usage_daily where day='$DAY_MAIN'")"
 
 echo
 echo "reset"
@@ -255,11 +297,37 @@ echo
 echo "retention purge"
 is "raw events past the window are gone" 0 "$(q "select count(*) from events where day='$DAY_OLD'")"
 is "nothing older than the cutoff survives" 0 "$(q "select count(*) from events where day<'$CUTOFF'")"
-is "events inside the window are untouched" 7 "$(q "select count(*) from events where day='$DAY_MAIN'")"
+# 6 seeded, minus the legacy usage row the rollup folded into usage_daily.
+is "events inside the window are untouched" 5 "$(q "select count(*) from events where day='$DAY_MAIN'")"
+is "usage counters past the window are purged" 0 "$(q "select count(*) from usage_daily where day='$DAY_ANCIENT'")"
+is "…and inside it they stay" 2 "$(q "select count(*) from usage_daily where day='$DAY_MAIN'")"
 is "machine_days is NOT purged (retention cohorts need it)" 1 \
    "$(q "select count(*) from machine_days where day='$DAY_OLD'")"
 is "machine_first_seen is NOT purged" "$DAY_OLD" \
    "$(q "select first_day from machine_first_seen where machine_id='99999999-9999-4999-8999-999999999999'")"
+
+echo
+echo "first_index_day — the activation funnel's input"
+is "machines that indexed get that day" "$DAY_MAIN" \
+   "$(q "select first_index_day from machine_first_seen where machine_id='11111111-1111-4111-8111-111111111111'")"
+is "a machine that never indexed stays NULL" "null" \
+   "$(q "select coalesce(first_index_day, 'null') from machine_first_seen where machine_id='33333333-3333-4333-8333-333333333333'")"
+is "set on a reset run too" "$DAY_RESET" \
+   "$(q "select first_index_day from machine_first_seen where machine_id='44444444-4444-4444-8444-444444444444'")"
+is "outlives the purge of the events it came from" "$DAY_OLD" \
+   "$(q "select first_index_day from machine_first_seen where machine_id='99999999-9999-4999-8999-999999999999'")"
+is "only ever lowered: re-rolling a later index day leaves an earlier one" "$DAY_RESET" \
+   "$(q "select first_index_day from machine_first_seen where machine_id='22222222-2222-4222-8222-222222222222'")"
+
+echo
+echo "the cron catches up on a day nobody rolled up"
+is "$DAY_MISSED got its daily_machines row" "1/1" \
+   "$(q "select machines||'/'||prod_machines from daily_machines where day='$DAY_MISSED'")"
+is "…and its event counts" "1/1" \
+   "$(q "select count||'/'||machines from daily_event_counts where day='$DAY_MISSED' and event='index'")"
+is "…and its breakdowns" "1/1" "$(dim "$DAY_MISSED" index language go)"
+is "…and its first index day" "$DAY_MISSED" \
+   "$(q "select first_index_day from machine_first_seen where machine_id='55555555-5555-4555-8555-555555555555'")"
 
 echo
 echo "rollups outlive the events they came from"

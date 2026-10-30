@@ -87,6 +87,28 @@ fn strip_js_ws(s: &str) -> String {
     s.chars().filter(|c| !is_js_space(*c)).collect()
 }
 
+/// A receiver chain the resolver can type (TS `KOTLIN_RECEIVER_CHAIN`):
+/// whitespace stripped, `?.` read as `.`, then `this` or an identifier
+/// followed by one to three `.identifier` segments.
+fn kotlin_receiver_chain(text: &str) -> Option<String> {
+    let chain = strip_js_ws(text).replace("?.", ".");
+    let segments: Vec<&str> = chain.split('.').collect();
+    if segments.len() < 2 || segments.len() > 4 {
+        return None;
+    }
+    let ident = |s: &str| {
+        let b = s.as_bytes();
+        !b.is_empty()
+            && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+            && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    };
+    if segments.iter().all(|s| ident(s)) {
+        Some(chain)
+    } else {
+        None
+    }
+}
+
 /// A property's CODE children: the named child right after the `=` token, a
 /// `property_delegate` (`by lazy { … }`), and an accessor the grammar nested
 /// under the declaration (`val x: Int get() = compute()` — written on ONE line;
@@ -191,6 +213,7 @@ pub struct Walker<'t> {
     file_path: &'t str,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     node_ids: Vec<String>,
@@ -224,6 +247,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         file_path,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         node_ids: Vec::new(),
@@ -328,7 +352,7 @@ impl<'t> Walker<'t> {
     fn inside_class_like(&self) -> bool {
         self.stack
             .last()
-            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module"))
+            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module" | "enum_member"))
             .unwrap_or(false)
     }
 
@@ -383,7 +407,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
         // endLine extension via resolveBody — LIVE for kotlin function/method
         // kinds (in-range for this grammar, so practically a no-op — but the
         // hook is part of the contract).
@@ -730,7 +755,10 @@ impl<'t> Walker<'t> {
         })
     }
 
-    fn try_visit_hook(&mut self, node: Node<'t>) -> bool {
+    /// The Kotlin visitNode hook: `Some` when it consumed the node, holding the
+    /// initializers it walked as such (`walkInitializer`), which the caller's
+    /// fn-ref scan of the node skips.
+    fn try_visit_hook(&mut self, node: Node<'t>) -> Option<Vec<usize>> {
         // An own-line accessor already walked by its owning property below. The
         // ownership test re-derives the property's kind rather than remembering
         // it: a destructured or local declaration mints no node, so its
@@ -738,10 +766,10 @@ impl<'t> Walker<'t> {
         if matches!(node.kind(), "getter" | "setter") {
             return accessor_owner(node)
                 .and_then(|owner| self.property_kind(owner))
-                .is_some();
+                .map(|_| Vec::new());
         }
         if node.kind() != "property_declaration" {
-            return false;
+            return None;
         }
         let var_decl = (0..node.named_child_count())
             .filter_map(|i| node.named_child(i))
@@ -761,11 +789,11 @@ impl<'t> Walker<'t> {
             for init in property_initializers(node) {
                 self.visit_function_body(init);
             }
-            return true;
+            return Some(Vec::new());
         };
         let name = self.text(name_node).to_string();
         if name.is_empty() {
-            return false;
+            return None;
         }
         let Some(kind) = self.property_kind(node) else {
             // A local — no node is minted, but the initializer is still code.
@@ -775,38 +803,44 @@ impl<'t> Walker<'t> {
             for init in property_initializers(node) {
                 self.visit_function_body(init);
             }
-            return true;
+            return Some(Vec::new());
         };
         // The `type`-field signature read is dead (zero fields) → signature
-        // undefined; NO docstring/visibility/isStatic — the modifiers merge in
-        // create_node still decorates expect/actual properties.
-        let row = self.create_node(kind, &name, node, Extra::default());
+        // undefined; NO docstring/isStatic — the modifiers merge in
+        // create_node still decorates expect/actual properties. Visibility IS
+        // read: a `private val` is file-local to the resolver (#1731).
+        let extra = Extra { visibility: Some(self.visibility_of(node)), ..Extra::default() };
+        let row = self.create_node(kind, &name, node, extra);
         // Walk the initializer ATTRIBUTED to the declared symbol (#693, the Go
         // fix, ported): without this the subtree is only fn-ref-scanned, so a
         // lambda / SAM / object initializer (`val cb = Runnable { target() }` —
         // the idiomatic Android callback field) contributed NO call edge at all.
         // The property also OWNS any accessor written on its own line, which the
         // grammar makes a following SIBLING rather than a child; those bodies
-        // used to attribute to the enclosing class.
+        // used to attribute to the enclosing class. The initializers are
+        // walked as such: the fn-ref scan skips them, or it would take each
+        // function value again for the enclosing file or class.
+        let mut walked = Vec::new();
         if let Some(row) = row {
             self.stack.push(Scope { row, kind, name: name.clone() });
             for init in property_initializers(node) {
                 self.visit_function_body(init);
+                walked.push(init.id());
             }
             for acc in following_accessors(node) {
                 self.visit_function_body(acc);
             }
             self.stack.pop();
         }
-        true
+        Some(walked)
     }
 
     // --- the dispatcher (visitNode, Kotlin-relevant branches) -----------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
         stack_guard!();
-        if self.try_visit_hook(node) {
-            self.scan_fn_ref_subtree(node, 0);
+        if let Some(walked) = self.try_visit_hook(node) {
+            self.scan_fn_ref_subtree(node, 0, &walked);
             return;
         }
 
@@ -853,16 +887,23 @@ impl<'t> Walker<'t> {
             // Hook-declined destructuring: extractField/extractVariable both
             // find no matching children for kotlin — NOTHING minted, RHS
             // invisible; candidates-only scan.
-            self.scan_fn_ref_subtree(node, 0);
+            self.scan_fn_ref_subtree(node, 0, &[]);
             skip_children = true;
         } else if kind == "import_header" {
             self.extract_import(node);
         } else if kind == "call_expression" {
             self.extract_call(node);
+        } else if kind == "infix_expression" {
+            self.extract_infix_call(node);
+        } else if kind == "object_literal" {
+            // `object : Api.Listener { … }` — an anonymous class.
+            if self.extract_object_literal(node, false) {
+                skip_children = true;
+            }
         }
         // companion_object, anonymous_initializer, secondary_constructor,
-        // getter/setter siblings, file_annotation, object_literal, if/when at
-        // top level: no branch — recursed (calls attribute to the stack top).
+        // getter/setter siblings, file_annotation, if/when at top level: no
+        // branch — recursed (calls attribute to the stack top).
 
         if !skip_children {
             for i in 0..node.named_child_count() {
@@ -887,10 +928,18 @@ impl<'t> Walker<'t> {
 
         if kind == "call_expression" {
             self.extract_call(node);
+        } else if kind == "infix_expression" {
+            self.extract_infix_call(node);
         }
         // (INSTANTIATION_KINDS has no kotlin members; extractBareCall absent.)
 
         self.extract_static_member_ref(node);
+
+        // `object : Api.Listener { … }` in a body or an initializer — an
+        // anonymous class; its header is this body's code.
+        if kind == "object_literal" && self.extract_object_literal(node, true) {
+            return;
+        }
 
         if kind == "function_declaration" {
             let name = self.extract_name(node);
@@ -1082,7 +1131,8 @@ impl<'t> Walker<'t> {
         for i in 0..body.named_child_count() {
             let Some(child) = body.named_child(i) else { continue };
             if child.kind() == "enum_entry" {
-                self.extract_enum_members(child);
+                let member = self.extract_enum_members(child);
+                self.visit_enum_entry_body(child, member);
             } else {
                 self.visit_node(child);
             }
@@ -1090,18 +1140,36 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    fn extract_enum_members(&mut self, node: Node<'t>) {
+    fn extract_enum_members(&mut self, node: Node<'t>) -> Option<(u32, String)> {
         // name field → null (zero fields) → the identifier-children scan: one
         // enum_member per direct simple_identifier, positioned AT the
-        // identifier. Entry value_arguments and entry class_bodies (override
-        // methods!) are never visited — invisible (quirk).
+        // identifier. Entry value_arguments are never visited.
+        let mut first: Option<(u32, String)> = None;
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
             if matches!(child.kind(), "simple_identifier" | "identifier" | "property_identifier") {
                 let name = self.text(child).to_string();
-                self.create_node("enum_member", &name, child, Extra::default());
+                let row = self.create_node("enum_member", &name, child, Extra::default());
+                if first.is_none() {
+                    first = row.map(|r| (r, name));
+                }
             }
         }
+        first
+    }
+
+    /// `NewBuffer { override fun pipe() … }`: an entry's own class_body
+    /// declares members of its own, scoped under the entry.
+    fn visit_enum_entry_body(&mut self, node: Node<'t>, member: Option<(u32, String)>) {
+        let Some((row, name)) = member else { return };
+        let Some(body) = (0..node.named_child_count()).filter_map(|i| node.named_child(i)).find(|c| c.kind() == "class_body") else { return };
+        self.stack.push(Scope { row, kind: "enum_member", name });
+        for i in 0..body.named_child_count() {
+            if let Some(c) = body.named_child(i) {
+                self.visit_node(c);
+            }
+        }
+        self.stack.pop();
     }
 
     /// extractTypeAlias — plain node; the alias-value ref walk reads the
@@ -1146,6 +1214,28 @@ impl<'t> Walker<'t> {
     /// extractCall — the kotlin paths: navigation member branch (+ the #750
     /// re-encode) and the raw-text else (paren-then-lambda / glued-invoke
     /// garbage preserved).
+    /// extractKotlinInfixCall — `Users.id eq id1` / `a to b`: a call of the
+    /// middle simple_identifier, `lhs.fn` when the left operand is a plain
+    /// name, else the bare name; literal left operands emit nothing.
+    fn extract_infix_call(&mut self, node: Node<'t>) {
+        if self.stack.is_empty() || node.named_child_count() != 3 {
+            return;
+        }
+        let (Some(lhs), Some(func)) = (node.named_child(0), node.named_child(1)) else { return };
+        if func.kind() != "simple_identifier" || is_literal_receiver(lhs.kind()) {
+            return;
+        }
+        let caller = self.top_row();
+        let name = self.text(func);
+        let receiver = if lhs.kind() == "simple_identifier" { self.text(lhs) } else { "" };
+        let callee = if !receiver.is_empty() && receiver != "this" && receiver != "super" {
+            format!("{receiver}.{name}")
+        } else {
+            name.to_string()
+        };
+        self.push_ref_at(caller, &callee, edge_kind_index("calls").unwrap(), node);
+    }
+
     fn extract_call(&mut self, node: Node<'t>) {
         if self.stack.is_empty() {
             return;
@@ -1209,9 +1299,17 @@ impl<'t> Walker<'t> {
                     } else {
                         method_name.to_string()
                     };
+                } else if let Some(chain) = receiver
+                    .filter(|r| r.kind() == "navigation_expression")
+                    .and_then(|r| kotlin_receiver_chain(self.text(r)))
+                {
+                    // Receiver chain `a.b` / `this.a` / `a?.b`: kept for the
+                    // resolver to type through the properties' declared types.
+                    callee_name = format!("{chain}.{method_name}");
                 } else {
-                    // this_expression / super_expression / 2-hop nav /
-                    // postfix `!!` / parenthesized → bare method name.
+                    // this_expression / super_expression / a longer or
+                    // non-identifier chain / postfix `!!` / parenthesized →
+                    // bare method name.
                     callee_name = method_name.to_string();
                 }
             }
@@ -1273,10 +1371,10 @@ impl<'t> Walker<'t> {
     }
 
     /// extractInheritance — delegation_specifier: user_type ?? its
-    /// constructor_invocation's user_type → FIRST type_identifier → ONE
-    /// `extends` ref at the typeId (interfaces ride extends too; qualified
-    /// supertypes take the FIRST segment — `com`; `by`-delegation emits
-    /// NOTHING).
+    /// constructor_invocation's user_type → ONE `extends` ref named by the
+    /// user_type's type_identifiers joined with `.` (`Outer.Inner`, type
+    /// arguments left out), at the first one (interfaces ride extends too;
+    /// `by`-delegation emits NOTHING).
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
         let extends_kind = edge_kind_index("extends").unwrap();
         for i in 0..node.named_child_count() {
@@ -1292,27 +1390,123 @@ impl<'t> Walker<'t> {
                 .find(|c| c.kind() == "constructor_invocation");
             let target = user_type.or(ctor_inv);
             let Some(target) = target else { continue };
-            let type_id: Node = if target.kind() == "user_type" {
+            let type_node: Option<Node> = if target.kind() == "user_type" {
+                Some(target)
+            } else {
                 (0..target.named_child_count())
                     .filter_map(|j| target.named_child(j))
-                    .find(|c| c.kind() == "type_identifier")
-                    .unwrap_or(target)
-            } else {
-                // constructor_invocation → its user_type → first type_identifier
-                let ut = (0..target.named_child_count())
-                    .filter_map(|j| target.named_child(j))
-                    .find(|c| c.kind() == "user_type");
-                match ut {
-                    Some(ut) => (0..ut.named_child_count())
-                        .filter_map(|j| ut.named_child(j))
-                        .find(|c| c.kind() == "type_identifier")
-                        .unwrap_or(ut),
-                    None => target,
-                }
+                    .find(|c| c.kind() == "user_type")
             };
-            let name = self.text(type_id).to_string();
+            let ids: Vec<Node> = match type_node {
+                Some(t) => (0..t.named_child_count())
+                    .filter_map(|j| t.named_child(j))
+                    .filter(|c| c.kind() == "type_identifier")
+                    .collect(),
+                None => Vec::new(),
+            };
+            let type_id: Node = ids.first().copied().or(type_node).unwrap_or(target);
+            let name = if ids.is_empty() {
+                self.text(type_id).to_string()
+            } else {
+                ids.iter().map(|c| self.text(*c)).collect::<Vec<_>>().join(".")
+            };
             self.push_ref_at(class_row, &name, extends_kind, type_id);
         }
+    }
+
+    /// extractKotlinObjectLiteral — `object : Api.Listener { … }`: an anonymous
+    /// class. Headers (each delegation_specifier) walked first by the CURRENT
+    /// walker in the enclosing scope; an `instantiates` ref from the stack top
+    /// to the first supertype's last segment; a class `<Short$anon@line>`;
+    /// `extends` refs (dotted path) from it, at each path's first
+    /// type_identifier; its class_body children through visit_node. False
+    /// (nothing done) without a class_body.
+    fn extract_object_literal(&mut self, node: Node<'t>, body_walker: bool) -> bool {
+        stack_guard!();
+        let Some(body) = (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i))
+            .find(|c| c.kind() == "class_body")
+        else {
+            return false;
+        };
+        let specs: Vec<Node<'t>> = (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i))
+            .filter(|c| c.kind() == "delegation_specifier")
+            .collect();
+        // (name, first type_identifier, built by a constructor_invocation)
+        let mut supertypes: Vec<(String, Node<'t>, bool)> = Vec::new();
+        for spec in &specs {
+            let holder = (0..spec.named_child_count())
+                .filter_map(|j| spec.named_child(j))
+                .find(|c| c.kind() == "constructor_invocation" || c.kind() == "explicit_delegation");
+            let from = holder.unwrap_or(*spec);
+            let user_type = (0..from.named_child_count())
+                .filter_map(|j| from.named_child(j))
+                .find(|c| c.kind() == "user_type");
+            let ids: Vec<Node<'t>> = match user_type {
+                Some(t) => (0..t.named_child_count())
+                    .filter_map(|j| t.named_child(j))
+                    .filter(|c| c.kind() == "type_identifier")
+                    .collect(),
+                None => Vec::new(),
+            };
+            if let Some(first) = ids.first() {
+                let name = ids.iter().map(|c| self.text(*c)).collect::<Vec<_>>().join(".");
+                let built = holder.map(|h| h.kind() == "constructor_invocation").unwrap_or(false);
+                supertypes.push((name, *first, built));
+            }
+        }
+        for spec in &specs {
+            if body_walker {
+                self.visit_for_calls_and_structure(*spec);
+            } else {
+                self.visit_node(*spec);
+            }
+        }
+        // The class it builds, else its first supertype: the object's name and,
+        // as written, what the code around instantiates.
+        let primary = supertypes.iter().find(|s| s.2).or(supertypes.first());
+        let short_name = match primary {
+            Some((name, _, _)) => match name.rfind('.') {
+                Some(dot) => name[dot + 1..].to_string(),
+                None => name.clone(),
+            },
+            None => "Object".to_string(),
+        };
+        if let Some((written, at, _)) = primary {
+            if !self.stack.is_empty() {
+                let owner = self.top_row();
+                let at = *at;
+                let written = written.clone();
+                self.push_ref_at(owner, &written, edge_kind_index("instantiates").unwrap(), at);
+            }
+        }
+        let anon_name = format!("<{short_name}$anon@{}>", node.start_position().row + 1);
+        let Some(row) = self.create_node("class", &anon_name, node, Extra::default()) else {
+            for i in 0..body.named_child_count() {
+                if let Some(c) = body.named_child(i) {
+                    if body_walker {
+                        self.visit_for_calls_and_structure(c);
+                    } else {
+                        self.visit_node(c);
+                    }
+                }
+            }
+            return true;
+        };
+        let extends_kind = edge_kind_index("extends").unwrap();
+        for (name, at, _) in &supertypes {
+            let at = *at;
+            self.push_ref_at(row, name, extends_kind, at);
+        }
+        self.stack.push(Scope { row, kind: "class", name: anon_name });
+        for i in 0..body.named_child_count() {
+            if let Some(c) = body.named_child(i) {
+                self.visit_node(c);
+            }
+        }
+        self.stack.pop();
+        true
     }
 
     /// extractDecoratorsFor — kotlin annotations inside `modifiers`:
@@ -1526,9 +1720,13 @@ impl<'t> Walker<'t> {
         });
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
         stack_guard!();
         if depth > 12 {
+            return;
+        }
+        // Subtrees the body walker has already been through.
+        if walked.contains(&node.id()) {
             return;
         }
         // Halts at functionTypes (function_declaration) + the fixed list —
@@ -1546,7 +1744,7 @@ impl<'t> Walker<'t> {
         self.maybe_capture_fn_refs(node);
         for i in 0..node.named_child_count() {
             if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
+                self.scan_fn_ref_subtree(c, depth + 1, walked);
             }
         }
     }

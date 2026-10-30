@@ -103,6 +103,34 @@ def handle_request(req):
     cg.close?.();
   });
 
+  it('numbers each dispatch by its own file, when two files of one length are scanned in a row', async () => {
+    // The pass reuses a line index while the text is the same; two files of the
+    // same length but different line breaks must still each get their own lines.
+    fs.writeFileSync(path.join(dir, 'tasks.py'), 'from celery import shared_task\n\n\n@shared_task\ndef send_email(to):\n    return to\n');
+    const a = 'from tasks import send_email\n\n\n\ndef first(req):\n    send_email.delay(req.addr)\n';
+    const b = 'from tasks import send_email\ndef second(req):\n    send_email.delay(req.addr)\n';
+    const padTo = (s: string, n: number): string => `${s}#${'x'.repeat(n - s.length - 2)}\n`;
+    const len = Math.max(a.length, b.length) + 8;
+    fs.writeFileSync(path.join(dir, 'a.py'), padTo(a, len));
+    fs.writeFileSync(path.join(dir, 'b.py'), padTo(b, len));
+    expect(fs.statSync(path.join(dir, 'a.py')).size).toBe(fs.statSync(path.join(dir, 'b.py')).size);
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const rows = (cg as any).db.db
+      .prepare(
+        `SELECT s.name source, e.line line, json_extract(e.metadata,'$.registeredAt') at
+         FROM edges e JOIN nodes s ON s.id = e.source
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'celery-dispatch' ORDER BY s.name`
+      )
+      .all();
+    expect(rows).toEqual([
+      { source: 'first', line: 6, at: 'a.py:6' },
+      { source: 'second', line: 3, at: 'b.py:3' },
+    ]);
+    cg.close?.();
+  });
+
   it('produces no edges in a Celery-free project (clean control)', async () => {
     fs.writeFileSync(
       path.join(dir, 'app.py'),

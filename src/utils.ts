@@ -30,7 +30,9 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+import { threadId } from 'worker_threads';
 
 // ============================================================
 // SECURITY UTILITIES
@@ -45,6 +47,22 @@ const SENSITIVE_PATHS = new Set([
   '/root', '/boot', '/lib', '/lib64', '/opt',
   'c:\\', 'c:\\windows', 'c:\\windows\\system32',
 ]);
+
+/**
+ * Credential and config folders in the home directory. Unlike the system set,
+ * everything under them is refused too.
+ */
+const SENSITIVE_HOME_DIRS = ['.ssh', '.gnupg', '.aws', '.config'];
+
+/**
+ * How long the real paths of the sensitive home folders are reused. The viewer
+ * re-checks its root on every file it reads, so they are not re-read per check,
+ * but a folder linked somewhere new while the process runs is noticed soon.
+ */
+const SENSITIVE_HOME_TTL_MS = 2_000;
+
+let sensitiveHomeCache: { home: string; expires: number; trees: string[] } | undefined;
+let sensitiveSystemRealPaths: Set<string> | undefined;
 
 /**
  * Config "languages" whose nodes are pure key/value DATA lifted from a config
@@ -66,18 +84,27 @@ export function isConfigLeafNode(node: { kind: string; language?: string }): boo
 }
 
 /**
+ * Whether `child` is `parent` or lies under it, compared exactly as given.
+ *
+ * A root (`C:\`, `\\server\share\`, `/`) already ends with its separator, so
+ * none is added to it. Adding one made `C:\\` the prefix, which no path under
+ * the root starts with, so a project at a drive root indexed nothing (#415).
+ */
+function isSameOrUnder(child: string, parent: string): boolean {
+  if (child === parent) return true;
+  return child.startsWith(parent.endsWith(path.sep) ? parent : parent + path.sep);
+}
+
+/**
  * Whether `child` is `parent` itself or sits underneath it. Case-insensitive on
  * Windows — NTFS is case-insensitive, and realpathSync can hand back a different
  * case than the lexical root, which would otherwise false-reject a valid file.
  */
 function isWithinDir(child: string, parent: string): boolean {
-  let c = child;
-  let p = parent;
   if (process.platform === 'win32') {
-    c = c.toLowerCase();
-    p = p.toLowerCase();
+    return isSameOrUnder(child.toLowerCase(), parent.toLowerCase());
   }
-  return c === p || c.startsWith(p + path.sep);
+  return isSameOrUnder(child, parent);
 }
 
 /**
@@ -96,6 +123,28 @@ function isWithinDir(child: string, parent: string): boolean {
 export function lexicalPathWithinRoot(projectRoot: string, filePath: string): string | null {
   const resolved = path.resolve(projectRoot, filePath);
   return isWithinDir(resolved, path.resolve(projectRoot)) ? resolved : null;
+}
+
+/**
+ * Whether a path made relative to a root (`path.relative(root, p)`, or a
+ * project-relative path) leaves the root: `..` itself, a first segment of
+ * `..` (`../x`, or `..\x` from Windows), or an absolute path, which
+ * `path.relative` gives on Windows for another drive. A folder whose NAME
+ * starts with two dots, like `..generated/`, is inside the root:
+ * `startsWith('..')` took it for a way out.
+ */
+export function escapesRoot(rel: string): boolean {
+  return rel === '..' || rel.startsWith('../') || rel.startsWith('..\\') || path.isAbsolute(rel);
+}
+
+/**
+ * Whether a filesystem error means nothing is at the path: ENOENT, or ENOTDIR,
+ * which POSIX reports instead when a folder on the way is a file (Windows
+ * reports ENOENT for both).
+ */
+export function isMissingPathError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
 }
 
 /**
@@ -123,7 +172,8 @@ export function lexicalPathWithinRoot(projectRoot: string, filePath: string): st
  * @param options.allowSymlinkEscape - Follow in-root symlinks out of the root
  *   (indexing read path only); defaults to the strict, leak-safe behavior.
  * @returns The resolved absolute path (realpath when it exists), or null if it
- *   escapes the root
+ *   escapes the root. A path that does not exist yet is judged by its nearest
+ *   existing ancestor, and every path under a root that does not exist is null.
  */
 export function validatePathWithinRoot(
   projectRoot: string,
@@ -143,23 +193,125 @@ export function validatePathWithinRoot(
   //    The indexing read path (allowSymlinkEscape) skips only this rejection so
   //    it stays consistent with the directory walk, which already followed the
   //    in-root symlink to enumerate these files (#935).
+  let realRoot: string;
   try {
-    const realRoot = fs.realpathSync(normalizedRoot);
+    realRoot = fs.realpathSync(normalizedRoot);
+  } catch {
+    return null;
+  }
+
+  try {
     const realResolved = fs.realpathSync(resolved);
     if (options?.allowSymlinkEscape) {
       return realResolved;
     }
     return isWithinDir(realResolved, realRoot) ? realResolved : null;
   } catch (err) {
-    // ENOENT: the path doesn't exist yet (a file about to be written, or an
-    // index entry for a since-deleted file) — no symlink to follow, and the
-    // lexical check already passed, so allow the lexical path. Any other
-    // resolution failure (ELOOP, EACCES, …) is treated as unsafe → reject.
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return resolved;
+    // A missing leaf may still sit below an EXISTING symlink. Resolve the
+    // nearest existing ancestor before allowing a write path: otherwise
+    // `project/.codegraph/ui -> /outside` plus a missing `trails/` directory
+    // passes the lexical check and mkdir follows the symlink out of the root.
+    // A path under a file (ENOTDIR on POSIX) is a missing leaf too.
+    if (!isMissingPathError(err)) return null;
+  }
+
+  let ancestor = path.dirname(resolved);
+  while (isWithinDir(ancestor, normalizedRoot)) {
+    try {
+      const realAncestor = fs.realpathSync(ancestor);
+      if (options?.allowSymlinkEscape || isWithinDir(realAncestor, realRoot)) {
+        return resolved;
+      }
+      return null;
+    } catch (err) {
+      if (!isMissingPathError(err)) return null;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) return null;
+      ancestor = parent;
     }
+  }
+  return null;
+}
+
+/**
+ * A path in the form the sensitive-folder check compares: lower-cased where the
+ * file system ignores case by default (NTFS, APFS), so `~/.SSH` is `~/.ssh`.
+ */
+function foldPathCase(p: string): string {
+  return process.platform === 'win32' || process.platform === 'darwin' ? p.toLowerCase() : p;
+}
+
+/**
+ * The plain spelling of a Win32 namespace path: `\\?\C:\x` and `\\.\C:\x` are
+ * `C:\x`, and `\\?\UNC\host\share` is `\\host\share`. `path.resolve` keeps the
+ * prefix, so a string comparison would never see the folder behind it. Other
+ * namespace paths (a `\\?\Volume{…}\` name, a device) are returned unchanged;
+ * the real path the caller also checks names their folder.
+ */
+function stripWin32NamespacePrefix(p: string): string {
+  if (process.platform !== 'win32') return p;
+  const prefix = /^[\\/]{2}[?.][\\/](UNC[\\/])?/i.exec(p);
+  if (!prefix) return p;
+  const rest = p.slice(prefix[0].length);
+  if (prefix[1]) return `\\\\${rest}`;
+  return /^[a-z]:[\\/]/i.test(rest) ? rest : p;
+}
+
+/**
+ * The folder a path really names: links (symlinks, junctions, a `subst` drive)
+ * followed, and the case and long names stored on disk. Null when it can't be
+ * resolved, most often because it doesn't exist; the lexical check still runs.
+ */
+function nativeRealPath(p: string): string | null {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
     return null;
   }
+}
+
+/**
+ * The system set's own real paths, folded. macOS keeps `/etc`, `/tmp` and
+ * `/var` under `/private`, so a project whose real path is `/private/etc` is
+ * `/etc`. Read once: these folders don't move.
+ */
+function sensitiveSystemPaths(): Set<string> {
+  if (!sensitiveSystemRealPaths) {
+    sensitiveSystemRealPaths = new Set();
+    for (const entry of SENSITIVE_PATHS) {
+      // Only this platform's entries: on Windows `/` would resolve to the root
+      // of the current drive and refuse every project at a drive root.
+      const native = process.platform === 'win32' ? /^[a-z]:\\/.test(entry) : entry.startsWith('/');
+      if (!native) continue;
+      const real = nativeRealPath(entry);
+      if (real) sensitiveSystemRealPaths.add(foldPathCase(real));
+    }
+  }
+  return sensitiveSystemRealPaths;
+}
+
+/**
+ * The sensitive home folders, folded: as spelled under the home directory,
+ * under the home's real path (a linked home), and each folder's own real path
+ * (a `~/.ssh` that is itself a link into a dotfiles checkout).
+ */
+function sensitiveHomeTrees(): string[] {
+  const home = os.homedir();
+  const now = Date.now();
+  if (sensitiveHomeCache && sensitiveHomeCache.home === home && now < sensitiveHomeCache.expires) {
+    return sensitiveHomeCache.trees;
+  }
+  const trees = new Set<string>();
+  const realHome = nativeRealPath(home);
+  for (const dir of SENSITIVE_HOME_DIRS) {
+    const spelled = path.join(home, dir);
+    trees.add(foldPathCase(spelled));
+    if (realHome) trees.add(foldPathCase(path.join(realHome, dir)));
+    const real = nativeRealPath(spelled);
+    if (real) trees.add(foldPathCase(real));
+  }
+  sensitiveHomeCache = { home, expires: now + SENSITIVE_HOME_TTL_MS, trees: [...trees] };
+  return sensitiveHomeCache.trees;
 }
 
 /**
@@ -169,28 +321,21 @@ export function validatePathWithinRoot(
  * a real, existing directory. Used at MCP and API entry points
  * to prevent arbitrary directory access.
  *
+ * The path is checked both as spelled and as the folder it really names, so a
+ * link to `~/.ssh`, a case variant (`~/.SSH`) or a `\\?\` spelling is refused
+ * like the folder itself (#1930). It is kept to one realpath per call, since the
+ * viewer calls this for every file it reads: the sensitive folders' own real
+ * paths are cached and re-read every couple of seconds.
+ *
  * @param dirPath - The path to validate
  * @returns An error message if invalid, or null if valid
  */
 export function validateProjectPath(dirPath: string): string | null {
-  const resolved = path.resolve(dirPath);
-
-  // Block sensitive system directories
-  if (SENSITIVE_PATHS.has(resolved) || SENSITIVE_PATHS.has(resolved.toLowerCase())) {
-    return `Refusing to operate on sensitive system directory: ${resolved}`;
-  }
-
-  // Also block common sensitive home subdirectories
-  const homeDir = require('os').homedir();
-  const sensitiveHomeDirs = ['.ssh', '.gnupg', '.aws', '.config'];
-  for (const dir of sensitiveHomeDirs) {
-    const sensitivePath = path.join(homeDir, dir);
-    if (resolved === sensitivePath || resolved.startsWith(sensitivePath + path.sep)) {
-      return `Refusing to operate on sensitive directory: ${resolved}`;
-    }
-  }
+  const refusal = sensitiveDirectoryRefusal(dirPath);
+  if (refusal) return refusal;
 
   // Verify it's a real directory
+  const resolved = path.resolve(dirPath);
   try {
     const stats = fs.statSync(resolved);
     if (!stats.isDirectory()) {
@@ -198,6 +343,45 @@ export function validateProjectPath(dirPath: string): string | null {
     }
   } catch {
     return `Path does not exist or is not accessible: ${resolved}`;
+  }
+
+  return null;
+}
+
+/**
+ * The sensitive-folder half of {@link validateProjectPath}: why `dirPath` is,
+ * or is inside, a folder CodeGraph never uses as a project, or null. Unlike
+ * that function it doesn't require the path to exist or be a directory, so it
+ * can vet a path a project root is searched for from.
+ */
+export function sensitiveDirectoryRefusal(dirPath: string): string | null {
+  const resolved = path.resolve(dirPath);
+  const lexical = path.resolve(stripWin32NamespacePrefix(dirPath));
+  const real = nativeRealPath(lexical);
+  const candidates = [lexical];
+  if (real && real !== lexical) candidates.push(real);
+  const named = (candidate: string): string =>
+    candidate === resolved ? resolved : `${resolved} (resolves to ${candidate})`;
+
+  // Block sensitive system directories
+  const systemPaths = sensitiveSystemPaths();
+  for (const candidate of candidates) {
+    if (
+      SENSITIVE_PATHS.has(candidate) ||
+      SENSITIVE_PATHS.has(candidate.toLowerCase()) ||
+      systemPaths.has(foldPathCase(candidate))
+    ) {
+      return `Refusing to operate on sensitive system directory: ${named(candidate)}`;
+    }
+  }
+
+  // Also block common sensitive home subdirectories
+  const homeTrees = sensitiveHomeTrees();
+  for (const candidate of candidates) {
+    const folded = foldPathCase(candidate);
+    if (homeTrees.some((tree) => isSameOrUnder(folded, tree))) {
+      return `Refusing to operate on sensitive directory: ${named(candidate)}`;
+    }
   }
 
   return null;
@@ -232,6 +416,37 @@ export function normalizePath(filePath: string): string {
 }
 
 /**
+ * Escape `text` to match itself literally inside a regular expression.
+ * Symbol names are not always plain words: C++'s `operator++` and
+ * `operator()`, Scala's `++`, a Kotlin name in backticks. Pass every name
+ * through this before writing it into a `new RegExp(…)` pattern, or the name
+ * is read as pattern syntax and may not compile at all.
+ */
+export function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * An empty lock file younger than this is still being written by the process
+ * that created it (#2979): where hard links are missing, the lock is created
+ * first and the PID written a moment later. Only a crash leaves one empty for
+ * long, and FAT's 2 s timestamps stay well inside this.
+ */
+const EMPTY_LOCK_GRACE_MS = 10_000;
+
+/**
+ * How many `.break` levels a takeover may climb. Each level is needed only if
+ * a process died inside the level above it, within a few file operations.
+ */
+const MAX_LOCK_BREAK_DEPTH = 3;
+
+/** What a lock file says about its holder. */
+type LockHolder =
+  | { state: 'free' }
+  | { state: 'held'; pid?: number }
+  | { state: 'stale' };
+
+/**
  * Cross-process file lock using a lock file with PID tracking.
  *
  * Prevents multiple processes (e.g., git hooks, CLI, MCP server) from
@@ -241,58 +456,119 @@ export class FileLock {
   private lockPath: string;
   private held = false;
 
-  /** Locks older than this are considered stale regardless of PID status */
-  private static readonly STALE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
-
   constructor(lockPath: string) {
     this.lockPath = lockPath;
   }
 
   /**
    * Acquire the lock. Throws if the lock is held by another live process.
+   *
+   * A free lock costs one create. A stale one, whose PID is dead or missing,
+   * is replaced only by the process holding `<lock>.break` (itself a
+   * FileLock), after reading it again there (#2979). Before, two processes
+   * that read the same dead PID both unlinked the lock and created their own,
+   * the second one deleting the first one's live lock, and both went on to
+   * write as the only writer.
    */
   acquire(): void {
-    // Check for existing lock
-    if (fs.existsSync(this.lockPath)) {
-      try {
-        const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
-        const pid = parseInt(content, 10);
-        const stat = fs.statSync(this.lockPath);
-        const lockAge = Date.now() - stat.mtimeMs;
-
-        // Treat locks older than the timeout as stale, regardless of PID
-        if (lockAge < FileLock.STALE_TIMEOUT_MS && !isNaN(pid) && this.isProcessAlive(pid)) {
-          throw new Error(
-            `CodeGraph database is locked by another process (PID ${pid}). ` +
-            `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
-          );
-        }
-
-        // Stale lock (dead process or timed out) - remove it
-        fs.unlinkSync(this.lockPath);
-      } catch (err) {
-        if (err instanceof Error && err.message.includes('locked by another')) {
-          throw err;
-        }
-        // Other errors reading lock file - try to remove it
-        try { fs.unlinkSync(this.lockPath); } catch { /* ignore */ }
-      }
+    const refusal = this.tryAcquire(0);
+    if (refusal) {
+      const who = refusal.state === 'held' && refusal.pid !== undefined ? ` (PID ${refusal.pid})` : '';
+      throw new Error(
+        `CodeGraph database is locked by another process${who}. ` +
+        `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
+      );
     }
+  }
 
-    // Write our PID to the lock file using exclusive create flag
+  /** Null once the lock is ours; otherwise what kept us out. */
+  private tryAcquire(depth: number): LockHolder | null {
+    if (this.create()) return this.taken();
+    let holder = this.readHolder();
+    if (holder.state === 'free') {
+      // Released between our create and our read.
+      if (this.create()) return this.taken();
+      holder = this.readHolder();
+    }
+    // A long sync can hold the lock for hours. Its age says nothing about
+    // whether the writer is still alive; only a dead PID is stale.
+    if (holder.state !== 'stale') return holder;
+    if (depth >= MAX_LOCK_BREAK_DEPTH) return { state: 'held' };
+    const breaker = new FileLock(`${this.lockPath}.break`);
+    // Refused: a live process is replacing this stale lock right now.
+    const breaking = breaker.tryAcquire(depth + 1);
+    if (breaking) return breaking;
     try {
-      fs.writeFileSync(this.lockPath, String(process.pid), { flag: 'wx' });
-      this.held = true;
-    } catch (err: any) {
-      if (err.code === 'EEXIST') {
-        // Race condition: another process grabbed the lock between our check and write
-        throw new Error(
-          'CodeGraph database is locked by another process. ' +
-          `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
-        );
+      // What we read before holding the break lock may be out of date: another
+      // process may have replaced the stale lock, or released its own, since.
+      const current = this.readHolder();
+      if (current.state === 'held') return current;
+      // Nobody else replaces a stale lock while we hold the break lock, and no
+      // create succeeds while the file exists, so this unlinks the stale lock.
+      if (current.state === 'stale') {
+        try { fs.unlinkSync(this.lockPath); } catch { /* gone, or the create below says who has it */ }
       }
+      return this.create() ? this.taken() : this.readHolder();
+    } finally {
+      breaker.release();
+    }
+  }
+
+  private taken(): null {
+    this.held = true;
+    return null;
+  }
+
+  /**
+   * Create the lock file with our PID already in it, so no reader ever finds
+   * it empty: write a private file, then hard-link it into place, which fails
+   * if the lock exists. Where hard links are missing, fall back to an
+   * exclusive create, whose PID lands a moment later (see
+   * EMPTY_LOCK_GRACE_MS). False when the lock already exists.
+   */
+  private create(): boolean {
+    const pid = String(process.pid);
+    const tmp = `${this.lockPath}.${process.pid}.${threadId}.tmp`;
+    try {
+      fs.writeFileSync(tmp, pid);
+      fs.linkSync(tmp, this.lockPath);
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
+      // No hard links here (or no private file): create in place instead.
+    } finally {
+      try { fs.unlinkSync(tmp); } catch { /* never written */ }
+    }
+    try {
+      fs.writeFileSync(this.lockPath, pid, { flag: 'wx' });
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
       throw err;
     }
+  }
+
+  private readHolder(): LockHolder {
+    let content: string;
+    try {
+      content = fs.readFileSync(this.lockPath, 'utf-8').trim();
+    } catch (err) {
+      // Unreadable is not proof the holder is gone: leave it to `codegraph unlock`.
+      return (err as NodeJS.ErrnoException).code === 'ENOENT' ? { state: 'free' } : { state: 'held' };
+    }
+    if (content === '') {
+      let age: number;
+      try {
+        age = Date.now() - fs.statSync(this.lockPath).mtimeMs;
+      } catch {
+        return { state: 'free' };
+      }
+      return age < EMPTY_LOCK_GRACE_MS ? { state: 'held' } : { state: 'stale' };
+    }
+    const pid = parseInt(content, 10);
+    // Malformed: no process owns it.
+    if (!(pid > 0)) return { state: 'stale' };
+    return this.isProcessAlive(pid) ? { state: 'held', pid } : { state: 'stale' };
   }
 
   /**
@@ -343,8 +619,9 @@ export class FileLock {
     try {
       process.kill(pid, 0);
       return true;
-    } catch {
-      return false;
+    } catch (err) {
+      // EPERM: it exists but is not ours to signal (another user's, or elevated on Windows).
+      return (err as NodeJS.ErrnoException).code === 'EPERM';
     }
   }
 }

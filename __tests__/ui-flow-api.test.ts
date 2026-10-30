@@ -29,6 +29,7 @@ import * as path from 'path';
 import CodeGraph from '../src/index';
 import { createGraphApi, startUiServer, type GraphApi, type UiServerHandle } from '../src/ui-server';
 import { flowEdgeLabel, parseFlowQuery } from '../src/ui-server/api/flow';
+import { MAX_TRAIL_HOPS } from '../src/ui-server/api/trail-store';
 import { resolveNamedSymbolFlow } from '../src/graph/named-symbol-flow';
 import { ToolHandler } from '../src/mcp/tools';
 import { continuationsFrom } from '../src/graph/dynamic-boundary-report';
@@ -600,11 +601,14 @@ describe('GET /api/flow — refusals', () => {
     expect(payload.hint).toMatch(/\?from=/);
   });
 
-  it('caps the number of trail hops it will read', async () => {
-    const query = Array.from({ length: 40 }, (_, i) => `hop=s${i}xx`).join('&');
-    const payload = await getFlow(`?${query}`, 400);
+  it('caps the number of trail hops it will read at what the trail store saves (#1976)', async () => {
+    const hopsQuery = (n: number) => Array.from({ length: n }, (_, i) => `hop=s${i}xx`).join('&');
+    // A 64-hop trail is one the store saves, so it must be readable as a flow.
+    const saved = await request(`/api/flow?${hopsQuery(MAX_TRAIL_HOPS)}`);
+    expect(saved.status).toBe(200);
+    const payload = await getFlow(`?${hopsQuery(MAX_TRAIL_HOPS + 1)}`, 400);
     expect(payload.code).toBe('bad-request');
-    expect(payload.error).toMatch(/longer than this endpoint reads/);
+    expect(payload.error).toMatch(/longer than this endpoint reads \(64\)/);
   });
 
   it('is listed on the API index', async () => {

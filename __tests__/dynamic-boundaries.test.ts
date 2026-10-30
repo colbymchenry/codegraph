@@ -149,6 +149,25 @@ describe('codegraph_explore — dynamic boundaries', () => {
     if (testDir && fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
   });
 
+  it('announces a template import boundary from indexed source (#1967)', async () => {
+    await setup({
+      'loader.ts': [
+        'export async function loadLocale(lang: string) {',
+        '  return import(`./locales/${lang}.js`);',
+        '}',
+      ].join('\n'),
+      'locale.ts': 'export function translate() { return "hello"; }',
+    }, ['**/*.ts']);
+
+    const res = await handler.execute('codegraph_explore', { query: 'loadLocale translate' });
+    const text = res.content[0].text as string;
+    expect(res.isError).not.toBe(true);
+    expect(text).toContain('**Dynamic boundaries');
+    expect(text).toContain('dynamic import');
+    expect(text).toMatch(/loader\.ts:2/);
+    expect(text).not.toContain('candidates for key');
+  });
+
   it('announces the boundary site and shortlists the keyed candidate', async () => {
     await setup({
       'router.ts': [
@@ -383,6 +402,38 @@ describe('codegraph_explore — interface dispatch', () => {
     expect(text).not.toContain('**Interface dispatch');
   });
 
+  // vscode shape: many unrelated classes share a lifecycle base and happen to
+  // share a member name the base never declares. That is not dispatch through
+  // the base — announcing it put "runtime dispatch to 2706 types implementing
+  // Disposable" at the top of every answer whose query said "extension".
+  const lifecycleFamily = () => {
+    const names = ['Editor', 'Terminal', 'Search', 'Debug', 'Scm', 'Chat', 'Notebook', 'Output', 'Tasks', 'Remote'];
+    return [
+      'export abstract class Disposable { dispose(): void {} }',
+      ...names.map((nm, i) => [
+        `export class ${nm}Service extends Disposable {`,
+        `  get extension(): string { return '${nm.toLowerCase()}'; }`,
+        `  dispose(): void { super.dispose(); }`,
+        `  describe${nm}() { return this.extension + ${i}; }`,
+        '}',
+      ].join('\n')),
+    ].join('\n');
+  };
+
+  it('stays SILENT for a shared name the common base never declares', async () => {
+    await setup({ 'services.ts': lifecycleFamily() }, ['**/*.ts']);
+    const res = await handler.execute('codegraph_explore', { query: 'extension describeEditor describeChat' });
+    const text = res.content[0].text as string;
+    expect(text).not.toMatch(/`extension` → runtime dispatch/);
+  });
+
+  it('still announces a member the common base declares', async () => {
+    await setup({ 'services.ts': lifecycleFamily() }, ['**/*.ts']);
+    const res = await handler.execute('codegraph_explore', { query: 'dispose describeEditor describeChat' });
+    const text = res.content[0].text as string;
+    expect(text).toMatch(/`dispose` → runtime dispatch to \*\*10\*\* types implementing `Disposable`/);
+  });
+
   it('stays SILENT when the interface family is below the polymorphism threshold (3 impls)', async () => {
     await setup({ 'nodes.ts': nodeFamily(3), 'registry.ts': registry, 'engine.ts': engine }, ['**/*.ts']);
 
@@ -390,4 +441,71 @@ describe('codegraph_explore — interface dispatch', () => {
     const text = res.content[0].text as string;
     expect(text).not.toContain('**Interface dispatch');
   });
+});
+
+describe('scanDynamicDispatch — dynamic import arguments (#1967)', () => {
+  const forms = (body: string): string[] =>
+    scanDynamicDispatch(body, 'typescript', 1).map((m) => m.form);
+
+  it('flags an import built from a template literal with a substitution', () => {
+    expect(forms('async function load(lang) {\n  return import(`./locales/${lang}.js`);\n}')).toEqual(['dynamic-import']);
+    expect(forms('function load(name) {\n  return require(`./plugins/${name}`);\n}')).toEqual(['dynamic-import']);
+  });
+
+  it('flags an import built by string concatenation', () => {
+    expect(forms("async function load(lang) {\n  return import('./locales/' + lang + '.js');\n}")).toEqual(['dynamic-import']);
+    expect(forms('function load(dir) {\n  return require(dir + "/index");\n}')).toEqual(['dynamic-import']);
+  });
+
+  it('still flags an import of a bare expression', () => {
+    expect(forms('async function load(p) {\n  return import(p);\n}')).toEqual(['dynamic-import']);
+  });
+
+  it('leaves a single complete literal alone', () => {
+    expect(forms("async function a() {\n  return import('./fixed.js');\n}")).toEqual([]);
+    expect(forms('async function a() {\n  return import(`./fixed.js`);\n}')).toEqual([]);
+    expect(forms('function a() {\n  return require("./fixed");\n}')).toEqual([]);
+    expect(forms("async function a() {\n  return import('./data.json', { with: { type: 'json' } });\n}")).toEqual([]);
+  });
+});
+
+
+describe('scanDynamicDispatch — import escapes and trivia (#1967)', () => {
+  it.each(['import', 'require'])('%s respects escapes and complete literals', (call) => {
+    const staticArgs = [
+      '`./plugins/\\${name}`',
+      '`./plugins/\\\\\\${name}`',
+      '`./plugins/\\`fixed`',
+      '"./plugins/\\"fixed"',
+      "'./plugins/\\'fixed'",
+      '/* before */ `./fixed` /* after */',
+      '// before\n "./fixed" // after\n',
+      '`./fixed`, { with: { type: "json" } }',
+      '"./${name}"',
+    ];
+    for (const arg of staticArgs) {
+      expect(scanDynamicDispatch(`${call}(${arg})`, 'typescript', 1), arg).toEqual([]);
+    }
+    const runtimeArgs = [
+      '`./plugins/\\\\${name}`',
+      '`./plugins/\\${literal}/${name}`',
+      '`./plugins/${`nested-${name}`}`',
+      '/* before */ "./plugins/" /* after */ + name',
+      '`./plugins/\\${literal}` + name',
+      '"./plugins/".concat(name)',
+      '// before\n `./plugins/${name}`, { with: { type: "json" } }',
+    ];
+    for (const arg of runtimeArgs) {
+      const matches = scanDynamicDispatch(`function load() {\n  ${call}(${arg});\n}`, 'typescript', 20);
+      expect(matches, arg).toHaveLength(1);
+      expect(matches[0], arg).toMatchObject({ form: 'dynamic-import', line: 21 });
+    }
+  });
+
+  it.each(['javascript', 'typescript', 'jsx', 'tsx', 'vue', 'svelte', 'astro', 'arkts'])(
+    'detects runtime imports across %s', (language) => {
+      expect(scanDynamicDispatch('import(`./${name}`)', language, 1)[0]?.form).toBe('dynamic-import');
+      expect(scanDynamicDispatch('import(`./fixed`)', language, 1)).toEqual([]);
+    },
+  );
 });

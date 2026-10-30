@@ -16,7 +16,7 @@ int blockDoc() => 1;
 // Plain comment doc.
 String plainDoc() => 'x';
 
-/// Broken by annotation.
+/// Kept past the annotation.
 @deprecated
 void annotated() {}
 

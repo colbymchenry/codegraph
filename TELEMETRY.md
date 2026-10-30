@@ -115,9 +115,9 @@ take, and there is nothing after it. This is a stronger guarantee than a promise
 share: there is no second party to share with.
 
 What is kept is checkable rather than asserted. The storage schema —
-[`telemetry-worker/migrations/0001_init.sql`](telemetry-worker/migrations/0001_init.sql),
-checked in beside the endpoint that writes it — is the complete list of what a row can
-hold, with a comment on every column.
+[`telemetry-worker/migrations/`](telemetry-worker/migrations/), checked in beside the
+endpoint that writes it — is the complete list of what a row can hold, with a comment on
+every column.
 
 Individual events are **deleted after 90 days**. What outlives them is anonymous daily
 totals: counts per day of things like operating system, version, and language, plus which

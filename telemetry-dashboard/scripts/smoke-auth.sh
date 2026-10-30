@@ -64,9 +64,10 @@ lacks() { # lacks <description> <needle> <haystack>
   fi
 }
 
-echo "Seeding local D1 from the ingest worker's migration…"
-npx wrangler d1 execute codegraph-telemetry --local \
-  --file=../telemetry-worker/migrations/0001_init.sql >/dev/null 2>&1
+echo "Seeding local D1 from the ingest worker's migrations…"
+for migration in ../telemetry-worker/migrations/*.sql; do
+  npx wrangler d1 execute codegraph-telemetry --local --file="$migration" >/dev/null 2>&1
+done
 
 echo "Starting wrangler dev on :${DASH_PORT}…"
 npx wrangler dev --port "$DASH_PORT" --ip 127.0.0.1 >"$LOG" 2>&1 &

@@ -285,9 +285,11 @@ static bool scan_automatic_semicolon(TSLexer *lexer) {
 
   if (sameline) {
     switch (lexer->lookahead) {
-      // Don't insert a semicolon before an else
+      // Don't insert a semicolon before an else — nor before any other word
+      // starting with `e` on the same line: that is an infix call
+      // (`Users.id eq id1`), which continues the expression. (codegraph patch)
       case 'e':
-        return !scan_for_word(lexer, "lse", 3);
+        return false;
 
       case 'i':
         return scan_for_word(lexer, "mport", 5);

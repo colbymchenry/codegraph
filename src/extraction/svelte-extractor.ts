@@ -2,6 +2,7 @@ import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference, Lan
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
+import { foldScriptResult, sfcFileNode, sfcScriptLanguage, SFC_SCRIPT_ELEMENT, sfcBlockLineRanges } from './sfc-script';
 
 /** Svelte 5 rune names — compiler builtins, not real functions */
 const SVELTE_RUNES = new Set([
@@ -41,8 +42,10 @@ export class SvelteExtractor {
     const startTime = Date.now();
 
     try {
-      // Create component node for the .svelte file itself
+      // The file, holding the component the .svelte file is
+      this.nodes.push(sfcFileNode(this.filePath, this.source, 'svelte'));
       const componentNode = this.createComponentNode();
+      this.edges.push({ source: `file:${this.filePath}`, target: componentNode.id, kind: 'contains' });
 
       // Extract and process script blocks
       const scriptBlocks = this.extractScriptBlocks();
@@ -122,18 +125,22 @@ export class SvelteExtractor {
       isTypeScript: boolean;
     }> = [];
 
-    const scriptRegex = /<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/g;
+    // A self-closing `<script ... />` (e.g. a third-party script in
+    // `<svelte:head>`) has no body; match it on its own so it cannot run on to
+    // the next `</script>`.
+    const scriptRegex = new RegExp(SFC_SCRIPT_ELEMENT);
     let match;
 
     while ((match = scriptRegex.exec(this.source)) !== null) {
+      if (match.groups?.content === undefined) continue;
       const attrs = match[1] || '';
-      const content = match.groups?.content || match[2] || '';
+      const content = match.groups.content;
 
       // Detect TypeScript from lang attribute
-      const isTypeScript = /lang\s*=\s*["'](ts|typescript)["']/.test(attrs);
+      const isTypeScript = sfcScriptLanguage(attrs, 'svelte') === 'typescript';
 
-      // Detect module script
-      const isModule = /context\s*=\s*["']module["']/.test(attrs);
+      // Detect module script: Svelte 4's `context="module"`, Svelte 5's `module`
+      const isModule = /context\s*=\s*["']module["']|(?:^|\s)module(?=[\s=]|$)/.test(attrs);
 
       // Calculate the 0-indexed line where the content begins. The content
       // starts right after the opening tag's `>` — its leading `\n` is part
@@ -179,45 +186,11 @@ export class SvelteExtractor {
     const extractor = new TreeSitterExtractor(this.filePath, block.content, scriptLanguage);
     const result = extractor.extract();
 
-    // Offset line numbers from script block back to .svelte file positions
-    for (const node of result.nodes) {
-      node.startLine += block.startLine;
-      node.endLine += block.startLine;
-      node.language = 'svelte'; // Mark as svelte, not TS/JS
-
-      this.nodes.push(node);
-
-      // Add containment edge from component to this node
-      this.edges.push({
-        source: componentNodeId,
-        target: node.id,
-        kind: 'contains',
-      });
-    }
-
-    // Offset edges (they reference line numbers)
-    for (const edge of result.edges) {
-      if (edge.line) {
-        edge.line += block.startLine;
-      }
-      this.edges.push(edge);
-    }
-
-    // Offset unresolved references
-    for (const ref of result.unresolvedReferences) {
-      ref.line += block.startLine;
-      ref.filePath = this.filePath;
-      ref.language = 'svelte';
-      this.unresolvedReferences.push(ref);
-    }
-
-    // Carry over errors
-    for (const error of result.errors) {
-      if (error.line) {
-        error.line += block.startLine;
-      }
-      this.errors.push(error);
-    }
+    foldScriptResult(
+      result,
+      { filePath: this.filePath, componentNodeId, lineOffset: block.startLine, language: 'svelte', perInstance: !block.isModule },
+      { nodes: this.nodes, edges: this.edges, unresolvedReferences: this.unresolvedReferences, errors: this.errors }
+    );
   }
 
   /**
@@ -231,17 +204,10 @@ export class SvelteExtractor {
     componentNodeId: string,
     _scriptBlocks: Array<{ content: string; startLine: number }>
   ): void {
-    // Build a set of line ranges covered by <script> and <style> blocks so we skip them
-    const coveredRanges: Array<[number, number]> = [];
-
-    // Find all <script>...</script> and <style>...</style> ranges
-    const tagRegex = /<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
-    let tagMatch;
-    while ((tagMatch = tagRegex.exec(this.source)) !== null) {
-      const startLine = (this.source.substring(0, tagMatch.index).match(/\n/g) || []).length;
-      const endLine = startLine + (tagMatch[0].match(/\n/g) || []).length;
-      coveredRanges.push([startLine, endLine]);
-    }
+    // Line ranges covered by <script> and <style> blocks, so we skip them. A
+    // self-closing tag covers nothing: its attributes
+    // (`src={assetUrl('/analytics.js')}`) are template expressions.
+    const coveredRanges = sfcBlockLineRanges(this.source);
 
     // Find template expressions: {...} outside of script/style blocks
     // Matches curly-brace expressions, excluding Svelte block syntax ({#if}, {:else}, {/if}, {@html}, {@render})
@@ -290,14 +256,7 @@ export class SvelteExtractor {
    */
   private extractTemplateComponents(componentNodeId: string): void {
     // Build ranges covered by <script> and <style> blocks to skip them
-    const coveredRanges: Array<[number, number]> = [];
-    const tagRegex = /<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
-    let tagMatch;
-    while ((tagMatch = tagRegex.exec(this.source)) !== null) {
-      const startLine = (this.source.substring(0, tagMatch.index).match(/\n/g) || []).length;
-      const endLine = startLine + (tagMatch[0].match(/\n/g) || []).length;
-      coveredRanges.push([startLine, endLine]);
-    }
+    const coveredRanges = sfcBlockLineRanges(this.source);
 
     const lines = this.source.split('\n');
     // Match PascalCase opening/self-closing tags (closing tags </Foo> start with </ so won't match)

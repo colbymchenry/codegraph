@@ -59,6 +59,14 @@ function isSvelteKitPage(node: Node): boolean {
   );
 }
 
+/**
+ * True for a page the table holds. `[...rest]` becomes `*rest`, which matches
+ * anything — never an answer.
+ */
+function inSvelteKitTable(node: Node): boolean {
+  return isSvelteKitPage(node) && node.name.startsWith('/') && !node.name.includes('*');
+}
+
 /** `:id?` — a parameter SvelteKit serves the route with or without. */
 function isOptionalParam(seg: string): boolean {
   return seg.startsWith(':') && seg.endsWith('?');
@@ -78,9 +86,7 @@ export function svelteKitTable(context: ResolutionContext): SvelteKitTable {
     return t;
   };
   for (const node of all) {
-    if (!isSvelteKitPage(node)) continue;
-    // `[...rest]` becomes `*rest`, which matches anything — never an answer.
-    if (!node.name.startsWith('/') || node.name.includes('*')) continue;
+    if (!inSvelteKitTable(node)) continue;
     const root = appRootFor(node.filePath);
     addRouteTo(tableAt(root), node.name, node);
     // `[[optional]]` is `:x?`: the route serves the path with and without it.
@@ -127,6 +133,12 @@ export const svelteKitRouterResolver: FrameworkResolver = {
 
   claimsReference(name: string): boolean {
     return NAV_CALL.test(name);
+  },
+
+  navigation: {
+    tails: ['goto', 'redirect'],
+    // A call matches against the table of the app its file is in.
+    scope: (route) => (inSvelteKitTable(route) ? [appRootFor(route.filePath)] : null),
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {

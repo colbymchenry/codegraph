@@ -197,7 +197,9 @@ describe('Shared MCP daemon (issue #411)', () => {
     }
     await new Promise((r) => setTimeout(r, 50));
     servers.length = 0;
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    // A killed process releases its handles asynchronously on Windows; under
+    // full-suite load 50 ms is not always enough, so retry EPERM/EBUSY.
+    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it('takes over after SIGKILL even when the stale PID has been reused (#1553)', async () => {

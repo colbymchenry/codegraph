@@ -7,6 +7,8 @@
 
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
+import { pageComponentRef, resolvePageComponent } from './page-component';
+import { inReferencingFolder } from './component-folder';
 
 /**
  * Astro virtual module prefixes — framework-provided, not user code
@@ -47,6 +49,10 @@ export const astroResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // A page route names the component its file is.
+    const page = resolvePageComponent(ref, context);
+    if (page) return page;
+
     // Pattern 1: the `Astro` global (Astro.props, Astro.url, Astro.params, …)
     // — runtime-provided in every component's frontmatter. Resolving it as
     // framework-provided keeps it from name-matching a user symbol named Astro.
@@ -74,7 +80,10 @@ export const astroResolver: FrameworkResolver = {
     // Pattern 3: Component references (PascalCase) — resolve to component
     // nodes. Template tags arrive as `references`, frontmatter expression
     // usages as `calls`.
+    // Only from Astro markup: a `.ts` file's `Page` (Playwright's) or a
+    // declaration file's `image?: Image` is no `Page.astro` / `Image.astro`.
     if (
+      ref.filePath.endsWith('.astro') &&
       isPascalCase(ref.referenceName) &&
       (ref.referenceKind === 'references' || ref.referenceKind === 'calls')
     ) {
@@ -92,8 +101,9 @@ export const astroResolver: FrameworkResolver = {
     return null;
   },
 
-  extract(filePath: string, _content: string) {
+  extract(filePath: string, content: string) {
     const nodes: Node[] = [];
+    const references: UnresolvedRef[] = [];
     const now = Date.now();
 
     // Normalize to forward slashes
@@ -115,8 +125,9 @@ export const astroResolver: FrameworkResolver = {
         !/\.config\.[a-z]+$/.test(base)
       ) {
         const routePath = filePathToAstroRoute(afterPages);
-
-        nodes.push({
+        const isPage = normalized.endsWith('.astro');
+        const language = isPage ? 'astro' : 'typescript';
+        const route: Node = {
           id: `route:${filePath}:${routePath}:1`,
           kind: 'route',
           name: routePath,
@@ -126,15 +137,30 @@ export const astroResolver: FrameworkResolver = {
           endLine: 1,
           startColumn: 0,
           endColumn: 0,
-          language: normalized.endsWith('.astro') ? 'astro' : 'typescript',
+          language,
           updatedAt: now,
-        });
+        };
+        nodes.push(route);
+        if (isPage) {
+          references.push(pageComponentRef(route, '.astro', 'astro'));
+        } else {
+          // An endpoint is served by the verbs it exports: `export const GET:
+          // APIRoute = …`, `export async function POST(…)`.
+          for (const m of content.matchAll(ENDPOINT_EXPORT)) {
+            const verb = m[1] ?? m[2]!;
+            const line = content.slice(0, m.index).split('\n').length;
+            references.push({ fromNodeId: route.id, referenceName: verb, referenceKind: 'references', line, column: 0, filePath, language, candidates: [verb] });
+          }
+        }
       }
     }
 
-    return { nodes, references: [] };
+    return { nodes, references };
   },
 };
+
+/** An Astro endpoint's exported handler: `export const GET`, `export async function POST`. */
+const ENDPOINT_EXPORT = /^\s*export\s+(?:(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|ALL)\b|const\s+(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|ALL)\b)/gm;
 
 /**
  * Check if string is PascalCase
@@ -157,9 +183,8 @@ function resolveComponent(
 
   if (components.length === 0) return null;
 
-  // Prefer same directory
-  const fromDir = fromFile.substring(0, fromFile.lastIndexOf('/'));
-  const sameDir = components.filter((n) => n.filePath.startsWith(fromDir));
+  // Prefer the referencing file's folder, or one below it
+  const sameDir = inReferencingFolder(fromFile, components, (n) => n.filePath);
   if (sameDir.length > 0) return sameDir[0]!.id;
 
   // No positional signal: only an UNAMBIGUOUS name may resolve — picking

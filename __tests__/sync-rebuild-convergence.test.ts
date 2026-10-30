@@ -41,8 +41,19 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { createDatabase } from '../src/db/sqlite-adapter';
+import { QueryBuilder } from '../src/db/queries';
+import { ToolHandler } from '../src/mcp/tools';
 
-describe('Incremental sync converges to a full rebuild (CG-33)', () => {
+/**
+ * Every case here builds a real index, and most rebuild it from scratch to
+ * compare against, three to nine index passes each. On a Windows VM with
+ * on-access scanning and a busy host even a single index-and-sync case took
+ * over 5s and the heaviest 35s, so the default timeout measured the machine
+ * rather than the tree (#1773). This bound only catches a hang.
+ */
+const INDEXING_TIMEOUT = { timeout: 60_000 };
+
+describe('Incremental sync converges to a full rebuild (CG-33)', INDEXING_TIMEOUT, () => {
   let testDir: string;
   let cg: CodeGraph;
 
@@ -489,7 +500,7 @@ describe('Incremental sync converges to a full rebuild (CG-33)', () => {
  * cannot fix: without it, re-resolving a reference against the very same graph
  * can still pick a different winner than a rebuild does.
  */
-describe('Same-name candidate order is content-derived, not insertion-derived (CG-33)', () => {
+describe('Same-name candidate order is content-derived, not insertion-derived (CG-33)', INDEXING_TIMEOUT, () => {
   let testDir: string;
   let cg: CodeGraph;
 
@@ -516,5 +527,293 @@ describe('Same-name candidate order is content-derived, not insertion-derived (C
     expect(keys.length).toBeGreaterThanOrEqual(3);
     expect(keys).toEqual([...keys].sort());
     expect(keys[0]).toContain('src/alpha.ts');
+  });
+});
+
+/** Synthesis owns a whole-graph result, including registrations in third files. */
+describe('Synthesized edges converge after sync (#1988)', INDEXING_TIMEOUT, () => {
+  let dir: string;
+  let cg: CodeGraph;
+  const write = (file: string, content: string) => fs.writeFileSync(path.join(dir, file), content);
+  const bus = `import { EventEmitter } from 'events';
+export const bus = new EventEmitter();
+export function fire(): void { bus.emit('ping'); }
+export function onPing(): void {}
+`;
+  const wiring = "import { bus, onPing } from './bus';\nbus.on('ping', onPing);\n";
+  const readEdges = (synthesized = true) => {
+    const { db } = createDatabase(path.join(dir, '.codegraph', 'codegraph.db'), { readOnly: true });
+    try {
+      return db.prepare(`SELECT source, target, kind, metadata, line, col, provenance FROM edges
+        ${synthesized ? "WHERE json_extract(metadata, '$.synthesizedBy') IS NOT NULL" : ''}
+        ORDER BY source, target, kind, line, col, metadata`).all();
+    } finally { db.close(); }
+  };
+  const load = async () => {
+    cg = CodeGraph.initSync(dir, { config: { exclude: [] } });
+    await cg.indexAll();
+  };
+  const converges = async () => {
+    const synced = readEdges();
+    cg.close();
+    cg = await CodeGraph.recreate(dir, { silent: true });
+    await cg.indexAll();
+    expect(synced).toEqual(readEdges());
+  };
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-sync-synthesis-')); });
+  afterEach(() => {
+    cg?.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.each([false, true])('adds and removes registration without changing endpoints (scoped=%s)', async (scoped) => {
+    write('bus.ts', bus);
+    write('wiring.ts', "import { bus, onPing } from './bus';\n");
+    await load();
+    expect(readEdges()).toHaveLength(0);
+    write('wiring.ts', wiring);
+    const phases: string[] = [];
+    await cg.sync({ paths: scoped ? ['wiring.ts'] : undefined, onProgress: p => phases.push(p.phase) });
+    expect(readEdges()).toHaveLength(1);
+    expect(phases.indexOf('linking')).toBeGreaterThan(phases.lastIndexOf('resolving'));
+    await converges();
+    write('wiring.ts', "import { bus, onPing } from './bus';\n");
+    await cg.sync({ paths: scoped ? ['wiring.ts'] : undefined });
+    expect(readEdges()).toHaveLength(0);
+    await converges();
+  });
+
+  it('adds, renames and deletes a separate registration file', async () => {
+    write('bus.ts', bus);
+    await load();
+    write('wiring.ts', wiring);
+    await cg.sync({ paths: ['wiring.ts'] });
+    expect(readEdges()).toHaveLength(1);
+    await converges();
+    fs.renameSync(path.join(dir, 'wiring.ts'), path.join(dir, 'renamed.ts'));
+    await cg.sync({ paths: ['wiring.ts', 'renamed.ts'] });
+    expect(JSON.parse(readEdges()[0].metadata).registeredAt).toBe('renamed.ts:2');
+    await converges();
+    fs.unlinkSync(path.join(dir, 'renamed.ts'));
+    await cg.sync({ paths: ['renamed.ts'] });
+    expect(readEdges()).toHaveLength(0);
+    await converges();
+  });
+
+  it('refreshes when a dispatcher loses its emit pattern before its edges cascade', async () => {
+    write('bus.ts', bus);
+    write('wiring.ts', wiring);
+    await load();
+    write('bus.ts', bus.replace("bus.emit('ping');", ''));
+    await cg.sync({ paths: ['bus.ts'] });
+    expect(readEdges()).toHaveLength(0);
+    await converges();
+  });
+
+  it('skips synthesis for no-op syncs and unrelated ordinary edits', async () => {
+    write('bus.ts', bus);
+    write('wiring.ts', wiring);
+    write('math.ts', 'export function square(n: number) { return n * n; }\n');
+    await load();
+    const before = readEdges();
+    const phases: string[] = [];
+    await cg.sync({ onProgress: p => phases.push(p.phase) });
+    write('math.ts', 'export function square(n: number) { return n * n + 1; }\n');
+    await cg.sync({ paths: ['math.ts'], onProgress: p => phases.push(p.phase) });
+    expect(phases).not.toContain('linking');
+    expect(readEdges()).toEqual(before);
+  });
+
+  it('refreshes all event channels when a registration crosses the global fan-out cap', async () => {
+    write('bus.ts', bus);
+    write('wiring.ts', wiring);
+    for (let i = 0; i < 5; i++) {
+      write(`handler${i}.ts`, `import { bus } from './bus';\nfunction handler${i}() {}\nbus.on('ping', handler${i});\n`);
+    }
+    await load();
+    expect(readEdges()).toHaveLength(6);
+    write('extra.ts', "import { bus } from './bus';\nfunction extra() {}\nbus.on('ping', extra);\n");
+    await cg.sync({ paths: ['extra.ts'] });
+    expect(readEdges()).toHaveLength(0);
+    await converges();
+    fs.unlinkSync(path.join(dir, 'extra.ts'));
+    await cg.sync({ paths: ['extra.ts'] });
+    expect(readEdges()).toHaveLength(6);
+    await converges();
+  });
+
+  it('converges after C table, header and header-deletion edits', async () => {
+    const header = 'struct ops { int (*fn)(void); };\n';
+    write('ops.h', header);
+    write('handlers.c', 'int first(void) { return 1; }\nint second(void) { return 2; }\n');
+    write('table.c', '#include "ops.h"\nextern int first(void);\nextern int second(void);\nstruct ops table = { .fn = first };\n');
+    write('dispatch.c', '#include "ops.h"\nint dispatch(struct ops *p) { return p->fn(); }\n');
+    await load();
+    expect(readEdges().some(e => JSON.parse(e.metadata).synthesizedBy === 'fn-pointer-dispatch')).toBe(true);
+    write('table.c', '#include "ops.h"\nextern int first(void);\nextern int second(void);\nstruct ops table = { .fn = second };\n');
+    await cg.sync({ paths: ['table.c'] });
+    await converges();
+    write('ops.h', 'struct ops { int fn; };\n');
+    await cg.sync({ paths: ['ops.h'] });
+    expect(readEdges()).toHaveLength(0);
+    await converges();
+    write('ops.h', header);
+    await cg.sync({ paths: ['ops.h'] });
+    expect(readEdges().length).toBeGreaterThan(0);
+    await converges();
+    fs.unlinkSync(path.join(dir, 'ops.h'));
+    await cg.sync({ paths: ['ops.h'] });
+    expect(readEdges()).toHaveLength(0);
+    await converges();
+  });
+
+  it('keeps C layout precedence independent of file insertion order', async () => {
+    write('alpha.c', 'struct ops { int (*first)(void); };\nint a(void) { return 1; }\nstruct ops one = { .first = a };\nint runA(struct ops *p) { return p->first(); }\n');
+    write('zeta.c', 'struct ops { int (*second)(void); };\nint z(void) { return 2; }\nstruct ops two = { .second = z };\nint runZ(struct ops *p) { return p->second(); }\n');
+    await load();
+    fs.appendFileSync(path.join(dir, 'alpha.c'), '// edit earlier file\n');
+    await cg.sync({ paths: ['alpha.c'] });
+    await converges();
+  });
+
+  it('recovers synthesis after extraction was interrupted before resolution', async () => {
+    write('bus.ts', bus);
+    write('wiring.ts', wiring);
+    await load();
+    fs.appendFileSync(path.join(dir, 'bus.ts'), '// interrupted index\n');
+    await cg.indexFiles(['bus.ts']);
+    expect(cg.getPendingReferenceCount()).toBeGreaterThan(0);
+    const result = await cg.sync();
+    expect(result.filesAdded + result.filesModified + result.filesRemoved).toBe(0);
+    expect(readEdges()).toHaveLength(1);
+    await converges();
+  });
+
+  it('keeps old synthesis on pass failure and retries on a no-op sync', async () => {
+    write('bus.ts', bus);
+    write('wiring.ts', wiring);
+    await load();
+    const before = readEdges();
+    write('wiring.ts', wiring.replace("'ping'", "'pong'"));
+    await expect(cg.sync({ paths: ['wiring.ts'], onProgress: p => {
+      if (p.phase === 'linking' && p.current > 0) throw new Error('interrupted synthesis');
+    } })).rejects.toThrow('interrupted synthesis');
+    expect(readEdges()).toEqual(before);
+    await cg.sync({ paths: ['wiring.ts'] });
+    expect(readEdges()).toHaveLength(0);
+    await converges();
+  });
+
+  it('rolls back a failed replacement without removing ordinary or old synthesized edges', async () => {
+    write('bus.ts', bus);
+    write('wiring.ts', wiring);
+    await load();
+    const before = readEdges();
+    const ordinary = readEdges(false).filter(e => e.provenance !== 'heuristic');
+    const { db } = createDatabase(path.join(dir, '.codegraph', 'codegraph.db'));
+    try {
+      db.exec(`CREATE TRIGGER fail_synthesis BEFORE INSERT ON edges
+        WHEN NEW.provenance = 'heuristic' BEGIN SELECT RAISE(FAIL, 'publish failed'); END`);
+      write('wiring.ts', wiring + '// changed registration file\n');
+      await expect(cg.sync({ paths: ['wiring.ts'] })).rejects.toThrow('publish failed');
+      expect(readEdges()).toEqual(before);
+      expect(readEdges(false).filter(e => e.provenance !== 'heuristic')).toEqual(ordinary);
+      db.exec('DROP TRIGGER fail_synthesis');
+    } finally { db.close(); }
+    await cg.sync({ paths: ['wiring.ts'] });
+    expect(readEdges()).toEqual(before);
+    await converges();
+  });
+
+  it('migrates an existing index and repairs synthesis without requiring a file edit', async () => {
+    write('bus.ts', bus);
+    write('wiring.ts', wiring);
+    await load();
+    cg.close();
+    const { db } = createDatabase(path.join(dir, '.codegraph', 'codegraph.db'));
+    try {
+      db.exec(`DELETE FROM schema_versions WHERE version >= 10;
+        INSERT OR IGNORE INTO schema_versions(version, applied_at, description) VALUES (9, 0, 'legacy fixture');
+        DROP TABLE synthesis_inputs;
+        DROP INDEX idx_edges_synthesis_site;
+        DROP INDEX idx_nodes_kind;
+        CREATE INDEX idx_nodes_kind ON nodes(kind);
+        DELETE FROM edges WHERE provenance = 'heuristic'`);
+    } finally { db.close(); }
+    cg = CodeGraph.openSync(dir);
+    await cg.sync();
+    expect(readEdges()).toHaveLength(1);
+    await converges();
+  });
+
+  it('refreshes Go prerequisites before interface dispatch', async () => {
+    write('api.go', 'package demo\ntype Runner interface { Run() }\ntype Worker struct {}\n');
+    await load();
+    write('worker.go', 'package demo\nfunc (w Worker) Run() {}\n');
+    await cg.sync({ paths: ['worker.go'] });
+    expect(readEdges().some(e => JSON.parse(e.metadata).synthesizedBy === 'go-implements')).toBe(true);
+    await converges();
+    write('worker.go', 'package demo\nfunc (w Worker) Other() {}\n');
+    await cg.sync({ paths: ['worker.go'] });
+    expect(readEdges().some(e => JSON.parse(e.metadata).synthesizedBy === 'go-implements')).toBe(false);
+    await converges();
+  });
+
+  it('keeps cross-file Go method containment structural after indexing and incremental refresh', async () => {
+    write('types.go', 'package demo\ntype Worker struct {}\n');
+    write('worker.go', 'package demo\nfunc (w Worker) Run() {}\n');
+    await load();
+    const assertStructural = async () => {
+      const contains = readEdges().filter(e => JSON.parse(e.metadata).synthesizedBy === 'go-method-contains');
+      expect(contains).toHaveLength(1);
+      expect(contains[0].kind).toBe('contains');
+      expect.soft(contains[0].provenance).toBeNull();
+      const result = await new ToolHandler(cg).execute('codegraph_explore', { query: 'Worker Run' });
+      expect(result.isError).not.toBe(true);
+      const text = result.content.map(c => c.text ?? '').join('\n');
+      expect(text).toContain('func (w Worker) Run()');
+      expect(text).not.toMatch(/\[dynamic\b/i);
+      const { db } = createDatabase(path.join(dir, '.codegraph', 'codegraph.db'), { readOnly: true });
+      try {
+        const queries = new QueryBuilder(db);
+        expect(queries.hasSynthesizedEdgesTouchingFile('types.go')).toBe(true);
+        expect(queries.hasSynthesizedEdgesTouchingFile('worker.go')).toBe(true);
+      } finally { db.close(); }
+    };
+    await assertStructural();
+    // Refresh with both endpoints untouched, then with the method re-extracted.
+    write('unrelated.go', 'package demo\ntype Extra struct {}\n');
+    await cg.sync({ paths: ['unrelated.go'] });
+    await assertStructural();
+    await converges();
+    write('worker.go', 'package demo\n\nfunc (w Worker) Run() {}\n');
+    await cg.sync({ paths: ['worker.go'] });
+    await assertStructural();
+    await converges();
+  });
+
+  it('migrates legacy Go containment ownership without changing provenance', async () => {
+    write('types.go', 'package demo\ntype Worker struct {}\n');
+    write('worker.go', 'package demo\nfunc (w Worker) Run() {}\n');
+    await load();
+    cg.close();
+    const { db } = createDatabase(path.join(dir, '.codegraph', 'codegraph.db'));
+    try {
+      db.exec(`DELETE FROM schema_versions WHERE version >= 10;
+        INSERT OR IGNORE INTO schema_versions(version, applied_at, description) VALUES (9, 0, 'legacy fixture');
+        DROP TABLE synthesis_inputs;
+        DROP INDEX idx_edges_synthesis_site;
+        UPDATE edges SET provenance = NULL, metadata = NULL
+          WHERE json_extract(metadata, '$.synthesizedBy') = 'go-method-contains'`);
+    } finally { db.close(); }
+    cg = CodeGraph.openSync(dir);
+    // Inspect the migration itself before sync can replace its output.
+    const migrated = readEdges();
+    expect(migrated).toHaveLength(1);
+    expect(migrated[0].provenance).toBeNull();
+    expect(JSON.parse(migrated[0].metadata).synthesizedBy).toBe('go-method-contains');
+    await cg.sync();
+    expect(readEdges()).toEqual(migrated);
+    await converges();
   });
 });

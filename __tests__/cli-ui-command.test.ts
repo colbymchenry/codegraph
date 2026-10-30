@@ -25,6 +25,8 @@ const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
 const BASE_ENV = {
   ...process.env,
+  // The viewer is opt-in until it is released (see src/bin/viewer-gate.ts).
+  CODEGRAPH_UI: '1',
   CODEGRAPH_NO_DAEMON: '1',
   CODEGRAPH_WASM_RELAUNCHED: '1',
   NO_COLOR: '1',
@@ -183,6 +185,22 @@ describe('codegraph ui — refusals', () => {
     expect(code).toBe(1);
     expect(output).toContain('Refusing to operate on sensitive');
   });
+
+  // #1930: a link (a junction on Windows) to a sensitive folder is refused like
+  // the folder itself, not taken for an ordinary unindexed project.
+  it('refuses a link to a sensitive home folder', () => {
+    const home = path.join(unindexed, 'home');
+    fs.mkdirSync(path.join(home, '.config'), { recursive: true });
+    const link = path.join(unindexed, 'config-link');
+    fs.symlinkSync(path.join(home, '.config'), link, process.platform === 'win32' ? 'junction' : 'dir');
+    try {
+      const { code, output } = runCli(['ui', link], { HOME: home, USERPROFILE: home });
+      expect(code).toBe(1);
+      expect(output).toContain('Refusing to operate on sensitive');
+    } finally {
+      fs.unlinkSync(link);
+    }
+  });
 });
 
 describe('codegraph ui — serving', () => {
@@ -324,6 +342,29 @@ describe('codegraph ui — serving', () => {
     } finally {
       await new Promise<void>((resolve) => blocker.close(() => resolve()));
     }
+  }, 60_000);
+
+  // `codegraph ui` re-execs itself with `--liftoff-only`, and the command the
+  // user started blocks in spawnSync, unable to forward a signal: killing it by
+  // pid (a process manager, an IDE task, `kill`) used to leave the server
+  // serving the port forever. POSIX-only: it relies on reparenting.
+  it.runIf(process.platform !== 'win32')('stops serving when the command it was started as is killed', async () => {
+    const viewer = await startViewer(['--no-open', '--port', '0', projectDir], {
+      CODEGRAPH_WASM_RELAUNCHED: '',
+      CODEGRAPH_PPID_POLL_MS: '200',
+    });
+    expect((await get(viewer.port, '/api/stats')).status).toBe(200);
+    viewer.child.kill('SIGKILL');
+    const deadline = Date.now() + 15_000;
+    let serving = true;
+    while (serving && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 200));
+      serving = await get(viewer.port, '/api/stats').then(
+        () => true,
+        () => false
+      );
+    }
+    expect(serving).toBe(false);
   }, 60_000);
 
   it('refuses a foreign Host end-to-end', async () => {

@@ -124,27 +124,25 @@ describe('generated flag — schema migration to v9', () => {
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  /** A pre-v9 `files` table: no `generated` column, no partial index. */
+  /** A pre-v9 database: no `generated` column or partial index. */
   function makeLegacyDb(): SqliteDatabase {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-genmigrate-'));
     const conn = createDatabase(path.join(dir, 'legacy.db')).db;
+    db = conn;
+    // Later migrations also run, so retain the rest of the real graph schema.
+    conn.exec(fs.readFileSync(path.join(__dirname, '../src/db/schema.sql'), 'utf8'));
     conn.exec(`
-      CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, description TEXT);
+      DELETE FROM schema_versions;
       INSERT INTO schema_versions VALUES (8, 0, 'legacy');
-      CREATE TABLE files (
-        path TEXT PRIMARY KEY,
-        content_hash TEXT NOT NULL,
-        language TEXT NOT NULL,
-        size INTEGER NOT NULL,
-        modified_at INTEGER NOT NULL,
-        indexed_at INTEGER NOT NULL,
-        node_count INTEGER DEFAULT 0,
-        errors TEXT
-      );
+      DROP INDEX idx_files_generated;
+      ALTER TABLE files DROP COLUMN generated;
+      DROP TABLE synthesis_inputs;
+      DROP INDEX idx_edges_synthesis_site;
+      DROP INDEX idx_nodes_kind;
+      CREATE INDEX idx_nodes_kind ON nodes(kind);
       INSERT INTO files VALUES ('x/bank/types/tx.pb.go', 'h1', 'go', 10, 0, 0, 1, NULL);
       INSERT INTO files VALUES ('internal/payroll/payroll.go', 'h2', 'go', 10, 0, 0, 1, NULL);
     `);
-    db = conn;
     return conn;
   }
 

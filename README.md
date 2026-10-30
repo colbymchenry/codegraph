@@ -68,6 +68,7 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 - [Supported Languages](#supported-languages)
 - [Measured cross-file coverage](#measured-cross-file-coverage)
 - [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
 - [License](#license)
 
 ## Get Started
@@ -322,7 +323,7 @@ CodeGraph detects web-framework routing files and emits `route` nodes linked by 
 | **Flask** | `@app.route('/path', methods=[...])`, blueprint routes |
 | **FastAPI** | `@app.get(...)`, `@router.post(...)`, all standard methods |
 | **Express** | `app.get(...)`, `router.post(...)` with middleware chains |
-| **NestJS** | `@Controller` + `@Get/@Post/...`, GraphQL `@Resolver` + `@Query/@Mutation`, `@MessagePattern`/`@EventPattern`, `@SubscribeMessage` |
+| **NestJS** | `@Controller` + `@Get/@Post/...` (with `RouterModule` prefixes, `setGlobalPrefix` and URI versioning), GraphQL `@Resolver` + `@Query/@Mutation`, `@MessagePattern`/`@EventPattern`, `@SubscribeMessage` |
 | **Laravel** | `Route::get()`, `Route::resource()`, `Controller@action`, tuple syntax |
 | **Drupal** | `*.routing.yml` routes (`_controller`, `_form`, entity handlers); `hook_*` implementations in `.module`/`.theme`/`.install`/`.inc` |
 | **Rails** | `get '/x', to: 'users#index'`, hash-rocket `=>` syntax |
@@ -340,12 +341,13 @@ These frameworks additionally emit **`navigates`** edges: the function that send
 
 | Router | Routes from | Navigation from |
 |---|---|---|
-| **Expo Router** | Every screen file under `app/` (`app/item/[id].tsx` → `/item/[id]`, groups stripped), bound to its default-export component | `router.push` / `replace` / `navigate`, template hrefs, `{ pathname }` objects, and a helper's returned href |
+| **Expo Router** | Every screen file under `app/` (`app/item/[id].tsx` → `/item/[id]`, groups stripped), bound to its default-export component; `+api` files are endpoints (`GET /hello`) bound to their handlers | `router.push` / `replace` / `navigate`, template hrefs, `{ pathname }` objects, and a helper's returned href |
 | **Next.js** | App Router `app/**/page.tsx` and Pages Router pages (`(group)` stripped, `[slug]` → `:slug`); `app/api/**/route.ts` exports and `pages/api/*` are endpoints, not screens | `router.push` / `replace` / `prefetch`, `redirect()` / `permanentRedirect()` in a server action or page, `NextResponse.redirect(new URL(…))` in middleware, `<Link href>` and internal `<a href>` |
-| **React Router** | `<Route path component/element>` (v5 and v6) and `createBrowserRouter([{ path, element }])` | `history.push` / `replace`, `useNavigate`'s `navigate`, a loader's `redirect`, `<Link to>` / `<NavLink to>` / `<Navigate to>` / react-router-bootstrap's `<LinkContainer to>` |
+| **React Router** | `<Route path component/element>` (v5 and v6) and `createBrowserRouter([{ path, element }])` | `history.push` / `replace`, `useNavigate`'s `navigate`, a loader's `redirect`, `<Link to>` / `<NavLink to>` / `<Navigate to>` / v5's `<Redirect to>` / react-router-bootstrap's `<LinkContainer to>`, and a `styled(Link)` wrapper |
 | **TanStack Router** | `createFileRoute('/posts/$postId')` (file-based) and `createRoute({ path, getParentRoute })` composed up its parent chain (code-based); `_pathless` segments, `(group)` folders, `__root` and `<Outlet/>` layouts are not addresses | `navigate({ to })`, a thrown `redirect({ to })`, `<Link to>` / `<Navigate to>` — where `to` is the route PATTERN and the values ride beside it in `params` |
-| **Vue Router** / **Nuxt** | `createRouter({ routes: [...] })` with the view each entry names, plus Nuxt `pages/` file-based routes, `server/api/` endpoints and route middleware | `router.push` / `replace`, `$router.push`, Nuxt's `navigateTo`, `<router-link>` / `<RouterLink>` / `<NuxtLink>` — **by route name** (`push({ name: 'profile' })`) as well as by path |
-| **SvelteKit** | `src/routes/**/+page.svelte` (`[slug]` → `:slug`, `[[opt]]` → `:opt?`), joined to the `+page.server.js` beside it so a loader's guard belongs to its page | `goto('/x')`, `redirect(status, '/x')` from a load or form action, and the plain `<a href>` that is a link in a SvelteKit app |
+| **Vue Router** / **Nuxt** | `createRouter({ routes: [...] })` / `new Router(...)` and the route tables it's given (`export const constantRoutes = [...]`, per-module route files), with the view each entry names — a lazy `() => import(…)` bound to its file — and `children` joined onto their parent's path, the parent being the layout around them; plus Nuxt `pages/` file-based routes, `server/api/` endpoints and route middleware | `router.push` / `replace`, `this.$router.push`, Nuxt's `navigateTo`, `<router-link>` / `<RouterLink>` / `<NuxtLink>` — **by route name** (`push({ name: 'profile' })`) as well as by path |
+| **SvelteKit** | `src/routes/**/+page.svelte` (`[slug]` → `:slug`, `[[opt]]` → `:opt?`, `[id=matcher]` → `:id`, `(group)` folders stripped), joined to the `+page.server.js` beside it so a loader's guard belongs to its page | `goto('/x')`, `redirect(status, '/x')` from a load or form action, and the plain `<a href>` that is a link in a SvelteKit app |
+| **Angular** | `Routes` arrays (`RouterModule.forRoot` / `forChild`, `provideRouter`, a routes file's default export) with `component` or a lazy `loadComponent`; `children` and lazy `loadChildren` (an NgModule's through its routing module) joined into full paths; paths written as route constants or `$localize` strings; a route with children is a layout around the screens inside it | `router.navigate([...])`, `navigateByUrl`, a guard's `createUrlTree` / `parseUrl` — a command array, a route constant, or a component property holding one — `routerLink` / `[routerLink]` in the component's template, and `redirectTo`. Each template's child components (`<app-foo>`) are linked to the component that renders them |
 
 In a repository holding several apps, each app's routes are matched only against navigation written inside that app.
 
@@ -362,9 +364,9 @@ Real iOS and React Native codebases live across multiple languages — a Swift c
 | **React Native legacy bridge** | JS `NativeModules.X.fn(...)` | ObjC `RCT_EXPORT_METHOD` / `RCT_REMAP_METHOD` · Java/Kotlin `@ReactMethod` | Parses macro/annotation declarations to build a JS-name → native-method map |
 | **React Native TurboModules** | JS `import M from './NativeM'; M.fn(...)` | Native impl matching the Codegen spec | Treats the `Native<X>.ts` spec interface as ground truth |
 | **RN native → JS events** | JS `new NativeEventEmitter(...).addListener('e', cb)` | ObjC `[self sendEventWithName:@"e" body:...]` · Swift `sendEvent(withName: "e", ...)` · Java/Kotlin `.emit("e", ...)` | Synthesized cross-language event channel keyed by literal event name |
-| **Expo Modules** | JS `requireNativeModule('X').fn(...)` | Swift / Kotlin `Module { Name("X"); AsyncFunction("fn") { ... } }` | Parses the Expo DSL literals; synthetic method nodes resolve via existing name-match |
+| **Expo Modules** | JS `requireNativeModule('X').fn(...)`, directly or through a binding (`export default requireNativeModule<T>('X')`) | Swift / Kotlin `Module { Name("X"); AsyncFunction("fn") { ... } }` | Parses the Expo DSL literals into method nodes; a call on a binding resolves to module `X`'s `fn` on both platforms, else to the method on the binding's declared type |
 | **Fabric view components** | JSX `<MyView prop={v}/>` | TS Codegen spec + native impl class | Spec → `component` node; convention-based name+suffix lookup (`View`/`ComponentView`/`Manager`/`ViewManager`) bridges to native |
-| **Legacy Paper view managers** | JSX `<MyView prop={v}/>` | ObjC `RCT_EXPORT_VIEW_PROPERTY` · Java/Kotlin `@ReactProp` | Same as Fabric — Paper-era declarations also produce `component` + `property` nodes |
+| **Legacy Paper view managers** | JSX `<MyView prop={v}/>`, through a `requireNativeComponent('X')` module | ObjC `RCT_EXPORT_VIEW_PROPERTY` · Java/Kotlin `@ReactProp` | Same as Fabric — `requireNativeComponent('X')` is a JS `component` node, and Paper-era declarations also produce `component` + `property` nodes |
 
 **Validated on real codebases** (small + medium + large for each bridge):
 
@@ -376,7 +378,7 @@ Real iOS and React Native codebases live across multiple languages — a Swift c
 | Expo Modules | expo-haptics | expo-camera | expo SDK sweep (7 packages) |
 | Fabric / Paper views | [react-native-segmented-control](https://github.com/react-native-segmented-control/segmented-control) | [react-native-screens](https://github.com/software-mansion/react-native-screens) | [react-native-skia](https://github.com/Shopify/react-native-skia) |
 
-Each bridge emits edges tagged `provenance:'heuristic'` with `metadata.synthesizedBy:` set to a stable channel name (e.g. `swift-objc-bridge`, `rn-event-channel`, `fabric-native-impl`, `expo-module-extract`), so the agent can tell at a glance how a hop got into the graph.
+Every bridge hop says how it got into the graph. A hop matched by a bridge resolver carries `metadata.resolvedBy: 'framework'` and `metadata.framework` naming the resolver (`swift-objc-bridge`, `react-native-bridge`, `expo-modules-js`, `fabric-view`). A synthesized channel is tagged `provenance:'heuristic'` with `metadata.synthesizedBy` (`rn-event-channel`, `fabric-native-impl`).
 
 ---
 
@@ -649,7 +651,10 @@ What it skips out of the box:
 - **Dependency, build, and cache directories** — `node_modules`, `vendor`,
   `dist`, `build`, `target`, `.venv`, `Pods`, `.next`, and the like across every
   [supported stack](#supported-languages) — so the graph is your code, not
-  third-party noise. This holds even with no `.gitignore`.
+  third-party noise. This holds even with no `.gitignore`. A `build` folder
+  inside `src/` is the exception: no build step writes TypeScript, JSX, Vue,
+  Svelte, Astro, Go, C# or Rust files into one, so those are indexed from it,
+  and a Java, Kotlin or Scala package named `build` is indexed whole.
 - **Anything in your `.gitignore`** — honored in git repos via git, and in
   non-git projects by reading `.gitignore` directly (root and nested).
 - **Files larger than 1 MB** — generated bundles, minified JS, vendored blobs.
@@ -790,12 +795,15 @@ See [Get Started](#get-started) for the one-line install commands.
 ## Supported Agents
 
 The interactive installer auto-detects and configures each of these — wiring up
-the MCP server (which delivers its own usage guidance, so no instructions file
-is written):
+the MCP server, which delivers its own usage guidance. For Claude Code, Codex
+CLI, Gemini CLI and opencode it also writes a short marker-fenced CodeGraph
+section into the agent's instructions file (`CLAUDE.md` / `AGENTS.md` /
+`GEMINI.md`), so subagents and non-MCP agents learn the `codegraph explore`
+command:
 
 - **Claude Code**
 - **Cursor**
-- **Codex CLI**
+- **Codex CLI** — the Codex IDE extension reads the same config: a global install writes `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`), and a local install writes `.codex/config.toml`, which Codex uses only in a project you've marked as trusted
 - **opencode** — MCP entry is OpenCode 2's `mcp.servers.codegraph` with `codemode: false` (keeps `codegraph_explore` on the native tool list; `codegraph install` migrates the older `mcp.codegraph` shape)
 - **Hermes Agent**
 - **Gemini CLI**
@@ -889,13 +897,17 @@ Framework routing is validated the same way, on a canonical app per framework: E
 
 **Two `codegraph serve --mcp` on one project fight over the index / auto-sync stops** — CodeGraph allows one live MCP *writer* per project (the shared background daemon, or a single direct-mode process). Extra clients should proxy to that daemon. If you set `CODEGRAPH_NO_DAEMON=1`, run only one `serve --mcp` for that project; a second instance exits with a clear writer-lock error (see `writer.pid` under `.codegraph/`). Prefer leaving the daemon enabled so multiple MCP hosts share one watcher.
 
-**MCP tool calls fail with `Transport closed` while `codegraph status`/`sync` are healthy** — almost always WSL2 with the project on a Windows drive (a `/mnt/c` or `/mnt/d` path), where the local socket CodeGraph uses to share one background server across sessions is unreliable. CodeGraph now falls back to serving the session in-process instead of dropping the connection, but if you still hit it, set `CODEGRAPH_NO_DAEMON=1` in your MCP server's environment to skip the shared server entirely (each session runs in its own process). Moving the project onto the Linux-native filesystem (e.g. under `~/` instead of `/mnt/`) restores the shared server.
+**MCP tool calls fail with `Transport closed` while `codegraph status`/`sync` are healthy** — almost always WSL2 with the project on a Windows drive (a `/mnt/c` or `/mnt/d` path), where the local socket CodeGraph uses to share one background server across sessions is unreliable. CodeGraph works around this itself now: when the project's filesystem can't host that socket, the shared server puts it in the system temp directory instead, and when the shared server still can't be reached, or drops, the session is served in-process instead of losing the connection. If you still hit it, set `CODEGRAPH_NO_DAEMON=1` in your MCP server's environment to skip the shared server entirely (each session runs in its own process). Moving the project onto the Linux-native filesystem (e.g. under `~/` instead of `/mnt/`) restores the shared server.
 
 **Missing symbols** — The MCP server auto-syncs on save (wait a couple seconds). Run `codegraph sync` manually if needed. Check that the file's language is supported and isn't inside a `.gitignore`d or default-excluded directory (e.g. `node_modules`, `dist`).
 
-**Sharing one checkout between Windows and WSL** — Don't point both at the same `.codegraph/`: the background-server lock and the SQLite index are tied to the OS that wrote them, and SQLite locking across the WSL2/Windows filesystem boundary is unreliable. Give each side its own index in the same tree by setting `CODEGRAPH_DIR` to a distinct name on one of them — e.g. `CODEGRAPH_DIR=.codegraph-win` on Windows, leaving WSL on the default `.codegraph`. CodeGraph skips any sibling `.codegraph-*` directory when indexing and watching, so the two never trip over each other.
+**Sharing one checkout between Windows and WSL** — Don't point both at the same `.codegraph/`: the background-server lock and the SQLite index are tied to the OS that wrote them, and SQLite locking across the WSL2/Windows filesystem boundary is unreliable (WSL reports it as a `disk I/O error`). For a project on a Windows drive (a `/mnt/c/…` path), WSL keeps its own index automatically: an index first built from WSL goes in `.codegraph-wsl/`, leaving `.codegraph/` to Windows. An index already in `.codegraph/` stays where it is, so if Windows built that one, give WSL its own by setting `CODEGRAPH_DIR=.codegraph-wsl` in WSL and running `codegraph init` there. `CODEGRAPH_DIR` always picks the name when set, on either side. CodeGraph skips any sibling `.codegraph-*` directory when indexing and watching, so the two never trip over each other.
 
 **Very large repositories (hundreds of thousands of files), or a large `.codegraph/codegraph.db-wal` file** — The `-wal` file is SQLite's write-ahead log: writes waiting to be folded into `codegraph.db`. While a big index is being built, CodeGraph lets it grow in proportion to the index (soft threshold = the larger of 256 MB and a quarter of the index size, up to 2 GB) before folding it back, because folding too often is what made large indexes slow on ordinary disks. At rest it is trimmed to 64 MB, and a leftover from a killed session is folded and trimmed the next time the project opens — the index itself has no size limit. Two environment variables tune this: `CODEGRAPH_WAL_VALVE_MB` (the soft threshold during indexing) and `CODEGRAPH_WAL_HEAL_MB` (the resting size and the trim threshold). `CODEGRAPH_WAL_VALVE_DEBUG=1` prints every decision to stderr.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) to build from source, test a change and prepare a pull request. The [documentation index](docs/README.md) links to the project's guides and design notes.
 
 ## License
 

@@ -186,6 +186,40 @@ describe('Telemetry', () => {
       expect(fs.readFileSync(t.queuePath, 'utf8')).toContain('"status"');
     });
 
+    // Each codegraph process aggregates in memory and appends on exit. The server
+    // wants ONE counter per machine × day × tool, so lines for the same counter from
+    // different processes must merge — not pile up one `count: 1` line per process.
+    it('merges the same counter across processes into one queued line', async () => {
+      const client = { name: 'Claude Code', version: '2.1' };
+      for (let process = 0; process < 3; process++) {
+        const t = make();
+        t.recordUsage('mcp_tool', 'codegraph_explore', process !== 1, client);
+        t.recordUsage('cli_command', 'serve', true);
+        t.persistSync();
+      }
+      const queued = fs.readFileSync(make().queuePath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      expect(queued).toHaveLength(2);
+      expect(queued.find((l) => l.n === 'codegraph_explore')).toMatchObject({ c: 3, e: 1, cn: 'Claude Code' });
+      expect(queued.find((l) => l.n === 'serve')).toMatchObject({ c: 3, e: 0 });
+
+      nowValue = new Date('2026-06-13T08:00:00.000Z');
+      await make().flushNow();
+      const events = calls[0]!.body.events as Array<{ props: Record<string, unknown> }>;
+      expect(events).toHaveLength(2);
+      expect(events.find((e) => e.props.name === 'serve')!.props).toMatchObject({ count: 3, error_count: 0 });
+    });
+
+    it('a queue left by an older version still sends one event per counter', async () => {
+      const t = make();
+      fs.mkdirSync(dir, { recursive: true });
+      const line = JSON.stringify({ v: 2, d: '2026-06-11', k: 'cli_command', n: 'serve', c: 1, e: 0 });
+      fs.writeFileSync(t.queuePath, `${line}\n${line}\n${line}\n`);
+      await t.flushNow();
+      const events = calls[0]!.body.events as Array<{ props: Record<string, unknown> }>;
+      expect(events).toHaveLength(1);
+      expect(events[0]!.props).toMatchObject({ name: 'serve', count: 3 });
+    });
+
     it('lifecycle events send on the next flush regardless of day', async () => {
       const t = make();
       t.recordLifecycle('install', { targets: ['claude'], scope: 'local', kind: 'fresh' });
@@ -273,6 +307,21 @@ describe('Telemetry', () => {
       expect(fs.existsSync(stale)).toBe(false);
       expect(calls).toHaveLength(1);
       expect((calls[0]!.body.events as Array<{ event: string }>)[0]!.event).toBe('uninstall');
+    });
+
+    it('merges a recovered claim into the queue instead of appending beside it', async () => {
+      const t = make();
+      t.setEnabled(true, 'cli');
+      const line = JSON.stringify({ v: 2, d: '2026-06-11', k: 'cli_command', n: 'serve', c: 2, e: 0 });
+      fs.writeFileSync(t.queuePath, `${line}\n`);
+      const stale = path.join(dir, 'telemetry-queue.sending.99998.jsonl');
+      fs.writeFileSync(stale, `${line}\n${line}\n`);
+      const old = new Date(nowValue.getTime() - 2 * 60 * 60_000);
+      fs.utimesSync(stale, old, old);
+      await t.flushNow();
+      const events = calls[0]!.body.events as Array<{ props: Record<string, unknown> }>;
+      expect(events).toHaveLength(1);
+      expect(events[0]!.props).toMatchObject({ name: 'serve', count: 6 });
     });
   });
 

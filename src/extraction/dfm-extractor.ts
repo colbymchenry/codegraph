@@ -34,7 +34,7 @@ export class DfmExtractor {
 
     try {
       const fileNode = this.createFileNode();
-      this.parseComponents(fileNode.id);
+      this.parseComponents(fileNode);
     } catch (error) {
       this.errors.push({
         message: `DFM extraction error: ${error instanceof Error ? error.message : String(error)}`,
@@ -76,9 +76,9 @@ export class DfmExtractor {
   }
 
   /** Parse object/end blocks and extract components + event handlers */
-  private parseComponents(fileNodeId: string): void {
+  private parseComponents(fileNode: Node): void {
     const lines = this.source.split('\n');
-    const stack: string[] = [fileNodeId];
+    const stack: Node[] = [fileNode];
 
     const objectPattern = /^\s*(object|inherited|inline)\s+(\w+)\s*:\s*(\w+)/;
     const eventPattern = /^\s*(On\w+)\s*=\s*(\w+)\s*$/;
@@ -113,7 +113,7 @@ export class DfmExtractor {
       if (objMatch) {
         const [, , name, typeName] = objMatch;
         const nodeId = generateNodeId(this.filePath, 'component', name!, lineNum);
-        this.nodes.push({
+        const node: Node = {
           id: nodeId,
           kind: 'component',
           name: name!,
@@ -126,13 +126,14 @@ export class DfmExtractor {
           endColumn: line.length,
           signature: typeName,
           updatedAt: Date.now(),
-        });
+        };
+        this.nodes.push(node);
         this.edges.push({
-          source: stack[stack.length - 1]!,
+          source: stack[stack.length - 1]!.id,
           target: nodeId,
           kind: 'contains',
         });
-        stack.push(nodeId);
+        stack.push(node);
         continue;
       }
 
@@ -141,7 +142,7 @@ export class DfmExtractor {
       if (eventMatch) {
         const [, , methodName] = eventMatch;
         this.unresolvedReferences.push({
-          fromNodeId: stack[stack.length - 1]!,
+          fromNodeId: stack[stack.length - 1]!.id,
           referenceName: methodName!,
           referenceKind: 'references',
           line: lineNum,
@@ -152,7 +153,11 @@ export class DfmExtractor {
 
       // Block end
       if (endPattern.test(line)) {
-        if (stack.length > 1) stack.pop();
+        if (stack.length > 1) {
+          const node = stack.pop()!;
+          node.endLine = lineNum;
+          node.endColumn = line.length;
+        }
       }
     }
   }

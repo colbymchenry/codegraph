@@ -58,6 +58,23 @@ export function initializeInstructions(base: string, notice: string | null = get
 /** MCP Protocol Version (latest the server claims). */
 export const PROTOCOL_VERSION = '2024-11-05';
 
+/** The invalid-params message for {@link toolCallArguments}' null. */
+export const TOOL_ARGUMENTS_NOT_OBJECT = 'Tool arguments must be an object';
+
+/**
+ * The arguments a `tools/call` passes, or null when they are not an object.
+ * A string, number or array there is a malformed request, the client's to
+ * fix, so it is answered with a JSON-RPC invalid-params error, as a call that
+ * names no tool is, and never run: run, a string made the tool handler throw,
+ * which came back as an internal codegraph error to retry (#2981). Exported so
+ * the proxy, serving in process while the daemon is unavailable, answers it
+ * the same way. No arguments (missing, null or another empty value) are none.
+ */
+export function toolCallArguments(params: { arguments?: unknown }): Record<string, unknown> | null {
+  const args = params.arguments || {};
+  return typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : null;
+}
+
 /**
  * How long to wait for the client's `roots/list` response before giving up
  * and falling back to the process cwd.
@@ -246,6 +263,8 @@ export class MCPSession {
     // sub-projects indexed) and never surfaced the tools after a mid-session
     // `codegraph init`. When no explicit path is known yet (roots/list dance
     // pending), cwd is the best predictor of where the default will resolve.
+    // A root in a sensitive folder resolves to null here as in the engine, so
+    // that session gets the no-default-project variant too.
     const indexed = resolveServerRoot(explicitPath ?? process.cwd()).root !== null;
 
     // Respond to the handshake BEFORE doing any heavy init — see issue #172.
@@ -294,7 +313,11 @@ export class MCPSession {
     }
 
     const toolName = params.name;
-    const toolArgs = params.arguments || {};
+    const toolArgs = toolCallArguments(params);
+    if (!toolArgs) {
+      this.transport.sendError(request.id, ErrorCodes.InvalidParams, TOOL_ARGUMENTS_NOT_OBJECT);
+      return;
+    }
 
     const tool = tools.find((t) => t.name === toolName);
     if (!tool) {

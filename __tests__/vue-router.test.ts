@@ -65,15 +65,18 @@ describe('vue-router: parseVueRoutes', () => {
       ['home', '/'],
       ['login', '/login'],
       ['settings', '/settings'],
+      [null, '/profile/:username/favorites'],
       ['profile', '/profile/:username'],
     ]);
   });
 
   it('reads the component from a lazy import and from an identifier', () => {
-    expect(entries.map((e) => e.component)).toEqual(['Home', 'Login', 'Settings', 'Profile']);
+    expect(entries.map((e) => e.component)).toEqual(['Home', 'Login', 'Settings', 'Favorites', 'Profile']);
   });
 
-  it('skips a child route, whose path is relative to a parent this does not compose', () => {
+  it('joins a child route onto its parent, which is the layout around it', () => {
+    const child = entries.find((e) => e.path === '/profile/:username/favorites')!;
+    expect(child.layouts.map((l) => l.component)).toEqual(['Profile']);
     expect(entries.some((e) => e.path === 'favorites')).toBe(false);
   });
 
@@ -297,5 +300,162 @@ describe('vue-router: a routed app end to end', () => {
     expect(toProfile.sites[0]).toMatchObject({ href: 'profile', method: 'push' });
     expect(screens.links.find((l) => l.from === at('/login').id && l.to === at('/register').id)).toBeDefined();
     expect(screens.dropped).toBe(0);
+  });
+});
+
+// =============================================================================
+// Admin-template route tables, and Nuxt's own file routes
+// =============================================================================
+
+describe('vue-router: route tables beyond an inline createRouter', () => {
+  const roots: string[] = [];
+  afterAll(() => {
+    for (const r of roots.splice(0)) fs.rmSync(r, { recursive: true, force: true });
+  });
+
+  async function project(files: Record<string, string>): Promise<CodeGraph> {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-vue-tables-'));
+    roots.push(root);
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), content);
+    }
+    return CodeGraph.init(root, { index: true });
+  }
+
+  const routeNames = (cg: CodeGraph): string[] => cg.getNodesByKind('route').map((n) => n.name).sort();
+  const edgesFrom = (cg: CodeGraph, routeName: string, kind: 'calls' | 'references') => {
+    const r = cg.getNodesByKind('route').find((n) => n.name === routeName)!;
+    return cg.getOutgoingEdges(r.id).filter((e) => e.kind === kind).map((e) => ({ edge: e, target: cg.getNode(e.target)! }));
+  };
+
+  it('vue-element-admin: named tables, `new Router`, module files, children and layouts', async () => {
+    const view = (name: string) => `<template><div>${name}</div></template>\n<script>\nexport default { name: '${name}' }\n</script>\n`;
+    const cg = await project({
+      'package.json': JSON.stringify({ name: 'admin', dependencies: { vue: '^2.6.0', 'vue-router': '^3.0.0' } }),
+      'src/router/index.js': `import Vue from 'vue'
+import Router from 'vue-router'
+import Layout from '@/layout'
+import tableRouter from './modules/table'
+Vue.use(Router)
+
+export const constantRoutes = [
+  { path: '/login', component: () => import('@/views/login/index'), hidden: true },
+  {
+    path: '/',
+    component: Layout,
+    redirect: '/dashboard',
+    children: [
+      { path: 'dashboard', component: () => import('@/views/dashboard/index'), name: 'Dashboard' }
+    ]
+  }
+]
+
+export const asyncRoutes = [tableRouter, { path: '*', redirect: '/404', hidden: true }]
+
+const createRouter = () => new Router({ routes: constantRoutes })
+export default createRouter()
+`,
+      'src/router/modules/table.js': `import Layout from '@/layout'
+
+const tableRouter = {
+  path: '/table',
+  component: Layout,
+  redirect: '/table/complex-table',
+  name: 'Table',
+  children: [
+    { path: 'complex-table', component: () => import('@/views/table/complex-table'), name: 'ComplexTable' }
+  ]
+}
+export default tableRouter
+`,
+      'src/layout/index.vue': view('Layout'),
+      'src/views/login/index.vue': `<template><button @click="go">in</button></template>
+<script>
+export default {
+  name: 'Login',
+  methods: {
+    go() { this.$router.push({ name: 'Dashboard' }) }
+  }
+}
+</script>
+`,
+      'src/views/dashboard/index.vue': view('Dashboard'),
+      'src/views/table/complex-table.vue': view('ComplexTable'),
+    });
+    try {
+      // `/` and `/table` redirect into their children: frames, not pages.
+      expect(routeNames(cg)).toEqual(['/dashboard', '/login', '/table/complex-table']);
+      // Each lazy view binds to ITS file's component, though every one is `index`.
+      expect(edgesFrom(cg, '/dashboard', 'calls').map((e) => e.target.filePath)).toEqual(['src/views/dashboard/index.vue']);
+      expect(edgesFrom(cg, '/login', 'calls').map((e) => e.target.filePath)).toEqual(['src/views/login/index.vue']);
+      // The parent's component is the layout around it.
+      const layouts = edgesFrom(cg, '/table/complex-table', 'references');
+      expect(layouts.map((e) => e.target.filePath)).toEqual(['src/layout/index.vue']);
+      expect(layouts[0]!.edge.metadata).toMatchObject({ layout: true });
+      // Navigation by name reaches the composed child.
+      const nav = cg
+        .getOutgoingEdgesFrom(cg.getNodesInFile('src/views/login/index.vue').map((n) => n.id), ['navigates' as never])
+        .filter((e) => e.kind === 'navigates');
+      expect(nav.map((e) => cg.getNode(e.target)!.name)).toEqual(['/dashboard']);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('vben: a typed routes module with an alias the resolver cannot follow', async () => {
+    const cg = await project({
+      'package.json': JSON.stringify({ name: 'mono', private: true }),
+      'apps/web/package.json': JSON.stringify({ name: 'web', imports: { '#/*': './src/*' }, dependencies: { vue: '*', 'vue-router': '*' } }),
+      'apps/web/src/router/routes/modules/dashboard.ts': `import type { RouteRecordRaw } from 'vue-router';
+
+const routes: RouteRecordRaw[] = [
+  {
+    name: 'Dashboard',
+    path: '/dashboard',
+    children: [
+      { name: 'Analytics', path: 'analytics', component: () => import('#/views/dashboard/analytics/index.vue') },
+    ],
+  },
+];
+
+export default routes;
+`,
+      'apps/web/src/views/dashboard/analytics/index.vue': `<template><div>analytics</div></template>
+<script setup lang="ts">
+const title = 'Analytics';
+</script>
+`,
+    });
+    try {
+      expect(routeNames(cg)).toEqual(['/dashboard/analytics']);
+      expect(edgesFrom(cg, '/dashboard/analytics', 'calls').map((e) => e.target.filePath)).toEqual([
+        'apps/web/src/views/dashboard/analytics/index.vue',
+      ]);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('Nuxt pages at the repository root are routes; a plain Vue app’s pages/ folder is not', async () => {
+    const nuxt = await project({
+      'package.json': JSON.stringify({ name: 'site', dependencies: { nuxt: '*', vue: '*' } }),
+      'pages/index.vue': '<template><div/></template>\n',
+      'pages/users/[id].vue': '<template><div/></template>\n',
+    });
+    try {
+      expect(routeNames(nuxt)).toEqual(['/', '/users/:id']);
+    } finally {
+      nuxt.close();
+    }
+    const plain = await project({
+      'ui/package.json': JSON.stringify({ name: 'console', dependencies: { vue: '*', 'vue-router': '*' } }),
+      'ui/src/modules/contents/pages/SinglePageList.vue': '<template><div/></template>\n',
+    });
+    try {
+      expect(routeNames(plain)).toEqual([]);
+    } finally {
+      plain.close();
+    }
   });
 });

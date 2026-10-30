@@ -18,7 +18,9 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   detectWorktreeIndexMismatch,
+  nestedRepositoryBelow,
   worktreeMismatchWarning,
+  worktreeMismatchNotice,
   gitWorktreeRoot,
   gitCommonDir,
 } from '../src/sync/worktree';
@@ -101,7 +103,92 @@ describe('detectWorktreeIndexMismatch (issue #155)', () => {
     const msg = worktreeMismatchWarning(detectWorktreeIndexMismatch(worktree, mainRepo)!);
     expect(msg).toContain(real(worktree));
     expect(msg).toContain(real(mainRepo));
-    expect(msg).toContain('codegraph init');
+    expect(msg).toContain('Run "codegraph init" in this worktree');
+    expect(msg).not.toContain('init -i');
+  });
+
+  it('words the fix as the user\'s option when an agent reads it', () => {
+    const m = detectWorktreeIndexMismatch(worktree, mainRepo)!;
+    expectAgentAdvice(worktreeMismatchWarning(m, 'agent'));
+    expectAgentAdvice(worktreeMismatchNotice(m));
+  });
+});
+
+/**
+ * What an agent is told about a borrowed index. Indexing is the user's
+ * decision (the server instructions tell the agent not to run `codegraph init`
+ * itself), so the text says the user can build a worktree-local index, never
+ * tells the agent to, and doesn't name the `-i` flag, which does nothing now.
+ */
+function expectAgentAdvice(text: string): void {
+  expect(text).toContain('The user can run "codegraph init" in this worktree');
+  expect(text).not.toContain('Run "codegraph init');
+  expect(text).not.toContain('init -i');
+}
+
+/**
+ * Windows spells one directory several ways. VS Code and Cursor pass a
+ * lowercase drive letter (`d:\repo`), a `subst` drive is a second name for a
+ * folder, and NTFS ignores case, while git answers with the spelling on disk.
+ * Compared as strings, a linked worktree spelled unlike git looked like a
+ * different directory: `status` lost the borrowed-index warning, and the MCP
+ * tools refused the worktree as an unindexed repository of its own (#2517).
+ * A lowercase drive letter needs no `subst` mapping or admin rights to show it.
+ */
+describe('a linked worktree spelled with a lowercase drive letter (#2517)', () => {
+  let mainRepo: string;
+  let worktree: string;
+  let embedded: string; // a different repository nested below: still reported
+  const lowerDrive = (p: string) => p.charAt(0).toLowerCase() + p.slice(1);
+
+  beforeEach(() => {
+    mainRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-wt-2517-'));
+    git(mainRepo, 'init', '-q');
+    git(mainRepo, 'config', 'user.email', 'test@example.com');
+    git(mainRepo, 'config', 'user.name', 'Test');
+    git(mainRepo, 'config', 'commit.gpgsign', 'false');
+    fs.writeFileSync(path.join(mainRepo, '.gitignore'), 'wt/\nembedded/\n');
+    fs.mkdirSync(path.join(mainRepo, 'src'));
+    fs.writeFileSync(path.join(mainRepo, 'src', 'a.ts'), 'export const a = 1;\n');
+    git(mainRepo, 'add', '.');
+    git(mainRepo, 'commit', '-q', '-m', 'init');
+    worktree = path.join(mainRepo, 'wt');
+    git(mainRepo, 'worktree', 'add', '-q', '-b', 'feature', worktree);
+    embedded = path.join(mainRepo, 'embedded');
+    fs.mkdirSync(embedded);
+    git(embedded, 'init', '-q');
+  });
+
+  afterEach(() => {
+    try { git(mainRepo, 'worktree', 'remove', '--force', worktree); } catch { /* best effort */ }
+    fs.rmSync(mainRepo, { recursive: true, force: true });
+  });
+
+  it.runIf(process.platform === 'win32')('still flags the borrowed index, keeping the caller\'s spelling', () => {
+    expect(mainRepo).toMatch(/^[A-Z]:\\/);
+    const lowerMain = lowerDrive(mainRepo);
+    const lowerWorktree = lowerDrive(worktree);
+    for (const [start, index] of [[lowerWorktree, lowerMain], [worktree, lowerMain], [lowerWorktree, mainRepo]]) {
+      const m = detectWorktreeIndexMismatch(start, index);
+      expect(m, `${start} on ${index}`).not.toBeNull();
+      expect(m!.indexRoot).toBe(real(index));
+    }
+  });
+
+  it.runIf(process.platform === 'win32')('is not a mismatch from the index root\'s own working tree', () => {
+    const lowerMain = lowerDrive(mainRepo);
+    expect(detectWorktreeIndexMismatch(lowerMain, mainRepo)).toBeNull();
+    expect(detectWorktreeIndexMismatch(mainRepo, lowerMain)).toBeNull();
+    expect(detectWorktreeIndexMismatch(path.join(lowerMain, 'src'), mainRepo)).toBeNull();
+  });
+
+  it.runIf(process.platform === 'win32')('is not a nested repository of its own; a different repository below still is', () => {
+    const lowerMain = lowerDrive(mainRepo);
+    const lowerWorktree = lowerDrive(worktree);
+    expect(nestedRepositoryBelow(lowerWorktree, lowerMain)).toBeNull();
+    expect(nestedRepositoryBelow(worktree, lowerMain)).toBeNull();
+    expect(nestedRepositoryBelow(lowerWorktree, mainRepo)).toBeNull();
+    expect(nestedRepositoryBelow(lowerDrive(embedded), lowerMain)?.relPath).toBe('embedded');
   });
 });
 
@@ -153,7 +240,7 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
     expect(res.isError).toBeFalsy();
     expect(text).toContain('different git worktree');
     expect(text).toContain(real(worktree));
-    expect(text).toContain('codegraph init');
+    expectAgentAdvice(text);
   });
 
   it('does NOT prefix when the default project is the main checkout itself', async () => {
@@ -168,6 +255,7 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
     const text = res.content[0].text;
     expect(text).toContain('different git working tree');
     expect(text).toContain(real(worktree));
+    expectAgentAdvice(text);
   });
 
   it('caches detection — a later tool call needs no further git spawn', async () => {
@@ -270,7 +358,7 @@ describe('worktree mismatch verdict re-resolves when the index root changes (iss
  * super-repo descends into its submodules and gitlinked clones, so a query run
  * from inside one resolves up to the parent index — which genuinely contains
  * that nested repo's symbols. The warning's premise is false there, and its
- * "run codegraph init -i" advice would fragment the unified index. (#1031, #1033)
+ * "codegraph init" advice would fragment the unified index. (#1031, #1033)
  */
 describe('detectWorktreeIndexMismatch — nested repos covered by the parent index (#1031, #1033)', () => {
   let parent: string;     // super-repo that owns the .codegraph index

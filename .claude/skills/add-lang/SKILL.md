@@ -60,11 +60,14 @@ still be unusable:**
 ```bash
 node scripts/add-lang/check-grammar.mjs <lang> path/to/valid-sample.<ext>
 ```
-It prints the grammar's ABI version and parses a valid sample many times in a
-multi-grammar runtime. If it **FAILs** (ERROR trees on valid code — an old ABI
+It prints the grammar's ABI version and runs it the way indexing does: in a
+child process with indexing's V8 flags, beside the vendored grammars, parsing a
+valid sample many times and once at the 1 MiB file-size limit. If it **FAILs**
+(ERROR trees, or later parses giving a different tree, on valid code — an old ABI
 corrupting the shared WASM heap, which silently drops nested calls/imports on
 every file after the first; e.g. the tree-sitter-wasms **Lua** grammar is ABI 13
-and fails), do NOT use that wasm. **Vendor a newer (ABI 14/15) build instead:**
+and fails — or the process running it crashing or hanging, even after every
+parse finished), do NOT use that wasm. **Vendor a newer (ABI 14/15) build instead:**
 ```bash
 npm pack @tree-sitter-grammars/tree-sitter-<lang>   # often ships a prebuilt *.wasm
 # or build one: npx tree-sitter build --wasm   (needs Docker/emscripten)
@@ -131,7 +134,7 @@ npm run build            # tsc + copy-assets (copies any vendored *.wasm into di
 ```
 Index a small sample repo and check extraction:
 ```bash
-( cd <sample-repo> && codegraph init -i )
+( cd <sample-repo> && codegraph init )
 node scripts/add-lang/verify-extraction.mjs <sample-repo> <lang>
 ```
 `verify-extraction.mjs` fails (exit 1) if the language isn't detected or only

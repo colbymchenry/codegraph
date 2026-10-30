@@ -4,7 +4,7 @@
  * This file is public on purpose: it is the exact code that receives codegraph's
  * anonymous usage telemetry, so anyone can audit what is (and is not) stored.
  * The schema contract lives in docs/design/telemetry.md; the storage schema — the
- * complete list of what is kept — is migrations/0001_init.sql.
+ * complete list of what is kept — is migrations/.
  *
  * Guarantees enforced here:
  * - strict allowlist: unknown events are dropped, unknown properties are stripped
@@ -39,7 +39,7 @@ sent; the client IP is never read or stored; the machine ID is a random UUID the
 client mints locally and can delete at any time. Accepted events are stored in our
 own database on Cloudflare (D1) and are never forwarded to any third-party analytics
 vendor. The stored schema is the complete list of what is kept:
-https://github.com/colbymchenry/codegraph/blob/main/telemetry-worker/migrations/0001_init.sql
+https://github.com/colbymchenry/codegraph/tree/main/telemetry-worker/migrations
 
 Individual events are deleted after ${keepDays} days. What outlives them: anonymous
 daily totals (counts per day of things like operating system, version and language),
@@ -200,14 +200,67 @@ const INSERT_EVENT = `INSERT INTO events (
 const UPSERT_MACHINE_DAY = `INSERT INTO machine_days (machine_id, day, prod) VALUES (?, ?, ?)
   ON CONFLICT (machine_id, day) DO UPDATE SET prod = max(machine_days.prod, excluded.prod)`;
 
-// A late-arriving offline buffer can move a machine's first day earlier, never later.
-const UPSERT_FIRST_SEEN = `INSERT INTO machine_first_seen (machine_id, first_day) VALUES (?, ?)
-  ON CONFLICT (machine_id) DO UPDATE SET first_day = min(machine_first_seen.first_day, excluded.first_day)`;
+// A late-arriving offline buffer can move a machine's first day earlier, never later —
+// and its first index day (the activation funnel's input) the same way. That one is set
+// here as well as by the nightly rollup because the rollup only re-rolls the last three
+// days, while this path accepts events up to 30 days old: an index run that uploads a
+// week late would otherwise never count. SQLite's multi-argument min() is NULL when
+// either side is, hence the coalesce: a batch with no index run leaves the stored day
+// alone, and the first index run on record sets it.
+const UPSERT_FIRST_SEEN = `INSERT INTO machine_first_seen (machine_id, first_day, first_index_day) VALUES (?, ?, ?)
+  ON CONFLICT (machine_id) DO UPDATE SET
+    first_day = min(machine_first_seen.first_day, excluded.first_day),
+    first_index_day = coalesce(min(machine_first_seen.first_index_day, excluded.first_index_day),
+                               machine_first_seen.first_index_day, excluded.first_index_day)`;
+
+// usage_rollup counters ADD into one row per machine × day × tool (migrations/0003):
+// clients upload the same counter many times over — once per process — so storing
+// a row per upload grew without bound.
+const UPSERT_USAGE = `INSERT INTO usage_daily (
+  day, machine_id, kind, name, client_name, client_version,
+  codegraph_version, os, arch, node_major, count, error_count
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT (day, machine_id, kind, name, client_name, client_version, codegraph_version, os, arch, node_major)
+  DO UPDATE SET count = usage_daily.count + excluded.count,
+                error_count = usage_daily.error_count + excluded.error_count`;
+
+interface UsageCounter {
+  day: string;
+  kind: string;
+  name: string;
+  clientName: string;
+  clientVersion: string;
+  count: number;
+  errors: number;
+}
 
 /**
- * Persist a sanitized batch: one `events` row per event, plus the machine×day and
- * first-seen bookkeeping the dashboard's retention/activation panels need. One D1
- * `batch()` = one implicit transaction = one round trip.
+ * Folds a batch's usage_rollup events into one counter per day × tool × client.
+ * Old clients send up to 100 copies of the same `count: 1` line per request; this
+ * turns them into one upsert instead of a hundred.
+ */
+function foldUsage(events: StoredEvent[], receivedAt: string): UsageCounter[] {
+  const byKey = new Map<string, UsageCounter>();
+  for (const e of events) {
+    const day = (e.ts ?? receivedAt).slice(0, 10);
+    const kind = String(e.props.kind);
+    const name = String(e.props.name);
+    const clientName = typeof e.props.client_name === 'string' ? e.props.client_name : '';
+    const clientVersion = typeof e.props.client_version === 'string' ? e.props.client_version : '';
+    const key = [day, kind, name, clientName, clientVersion].join('\u0000');
+    const counter = byKey.get(key) ?? { day, kind, name, clientName, clientVersion, count: 0, errors: 0 };
+    counter.count += typeof e.props.count === 'number' ? e.props.count : 0;
+    counter.errors += typeof e.props.error_count === 'number' ? e.props.error_count : 0;
+    byKey.set(key, counter);
+  }
+  return [...byKey.values()];
+}
+
+/**
+ * Persist a sanitized batch: one `events` row per lifecycle event, usage counters
+ * added into `usage_daily`, plus the machine×day and first-seen bookkeeping the
+ * dashboard's retention/activation panels need. One D1 `batch()` = one implicit
+ * transaction = one round trip.
  *
  * Fail-silent by design: the client treats every response as final and never retries,
  * so a failed write loses a datapoint rather than costing availability. The error is
@@ -236,9 +289,38 @@ async function writeToD1(
     // machine_days gets one row per distinct day rather than one per batch.
     const days = new Set<string>();
 
+    const usage = batch.filter((e) => e.event === 'usage_rollup');
+    if (usage.length > 0) {
+      const upsertUsage = env.DB.prepare(UPSERT_USAGE);
+      const [version, os, arch, nodeMajor] = envelopeCols;
+      for (const u of foldUsage(usage, receivedAt)) {
+        days.add(u.day);
+        stmts.push(
+          upsertUsage.bind(
+            u.day,
+            machineId,
+            u.kind,
+            u.name,
+            u.clientName,
+            u.clientVersion,
+            version ?? '',
+            os ?? '',
+            arch ?? '',
+            nodeMajor === null ? '' : String(nodeMajor),
+            u.count,
+            u.errors,
+          ),
+        );
+      }
+    }
+
+    // The earliest day this batch indexed on, if it did — see UPSERT_FIRST_SEEN.
+    let firstIndexDay: string | null = null;
     for (const e of batch) {
+      if (e.event === 'usage_rollup') continue;
       const day = (e.ts ?? receivedAt).slice(0, 10);
       days.add(day);
+      if (e.event === 'index' && (firstIndexDay === null || day < firstIndexDay)) firstIndexDay = day;
       stmts.push(
         insertEvent.bind(
           receivedAt,
@@ -258,7 +340,7 @@ async function writeToD1(
 
     const firstDay = [...days].sort()[0];
     if (firstDay !== undefined) {
-      stmts.push(env.DB.prepare(UPSERT_FIRST_SEEN).bind(machineId, firstDay));
+      stmts.push(env.DB.prepare(UPSERT_FIRST_SEEN).bind(machineId, firstDay, firstIndexDay));
     }
 
     await env.DB.batch(stmts);

@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { CodeGraph } from '../src';
-import { extractProseCandidates } from '../src/search/identifier-segments';
+import { extractProseCandidates, splitIdentifierSegments } from '../src/search/identifier-segments';
 
 /**
  * The graph-derived gate behind the prompt hook's MEDIUM tier: symbol names
@@ -60,6 +60,24 @@ export function writeConfig(): void {}
     cg.destroy();
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  type Rows<T> = { prepare(sql: string): { all(): T[] } };
+  const graphDb = <T>(): Rows<T> => (cg as unknown as { db: { getDb(): Rows<T> } }).db.getDb();
+  /** Every vocabulary row as "segment name", sorted. The table itself:
+   *  getSegmentMatches hides orphan rows, so a prune shows only here. */
+  const vocabRows = (): string[] =>
+    graphDb<{ segment: string; name: string }>()
+      .prepare('SELECT segment, name FROM name_segment_vocab')
+      .all()
+      .map((r) => `${r.segment} ${r.name}`)
+      .sort();
+  /** What a fresh index writes: the segments of every symbol name in the graph. */
+  const expectedVocab = (): string[] =>
+    graphDb<{ name: string }>()
+      .prepare("SELECT DISTINCT name FROM nodes WHERE kind NOT IN ('file', 'import')")
+      .all()
+      .flatMap((r) => splitIdentifierSegments(r.name).map((s) => `${s} ${r.name}`))
+      .sort();
 
   it('co-occurrence: two prose words on one name find it — the reported-prompt shape', () => {
     // The words a French prompt would produce: "comment marche la state
@@ -156,6 +174,76 @@ export function writeConfig(): void {}
     expect(cg.getSegmentMatches(['state', 'machine']).map((m) => m.name)).toContain('OrderStateMachine');
     // Populated vocab: the fast path (one SELECT) still reports usable.
     await expect(cg.healSegmentVocabIfEmpty()).resolves.toBe(true);
+  });
+
+  it('a second full index keeps the words of the names it did not rewrite (#2252)', async () => {
+    // Over an existing graph the store skips unchanged files, so their names
+    // are never written again: the run must not lose the rows it found.
+    const before = vocabRows();
+    expect(before).toEqual(expectedVocab());
+    for (let run = 0; run < 2; run++) {
+      expect((await cg.indexAll()).success).toBe(true);
+      expect(vocabRows()).toEqual(before);
+    }
+    expect(cg.getSegmentMatches(['state', 'machine']).map((m) => m.name)).toContain('OrderStateMachine');
+    expect(cg.getSegmentMatches(['checkout']).map((m) => m.name)).toContain('CheckoutService');
+  });
+
+  it('a full index after an edit keeps unchanged files\' words and prunes a renamed name (#2252)', async () => {
+    const touched = path.join(dir, 'src', 'state-machine.ts');
+    fs.writeFileSync(touched, fs.readFileSync(touched, 'utf8').replace('OrderStateMachine', 'RenamedWorkflowEngine'));
+    expect((await cg.indexAll()).success).toBe(true);
+    // Exactly the graph's names: the untouched files' rows kept, the new name
+    // added, and the old one's rows gone from the table itself.
+    expect(vocabRows()).toEqual(expectedVocab());
+    expect(vocabRows().filter((r) => r.endsWith(' OrderStateMachine'))).toEqual([]);
+    expect(cg.getSegmentMatches(['renamed', 'workflow']).map((m) => m.name)).toContain('RenamedWorkflowEngine');
+    expect(cg.getSegmentMatches(['checkout']).map((m) => m.name)).toContain('CheckoutService');
+    expect(cg.getSegmentMatches(['state', 'machine'])).toEqual([]);
+  });
+
+  it('a name a full index pruned is written again when it comes back in the same session (#2252)', async () => {
+    // The write path skips names it has already written this session; after
+    // the prune drops a name's rows, that memory must not hide its return.
+    const touched = path.join(dir, 'src', 'state-machine.ts');
+    const original = fs.readFileSync(touched, 'utf8');
+    const renamed = original.replace('OrderStateMachine', 'RenamedWorkflowEngine');
+    fs.writeFileSync(touched, renamed);
+    expect((await cg.indexAll()).success).toBe(true);
+    fs.writeFileSync(touched, original);
+    expect((await cg.indexAll()).success).toBe(true);
+    expect(vocabRows()).toEqual(expectedVocab());
+    expect(vocabRows().filter((r) => r.endsWith(' RenamedWorkflowEngine'))).toEqual([]);
+    fs.writeFileSync(touched, renamed);
+    await cg.sync();
+    expect(cg.getSegmentMatches(['renamed', 'workflow']).map((m) => m.name)).toContain('RenamedWorkflowEngine');
+  });
+
+  it('a cancelled full index keeps the vocabulary it found (#2252)', async () => {
+    const before = vocabRows();
+    const controller = new AbortController();
+    controller.abort();
+    const result = await cg.indexAll({ signal: controller.signal });
+    expect(result.success).toBe(false);
+    expect(result.errors.map((e) => e.message)).toContain('Aborted');
+    expect(vocabRows()).toEqual(before);
+    expect(cg.getSegmentMatches(['state', 'machine']).map((m) => m.name)).toContain('OrderStateMachine');
+  });
+
+  it('a full index into a fresh database still starts the vocabulary over (`codegraph index`)', async () => {
+    // `codegraph index` recreates the database, then runs a full index.
+    const before = vocabRows();
+    cg.close();
+    cg = await CodeGraph.recreate(dir);
+    expect((await cg.indexAll()).success).toBe(true);
+    expect(vocabRows()).toEqual(before);
+    // An emptied graph counts as fresh too: rows it no longer backs are dropped
+    // at the start, as before, rather than kept for a prune.
+    const queries = (cg as unknown as { queries: { insertNameSegmentsBatch(names: string[]): void } }).queries;
+    queries.insertNameSegmentsBatch(['GhostSymbolMachine']);
+    cg.clear();
+    expect((await cg.indexAll()).success).toBe(true);
+    expect(vocabRows()).toEqual(before);
   });
 
   it('a rename through updateNode reaches the vocab — the framework post-extract path (#1141)', () => {

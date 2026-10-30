@@ -13,7 +13,10 @@
  *
  * Scope:
  *   - reads tsconfig.json, then jsconfig.json, then tsconfig.base.json
- *   - honours `compilerOptions.baseUrl` and `compilerOptions.paths`
+ *   - honours `compilerOptions.baseUrl` and `compilerOptions.paths`; a
+ *     `baseUrl` with no `paths` still loads, because it alone makes
+ *     `layout/MainLayout` name `src/layout/MainLayout` (CRA / Vite admin
+ *     templates)
  *   - follows `extends` chains, nearest config wins (#1534) — Nx-style
  *     monorepos keep every alias in a `tsconfig.base.json` the root
  *     config merely inherits, so without this they resolved nothing
@@ -28,6 +31,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { logDebug } from '../errors';
+import { escapesRoot } from '../utils';
 
 /** A single alias pattern from `compilerOptions.paths`. */
 export interface AliasPattern {
@@ -50,8 +54,16 @@ export interface AliasMap {
   /** Absolute path. The directory `compilerOptions.paths` is rooted at. */
   baseUrl: string;
   /**
+   * Whether the config (or one it extends) sets `compilerOptions.baseUrl`.
+   * A non-relative specifier is then also read from {@link baseUrl}, after
+   * `paths`, the way tsc reads it. `paths` alone anchors only its own
+   * targets (TypeScript 4.1+), so a map without a `baseUrl` never does.
+   */
+  declaresBaseUrl?: boolean;
+  /**
    * Patterns ordered by specificity: longer prefix first, then literal-
    * before-wildcard, so the resolver tries the most-specific match.
+   * Empty for a config that sets only `baseUrl`.
    */
   patterns: AliasPattern[];
 }
@@ -175,13 +187,15 @@ function resolveExtendsTarget(spec: string, fromDir: string): string | null {
 function loadEffectiveOptions(
   filePath: string,
   stack: Set<string>,
-  depth: number
+  depth: number,
+  read?: Set<string>
 ): EffectiveOptions | null {
   const abs = path.resolve(filePath);
   if (stack.has(abs) || depth > MAX_EXTENDS_DEPTH) {
     logDebug('path-aliases: extends chain cycle or too deep', { filePath: abs, depth });
     return null;
   }
+  read?.add(abs);
   const raw = readTsconfigLike(abs);
   if (!raw) return null;
 
@@ -197,7 +211,7 @@ function loadEffectiveOptions(
       logDebug('path-aliases: unresolved extends', { from: abs, spec });
       continue;
     }
-    const inherited = loadEffectiveOptions(target, stack, depth + 1);
+    const inherited = loadEffectiveOptions(target, stack, depth + 1, read);
     if (!inherited) continue;
     if (inherited.baseUrl !== undefined) effective.baseUrl = inherited.baseUrl;
     if (inherited.paths !== undefined) {
@@ -229,6 +243,19 @@ function readTsconfigLike(filePath: string): RawTsconfig | null {
   }
 }
 
+/**
+ * What {@link loadProjectAliases} reads from one config file, its `extends`,
+ * `compilerOptions.baseUrl` and `compilerOptions.paths`, as one string, or
+ * `null` for a file it can't read. A sync compares it to tell an edit that
+ * moves the alias map from one that doesn't, like a `strict` flag (#2977).
+ */
+export function aliasConfigFields(filePath: string): string | null {
+  const raw = readTsconfigLike(path.resolve(filePath));
+  if (!raw) return null;
+  const co = raw.compilerOptions ?? {};
+  return JSON.stringify([raw.extends ?? null, co.baseUrl ?? null, co.paths ?? null]);
+}
+
 function splitWildcard(pattern: string): {
   prefix: string;
   suffix: string;
@@ -245,12 +272,15 @@ function splitWildcard(pattern: string): {
 
 /**
  * Load aliases for `projectRoot`. Returns `null` when no tsconfig /
- * jsconfig is present or when the file has no usable `paths`.
+ * jsconfig is present or when the file has neither usable `paths` nor a
+ * `baseUrl`.
  *
  * Cheap to call repeatedly — caching is the caller's job (the
- * resolver does it via {@link aliasCache}).
+ * resolver does it via {@link aliasCache}). `read` collects the absolute
+ * path of every config file the load read, the `extends` chain included, so
+ * the caller can tell when one of them changes (#2977).
  */
-export function loadProjectAliases(projectRoot: string): AliasMap | null {
+export function loadProjectAliases(projectRoot: string, read?: Set<string>): AliasMap | null {
   // `tsconfig.base.json` comes last on purpose: when a root `tsconfig.json`
   // exists it stays authoritative and reaches the base through `extends`.
   // The fallback is for the Nx layouts where that never happens — a
@@ -262,7 +292,7 @@ export function loadProjectAliases(projectRoot: string): AliasMap | null {
   for (const name of candidates) {
     const p = path.join(projectRoot, name);
     if (!fs.existsSync(p)) continue;
-    const opts = loadEffectiveOptions(p, new Set(), 0);
+    const opts = loadEffectiveOptions(p, new Set(), 0, read);
     if (!opts) continue;
     // Remember the first readable config so a `paths`-less project still
     // logs the file it was judged on, but keep looking: a config that
@@ -283,25 +313,24 @@ export function loadProjectAliases(projectRoot: string): AliasMap | null {
   // declared them — which is the project root only when that config is the
   // root one (the pre-`extends` assumption).
   const baseUrl = effective.baseUrl ?? effective.pathsDir ?? projectRoot;
-
-  const paths = effective.paths;
-  if (!paths || typeof paths !== 'object') {
-    // baseUrl alone isn't an "alias" per se; with no paths we'd just
-    // be redirecting the whole tree. Skip — the existing resolver
-    // already handles relative imports.
-    return null;
-  }
+  const declaresBaseUrl = effective.baseUrl !== undefined;
 
   const patterns: AliasPattern[] = [];
-  for (const [pattern, targets] of Object.entries(paths)) {
-    if (!Array.isArray(targets) || targets.length === 0) continue;
-    const filtered = targets.filter((t): t is string => typeof t === 'string');
-    if (filtered.length === 0) continue;
-    const { prefix, suffix, hasWildcard } = splitWildcard(pattern);
-    patterns.push({ prefix, suffix, hasWildcard, replacements: filtered });
+  const paths = effective.paths;
+  if (paths && typeof paths === 'object') {
+    for (const [pattern, targets] of Object.entries(paths)) {
+      if (!Array.isArray(targets) || targets.length === 0) continue;
+      const filtered = targets.filter((t): t is string => typeof t === 'string');
+      if (filtered.length === 0) continue;
+      const { prefix, suffix, hasWildcard } = splitWildcard(pattern);
+      patterns.push({ prefix, suffix, hasWildcard, replacements: filtered });
+    }
   }
 
-  if (patterns.length === 0) return null;
+  // A `baseUrl` with no `paths` is still a map: the resolver reads a bare
+  // specifier from it, but only one that names a project file and no package
+  // the app depends on (see resolveFromOwnConfig in import-resolver.ts).
+  if (patterns.length === 0 && !declaresBaseUrl) return null;
 
   // Specificity sort: longer prefix first; literal patterns before
   // wildcard patterns of the same prefix length. TypeScript itself
@@ -315,10 +344,11 @@ export function loadProjectAliases(projectRoot: string): AliasMap | null {
   logDebug('path-aliases loaded', {
     file: usedFile,
     baseUrl,
+    declaresBaseUrl,
     patternCount: patterns.length,
   });
 
-  return { baseUrl, patterns };
+  return { baseUrl, declaresBaseUrl, patterns };
 }
 
 /**
@@ -341,6 +371,12 @@ export function applyAliases(
 
     let captured = '';
     if (pat.hasWildcard) {
+      // The prefix and the suffix may not share characters. `@x/*/index`
+      // both starts and ends `@x/index` only by counting its one `/` twice,
+      // which leaves nothing for `*` to stand on. tsc's `isPatternMatch`
+      // wants the specifier at least as long as the two together, so this
+      // pattern is skipped and a less specific one may still match.
+      if (importPath.length < pat.prefix.length + pat.suffix.length) continue;
       captured = importPath.slice(pat.prefix.length, importPath.length - pat.suffix.length);
     } else if (importPath !== pat.prefix) {
       // Literal pattern must match exactly.
@@ -354,11 +390,33 @@ export function applyAliases(
       const absolute = path.resolve(aliases.baseUrl, filled);
       const relative = path.relative(projectRoot, absolute);
       // Skip if the rewrite escapes the project root (unsafe + can't
-      // be looked up via the file index anyway).
-      if (relative.startsWith('..')) continue;
+      // be looked up via the file index anyway). A folder named like
+      // `..generated` is inside it.
+      if (escapesRoot(relative)) continue;
       out.push(relative.replace(/\\/g, '/'));
     }
     return out;
   }
   return [];
+}
+
+/**
+ * Where a non-relative specifier can live under `aliases`, in the order tsc
+ * tries them: the targets of the most specific pattern it matches, then the
+ * specifier read from `baseUrl` when the config declares one. Relative to
+ * `projectRoot`; a candidate that escapes it is dropped.
+ */
+export function aliasAndBaseUrlCandidates(
+  importPath: string,
+  aliases: AliasMap,
+  projectRoot: string
+): string[] {
+  const out = applyAliases(importPath, aliases, projectRoot);
+  if (aliases.declaresBaseUrl) {
+    const relative = path.relative(projectRoot, path.resolve(aliases.baseUrl, importPath));
+    if (relative && !escapesRoot(relative)) {
+      out.push(relative.replace(/\\/g, '/'));
+    }
+  }
+  return out;
 }

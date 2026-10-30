@@ -42,7 +42,8 @@
  * whole-file view pages the same file repeatedly.
  */
 
-import { SYNTAX_TOKEN_CLASSES, tokenizeSource, type SyntaxTokenClass } from '../../extraction/syntax-tokens';
+import { SYNTAX_TOKEN_CLASSES, type SyntaxTokenClass } from '../../extraction/syntax-tokens';
+import { tokenizeBounded } from './bounded-tokenize';
 import type { Language } from '../../types';
 import { grammarFor } from './languages';
 
@@ -208,7 +209,11 @@ async function highlightUncached(
     return plain(lines, grammar, 'Too much text on too few lines to highlight (minified?).');
   }
 
-  const tokenized = await tokenizeSource(text, language as Language);
+  const bounded = await tokenizeBounded(text, language as Language);
+  if ('timedOut' in bounded) {
+    return plain(lines, grammar, `The ${grammar} grammar took too long on this slice, so it is shown unhighlighted.`);
+  }
+  const tokenized = bounded.result;
   if (!tokenized || tokenized.spans.length === 0) {
     return plain(lines, grammar, `The ${grammar} grammar is not available in this build.`);
   }

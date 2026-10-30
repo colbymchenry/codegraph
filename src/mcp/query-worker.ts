@@ -25,7 +25,7 @@ import { parentPort, workerData } from 'worker_threads';
 import type { ToolResult } from './tools';
 
 interface WorkerInit {
-  root: string;
+  root: string | null;
 }
 
 interface CallMessage {
@@ -46,14 +46,14 @@ if (parentPort) {
   const port = parentPort;
   const { root } = workerData as WorkerInit;
 
-  // Open the default project's READ connection once, at spawn. Other repos are
+  // Open the default project's READ connection once, if present. Other repos are
   // opened lazily on first cross-project (projectPath) call by the ToolHandler's
   // own per-handler cache. openSync does not start a watcher — workers are pure
   // readers; the single watcher/writer stays on the daemon's main thread.
   let handler: InstanceType<typeof import('./tools').ToolHandler> | null = null;
   let initError: string | null = null;
   try {
-    const cg = loadCodeGraph().openSync(root);
+    const cg = root ? loadCodeGraph().openSync(root) : null;
     handler = new (loadToolHandler())(cg);
   } catch (err) {
     initError = err instanceof Error ? err.message : String(err);

@@ -29,6 +29,23 @@ export function generateNodeId(
   return `${kind}:${hash}`;
 }
 
+/** Per-extraction identities: preserve legacy IDs unless distinct source positions collide. */
+export class NodeIdAllocator {
+  private firstColumns = new Map<string, number>();
+
+  generate(filePath: string, kind: NodeKind, name: string, line: number, column: number): string {
+    const id = generateNodeId(filePath, kind, name, line);
+    const firstColumn = this.firstColumns.get(id);
+    if (firstColumn === undefined) {
+      this.firstColumns.set(id, column);
+      return id;
+    }
+    // Columns are zero-based UTF-16 code units in both wasm and the kernel.
+    // Revisiting the same declaration must still produce the same identity.
+    return firstColumn === column ? id : `${id}:${column}`;
+  }
+}
+
 /**
  * Extract text from a syntax node
  */
@@ -44,13 +61,36 @@ export function getChildByField(node: SyntaxNode, fieldName: string): SyntaxNode
 }
 
 /**
+ * Built-in/primitive type names that shouldn't create references. Shared by the
+ * core type-annotation walker and the per-language ones (Dart's), so every type
+ * position skips the same names.
+ */
+export const BUILTIN_TYPE_NAMES: ReadonlySet<string> = new Set([
+  'string', 'number', 'boolean', 'void', 'null', 'undefined', 'never', 'any', 'unknown',
+  'object', 'symbol', 'bigint', 'true', 'false',
+  // Rust
+  'str', 'bool', 'i8', 'i16', 'i32', 'i64', 'i128', 'isize',
+  'u8', 'u16', 'u32', 'u64', 'u128', 'usize', 'f32', 'f64', 'char',
+  // Java/C#
+  'int', 'long', 'short', 'byte', 'float', 'double', 'char',
+  // Go
+  'int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64',
+  'float32', 'float64', 'complex64', 'complex128', 'rune', 'error',
+  // Scala (capitalized primitives + ubiquitous stdlib aliases)
+  'Int', 'Long', 'Short', 'Byte', 'Float', 'Double', 'Boolean', 'Char', 'Unit',
+  'String', 'Any', 'AnyRef', 'AnyVal', 'Nothing', 'Null',
+]);
+
+/**
  * Node types that *wrap* a declaration so a leading comment is a sibling of the
  * wrapper, not of the emitted (inner) declaration node. CodeGraph emits the
  * inner node, so before looking for its preceding comment we climb out through
  * these. Examples: `export class X {}` (export_statement), `@dec\ndef f()`
  * (decorated_definition), `const f = () => {}` (lexical_declaration →
- * variable_declarator). Each wraps exactly one declaration, so climbing can't
- * mis-attribute a comment to a sibling. (#780)
+ * variable_declarator), and each method, function or declaration of an
+ * Objective-C `@implementation` (implementation_definition). Each wraps
+ * exactly one declaration, so climbing can't mis-attribute a comment to a
+ * sibling. (#780)
  */
 const DOCSTRING_WRAPPER_TYPES = new Set([
   'export_statement', // JS/TS: export class/function/const ...
@@ -59,6 +99,7 @@ const DOCSTRING_WRAPPER_TYPES = new Set([
   'variable_declaration', // JS/TS: var x = ...
   'variable_declarator', // JS/TS: the `x = () => {}` inside the declaration
   'ambient_declaration', // TS: declare ...
+  'implementation_definition', // ObjC: each method, function or declaration of an @implementation
 ]);
 
 /**
@@ -90,9 +131,50 @@ function cleanCommentMarkers(comment: string): string {
 }
 
 /**
- * Get the docstring/comment preceding a node
+ * Number of ARGUMENTS in an `args` node — its named children minus comments.
+ *
+ * tree-sitter reports `comment` as a NAMED child, so a comment written at the
+ * top level of a parameter or argument list (`f(A, % why\n B)`) inflates a
+ * plain `namedChildCount`. Anywhere that count is an arity — and arity is part
+ * of an Erlang function's identity (#1610) — the comment must not be counted.
  */
-export function getPrecedingDocstring(node: SyntaxNode, source: string): string | undefined {
+export function namedArgCount(argsNode: SyntaxNode | null | undefined): number {
+  if (!argsNode) return 0;
+  return argsNode.namedChildren.filter((c) => c.type !== 'comment').length;
+}
+
+/**
+ * Get the docstring/comment preceding a node
+ *
+ * `stepOver` lists node types that may stand between the comments and the
+ * declaration without ending the run: Dart's annotations, in `/// Builds it.`
+ * `@override` `Widget build(…)`. They are not part of the docstring, and the
+ * comments on either side of one join as if it weren't there. Default: none.
+ *
+ * `skipTrailing` leaves out the comments the run opens with that belong to
+ * the line above: one written after code on its line (`const n = 4 // four.`),
+ * and any that begins on the line such a comment ends. Go reads them as that
+ * line's comment, never the next declaration's doc. Default: off.
+ *
+ * `skipDetached` keeps only the comments that end on the line right above the
+ * declaration, together with the ones written on the lines just before them:
+ * a blank line ends the docstring, and a comment that ends on the
+ * declaration's own line documents nothing. That is Go's doc comment, the one
+ * go doc shows. Default: off.
+ *
+ * `skipDirectives` leaves the comment directives Go tools read, like
+ * `//go:embed static` or `//nolint:errcheck`, out of the docstring's text, as
+ * go doc does. They still count as comments when the other options decide
+ * where the docstring starts. Default: off.
+ */
+export function getPrecedingDocstring(
+  node: SyntaxNode,
+  source: string,
+  stepOver: readonly string[] = [],
+  skipTrailing = false,
+  skipDetached = false,
+  skipDirectives = false
+): string | undefined {
   // Climb out of any wrapper(s) so a comment preceding the WHOLE construct
   // (export-, decorator-, or const-arrow-wrapped) is reachable as a sibling.
   // The emitted node's own `previousNamedSibling` is empty (export/const) or a
@@ -104,7 +186,7 @@ export function getPrecedingDocstring(node: SyntaxNode, source: string): string 
   }
 
   let sibling = anchor.previousNamedSibling;
-  const comments: string[] = [];
+  const comments: SyntaxNode[] = [];
 
   while (sibling) {
     if (
@@ -113,15 +195,67 @@ export function getPrecedingDocstring(node: SyntaxNode, source: string): string 
       sibling.type === 'block_comment' ||
       sibling.type === 'documentation_comment'
     ) {
-      comments.unshift(getNodeText(sibling, source));
+      comments.unshift(sibling);
+      sibling = sibling.previousNamedSibling;
+    } else if (stepOver.includes(sibling.type)) {
       sibling = sibling.previousNamedSibling;
     } else {
       break;
     }
   }
 
-  if (comments.length === 0) return undefined;
+  let first = 0;
+  if (skipTrailing) {
+    let endRow = -1;
+    for (const comment of comments) {
+      const trails =
+        first === 0 ? followsCodeOnItsLine(comment, source) : comment.startPosition.row === endRow;
+      if (!trails) break;
+      endRow = comment.endPosition.row;
+      first++;
+    }
+  }
+  if (skipDetached) {
+    // Walk back from the declaration: the last comment must end on the line
+    // above it, and each one before joins while it ends on the line the next
+    // one starts, or the line before that.
+    let start = comments.length;
+    if (start > first && comments[start - 1]!.endPosition.row + 1 === anchor.startPosition.row) {
+      start--;
+      while (start > first && comments[start - 1]!.endPosition.row + 1 >= comments[start]!.startPosition.row) {
+        start--;
+      }
+    }
+    first = start;
+  }
+  const docComments = comments
+    .slice(first)
+    .filter((c) => !skipDirectives || !isDirective(getNodeText(c, source)));
+  if (docComments.length === 0) return undefined;
 
   // Strip each comment's syntax markers (language-aware), then join.
-  return comments.map(cleanCommentMarkers).join('\n').trim();
+  return docComments
+    .map((c) => cleanCommentMarkers(getNodeText(c, source)))
+    .join('\n')
+    .trim();
+}
+
+/**
+ * Whether a comment is a directive Go tools read, which go doc leaves out of a
+ * doc comment's text (go/ast's isDirective): a `//` comment with no space
+ * after the slashes that is `//line `, `//extern ` or `//export ` followed by
+ * text, or that opens with a lowercase word, a colon and a lowercase letter or
+ * digit, like `//go:embed static` or `//nolint:errcheck`.
+ */
+function isDirective(comment: string): boolean {
+  if (!comment.startsWith('//')) return false;
+  const text = comment.slice(2);
+  return /^(?:line|extern|export) /.test(text) || /^[a-z0-9]+:[a-z0-9]/.test(text);
+}
+
+/** Whether code comes before `node` on the line it starts on. */
+function followsCodeOnItsLine(node: SyntaxNode, source: string): boolean {
+  let i = node.startIndex;
+  while (i > 0 && (source[i - 1] === ' ' || source[i - 1] === '\t')) i--;
+  return i > 0 && source[i - 1] !== '\n' && source[i - 1] !== '\r';
 }

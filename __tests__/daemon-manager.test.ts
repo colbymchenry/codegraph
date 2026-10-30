@@ -98,18 +98,20 @@ describe('runDaemonPicker', () => {
     expect(h.getDone()).toBe('Done.');
   });
 
-  it('does not report an unverified daemon as stopped', async () => {
+  it.each(['unverified', 'still-running'] as const)('does not report %s as stopped', async (outcome) => {
     const h = harness([rec('/p/a', 42, 1)], ['/p/a', CANCEL]);
     h.deps.stop = async (root): Promise<StopResult> => ({
       root,
       pid: 42,
-      outcome: 'unverified',
+      outcome,
     });
 
     await runDaemonPicker(h.deps);
 
     expect(h.notes).toEqual([
-      'Could not verify daemon (pid 42); left it running with its artifacts intact — /p/a',
+      outcome === 'unverified'
+        ? 'Could not verify daemon (pid 42); left it running with its artifacts intact — /p/a'
+        : 'Could not stop daemon (pid 42); left its artifacts intact — /p/a',
     ]);
     expect(h.getDone()).toContain('Cancelled');
   });

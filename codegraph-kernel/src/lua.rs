@@ -75,6 +75,7 @@ pub struct Walker<'t> {
     is_luau: bool,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     node_ids: Vec<String>,
@@ -103,6 +104,7 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         is_luau: language == "luau",
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         node_ids: Vec::new(),
@@ -203,7 +205,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
 
         // buildQualifiedName (1447-1460) — non-file stack NAMES joined `::`;
         // the receiver override (extractMethod:1790-1792) replaces it whole.

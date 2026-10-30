@@ -32,6 +32,23 @@ describe('DatabaseConnection — backend reporting', () => {
     conn.close();
   });
 
+  it('read-only opens never migrate, repair bulk-load state, or permit writes (#1963)', () => {
+    const dbPath = path.join(dir, 'test.db');
+    const owner = DatabaseConnection.initialize(dbPath);
+    const db = owner.getDb();
+    db.exec('DELETE FROM schema_versions WHERE version = (SELECT MAX(version) FROM schema_versions)');
+    db.exec('DROP TRIGGER nodes_ai');
+    const before = db.pragma('data_version', { simple: true });
+    const reader = DatabaseConnection.open(dbPath, { readOnly: true });
+    try {
+      expect(reader.getDb().prepare('SELECT COUNT(*) AS n FROM nodes').get()).toEqual({ n: 0 });
+      expect(() => reader.getDb().exec("CREATE TABLE reader_write (value TEXT)"))
+        .toThrow(/readonly|read-only/i);
+      expect(db.pragma('data_version', { simple: true })).toBe(before);
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name = 'nodes_ai'").get()).toBeUndefined();
+    } finally { reader.close(); owner.close(); }
+  });
+
   it('CodeGraph.getBackend() delegates to the underlying DatabaseConnection', async () => {
     fs.writeFileSync(path.join(dir, 'x.ts'), `export function x(): void {}\n`);
     const cg = await CodeGraph.init(dir, { index: true });

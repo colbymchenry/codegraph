@@ -8,6 +8,18 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { getCargoWorkspaceCrateMap } from './cargo-workspace';
+import { isRustNameInScope } from '../name-matcher';
+import { pickByNameAndKind } from './name-heuristic';
+
+/**
+ * Whether the item a name heuristic found is one the reference can name:
+ * `Context<'_>` under `use std::task::{Context, Poll}` is std's, not tokio's
+ * `runtime::context::Context` (642 of them).
+ */
+function inRustScope(id: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const node = context.getNodeById?.(id);
+  return !node || isRustNameInScope(node, ref, context);
+}
 
 const cargoWorkspaceMapCache = new WeakMap<ResolutionContext, Map<string, string>>();
 
@@ -31,8 +43,8 @@ export const rustResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Handler references
     if (ref.referenceName.endsWith('_handler') || ref.referenceName.startsWith('handle_')) {
-      const result = resolveByNameAndKind(ref.referenceName, FUNCTION_KINDS, HANDLER_DIRS, context);
-      if (result) {
+      const result = resolveByNameAndKind(ref, FUNCTION_KINDS, HANDLER_DIRS, context);
+      if (result && inRustScope(result, ref, context)) {
         return {
           original: ref,
           targetNodeId: result,
@@ -44,8 +56,8 @@ export const rustResolver: FrameworkResolver = {
 
     // Pattern 2: Service/Repository trait implementations
     if (ref.referenceName.endsWith('Service') || ref.referenceName.endsWith('Repository')) {
-      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);
-      if (result) {
+      const result = resolveByNameAndKind(ref, SERVICE_KINDS, SERVICE_DIRS, context);
+      if (result && inRustScope(result, ref, context)) {
         return {
           original: ref,
           targetNodeId: result,
@@ -57,8 +69,8 @@ export const rustResolver: FrameworkResolver = {
 
     // Pattern 3: Struct references (PascalCase)
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, STRUCT_KINDS, MODEL_DIRS, context);
-      if (result) {
+      const result = resolveByNameAndKind(ref, STRUCT_KINDS, MODEL_DIRS, context);
+      if (result && inRustScope(result, ref, context)) {
         return {
           original: ref,
           targetNodeId: result,
@@ -95,6 +107,13 @@ export const rustResolver: FrameworkResolver = {
     const references: UnresolvedRef[] = [];
     const now = Date.now();
     const safe = stripCommentsForRegex(content, 'rust');
+    // Where a handler's own name is written, for the handler expression `expr`
+    // ending at `exprEnd`: the Rust scope gate reads the reference's line, and
+    // rustfmt wraps a long `.route(` call so its handler sits below it (#2326).
+    const handlerSite = (exprEnd: number, expr: string, handler: string) => {
+      const offset = exprEnd - expr.length + expr.lastIndexOf(handler);
+      return { line: safe.slice(0, offset).split('\n').length, column: offset - safe.lastIndexOf('\n', offset - 1) - 1 };
+    };
 
     // Actix-web / Rocket attribute: #[get("/path")] fn handler(..)
     // Capture the method, path, and the fn identifier that follows.
@@ -153,12 +172,24 @@ export const rustResolver: FrameworkResolver = {
       const line = safe.slice(0, match.index).split('\n').length;
 
       const methodBody = args.slice(pathMatch[0].length);
+      const bodyAt = openIdx + 1 + pathMatch[0].length;
       const methodHandlerRegex = /\b(get|post|put|patch|delete|head|options|trace)\s*\(\s*([A-Za-z_][\w:]*)/g;
       let mh: RegExpExecArray | null;
+      // The method routers are the argument's top-level chain (`get(a).post(b)`);
+      // a `get(` nested in it — `get(|| async { cache.get(key) })` — is a call
+      // inside a closure handler, not a route.
+      let depth = 0;
+      let scanned = 0;
       while ((mh = methodHandlerRegex.exec(methodBody)) !== null) {
+        for (; scanned < mh.index; scanned++) {
+          if (methodBody[scanned] === '(') depth++;
+          else if (methodBody[scanned] === ')') depth--;
+        }
+        if (depth > 0) continue;
         const upper = mh[1]!.toUpperCase();
         const handler = mh[2]!.split('::').filter(Boolean).pop();
         if (!handler) continue;
+        const site = handlerSite(bodyAt + mh.index + mh[0].length, mh[2]!, handler);
 
         const routeNode: Node = {
           id: `route:${filePath}:${line}:${upper}:${routePath}`,
@@ -179,8 +210,8 @@ export const rustResolver: FrameworkResolver = {
           fromNodeId: routeNode.id,
           referenceName: handler,
           referenceKind: 'references',
-          line,
-          column: 0,
+          line: site.line,
+          column: site.column,
           filePath,
           language: 'rust',
         });
@@ -189,9 +220,10 @@ export const rustResolver: FrameworkResolver = {
 
     // Actix-web builder API (the dominant actix routing style; attribute macros
     // are handled above). The handler lives in `.to(handler)`, not `get(handler)`.
-    const pushActixRoute = (routePath: string, method: string, handlerExpr: string, line: number) => {
+    const pushActixRoute = (routePath: string, method: string, handlerExpr: string, line: number, exprEnd: number) => {
       const handler = handlerExpr.split('::').filter(Boolean).pop();
       if (!handler) return;
+      const site = handlerSite(exprEnd, handlerExpr, handler);
       const upper = method.toUpperCase();
       const routeNode: Node = {
         id: `route:${filePath}:${line}:${upper}:${routePath}`,
@@ -211,8 +243,8 @@ export const rustResolver: FrameworkResolver = {
         fromNodeId: routeNode.id,
         referenceName: handler,
         referenceKind: 'references',
-        line,
-        column: 0,
+        line: site.line,
+        column: site.column,
         filePath,
         language: 'rust',
       });
@@ -226,7 +258,16 @@ export const rustResolver: FrameworkResolver = {
       const after = match.index + match[0].length;
       // Bound the resource's method chain at the next resource() to avoid bleed.
       const nextRes = safe.indexOf('web::resource', after);
-      const end = Math.min(after + 500, nextRes === -1 ? safe.length : nextRes);
+      let end = Math.min(after + 500, nextRes === -1 ? safe.length : nextRes);
+      // ...and at the `)` of the call it is an argument of: in
+      // `.service(web::resource("/a").to(a)).route("/b", web::get().to(b))`, `b` is not `/a`'s.
+      for (let i = after, depth = 0; i < end; i++) {
+        if (safe[i] === '(') depth++;
+        else if (safe[i] === ')' && --depth < 0) {
+          end = i;
+          break;
+        }
+      }
       const chain = safe.slice(after, end);
 
       const methodTo = /web::(get|post|put|patch|delete|head)\s*\(\s*\)\s*\.to\s*\(\s*([A-Za-z_][\w:]*)/g;
@@ -234,13 +275,13 @@ export const rustResolver: FrameworkResolver = {
       let found = false;
       while ((m2 = methodTo.exec(chain)) !== null) {
         const mLine = startLine + chain.slice(0, m2.index).split('\n').length - 1;
-        pushActixRoute(routePath, m2[1]!, m2[2]!, mLine);
+        pushActixRoute(routePath, m2[1]!, m2[2]!, mLine, after + m2.index + m2[0].length);
         found = true;
       }
       // Direct `.resource("/x").to(handler)` (all methods) when no explicit verb route.
       if (!found) {
         const direct = chain.match(/^\s*\.to\s*\(\s*([A-Za-z_][\w:]*)/);
-        if (direct) pushActixRoute(routePath, 'ANY', direct[1]!, startLine);
+        if (direct) pushActixRoute(routePath, 'ANY', direct[1]!, startLine, after + direct[0].length);
       }
     }
 
@@ -248,7 +289,7 @@ export const rustResolver: FrameworkResolver = {
     const appRouteRegex = /\.route\s*\(\s*"([^"]+)"\s*,\s*web::(get|post|put|patch|delete|head)\s*\(\s*\)\s*\.to\s*\(\s*([A-Za-z_][\w:]*)/g;
     while ((match = appRouteRegex.exec(safe)) !== null) {
       const line = safe.slice(0, match.index).split('\n').length;
-      pushActixRoute(match[1]!, match[2]!, match[3]!, line);
+      pushActixRoute(match[1]!, match[2]!, match[3]!, line, match.index + match[0].length);
     }
 
     return { nodes, references };
@@ -277,30 +318,18 @@ function findMatchingParen(s: string, openIdx: number): number {
   return -1;
 }
 
-/**
- * Resolve a symbol by name using indexed queries instead of scanning all files.
- */
+/** A framework name heuristic's pick (see name-heuristic.ts): in scope by its `use`s and module paths. */
 function resolveByNameAndKind(
-  name: string,
+  ref: UnresolvedRef,
   kinds: Set<string>,
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  const candidates = context.getNodesByName(name);
-  if (candidates.length === 0) return null;
-
-  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
-  if (kindFiltered.length === 0) return null;
-
-  // Prefer candidates in framework-conventional directories
-  const preferred = kindFiltered.filter((n) =>
-    preferredDirPatterns.some((d) => n.filePath.includes(d))
-  );
-
-  if (preferred.length > 0) return preferred[0]!.id;
-
-  // Fall back to any match
-  return kindFiltered[0]!.id;
+  return pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context, {
+    // The file is a module: a sibling file is another one, reached only through a `use`.
+    sameDirectory: false,
+    accept: (n) => isRustNameInScope(n, ref, context),
+  });
 }
 
 interface ModuleResolution {

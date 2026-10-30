@@ -72,10 +72,87 @@ describe('call-expression receivers (#1683)', () => {
   it('encodes the receiver as `<inner>().<method>` and drops a receiver with no static callee', () => {
     const r = extractFromSource('src/x.js', 'function f(d) { d.setdefault("k", []).append(1); make().run(); (0, make)().run(); arr[0]().go(); }');
     const names = r.unresolvedReferences.filter((u) => u.referenceKind === 'calls').map((u) => u.referenceName).sort();
-    // `(0, make)` and `arr[0]` are the inner calls' own refs, unchanged; their chains are dropped.
-    expect(names).toEqual(['(0, make)', 'arr[0]', 'd.setdefault', 'd.setdefault().append', 'make', 'make().run']);
+    // `(0, make)()` and `arr[0]()` call a value with no name; their chains are dropped too.
+    expect(names).toEqual(['d.setdefault', 'd.setdefault().append', 'make', 'make().run']);
     const py = extractFromSource('x.py', 'def f(d):\n    d.setdefault("k", []).append(1)\n    d.items().get(2)\n');
     expect(py.unresolvedReferences.filter((u) => u.referenceKind === 'calls').map((u) => u.referenceName).sort())
       .toEqual(['d.items', 'd.items().get', 'd.setdefault', 'd.setdefault().append']);
+  });
+
+  // A callee that names nothing used to give the reference its whole source
+  // text: an IIFE's body, `connect(mapState)`, `handlers[type]`. No symbol has
+  // such a name, so nothing resolved and each one parked as a failed reference.
+  it('records no name for a callee that names nothing, and looks through wrappers that keep one', () => {
+    const js = extractFromSource('src/x.js', [
+      'class A extends B { constructor() { super(1); } }',
+      'function f(handlers, type, fn, ns) {',
+      '  (() => { inner(); })();',
+      '  (function () { inner2(); })();',
+      '  connect(mapState)(View);',
+      '  create()(setup);',
+      "  breakpoint('tablet')`padding: 0;`;",
+      '  handlers[type](1);',
+      '  (0, fn)();',
+      '  (fn)();',
+      '  (ns.fn)();',
+      '}',
+    ].join('\n'));
+    expect(js.unresolvedReferences.filter((u) => u.referenceKind === 'calls').map((u) => u.referenceName).sort())
+      .toEqual(['breakpoint', 'connect', 'create', 'fn', 'inner', 'inner2', 'ns.fn', 'super']);
+    // A tag with an object type argument error-recovers into a call on `css<{…}>`.
+    const ts = extractFromSource('src/x.ts', 'function g(fn: () => void) { fn!(); (fn as F)(); css<{ open: boolean }>`color: red;`; }');
+    expect(ts.unresolvedReferences.filter((u) => u.referenceKind === 'calls').map((u) => u.referenceName).sort())
+      .toEqual(['css', 'fn', 'fn']);
+  });
+
+  // tree-sitter-typescript parses a prefix operator over a generic call as the
+  // call's callee, as it does `await f<T>()` (#2586): `!settings.get<boolean>(…)`
+  // was a call named `!settings.get`.
+  it('looks through a prefix operator over a generic call', () => {
+    const ts = extractFromSource('src/x.ts', [
+      'function h() {',
+      "  if (!settings.get<boolean>('X')) return;",
+      '  void apiRequest<Status>(1);',
+      '  return typeof load<T>() === "x" || -count<number>() > 0 || !!useFlag<boolean>();',
+      '}',
+    ].join('\n'));
+    const calls = ts.unresolvedReferences.filter((u) => u.referenceKind === 'calls');
+    expect(calls.map((u) => u.referenceName).sort()).toEqual(['apiRequest', 'count', 'load', 'settings.get', 'useFlag']);
+    // Each sits where its callee's name starts, past the operator.
+    expect(calls.find((u) => u.referenceName === 'settings.get')).toMatchObject({ line: 2, column: 7 });
+    expect(calls.find((u) => u.referenceName === 'apiRequest')).toMatchObject({ line: 3, column: 7 });
+  });
+
+  // The reference sits where the name does, and is a bare call as a plain
+  // call's is: SigNoz's `(callback as FrameRequestCallback)(0)` names the
+  // arrow's own parameter, and `(callback)(0)` starting at the `(` bound a
+  // generated interface's `callback` property.
+  it('treats a wrapped callee as the plain call, so a parameter it names shadows a namesake', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cast-callee-'));
+    try {
+      fs.writeFileSync(path.join(root, 'schemas.ts'), 'export interface DTO {\n  callback?: string[] | null;\n}\n');
+      fs.writeFileSync(path.join(root, 'raf.test.ts'), [
+        "import type { DTO } from './schemas';",
+        "describe('raf', () => {",
+        '  beforeEach(() => {',
+        "    jest.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {",
+        '      callback(0);',
+        '      (callback as FrameRequestCallback)(1);',
+        '      callback!(2);',
+        '      (callback)(3);',
+        '      return 0;',
+        '    });',
+        '  });',
+        '});',
+        'export const dto: DTO = {};',
+      ].join('\n'));
+      const graph = CodeGraph.initSync(root);
+      await graph.indexAll();
+      const property = graph.getNodesByName('callback').find((n) => n.kind === 'property')!;
+      expect(graph.getCallers(property.id)).toEqual([]);
+      graph.destroy();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

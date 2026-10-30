@@ -2,6 +2,7 @@ import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference } fr
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
+import { foldScriptResult, sfcFileNode, SFC_SCRIPT_ELEMENT, sfcBlockLineRanges } from './sfc-script';
 
 /**
  * Astro built-in components — compiler-provided (`<Fragment>`) or shipped by
@@ -45,8 +46,10 @@ export class AstroExtractor {
     const startTime = Date.now();
 
     try {
-      // Create component node for the .astro file itself
+      // The file, holding the component the .astro file is
+      this.nodes.push(sfcFileNode(this.filePath, this.source, 'astro'));
       const componentNode = this.createComponentNode();
+      this.edges.push({ source: `file:${this.filePath}`, target: componentNode.id, kind: 'contains' });
 
       // Extract and process the frontmatter block (--- fenced, TypeScript)
       const frontmatter = this.extractFrontmatter();
@@ -156,11 +159,14 @@ export class AstroExtractor {
   private extractScriptBlocks(): Array<{ content: string; startLine: number }> {
     const blocks: Array<{ content: string; startLine: number }> = [];
 
-    const scriptRegex = /<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/g;
+    // A self-closing `<script ... />` (e.g. `is:inline set:html={...}`) has no
+    // body; match it on its own so it cannot run on to the next `</script>`.
+    const scriptRegex = new RegExp(SFC_SCRIPT_ELEMENT);
     let match;
 
     while ((match = scriptRegex.exec(this.source)) !== null) {
-      const content = match.groups?.content || match[2] || '';
+      if (match.groups?.content === undefined) continue;
+      const content = match.groups.content;
 
       // Calculate the 0-indexed line where the content begins. The content
       // starts right after the opening tag's `>` — its leading `\n` is part
@@ -199,45 +205,13 @@ export class AstroExtractor {
     const extractor = new TreeSitterExtractor(this.filePath, block.content, 'typescript');
     const result = extractor.extract();
 
-    // Offset line numbers from the block back to .astro file positions
-    for (const node of result.nodes) {
-      node.startLine += block.startLine;
-      node.endLine += block.startLine;
-      node.language = 'astro'; // Mark as astro, not TS
-
-      this.nodes.push(node);
-
-      // Add containment edge from component to this node
-      this.edges.push({
-        source: componentNodeId,
-        target: node.id,
-        kind: 'contains',
-      });
-    }
-
-    // Offset edges (they reference line numbers)
-    for (const edge of result.edges) {
-      if (edge.line) {
-        edge.line += block.startLine;
-      }
-      this.edges.push(edge);
-    }
-
-    // Offset unresolved references
-    for (const ref of result.unresolvedReferences) {
-      ref.line += block.startLine;
-      ref.filePath = this.filePath;
-      ref.language = 'astro';
-      this.unresolvedReferences.push(ref);
-    }
-
-    // Carry over errors
-    for (const error of result.errors) {
-      if (error.line) {
-        error.line += block.startLine;
-      }
-      this.errors.push(error);
-    }
+    // Frontmatter runs on every render of the component, and a <script> is
+    // the page's own client code: both are the component's doing.
+    foldScriptResult(
+      result,
+      { filePath: this.filePath, componentNodeId, lineOffset: block.startLine, language: 'astro', perInstance: true },
+      { nodes: this.nodes, edges: this.edges, unresolvedReferences: this.unresolvedReferences, errors: this.errors }
+    );
   }
 
   /**
@@ -254,13 +228,9 @@ export class AstroExtractor {
       coveredRanges.push([frontmatter.startLine - 1, frontmatter.endLine]);
     }
 
-    const tagRegex = /<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
-    let tagMatch;
-    while ((tagMatch = tagRegex.exec(this.source)) !== null) {
-      const startLine = (this.source.substring(0, tagMatch.index).match(/\n/g) || []).length;
-      const endLine = startLine + (tagMatch[0].match(/\n/g) || []).length;
-      coveredRanges.push([startLine, endLine]);
-    }
+    // A self-closing tag covers nothing: its attributes
+    // (`set:html={serializeJsonLd(schema)}`) are template expressions.
+    coveredRanges.push(...sfcBlockLineRanges(this.source));
 
     return coveredRanges;
   }

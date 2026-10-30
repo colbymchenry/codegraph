@@ -391,3 +391,51 @@ describe('splitting a route name', () => {
     });
   });
 });
+
+describe('entry points skip a vendored bundle', () => {
+  let app: Instance;
+  let payload: WireEntryPoints;
+
+  beforeAll(async () => {
+    resetEntryPointsCache();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-ui-entry-bundle-'));
+    const root = path.join(dir, 'project');
+    fs.mkdirSync(root, { recursive: true });
+    write(
+      root,
+      'src/store.ts',
+      `export function insertNode(name: string): string {
+  return name.trim();
+}
+export function readNode(name: string): string {
+  return insertNode(name);
+}
+export function warm(): string {
+  return insertNode('a') + readNode('b');
+}
+`
+    );
+    // A docs site's bundle, not named .min.js: one-letter functions calling
+    // each other on a few enormous lines.
+    const body = Array.from({ length: 400 }, (_, i) => `function f${i}(e){return n(e,${i})+t(e)}`).join(';');
+    write(root, 'docs/assets/bundle.js', `function n(e,r){return e+r};function t(e){return n(e,1)};${body};\n`);
+    const cg = CodeGraph.initSync(root, {
+      config: { include: ['src/**/*.ts', 'docs/**/*.js'], exclude: [] },
+    });
+    await cg.indexAll();
+    cg.resolveReferences();
+    app = await serve(root, dir, cg);
+    payload = (await getJson(app, '/api/entrypoints')) as WireEntryPoints;
+  }, 120_000);
+
+  afterAll(async () => {
+    await stop(app);
+  });
+
+  it('lists the project’s own hubs, not the bundle’s', () => {
+    const names = payload.hubs.items.map((h) => h.name);
+    expect(names).toContain('insertNode');
+    expect(names).not.toContain('n');
+    expect(names).not.toContain('t');
+  });
+});

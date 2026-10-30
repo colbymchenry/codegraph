@@ -54,6 +54,15 @@ mainframe and GnuCOBOL code:
    `SECURITY.` headers.
 10. **`CALL ... GIVING`** — upstream *intended* to support it but a misnested
     `field()` call swallowed the GIVING alternative entirely.
+11. **No hang when the input ends inside the sequence area.** The scanner
+    skips columns 1-6 by advancing until column 7, but `advance()` is a no-op
+    at end of input, so a file whose last line stops in that area (`    .`,
+    `X\n    .`, a sentence closed by a short `    .` line) spun forever inside
+    the scanner — parse timeouts and a zero-symbol file when indexing. The
+    loop now also stops at `eof()`. The loop is upstream code (present at
+    `e99dbdc3`), so this is a standalone upstream fix; inputs that parsed
+    before are unaffected (the NIST + ocesql test sources, 412 files, give
+    byte-identical trees before and after).
 
 ## Measured parse health (at vendoring time)
 
@@ -100,7 +109,9 @@ Sent as [yutaro-sakamoto/tree-sitter-cobol#41](https://github.com/yutaro-sakamot
 (branch `real-world-cobol-sources` on the colbymchenry fork). If upstream
 merges it, the vendored wasm can track upstream releases instead of this
 patch. Until then, `git apply tree-sitter-cobol.patch` on upstream commit
-`e99dbdc3` reproduces the fork exactly. The PR body as sent:
+`e99dbdc3` reproduces the vendored grammar exactly. Item 11 (the
+end-of-input hang) came after the PR was sent and is not on that branch
+yet. The PR body as sent:
 
 > **Parse real-world CICS/DB2 and GnuCOBOL sources**
 >

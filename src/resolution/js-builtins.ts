@@ -8,6 +8,59 @@ export const JS_BUILT_INS = new Set([
 ]);
 
 /**
+ * The browser's host objects a script reaches by name: the global object under
+ * its names (`window`, `self`, `globalThis`) and the members of it that code
+ * calls straight on. A call on one of them — `window.open()`,
+ * `localStorage.getItem()`, `history.back()` — is the browser's, unless the
+ * file binds or imports the name itself.
+ */
+export const JS_BROWSER_HOST_GLOBALS = new Set([
+  'window', 'self', 'globalThis', 'document', 'localStorage', 'sessionStorage',
+  'location', 'history', 'navigator', 'screen', 'performance',
+]);
+
+/** Method names that require receiver evidence before linking to project code. */
+export const JS_BUILTIN_METHODS = new Set([
+  // Array / typed arrays and collections.
+  'at', 'concat', 'copyWithin', 'entries', 'every', 'fill', 'filter', 'find',
+  'findIndex', 'findLast', 'findLastIndex', 'flat', 'flatMap', 'forEach',
+  'includes', 'indexOf', 'join', 'keys', 'lastIndexOf', 'map', 'pop', 'push',
+  'reduce', 'reduceRight', 'reverse', 'shift', 'slice', 'some', 'sort', 'splice',
+  'toReversed', 'toSorted', 'toSpliced', 'unshift', 'values', 'with', 'subarray',
+  'get', 'set', 'has', 'add', 'delete', 'clear',
+  // String.
+  'charAt', 'charCodeAt', 'codePointAt', 'endsWith', 'localeCompare', 'match',
+  'matchAll', 'normalize', 'padEnd', 'padStart', 'repeat', 'replace', 'replaceAll',
+  'search', 'split', 'startsWith', 'substring', 'substr', 'toLowerCase',
+  'toUpperCase', 'toLocaleLowerCase', 'toLocaleUpperCase', 'trim', 'trimStart',
+  'trimEnd', 'trimLeft', 'trimRight', 'toString', 'toLocaleString', 'valueOf',
+  // Promise, Function, EventTarget / EventEmitter and iterators.
+  'then', 'catch', 'finally', 'call', 'apply', 'bind',
+  'addEventListener', 'removeEventListener', 'dispatchEvent', 'on', 'once',
+  'off', 'emit', 'addListener', 'removeListener', 'removeAllListeners',
+  'prependListener', 'prependOnceListener', 'listeners', 'rawListeners',
+  'listenerCount', 'eventNames', 'setMaxListeners', 'getMaxListeners',
+  'next', 'return', 'throw', 'drop', 'take', 'toArray',
+  // fetch's Response / Request / Blob bodies.
+  'text', 'json', 'arrayBuffer', 'blob', 'formData',
+]);
+
+/**
+ * The methods an array has: `Array.prototype`'s and those every object
+ * inherits. On a local annotated as an array (`items: Item[]`) a call of one
+ * is the array's, never a method of the element's class.
+ */
+export const JS_ARRAY_METHODS = new Set([
+  'at', 'concat', 'copyWithin', 'entries', 'every', 'fill', 'filter', 'find',
+  'findIndex', 'findLast', 'findLastIndex', 'flat', 'flatMap', 'forEach',
+  'includes', 'indexOf', 'join', 'keys', 'lastIndexOf', 'map', 'pop', 'push',
+  'reduce', 'reduceRight', 'reverse', 'shift', 'slice', 'some', 'sort', 'splice',
+  'toReversed', 'toSorted', 'toSpliced', 'unshift', 'values', 'with',
+  'toString', 'toLocaleString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf',
+  'propertyIsEnumerable',
+]);
+
+/**
  * TypeScript primitive type names. Distinct from JS_BUILT_INS on purpose: those
  * are runtime globals a receiver can be constructed from, these only ever come
  * from a type annotation. A receiver typed `string` calls a built-in string

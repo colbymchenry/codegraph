@@ -125,6 +125,12 @@ interface NextTable extends RouteTable {
 
 const tables = new WeakMap<ResolutionContext, NextTable>();
 
+/** The page a route node is, or null for a node the table leaves out (a handler, another framework's route). */
+function tablePage(node: Node): NextRouteFile | null {
+  const file = nextRouteForFile(node.filePath);
+  return file && file.kind === 'page' && file.path === node.name ? file : null;
+}
+
 export function nextRouteTable(context: ResolutionContext): NextTable {
   const all = context.getNodesByKind('route');
   const cached = tables.get(context);
@@ -133,8 +139,8 @@ export function nextRouteTable(context: ResolutionContext): NextTable {
   const dynamic: RouteTable['dynamic'] = [];
   const roots = new Set<string>();
   for (const node of all) {
-    const file = nextRouteForFile(node.filePath);
-    if (!file || file.kind !== 'page' || file.path !== node.name) continue;
+    const file = tablePage(node);
+    if (!file) continue;
     exact.set(node.name, node);
     if (node.name.includes(':')) dynamic.push({ node, segs: node.name.split('/').slice(1) });
     roots.add(file.root);
@@ -222,6 +228,7 @@ export function nextNavVerb(name: string): string | null {
 export const nextjsResolver: FrameworkResolver = {
   name: 'nextjs',
   languages: [...ROUTE_LANGUAGES],
+  appDependencies: ['next'],
 
   detect(context: ResolutionContext): boolean {
     if (dependsOn(context, 'next')) return true;
@@ -232,6 +239,13 @@ export const nextjsResolver: FrameworkResolver = {
 
   claimsReference(name: string): boolean {
     return NAV_CALL.test(name);
+  },
+
+  navigation: {
+    tails: ['push', 'replace', 'prefetch', 'redirect', 'permanentRedirect'],
+    // One table holds every Next app's pages, and a call under any of them
+    // matches against all of it.
+    scope: (route, context) => (tablePage(route) ? nextRouteTable(context).roots : null),
   },
 
   extract(filePath: string, content: string) {

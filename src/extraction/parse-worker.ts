@@ -17,7 +17,9 @@ import { parentPort } from 'worker_threads';
 import { extractFromSource } from './tree-sitter';
 import { detectLanguage, loadGrammarsForLanguages, resetParser } from './grammars';
 import { tryKernelExtractRaw } from './kernel';
+import { commonJsRequireRefs } from './commonjs-requires';
 import { getAllFrameworkResolvers, getApplicableFrameworks } from '../resolution/frameworks';
+import { mayDefineCppMacroMethods } from './languages/cpp-macro-methods';
 import type { Language, ExtractionResult } from '../types';
 
 // Emscripten prints `Aborted()` (and a follow-up RuntimeError diag
@@ -89,6 +91,8 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
       // buffer clone is a flat memcpy). Only when no applicable framework has
       // an extract() hook: those merge extra nodes/refs into the DECODED
       // result inside extractFromSource, so such files keep the decoded path.
+      // So does a C++ file that may define methods with its own macros: they
+      // are minted after the kernel, in extractFromSource.
       let result: ExtractionResult | undefined;
       const frameworksNeedDecode =
         frameworkNames && frameworkNames.length > 0
@@ -97,13 +101,14 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
               language
             ).some((fw) => !!fw.extract)
           : false;
-      if (!frameworksNeedDecode) {
+      if (!frameworksNeedDecode && !(language === 'cpp' && mayDefineCppMacroMethods(content!))) {
         const raw = tryKernelExtractRaw(filePath!, content!, language);
         if (raw) {
           result = {
             nodes: [],
             edges: [],
-            unresolvedReferences: [],
+            // Read beside the kernel's tables (extractFromSource's own post-step).
+            unresolvedReferences: commonJsRequireRefs(filePath!, content!, language),
             errors: raw.errors,
             durationMs: 0,
             kernelBuffers: raw.buffers,

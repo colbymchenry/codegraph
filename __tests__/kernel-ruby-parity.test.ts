@@ -107,6 +107,137 @@ describe.skipIf(!kernelBuilt)('kernel Ruby extraction parity', () => {
     assertParity('fixtures/torture.rb (crlf)', crlf, 30);
   });
 
+  // A receiver written with its namespace (`Billing::ChargeCard.call`, `::Foo.call`)
+  // is a constant read, as a bare `ChargeCard.call`'s is (#2503): both backends
+  // emit the same `references` ref for it, under the receiver as written, at
+  // the receiver. A path through a value (`obj::Thing`, `self.class::LIMIT`)
+  // names no constant the index can know, and `.new` stays an instantiation.
+  it('namespaced constant receivers', () => {
+    const src = [
+      'class Callers',
+      '  def a',
+      '    Billing::ChargeCard.call(amount: 1)',
+      '    ::Billing::ChargeCard.call',
+      '    ::Foo.call',
+      '    Users::Create&.call',
+      '    A::B::C.run!',
+      '    Config::DEFAULTS.fetch(:x)',
+      '    Foo::Bar::baz',
+      '    obj::Thing.go',
+      '    self.class::LIMIT.times { }',
+      '    Billing::ChargeCard.new(amount: 3)',
+      '  end',
+      'end',
+      '',
+    ].join('\n');
+    assertParity('src/callers.rb', src);
+    process.env.CODEGRAPH_KERNEL = '0';
+    const refs = extractFromSource('src/callers.rb', src, 'ruby').unresolvedReferences
+      .filter((r) => r.referenceKind === 'references' || r.referenceKind === 'instantiates')
+      .map((r) => `${r.referenceKind} ${r.referenceName} ${r.line}:${r.column}`);
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(refs.sort()).toEqual([
+      'instantiates ChargeCard 12:4',
+      'references ::Billing::ChargeCard 4:4',
+      'references ::Foo 5:4',
+      'references A::B::C 7:4',
+      'references Billing::ChargeCard 3:4',
+      'references Config::DEFAULTS 8:4',
+      'references Foo::Bar 9:4',
+      'references Users::Create 6:4',
+    ]);
+  });
+
+  // A call on what `.new` made (`CacheWriter.new(key).write_cache`, #684) is
+  // recorded as `new CacheWriter().write_cache` on both backends: the class as
+  // written, without the arguments the receiver's text carried. A `new` on a
+  // value (`klass.new.run`, `self.class.new`) or a later link of a chain keeps
+  // the receiver's text, as before.
+  it('calls on a constructed receiver', () => {
+    const src = [
+      'class Callers',
+      '  def a(key, klass)',
+      '    CacheWriter.new.write_cache(key)',
+      '    CacheWriter.new(key, ttl: 5).flush!',
+      '    Billing::Ledger.new { |l| l }.post',
+      '    ::CacheWriter.new.ready?',
+      '    CacheWriter.new&.write_cache(key)',
+      '    klass.new.run',
+      '    self.class.new(key).run',
+      '    Widget.create(key).save',
+      '    CacheWriter.new.first.second',
+      '  end',
+      'end',
+      '',
+    ].join('\n');
+    assertParity('src/callers.rb', src);
+    process.env.CODEGRAPH_KERNEL = '0';
+    const calls = extractFromSource('src/callers.rb', src, 'ruby').unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls' && /[.(]/.test(r.referenceName))
+      .map((r) => `${r.referenceName} ${r.line}`);
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(calls.sort()).toEqual([
+      'CacheWriter.new.first.second 11',
+      'Widget.create 10',
+      'Widget.create(key).save 10',
+      'klass.new 8',
+      'klass.new.run 8',
+      'new ::CacheWriter().ready? 6',
+      'new Billing::Ledger().post 5',
+      'new CacheWriter().first 11',
+      'new CacheWriter().flush! 4',
+      'new CacheWriter().write_cache 3',
+      'new CacheWriter().write_cache 7',
+      'self.class.new 9',
+      'self.class.new(key).run 9',
+    ]);
+  });
+
+  // A class method (`def self.x`, `def Widget.x`, a `def` in `class << self`)
+  // is static on both backends, every other def is not: they share a
+  // qualified name with any instance method of the name.
+  it('class methods are static', () => {
+    const src = [
+      'class Widget',
+      '  def build = self',
+      '  def self.build(opts) = new',
+      '  def Widget.named = 1',
+      '  class << self',
+      '    def make = new',
+      '    def other',
+      '      def nested = 2',
+      '    end',
+      '  end',
+      '  def run',
+      '    def inner = 3',
+      '  end',
+      'end',
+      'def self.top = 4',
+      'def plain = 5',
+      '',
+    ].join('\n');
+    assertParity('src/widget.rb', src);
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    delete process.env.CODEGRAPH_KERNEL;
+    const viaKernel = tryKernelExtract('src/widget.rb', src, 'ruby');
+    const statics = viaKernel!.nodes
+      .filter((n) => n.kind === 'method' || n.kind === 'function')
+      .map((n) => `${n.kind} ${n.name}:${n.startLine} ${n.isStatic === true ? 'static' : n.isStatic === false ? 'instance' : 'unset'}`)
+      .sort();
+    expect(statics).toEqual([
+      'function inner:12 instance',
+      'function nested:8 instance',
+      'function plain:16 instance',
+      'function top:15 static',
+      'method build:2 instance',
+      'method build:3 static',
+      'method make:6 static',
+      'method named:4 static',
+      'method other:7 static',
+      'method run:11 instance',
+    ]);
+  });
+
   it('mixin implements refs carry filePath through the v2 ref-flag wire path', () => {
     const src = 'class Widget\n  include Comparable\nend\n';
     process.env.CODEGRAPH_KERNEL_LANGS = 'all';

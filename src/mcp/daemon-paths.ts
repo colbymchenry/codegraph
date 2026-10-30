@@ -32,14 +32,20 @@ import * as crypto from 'crypto';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
-import { getCodeGraphDir } from '../directory';
+import { canonicalProjectRoot, getCodeGraphDir } from '../directory';
 
 /** Soft upper bound for in-project socket paths. */
 const POSIX_SOCKET_PATH_LIMIT = 100;
 
-/** Short stable identifier for a project root — used in tmpdir/pipe names. */
+/**
+ * Short stable identifier for a project root — used in tmpdir/pipe names.
+ *
+ * Hashed over {@link canonicalProjectRoot}, never a raw `path.resolve`: the key
+ * is a rendezvous, so every spelling of one directory must land on one name or
+ * a proxy probes a pipe the running daemon never bound (see that function).
+ */
 function projectHash(projectRoot: string): string {
-  return crypto.createHash('sha256').update(path.resolve(projectRoot)).digest('hex').slice(0, 16);
+  return crypto.createHash('sha256').update(canonicalProjectRoot(projectRoot)).digest('hex').slice(0, 16);
 }
 
 /**
