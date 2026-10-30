@@ -13,7 +13,7 @@ import { applyAliases, aliasAndBaseUrlCandidates } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport, workspaceImportTargets, type WorkspaceImportTargets } from './workspace-packages';
 import { stripCommentsForRegex } from './strip-comments';
-import { makeLineAt } from './synth-utils';
+import { makeLineAt, enclosingFn, enclosingValue } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
 import { ambientModuleDeclares, findAmbientModuleExport, findAmbientModuleFile, inBlock, isInModuleBlock, namespaceBlocks, type NamespaceBlock } from './ambient-modules';
 import { isTestFile } from '../search/query-utils';
@@ -215,6 +215,14 @@ function statedDefaultExport(filePath: string, idx: FileExportIndex, context: Re
   if (source && /\bexport\s+default\b/.test(source)) {
     const code = stripCommentsForRegex(source, 'typescript');
     const lineAt = makeLineAt(code, 1);
+    // The nodes of the file, for telling a top-level `export default` from the
+    // same text written inside a template/string literal (issue #2968). A
+    // literal's text survives comment-stripping when its `${…}` interpolation
+    // holds a nested template (`\`a${\`b\`}c\``), so `EXPORT_DEFAULT_HEAD`
+    // can match it; such a match names a node of the file and is taken for the
+    // real statement. A real statement is at module scope, while a literal sits
+    // inside a function or a variable's value, so an enclosing one rules it out.
+    const nodesInFile = context.getNodesInFile(filePath);
     EXPORT_DEFAULT_HEAD.lastIndex = 0;
     for (let m = EXPORT_DEFAULT_HEAD.exec(code); m !== null; m = EXPORT_DEFAULT_HEAD.exec(code)) {
       const value = readDefaultExport(code, m.index + m[0].length);
@@ -224,6 +232,14 @@ function statedDefaultExport(filePath: string, idx: FileExportIndex, context: Re
       }
       stated ??= 'unstated';
       if (value === null) continue;
+      // A binding (`export default NAME`) names a declaration elsewhere in the
+      // file, so a literal's `export default NAME` text is indistinguishable
+      // from the real statement by name alone; a real statement is at module
+      // scope, so reject a binding written inside a function or a value.
+      if (!value.declared) {
+        const line = lineAt(m.index);
+        if (enclosingFn(nodesInFile, line) || enclosingValue(nodesInFile, line)) continue;
+      }
       const named = nodesInFileNamed(filePath, value.name, context);
       // A declaration starts on the statement's line, or on its name's when
       // the statement breaks before it (`export default\nfunction X`).
