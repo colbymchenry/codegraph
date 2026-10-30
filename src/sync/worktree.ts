@@ -111,8 +111,8 @@ export function detectWorktreeIndexMismatch(
   // and gitlinked clones, so a query run from inside one resolves up to the
   // parent index — whose graph *does* contain that nested repo's files. The
   // warning's premise ("results are a different branch; symbols changed only
-  // here are missing") is false there, and its "run codegraph init -i" advice
-  // would needlessly fragment the unified workspace index. A genuine borrowed
+  // here are missing") is false there, and its "codegraph init" advice would
+  // needlessly fragment the unified workspace index. A genuine borrowed
   // worktree and the index root are the SAME repository (they share a git
   // common dir); a submodule/embedded clone is a DIFFERENT repository and does
   // not — so suppress only when the two clearly differ. (#1031, #1033)
@@ -207,15 +207,32 @@ function directoryIdentity(p: string): string {
   return process.platform === 'win32' ? real.toLowerCase() : real;
 }
 
-/** One-line-per-fact warning describing a detected mismatch. */
-export function worktreeMismatchWarning(m: WorktreeIndexMismatch): string {
+/**
+ * The way out of a borrowed index: one built in the worktree itself. A person
+ * at the CLI is told to build it. An agent is told the user can: indexing is
+ * the user's decision, and the server instructions tell the agent not to run
+ * `codegraph init` itself, so a tool result must not tell it to.
+ */
+function worktreeIndexAdvice(audience: 'user' | 'agent'): string {
+  return audience === 'agent'
+    ? 'The user can run "codegraph init" in this worktree for a worktree-local index.'
+    : 'Run "codegraph init" in this worktree for a worktree-local index.';
+}
+
+/**
+ * One-line-per-fact warning describing a detected mismatch: `codegraph status`
+ * prints it for the user, and `codegraph_status` shows the agent's wording.
+ */
+export function worktreeMismatchWarning(
+  m: WorktreeIndexMismatch,
+  audience: 'user' | 'agent' = 'user',
+): string {
   return (
     `This CodeGraph index belongs to a different git working tree.\n` +
     `  Running in: ${m.worktreeRoot}\n` +
     `  Index from: ${m.indexRoot}\n` +
     `Results reflect that tree's code (often a different branch), not this worktree — ` +
-    `symbols changed only here are missing. Run "codegraph init -i" in this worktree ` +
-    `for a worktree-local index.`
+    `symbols changed only here are missing. ${worktreeIndexAdvice(audience)}`
   );
 }
 
@@ -223,13 +240,14 @@ export function worktreeMismatchWarning(m: WorktreeIndexMismatch): string {
  * Compact, single-line variant for prefixing a tool's result. Read tools
  * return their answer inline, so the heads-up has to ride on the same payload
  * the agent is already reading — a multi-line block would bury the result.
+ * Its reader is an agent, through MCP, the prompt hook or the `codegraph
+ * explore` and `codegraph node` CLI.
  */
 export function worktreeMismatchNotice(m: WorktreeIndexMismatch): string {
   return (
     `⚠ CodeGraph results below come from a different git worktree (${m.indexRoot}), ` +
     `not where you're working (${m.worktreeRoot}) — they may reflect another branch, ` +
-    `and symbols changed only here are missing. Run "codegraph init -i" here for a ` +
-    `worktree-local index.`
+    `and symbols changed only here are missing. ${worktreeIndexAdvice('agent')}`
   );
 }
 

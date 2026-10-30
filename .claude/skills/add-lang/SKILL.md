@@ -134,7 +134,7 @@ npm run build            # tsc + copy-assets (copies any vendored *.wasm into di
 ```
 Index a small sample repo and check extraction:
 ```bash
-( cd <sample-repo> && codegraph init -i )
+( cd <sample-repo> && codegraph init )
 node scripts/add-lang/verify-extraction.mjs <sample-repo> <lang>
 ```
 `verify-extraction.mjs` fails (exit 1) if the language isn't detected or only

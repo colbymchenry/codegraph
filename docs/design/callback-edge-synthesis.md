@@ -37,7 +37,7 @@ We synthesize `dispatcher → callback` edges that static parsing misses. It wor
 ```bash
 npm run build
 rm -rf /tmp/codegraph-corpus/excalidraw/.codegraph
-( cd /tmp/codegraph-corpus/excalidraw && codegraph init -i )
+( cd /tmp/codegraph-corpus/excalidraw && codegraph init )
 # synthesized edges (provenance='heuristic', metadata.synthesizedBy in {callback,event-emitter,…,http-client,queue-job,event-bus}):
 sqlite3 /tmp/codegraph-corpus/excalidraw/.codegraph/codegraph.db \
   "select s.name||' → '||t.name||'  '||coalesce(e.metadata,'') from edges e \
