@@ -107,7 +107,7 @@ class SQLCompiler:
 
     def get_select(self, with_col_aliases=False):
         # GET_SELECT_BODY
-${filler('sel', 34)}
+${filler('sel', 60)}
         return []
 
     def get_qualify_sql(self):
@@ -235,10 +235,14 @@ class IExact:
     return result.content?.[0]?.text ?? '';
   };
 
-  it('fixture sanity: the flow runs as_sql → get_qualify_sql → get_select and compiler.py goes focused', async () => {
+  it('fixture sanity: the flow runs as_sql → pre_sql_setup → setup_query → get_select and compiler.py goes focused', async () => {
     const text = await explore('SQLCompiler.as_sql pre_sql_setup get_select');
     expect(text).toContain('**Flow (call path among the symbols you queried)');
-    expect(text).toMatch(/1\. as_sql \(compiler\.py:\d+\)[\s\S]*2\. get_qualify_sql[\s\S]*3\. get_select/);
+    // Through every symbol the query names (#2970), as on django itself: the
+    // shorter route through the unnamed `get_qualify_sql` skipped `pre_sql_setup`.
+    // The named and spine bodies outgrow compiler.py's share, as django's do
+    // (18,390 chars against 8,895), which is what makes it a per-symbol view.
+    expect(text).toMatch(/1\. as_sql \(compiler\.py:\d+\)[\s\S]*2\. pre_sql_setup[\s\S]*3\. setup_query[\s\S]*4\. get_select/);
     expect(sectionFor(text, COMPILER), 'the family file renders as a per-symbol view').toContain('· focused');
   });
 

@@ -391,6 +391,7 @@ const DIRECTED_VISIT_CAP = 12_000;
 
 /** How the `named` walk reached a node, and what the route there carries. */
 interface WalkStep {
+  /** The route this one extends: its key in the walk's parent map. */
   prev: string | null;
   edge: Edge | null;
   node: Node;
@@ -402,6 +403,17 @@ interface WalkStep {
   named: number;
 }
 
+/** A node's callees, read once per search however many routes reach it. */
+type CalleesOf = (id: string) => ReturnType<CodeGraph['getCallees']>;
+
+/** Whether the route ending at `key` passes `nodeId`: a walk back of at most `maxHops` steps. */
+function onRoute(parent: ReadonlyMap<string, WalkStep>, key: string, nodeId: string): boolean {
+  for (let cur: string | null = key; cur !== null; cur = parent.get(cur)!.prev) {
+    if (parent.get(cur)!.node.id === nodeId) return true;
+  }
+  return false;
+}
+
 /**
  * Breadth-first over `calls` edges — synthesized ones included, which is what
  * carries a flow across a callback, a re-render or a JSX child.
@@ -410,62 +422,91 @@ interface WalkStep {
  * at most `maxBridge` unnamed symbols may sit between two of them. That cap is
  * what bounds the frontier, so {@link NAMED_VISIT_CAP} is generous.
  *
- * Two routes of the same length to one node are settled by the agent's naming,
- * not by the order the index lists callees in: the route through more named
- * symbols wins. An interface method calls every implementation, so
- * prometheus's `Queryable.Querier` reaches `NewMergeQuerier` through
- * `fanout.Querier` and the TSDB's `DB.Querier` alike; keeping whichever was
- * listed first took the Flow through `DB.Querier` when the query named
- * `fanout.Querier`. A rival route comes from another node at the same depth,
- * and every node at one depth is expanded before any node at the next, so the
- * choice is final before anything is reached through it. Ending on fewer
- * unnamed hops ranks first, so a choice never spends bridge budget that a later
- * hop needs (with the default budget of one, only a route node's streak can
- * differ).
+ * A node keeps every route to it that no other route to it beats: one that got
+ * there no later, through as many named symbols, with no more unnamed hops to
+ * end on. One route per node lost a named symbol (#2970): in `entry → mid2 →
+ * leaf` beside `entry → mid1 → deep → leaf`, `leaf` was reached first through
+ * the unnamed `mid2`, so the route through the named `deep` was turned away for
+ * being longer, and a query naming all three got a Flow without `leaf`. A
+ * longer route that passes fewer named symbols is still turned away, so it
+ * can't win the deepest-sink choice over a better one.
  *
- * Returns the parent map, so a caller can reconstruct any reached node's path.
+ * At one depth the same rule settles which route the agent's naming prefers,
+ * not the order the index lists callees in: an interface method calls every
+ * implementation, so prometheus's `Queryable.Querier` reaches `NewMergeQuerier`
+ * through `fanout.Querier` and the TSDB's `DB.Querier` alike, and the route
+ * through the named `fanout.Querier` beats the other. Every node at one depth is
+ * expanded before any node at the next, so a route beaten at its own depth is
+ * dropped before anything is reached through it. Ending on fewer unnamed hops
+ * is no worse, so no route spends bridge budget a later hop needs.
+ *
+ * Returns the parent map keyed by route, so a caller can reconstruct the path
+ * of any route that reached a named symbol (`reached`).
  */
 function walkCalls(
-  cg: CodeGraph,
+  calleesOf: CalleesOf,
   seed: Node,
   named: ReadonlySet<string>,
   maxHops: number,
   maxBridge: number
 ): { parent: Map<string, WalkStep>; reached: string[] } {
   const parent = new Map<string, WalkStep>();
-  parent.set(seed.id, {
-    prev: null,
-    edge: null,
-    node: seed,
-    depth: 0,
-    streak: 0,
-    named: named.has(seed.id) ? 1 : 0,
-  });
-  const queue: string[] = [seed.id];
+  /** The routes each reached node keeps, by key; its size is the nodes reached. */
+  const routes = new Map<string, string[]>();
+  const beaten = new Set<string>();
+  const queue: string[] = [];
+  /** Where each route waits in the queue. */
+  const slot = new Map<string, number>();
+  const beats = (a: WalkStep, b: WalkStep) => a.depth <= b.depth && a.named >= b.named && a.streak <= b.streak;
+  const keep = (step: WalkStep): void => {
+    const kept = routes.get(step.node.id) ?? [];
+    if (kept.some((other) => beats(parent.get(other)!, step))) return;
+    const key = String(parent.size);
+    parent.set(key, step);
+    // A route beaten here is one of this depth, still waiting in the queue: the
+    // better route takes its place there, so the walk visits nodes in the order
+    // it reached them, whichever route won.
+    let place = -1;
+    const live: string[] = [];
+    for (const other of kept) {
+      if (!beats(step, parent.get(other)!)) {
+        live.push(other);
+        continue;
+      }
+      beaten.add(other);
+      const at = slot.get(other)!;
+      if (place < 0 || at < place) place = at;
+    }
+    live.push(key);
+    routes.set(step.node.id, live);
+    if (place < 0) {
+      place = queue.length;
+      queue.push(key);
+    } else {
+      queue[place] = key;
+    }
+    slot.set(key, place);
+  };
+  keep({ prev: null, edge: null, node: seed, depth: 0, streak: 0, named: named.has(seed.id) ? 1 : 0 });
   const reached: string[] = [];
-  for (let head = 0; head < queue.length && parent.size < NAMED_VISIT_CAP; head++) {
-    const id = queue[head]!;
-    const at = parent.get(id)!;
-    if (id !== seed.id && named.has(id)) reached.push(id);
+  for (let head = 0; head < queue.length && routes.size < NAMED_VISIT_CAP; head++) {
+    const key = queue[head]!;
+    if (beaten.has(key)) continue;
+    const at = parent.get(key)!;
+    const id = at.node.id;
+    if (id !== seed.id && named.has(id)) reached.push(key);
     if (at.depth >= maxHops - 1) continue;
-    for (const c of cg.getCallees(id)) {
+    for (const c of calleesOf(id)) {
       if (!FLOW_EDGE_KINDS.has(c.edge.kind)) continue;
       const isNamed = named.has(c.node.id);
       // A route node is a connector, not a symbol the reader would have named:
       // crossing one costs no bridge budget.
       const streak = isNamed ? 0 : c.node.kind === 'route' ? at.streak : at.streak + 1;
       if (streak > maxBridge) continue;
-      const depth = at.depth + 1;
-      const namedOnRoute = at.named + (isNamed ? 1 : 0);
-      const prior = parent.get(c.node.id);
-      if (prior) {
-        // Reached already: only a better route of the same length replaces it.
-        if (prior.depth !== depth) continue;
-        if (streak > prior.streak || (streak === prior.streak && namedOnRoute <= prior.named)) continue;
-      } else {
-        queue.push(c.node.id);
-      }
-      parent.set(c.node.id, { prev: id, edge: c.edge, node: c.node, depth, streak, named: namedOnRoute });
+      // A route never passes a node twice: going round a cycle counts its named
+      // symbols again and would out-rank the flow it repeats.
+      if (onRoute(parent, key, c.node.id)) continue;
+      keep({ prev: key, edge: c.edge, node: c.node, depth: at.depth + 1, streak, named: at.named + (isNamed ? 1 : 0) });
     }
   }
   return { parent, reached };
@@ -586,7 +627,7 @@ function walkBidirectional(
 }
 
 function chainTo(
-  parent: Map<string, { prev: string | null; edge: Edge | null; node: Node }>,
+  parent: ReadonlyMap<string, { prev: string | null; edge: Edge | null; node: Node }>,
   target: string
 ): FlowStep[] {
   const steps: FlowStep[] = [];
@@ -636,22 +677,28 @@ export function resolveNamedSymbolFlow(
         if (steps) found.push(steps);
       }
     } else {
+      const callees = new Map<string, ReturnType<CodeGraph['getCallees']>>();
+      const calleesOf: CalleesOf = (id) => {
+        let out = callees.get(id);
+        if (!out) {
+          out = cg.getCallees(id);
+          callees.set(id, out);
+        }
+        return out;
+      };
       for (const seed of [...flow.named.values()].slice(0, MAX_SEEDS)) {
-        const { parent, reached } = walkCalls(cg, seed, namedIds, maxHops, maxBridge);
+        const { parent, reached } = walkCalls(calleesOf, seed, namedIds, maxHops, maxBridge);
         // Explore's rule: the DEEPEST named sink this seed can reach. Of two as
         // deep, the one whose route passes more named symbols, as in the walk.
-        let deepest: WalkStep | null = null;
-        for (const id of reached) {
-          const at = parent.get(id)!;
-          if (
-            !deepest ||
-            at.depth > deepest.depth ||
-            (at.depth === deepest.depth && at.named > deepest.named)
-          ) {
-            deepest = at;
+        let deepest: string | null = null;
+        for (const key of reached) {
+          const at = parent.get(key)!;
+          const best = deepest === null ? null : parent.get(deepest)!;
+          if (!best || at.depth > best.depth || (at.depth === best.depth && at.named > best.named)) {
+            deepest = key;
           }
         }
-        if (deepest) found.push(chainTo(parent, deepest.node.id));
+        if (deepest !== null) found.push(chainTo(parent, deepest));
       }
     }
 
