@@ -17608,6 +17608,9 @@ function cppOverloadFor(candidates: Node[], name: string, ref: UnresolvedRef, co
   return cppArgumentTypeChoice(overloads.filter((_, i) => fits[i] === top), name, args, ref, context);
 }
 
+/** The calls (`file:line:column:name`) whose arguments cppArgumentTypeChoice is typing. */
+const CPP_ARGUMENT_CHOICES_IN_FLIGHT = new Set<string>();
+
 /**
  * Of overloads the call's arguments `args` fit alike by count (in
  * preference order), the one the types the arguments have where the call
@@ -17616,7 +17619,19 @@ function cppOverloadFor(candidates: Node[], name: string, ref: UnresolvedRef, co
  */
 function cppArgumentTypeChoice(tied: Node[], name: string, args: string[], ref: UnresolvedRef, context: ResolutionContext): Node {
   if (tied.length === 1 || args.length === 0) return tied[0]!;
-  const types = args.map((arg) => cppArgumentType(arg, ref, context));
+  // Typing an argument can come back to this choice: in `extras(extras(id).prev())`
+  // on an overloaded `extras`, the inner `extras(id)` is chosen by the arguments
+  // of the call the reference is at — the outer one — and each lap starts its
+  // depth afresh. Re-entered, take the first, as when no argument's type is known.
+  const key = `${ref.filePath}:${ref.line}:${ref.column}:${name}`;
+  if (CPP_ARGUMENT_CHOICES_IN_FLIGHT.has(key)) return tied[0]!;
+  CPP_ARGUMENT_CHOICES_IN_FLIGHT.add(key);
+  let types: Array<CppArgumentType | null>;
+  try {
+    types = args.map((arg) => cppArgumentType(arg, ref, context));
+  } finally {
+    CPP_ARGUMENT_CHOICES_IN_FLIGHT.delete(key);
+  }
   if (types.every((t) => t === null)) return tied[0]!;
   const fits = tied.map((n) => cppArgumentTypeFit(n, name, types, context));
   const top = Math.max(...fits);
