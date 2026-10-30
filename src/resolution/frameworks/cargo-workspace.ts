@@ -159,22 +159,25 @@ export function parsePackageName(cargoToml: string): string | null {
 
 /**
  * The target roots a manifest names with a `path` of their own: `[lib] path =
- * "…"` and each `[[bin]] path = "…"` (ripgrep's `crates/core/main.rs`), as
- * written — relative to the manifest's directory.
+ * "…"`, each `[[bin]] path = "…"` (ripgrep's `crates/core/main.rs`), and each
+ * `[[example]]`, `[[test]]` and `[[bench]]` one (dioxus's
+ * `examples/07-fullstack/handling_errors.rs`), as written — relative to the
+ * manifest's directory.
  */
-export function parseTargetPaths(cargoToml: string): { lib?: string; bins: string[] } {
-  const out: { lib?: string; bins: string[] } = { bins: [] };
-  let table: 'lib' | 'bin' | null = null;
+export function parseTargetPaths(cargoToml: string): { lib?: string; bins: string[]; others: string[] } {
+  const out: { lib?: string; bins: string[]; others: string[] } = { bins: [], others: [] };
+  let table: 'lib' | 'bin' | 'other' | null = null;
   for (const raw of cargoToml.split(/\r?\n/)) {
     const line = raw.replace(/#.*$/, '').trim();
     if (line.startsWith('[')) {
-      table = line === '[lib]' ? 'lib' : line === '[[bin]]' ? 'bin' : null;
+      table = line === '[lib]' ? 'lib' : line === '[[bin]]' ? 'bin' : /^\[\[(?:example|test|bench)\]\]$/.test(line) ? 'other' : null;
       continue;
     }
     const at = table && /^path\s*=\s*["']([^"'\n]+)["']/.exec(line)?.[1]?.replace(/\\/g, '/');
     if (!at) continue;
     if (table === 'lib') out.lib = at;
-    else out.bins.push(at);
+    else if (table === 'bin') out.bins.push(at);
+    else out.others.push(at);
   }
   return out;
 }

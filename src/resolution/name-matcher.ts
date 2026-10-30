@@ -2862,6 +2862,24 @@ function rustModuleDir(filePath: string): string {
 }
 
 /**
+ * Whether a Rust file is inside the module whose file is `ownerFile` and whose
+ * submodules live under `ownerDir`: below that directory, or loaded by a
+ * `#[path]` declaration written inside it (fast-mlsirm's
+ * `tests/unit/scaling_tests.rs` is `scaling.rs`'s `mod tests`, and sees its
+ * private items).
+ */
+function rustFileUnder(file: string, ownerDir: string, ownerFile: string, context: ResolutionContext): boolean {
+  let f = file;
+  for (let i = 0; i < 8; i++) {
+    if (f.startsWith(`${ownerDir}/`) || (i > 0 && f === ownerFile)) return true;
+    const claim = rustPathClaim(f, context);
+    if (!claim) return false;
+    f = claim.file;
+  }
+  return false;
+}
+
+/**
  * Standard-library package names (and kubernetes' aliases of a few of its own
  * util packages). A dotted Go reference through one is taken for a call into
  * that package, unless the name is a parameter or local where the call is
@@ -3957,8 +3975,7 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
     // trait's, reached through a value whose type the call's receiver
     // declares (matchRustTypedReceiverCall). A guess by its name alone stays out.
     if (candidate.kind === 'method' && RUST_TYPED_REFS.get(context)?.has(ref) && rustTraitOf(candidate, context)?.visibility !== 'private') return true;
-    const owner = rustModuleDir(candidate.filePath);
-    return ref.filePath.startsWith(owner + '/');
+    return rustFileUnder(ref.filePath, rustModuleDir(candidate.filePath), candidate.filePath, context);
   }
   // A Dart `_name` is its library's, which spans the library file and its
   // parts: riverpod_generator's `class Counter extends _$Counter` names the
@@ -8732,6 +8749,10 @@ interface RustUses {
   blocks: RustModBlock[];
   /** Modules it declares with a `#[path = "…"]` of their own (often one per cfg), whose file can't be told from their name. */
   pathMods: Set<string>;
+  /** Modules it declares out of line with no `#[path]` (`mod name;`): the files the regular rules name. */
+  mods: Set<string>;
+  /** Whether it starts a binary of its own: a top-level `fn main` or `#![no_main]` (a trybuild case, a fuzz target). */
+  main: boolean;
   /** Whether every brace closes, so `blocks` can be trusted to say what is inside them. */
   balanced: boolean;
   /** The offset each line starts at. */
@@ -8852,6 +8873,8 @@ interface RustCrate {
   lib?: string;
   /** The binaries' roots its manifest gives a `path` (ripgrep's `crates/core/main.rs`), as project files. */
   bins: string[];
+  /** The examples', tests' and benches' roots its manifest gives a `path`, as project files: each its own crate. */
+  others: string[];
 }
 
 interface RustCrateGraph {
@@ -8892,8 +8915,8 @@ function rustCrateGraph(context: ResolutionContext): RustCrateGraph {
     if (!name) return false;
     const targets = parseTargetPaths(text!);
     const lib = targets.lib === undefined ? null : join(dir, targets.lib);
-    const bins = targets.bins.map((bin) => join(dir, bin)).filter((bin): bin is string => bin !== null);
-    crates.set(dir, { name, keys: new Map(), deps: new Set(), lib: lib ?? undefined, bins });
+    const files = (rels: string[]): string[] => rels.map((rel) => join(dir, rel)).filter((file): file is string => file !== null);
+    crates.set(dir, { name, keys: new Map(), deps: new Set(), lib: lib ?? undefined, bins: files(targets.bins), others: files(targets.others) });
     manifests.set(dir, text!);
     if (!byName.has(name)) byName.set(name, dir);
     return true;
@@ -9000,7 +9023,7 @@ function rustUsesOf(filePath: string, context: ResolutionContext): RustUses {
   if (hit) return hit;
   const uses: RustUses = {
     names: new Set(), globs: new Set(), external: new Set(), bound: new Set(), boundFrom: new Map(),
-    paths: new Map(), stdPaths: new Map(), globPaths: [], blocks: [], pathMods: new Set(), balanced: true, lineStarts: [],
+    paths: new Map(), stdPaths: new Map(), globPaths: [], blocks: [], pathMods: new Set(), mods: new Set(), main: false, balanced: true, lineStarts: [],
   };
   const leaves = (tree: string): string[] => [
     ...[...tree.matchAll(/([A-Za-z_]\w*)\s*(?=[,}]|$|\s+as\b)|\bas\s+([A-Za-z_]\w*)/g)]
@@ -9067,9 +9090,16 @@ function rustUsesOf(filePath: string, context: ResolutionContext): RustUses {
     for (const g of tree.matchAll(/(\w+)\s*::\s*(?:\{[^}]*)?\*/g)) uses.globs.add(g[1]!);
   });
   // `#[path = "atomic_u64_native.rs"] mod imp;`, `#[cfg_attr(docsrs, path = "…")] pub mod de;`
+  const pathModAt = new Set<number>();
   for (const m of text.matchAll(/#\[\s*(?:cfg_attr\s*\([^\]]*\bpath|path)\s*=[^\]]*\]\s*(?:#!?\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?([A-Za-z_]\w*)/g)) {
     uses.pathMods.add(m[1]!);
+    pathModAt.add(m.index! + m[0].search(/\bmod\s+(?:r#)?[A-Za-z_]\w*$/));
   }
+  // `mod name;` with no `#[path]` of its own.
+  for (const m of text.matchAll(/\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*;/g)) {
+    if (!pathModAt.has(m.index!)) uses.mods.add(m[1]!);
+  }
+  uses.main = /^(?:pub\s+)?(?:async\s+)?fn\s+main\s*\(|^[ \t]*#!\[\s*no_main\s*\]/m.test(text);
   for (let at = 0; at !== -1; at = text.indexOf('\n', at) + 1 || -1) uses.lineStarts.push(at);
   memo.set(filePath, uses);
   return uses;
@@ -9283,13 +9313,239 @@ function isRustTargetRoot(filePath: string, context: ResolutionContext): boolean
   const dir = rustCrateDirOf(filePath, graph);
   if (dir === null) return /(?:^|\/)(?:lib|main)\.rs$/.test(filePath);
   const crate = graph.crates.get(dir);
-  if (crate && (crate.lib === filePath || crate.bins.includes(filePath))) return true;
+  if (crate && (crate.lib === filePath || crate.bins.includes(filePath) || crate.others.includes(filePath))) return true;
   const rel = dir === '' ? filePath : filePath.slice(dir.length + 1);
   return /^(?:src\/(?:lib|main)\.rs|src\/bin\/[^/]+(?:\.rs|\/main\.rs)|(?:tests|examples|benches)\/[^/]+(?:\.rs|\/main\.rs)|build\.rs)$/.test(rel);
 }
 
+/** A `#[path = "…"] mod name;` declaration. */
+interface RustPathDecl {
+  /** The file it is written in, and the offset of its `mod`: the module it is declared in. */
+  file: string;
+  at: number;
+  name: string;
+  /**
+   * The file it loads, from the project's root, read as the Rust Reference
+   * reads the attribute; null for one a `cfg_attr` sets, which the build's
+   * cfg decides, or one that leaves the project.
+   */
+  target: string | null;
+}
+
+const RUST_PATH_DECLS = new WeakMap<ResolutionContext, Map<string, readonly RustPathDecl[]>>();
+const RUST_PATH_LOADS = new WeakMap<ResolutionContext, Map<string, RustPathDecl[]>>();
+const RUST_PATH_LOADERS = new WeakMap<ResolutionContext, Map<string, readonly RustPathDecl[]>>();
+const RUST_FILES_BY_DIR = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const NO_RUST_PATH_DECLS: readonly RustPathDecl[] = [];
+/** An out-of-line module declaration, `pub(crate) mod name;`, from its visibility. */
+const RUST_MOD_DECL = /(?:\bpub(?:\s*\([^()]*\))?\s+)?\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*;/g;
+
+/**
+ * A file's own `#[path = "…"] mod name;` declarations. The attribute's path
+ * is relative to the directory of the file it is written in — or, inside an
+ * inline `mod`, to that module's own directory: the file's for a `mod.rs` or
+ * a crate root, else the directory named after the file, then the inline
+ * modules' names (the Rust Reference, "The path attribute").
+ */
+function rustPathDeclsIn(file: string, context: ResolutionContext): readonly RustPathDecl[] {
+  let memo = RUST_PATH_DECLS.get(context);
+  if (!memo) RUST_PATH_DECLS.set(context, (memo = new Map()));
+  let decls = memo.get(file);
+  if (!decls) memo.set(file, (decls = rustReadPathDecls(file, context)));
+  return decls;
+}
+
+function rustReadPathDecls(file: string, context: ResolutionContext): readonly RustPathDecl[] {
+  let decls: RustPathDecl[] | undefined;
+  // Both forms write `path =`: `#[path = "…"]`, `#[cfg_attr(…, path = "…")]`.
+  // The bytes are checked first, so a file without the word is never decoded.
+  if (!file.endsWith('.rs') || (context.fileContains && !context.fileContains(file, 'path'))) return NO_RUST_PATH_DECLS;
+  const src = context.readFile(file);
+  if (!src || !/\bpath\s*=/.test(src)) return NO_RUST_PATH_DECLS;
+  const code = blankRustCode(src);
+  let blocks: RustModBlock[] | undefined;
+  for (const m of code.matchAll(RUST_MOD_DECL)) {
+    let target: string | null | undefined;
+    for (const [from, to] of rustAttributesBefore(code, m.index!)) {
+      const raw = src.slice(from, to);
+      const plain = /^#\s*\[\s*path\s*=\s*"([^"]*)"\s*\]$/.exec(raw);
+      if (plain) target = plain[1]!.replace(/\\/g, '/');
+      else if (target === undefined && /^#\s*\[\s*cfg_attr\b[\s\S]*\bpath\s*=/.test(raw)) target = null;
+    }
+    if (target === undefined) continue;
+    // The `mod` keyword's offset (`mod modules;` holds a second `mod`).
+    const at = m.index! + /\bmod\s/.exec(m[0])!.index;
+    // At the file's top level it is the file's own; only one inside braces
+    // (an inline module's, or a macro's) needs the file's block layout.
+    const block = rustBraceDepth(code, at) === 0 ? null : rustBlockAt((blocks ??= rustUsesOf(file, context).blocks), at);
+    // From the file's directory; in an inline module, from that module's.
+    let base = rustParentDir(file);
+    if (block) {
+      base = isRustTargetRoot(file, context) || /(?:^|\/)mod\.rs$/.test(file) ? base : file.replace(/\.rs$/, '');
+      const names: string[] = [];
+      for (let b: RustModBlock | null = block; b; b = b.parent) names.unshift(b.name);
+      for (const name of names) base = rustJoin(base, name);
+    }
+    let loads: string | null = null;
+    if (target !== null && !/^(?:\/|[A-Za-z]:)/.test(target)) {
+      const joined = path.posix.normalize(rustJoin(base, target));
+      loads = escapesRoot(joined) ? null : joined;
+    }
+    (decls ??= []).push({ file, at, name: m[1]!, target: loads });
+  }
+  return decls ?? NO_RUST_PATH_DECLS;
+}
+
+/** How many braces are open at `at` in blanked code. */
+function rustBraceDepth(code: string, at: number): number {
+  let depth = 0;
+  for (let i = 0; i < at; i++) {
+    const c = code.charCodeAt(i);
+    if (c === 123) depth++;
+    else if (c === 125 && depth > 0) depth--;
+  }
+  return depth;
+}
+
+/** Each file a `#[path]` of the project loads → the declarations that load it: every Rust file's, read once. */
+function rustPathLoads(context: ResolutionContext): Map<string, RustPathDecl[]> {
+  const hit = RUST_PATH_LOADS.get(context);
+  if (hit) return hit;
+  const out = new Map<string, RustPathDecl[]>();
+  RUST_PATH_LOADS.set(context, out);
+  for (const file of context.getAllFiles()) {
+    for (const decl of rustPathDeclsIn(file, context)) {
+      if (decl.target === null) continue;
+      const list = out.get(decl.target);
+      if (list) list.push(decl);
+      else out.set(decl.target, [decl]);
+    }
+  }
+  return out;
+}
+
+/** The project's Rust files directly in `dir`. */
+function rustFilesIn(dir: string, context: ResolutionContext): readonly string[] {
+  let index = RUST_FILES_BY_DIR.get(context);
+  if (!index) {
+    index = new Map();
+    for (const file of context.getAllFiles()) {
+      if (!file.endsWith('.rs')) continue;
+      const parent = rustParentDir(file);
+      const list = index.get(parent);
+      if (list) list.push(file);
+      else index.set(parent, [file]);
+    }
+    RUST_FILES_BY_DIR.set(context, index);
+  }
+  return index.get(dir) ?? [];
+}
+
+/**
+ * Whether the regular rules place a Rust file: a crate root (one with a
+ * `fn main` of its own too, as a trybuild case is), or `name.rs` /
+ * `name/mod.rs` that a plain `mod name;` declares in the module owning its
+ * directory (that directory's `mod.rs`, the file named after it, or a crate
+ * root in it) — or in an inline module of the module owning a directory
+ * above it, whose names make up the rest of the path (dioxus's
+ * ecommerce-site: `mod components { pub mod home; }` in `src/main.rs` places
+ * `src/components/home.rs`). Such a file is that module, whatever else loads it.
+ */
+function rustPlacedByName(file: string, context: ResolutionContext): boolean {
+  if (isRustTargetRoot(file, context) || rustUsesOf(file, context).main) return true;
+  const dir = rustParentDir(file);
+  const isMod = file === 'mod.rs' || file.endsWith('/mod.rs');
+  if (isMod && dir === '') return false;
+  const name = path.posix.basename(isMod ? dir : file, '.rs');
+  let parent = isMod ? rustParentDir(dir) : dir;
+  // The inline modules, outermost first, between the owner's directory and the file's.
+  const inline: string[] = [];
+  for (let depth = 0; depth < 4; depth++) {
+    const owners = [rustJoin(parent, 'mod.rs'), ...(parent === '' ? [] : [`${parent}.rs`])];
+    for (const f of rustFilesIn(parent, context)) if (isRustTargetRoot(f, context)) owners.push(f);
+    for (const owner of owners) {
+      if (owner === file || !context.fileExists(owner)) continue;
+      const uses = rustUsesOf(owner, context);
+      if (uses.mods.has(name) && (inline.length === 0 || rustHasInlineModules(uses.blocks, inline))) return true;
+    }
+    if (parent === '') break;
+    inline.unshift(path.posix.basename(parent));
+    parent = rustParentDir(parent);
+  }
+  return false;
+}
+
+/** Whether a file declares the inline modules `names` (outermost first) nested in one another from its top level. */
+function rustHasInlineModules(blocks: readonly RustModBlock[], names: readonly string[]): boolean {
+  return blocks.some((block) => {
+    let b: RustModBlock | null = block;
+    for (let i = names.length - 1; i >= 0; i--) {
+      if (!b || b.name !== names[i]) return false;
+      b = b.parent;
+    }
+    return b === null;
+  });
+}
+
+/**
+ * The `#[path]` declarations that load `file`, for a file the regular rules
+ * don't place (rustPlacedByName); none for one they do. Only then is every
+ * Rust file of the project read for its declarations.
+ */
+function rustPathLoaders(file: string, context: ResolutionContext): readonly RustPathDecl[] {
+  let memo = RUST_PATH_LOADERS.get(context);
+  if (!memo) RUST_PATH_LOADERS.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const loaders = !file.endsWith('.rs') || rustPlacedByName(file, context)
+    ? NO_RUST_PATH_DECLS
+    : rustPathLoads(context).get(file) ?? NO_RUST_PATH_DECLS;
+  memo.set(file, loaders);
+  return loaders;
+}
+
+/** The spans of the outer attributes (`#[…]`) written right before `at` in blanked code, nearest first. */
+function rustAttributesBefore(code: string, at: number): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  let p = at;
+  for (;;) {
+    let q = p - 1;
+    while (q >= 0 && /\s/.test(code[q]!)) q--;
+    if (code[q] !== ']') break;
+    let depth = 0;
+    let open = -1;
+    for (let i = q; i >= 0; i--) {
+      if (code[i] === ']') depth++;
+      else if (code[i] === '[' && --depth === 0) {
+        open = i;
+        break;
+      }
+    }
+    let hash = open - 1;
+    while (hash >= 0 && /\s/.test(code[hash]!)) hash--;
+    if (open < 0 || code[hash] !== '#') break;
+    spans.push([hash, q + 1]);
+    p = hash;
+  }
+  return spans;
+}
+
+/**
+ * The one `#[path]` declaration that loads `file` as a module, or null: a file
+ * the regular rules place, one no such declaration loads, or one several do
+ * (tests that each load a shared helper; then which module it is depends on
+ * the crate being built).
+ */
+function rustPathClaim(file: string, context: ResolutionContext): RustPathDecl | null {
+  const loaders = rustPathLoaders(file, context);
+  return loaders.length === 1 ? loaders[0]! : null;
+}
+
 /** The module a Rust file is, at its own top level. */
 function rustFileModule(filePath: string, context: ResolutionContext): RustModule {
+  // A file a `#[path]` loads owns its directory, as a `mod.rs` does: rustc
+  // reads every `#[path]` file so.
+  if (rustPathClaim(filePath, context)) return { file: filePath, dir: rustParentDir(filePath), block: null, root: false };
   const root = isRustTargetRoot(filePath, context);
   const dir = root || filePath.endsWith('/mod.rs') || filePath === 'mod.rs' ? rustParentDir(filePath) : filePath.replace(/\.rs$/, '');
   return { file: filePath, dir, block: null, root };
@@ -9314,10 +9570,15 @@ function rustModuleAt(filePath: string, offset: number, context: ResolutionConte
  * `main.rs` above it. null when no single root is the file's: a
  * `tests/support/` module serves every test that declares it.
  */
-function rustCrateRootModule(filePath: string, context: ResolutionContext): RustModule | null {
+function rustCrateRootModule(filePath: string, context: ResolutionContext, depth = 0): RustModule | null {
+  // A file a `#[path]` loads is in the crate of the file that declares it.
+  const claim = depth < 8 ? rustPathClaim(filePath, context) : null;
+  if (claim) return rustCrateRootModule(claim.file, context, depth + 1);
   const graph = rustCrateGraph(context);
   const dir = rustCrateDirOf(filePath, graph);
   if (dir === null) return rustNearestRootModule(filePath, context);
+  // An example, test or bench the manifest places with a path of its own is its own crate's root.
+  if (graph.crates.get(dir)?.others.includes(filePath)) return { file: filePath, dir: rustParentDir(filePath), block: null, root: true };
   const base = dir === '' ? '' : `${dir}/`;
   const rel = filePath.slice(base.length);
   const target = /^(src\/bin|tests|examples|benches)\/([^/]+?)(\.rs$|\/)/.exec(rel);
@@ -9370,14 +9631,21 @@ function rustLibModule(crateDir: string, context: ResolutionContext): RustModule
 /**
  * The module `name` that `m` declares: inline (`mod name { … }`), else
  * `<name>.rs` or `<name>/mod.rs` in its directory, else one it passes on under
- * that name — dioxus's `pub use dioxus_hooks as hooks;`. null for one a
- * `#[path]` puts elsewhere — tokio's `process::imp` is `unix/mod.rs` or
- * `windows.rs` by cfg — as for one with no file.
+ * that name — dioxus's `pub use dioxus_hooks as hooks;`. One a `#[path]`
+ * puts elsewhere is the file it names when `m` declares it once, whatever
+ * else loads that file too (a helper several tests load is each test's);
+ * null when cfg alternatives name a file each (tokio's `process::imp` is
+ * `unix/mod.rs` or `windows.rs`) or a `cfg_attr` sets the path, as for one
+ * with no file.
  */
 function rustSubmodule(m: RustModule, name: string, context: ResolutionContext, depth = 0): RustModule | null {
   const dir = rustJoin(m.dir, name);
   const layout = rustUsesOf(m.file, context);
-  if (layout.pathMods.has(name)) return null;
+  if (layout.pathMods.has(name)) {
+    const decls = rustPathDeclsIn(m.file, context).filter((d) => d.name === name && rustBlockAt(layout.blocks, d.at) === m.block);
+    const target = decls.length === 1 ? decls[0]!.target : null;
+    return target !== null && context.fileExists(target) ? { file: target, dir: rustParentDir(target), block: null, root: false } : null;
+  }
   const block = layout.blocks.find((b) => b.name === name && b.parent === m.block);
   if (block) return { file: m.file, dir, block, root: false };
   for (const file of [`${dir}.rs`, `${dir}/mod.rs`]) {
@@ -9392,11 +9660,18 @@ function rustSubmodule(m: RustModule, name: string, context: ResolutionContext, 
   return null;
 }
 
-/** The module `m` is declared in — what `super::` names — or null above a crate's root. */
+/**
+ * The module `m` is declared in — what `super::` names — or null above a
+ * crate's root. A file a `#[path]` loads is declared where that attribute is,
+ * wherever the file lies (fast-mlsirm's `tests/unit/scaling_tests.rs` is
+ * `crates/core/src/scaling.rs`'s `mod tests`).
+ */
 function rustSuperModule(m: RustModule, context: ResolutionContext): RustModule | null {
   if (m.block) {
     return m.block.parent ? { file: m.file, dir: rustParentDir(m.dir), block: m.block.parent, root: false } : rustFileModule(m.file, context);
   }
+  const claim = rustPathClaim(m.file, context);
+  if (claim) return rustModuleAt(claim.file, claim.at, context);
   if (m.root) return null;
   const dir = rustParentDir(m.dir);
   for (const file of [rustJoin(dir, 'mod.rs'), ...(dir === '' ? [] : [`${dir}.rs`]), rustJoin(dir, 'lib.rs'), rustJoin(dir, 'main.rs')]) {
@@ -9523,7 +9798,7 @@ function rustGlobbedItems(
     const from = fromOf(g);
     const mod = rustWalkModules(g.segs, from, context);
     if (mod === 'outside') continue;
-    const items = mod === null ? null : rustModuleItems(mod, name, context, seen, !rustModuleWithin(from, mod));
+    const items = mod === null ? null : rustModuleItems(mod, name, context, seen, !rustModuleWithin(from, mod, context));
     if (items === null) unknown = true;
     else found.push(...items);
   }
@@ -9531,14 +9806,17 @@ function rustGlobbedItems(
 }
 
 /** Whether module `inner` is `outer` or one declared inside it, inline or in a file below its directory. */
-function rustModuleWithin(inner: RustModule, outer: RustModule): boolean {
+function rustModuleWithin(inner: RustModule, outer: RustModule, context?: ResolutionContext, depth = 0): boolean {
   if (inner.file === outer.file) {
     for (let b: RustModBlock | null = inner.block; ; b = b.parent) {
       if (b === outer.block) return true;
       if (b === null) return false;
     }
   }
-  return inner.file.startsWith(outer.dir === '' ? '' : `${outer.dir}/`) && !(outer.dir === '' && outer.block !== null);
+  if (inner.file.startsWith(outer.dir === '' ? '' : `${outer.dir}/`) && !(outer.dir === '' && outer.block !== null)) return true;
+  // A file a `#[path]` loads is inside the module that declares it.
+  const claim = context && depth < 8 && inner.block === null ? rustPathClaim(inner.file, context) : null;
+  return claim !== null && rustModuleWithin(rustModuleAt(claim.file, claim.at, context!), outer, context, depth + 1);
 }
 
 /**
@@ -9716,9 +9994,9 @@ const RUST_MODULE_ITEM_KINDS = new Set(['function', 'struct', 'enum', 'union', '
  * same rule isVisibleAcrossFiles applies to the pipeline's pick, here ahead of
  * the ranking, so the crate's own `pub(crate) type Result` can win instead.
  */
-function isRustItemVisibleFrom(candidate: Node, ref: UnresolvedRef): boolean {
+function isRustItemVisibleFrom(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (candidate.language !== 'rust' || candidate.visibility !== 'private' || !RUST_MODULE_ITEM_KINDS.has(candidate.kind)) return true;
-  return candidate.filePath === ref.filePath || ref.filePath.startsWith(`${rustModuleDir(candidate.filePath)}/`);
+  return candidate.filePath === ref.filePath || rustFileUnder(ref.filePath, rustModuleDir(candidate.filePath), candidate.filePath, context);
 }
 
 /** What a Rust `impl` declares besides its functions: `type Err = …;`, `const MAX: usize = …;`. */
@@ -9761,7 +10039,7 @@ function rustGlobCovers(uses: RustUses, candidate: Node, ref: UnresolvedRef): bo
  */
 export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (RUST_SCOPED_REFS.get(context)?.has(ref)) return true;
-  if (!isRustItemVisibleFrom(candidate, ref)) return false;
+  if (!isRustItemVisibleFrom(candidate, ref, context)) return false;
   const name = ref.referenceName;
   // Bare in the SOURCE: the index keeps `crate::error::Result` by its last
   // segment, and a path is not a prelude lookup.
@@ -10088,7 +10366,10 @@ export function rustPathTarget(ref: UnresolvedRef, context: ResolutionContext): 
       return ids === null ? null : [...ids].map((id) => context.getNodeById?.(id)).filter((n): n is Node => !!n);
     }
     let items = rustUsePathItems(path, from, context, new Set());
-    if (items === null && bare) {
+    // As a 2015 path, from the crate's root — unless the module declares the
+    // head itself, where a `#[path]` puts it (a cfg's choice): another module
+    // of that name at the root is not it.
+    if (items === null && bare && !rustUsesOf(from.file, context).pathMods.has(head)) {
       const root = rustCrateRootModule(ref.filePath, context);
       if (root) items = rustUsePathItems(path, root, context, new Set());
     }
@@ -11127,7 +11408,7 @@ function rustTypeLookup(name: string, writtenPath: string[], file: string, conte
     if (segments.length === 0 && (RUST_STD_TYPES.has(real) || RUST_PRELUDE.has(real))) return outside;
     return { nodes: [], outside: false, undeclared: true, name: real };
   }
-  let nodes = all.filter((n) => isRustItemVisibleFrom(n, fileRef));
+  let nodes = all.filter((n) => isRustItemVisibleFrom(n, fileRef, context));
   // A path the project's modules can be walked along, written or the one a
   // `use` binds, names the item of the module it walks to, as a `use` does in
   // isRustNameInScope: tokio's `crate::runtime::Handle` is the one
@@ -20643,6 +20924,10 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_VISIBLE_ITEMS.delete(context);
   RUST_PATH_TARGETS.delete(context);
   RUST_TYPE_MEMBERS.delete(context);
+  RUST_PATH_DECLS.delete(context);
+  RUST_PATH_LOADS.delete(context);
+  RUST_PATH_LOADERS.delete(context);
+  RUST_FILES_BY_DIR.delete(context);
   RUST_SCOPED_REFS.delete(context);
   RUST_GLOB_ITEMS.delete(context);
   RUST_CRATES.delete(context);
