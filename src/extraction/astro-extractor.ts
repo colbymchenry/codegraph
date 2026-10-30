@@ -2,7 +2,7 @@ import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference } fr
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
-import { foldScriptResult, sfcFileNode } from './sfc-script';
+import { foldScriptResult, sfcFileNode, SFC_SCRIPT_ELEMENT, sfcBlockLineRanges } from './sfc-script';
 
 /**
  * Astro built-in components — compiler-provided (`<Fragment>`) or shipped by
@@ -161,7 +161,7 @@ export class AstroExtractor {
 
     // A self-closing `<script ... />` (e.g. `is:inline set:html={...}`) has no
     // body; match it on its own so it cannot run on to the next `</script>`.
-    const scriptRegex = /<script(\s[^>]*?)?(?:\/>|>(?<content>[\s\S]*?)<\/script>)/g;
+    const scriptRegex = new RegExp(SFC_SCRIPT_ELEMENT);
     let match;
 
     while ((match = scriptRegex.exec(this.source)) !== null) {
@@ -228,16 +228,9 @@ export class AstroExtractor {
       coveredRanges.push([frontmatter.startLine - 1, frontmatter.endLine]);
     }
 
-    const tagRegex = /<(script|style)(\s[^>]*?)?(?:\/>|>[\s\S]*?<\/\1>)/g;
-    let tagMatch;
-    while ((tagMatch = tagRegex.exec(this.source)) !== null) {
-      // A self-closing tag has no body to skip, and its attributes
-      // (`set:html={serializeJsonLd(schema)}`) are template expressions.
-      if (tagMatch[0].endsWith('/>')) continue;
-      const startLine = (this.source.substring(0, tagMatch.index).match(/\n/g) || []).length;
-      const endLine = startLine + (tagMatch[0].match(/\n/g) || []).length;
-      coveredRanges.push([startLine, endLine]);
-    }
+    // A self-closing tag covers nothing: its attributes
+    // (`set:html={serializeJsonLd(schema)}`) are template expressions.
+    coveredRanges.push(...sfcBlockLineRanges(this.source));
 
     return coveredRanges;
   }

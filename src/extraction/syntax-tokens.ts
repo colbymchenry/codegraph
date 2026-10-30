@@ -43,7 +43,7 @@ import { Language } from '../types';
 import { EXTRACTORS } from './languages';
 import { getParser, loadGrammarsForLanguages } from './grammars';
 import { parseWithinBudget } from './parse-budget';
-import { sfcScriptLanguage } from './sfc-script';
+import { sfcScriptLanguage, SFC_SCRIPT_ELEMENT } from './sfc-script';
 import type { LanguageExtractor } from './tree-sitter-types';
 
 /* ------------------------------------------------------------- the classes -- */
@@ -362,8 +362,9 @@ export interface SyntaxRegion {
   language: Language;
 }
 
-// A self-closing `<script ... />` has no body and must not run on to the next `</script>`.
-const SCRIPT_BLOCK = /<script(\s[^>]*?)?(?:\/>|>([\s\S]*?)<\/script>)/gi;
+// The extractors' own script element, read case-insensitively here. A
+// self-closing `<script ... />` has no body and must not run on to the next `</script>`.
+const SCRIPT_BLOCK = new RegExp(SFC_SCRIPT_ELEMENT.source, 'gi');
 /** Astro's frontmatter: a `---` fence at the very top of the file. */
 const ASTRO_FRONTMATTER = /^(---\r?\n)([\s\S]*?)\r?\n---/;
 
@@ -390,7 +391,8 @@ export function syntaxRegionsFor(source: string, language: Language): SyntaxRegi
   while ((match = SCRIPT_BLOCK.exec(source)) !== null) {
     const body = match[2] ?? '';
     if (body.trim() === '') continue;
-    const start = match.index + match[0].length - body.length - '</script>'.length;
+    // The body starts right after the opening tag, whose attributes hold no `>`.
+    const start = match.index + match[0].indexOf('>') + 1;
     regions.push({
       start,
       end: start + body.length,
