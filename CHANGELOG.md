@@ -20,6 +20,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### New Features
 
 - `codegraph files --format package` and `codegraph_files` with `format: "package"` now list a project's files by the package that owns them, the nearest `package.json` or `composer.json` above each file that names one, so a monorepo splits into its workspace members with no setup and files nothing claims get a section of their own (#1871). Thanks @LuisAlbertoMK.
+- CodeGraph's MCP server now gives agents and editors its display name and icon, so one that shows them, like the Codex app, lists CodeGraph by name and logo instead of a plain `codegraph`. Thanks @fedosov.
 
 ### Fixes
 

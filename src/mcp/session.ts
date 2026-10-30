@@ -24,14 +24,39 @@ import { getUpdateNotice } from '../upgrade/update-check';
 import { ExploreSessionState } from './explore-session-state';
 
 /**
+ * The site's favicon on a light tile: the bare mark is dark ink on nothing,
+ * which a dark UI loses. Written out rather than as base64 so a reader can see
+ * it is two lines of shapes and nothing else.
+ */
+const SERVER_ICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke="#16150f" stroke-width="2">' +
+  '<rect width="32" height="32" rx="6" fill="#f7f6f2" stroke="none"/>' +
+  '<line x1="16" y1="8" x2="8" y2="23"/><line x1="16" y1="8" x2="24" y2="23"/><line x1="8" y1="23" x2="24" y2="23"/>' +
+  '<circle cx="16" cy="8" r="3.4" fill="#16150f"/><circle cx="8" cy="23" r="3.4" fill="#f7f6f2"/><circle cx="24" cy="23" r="3.4" fill="#f7f6f2"/>' +
+  '</svg>';
+
+/**
  * MCP Server Info — kept on the session because some clients log it. The
  * version tracks the real package version (was a hard-coded '0.1.0').
+ *
+ * `title` and `icons` are what a host may show in place of `name`. They are
+ * newer than the protocol version this server claims, so a host that doesn't
+ * know them passes over them. The icon has no `sizes`: it is optional and says
+ * nothing about an SVG, and a host on an SDK that typed it as a string, as 1.18
+ * did, would fail the whole handshake on the array the spec settled on.
  */
 // Exported so the proxy can answer `initialize` locally with the IDENTICAL
 // payload the daemon would send — no drift between the two handshake paths.
 export const SERVER_INFO = {
   name: 'codegraph',
+  title: 'CodeGraph',
   version: CodeGraphPackageVersion,
+  icons: [
+    {
+      src: `data:image/svg+xml;base64,${Buffer.from(SERVER_ICON_SVG).toString('base64')}`,
+      mimeType: 'image/svg+xml',
+    },
+  ],
 };
 
 /**

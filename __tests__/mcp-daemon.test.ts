@@ -43,6 +43,7 @@ import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
 import { CodeGraphPackageVersion } from '../src/mcp/version';
 import { once } from 'events';
 import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
+import { SERVER_INFO } from '../src/mcp/session';
 import { recordSpawns, removeSpawnLog, settleLosingCandidates } from './daemon-candidates';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
@@ -282,7 +283,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     servers.push(first);
     sendInitialize(first.child, `file://${tempDir}`, 1);
     const firstResp = await waitFor(() => findResponse(first.stdout, 1), 10000);
-    expect(firstResp.result.serverInfo.name).toBe('codegraph');
+    expect(firstResp.result.serverInfo).toEqual(SERVER_INFO);
 
     // The launcher is a PROXY (not the daemon itself) — that's the detach fix.
     await waitFor(() => first.stderr.some((l) => l.includes('Attached to shared daemon')), 8000);
