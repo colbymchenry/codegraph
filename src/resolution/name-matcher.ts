@@ -21514,8 +21514,12 @@ function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[]
     // A base built by a class's factory — Django's `class Manager(
     // BaseManager.from_queryset(QuerySet))` — subclasses that class: the
     // qualifier is the supertype, not the method called on it.
-    case 'python': return names(/\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1]?.replace(/\w+\s*=\s*[\w.]+/g, '')
-      .replace(/([A-Za-z_][\w.]*)\.\w+\s*\(/g, '$1 ('));
+    // A parameterized base, `Base[User]`, is `Base`: its type arguments are no supertypes.
+    case 'python': {
+      let bases = /\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1];
+      while (bases && /\[[^[\]]*\]/.test(bases)) bases = bases.replace(/\[[^[\]]*\]/g, '');
+      return names(bases?.replace(/\w+\s*=\s*[\w.]+/g, '').replace(/([A-Za-z_][\w.]*)\.\w+\s*\(/g, '$1 ('));
+    }
     case 'ruby': return names(/\bclass\s+[\w:]+\s*<\s*([\w:]+)/.exec(head)?.[1]);
     case 'php': return names(/\bextends\s+([\w.\\]+)/.exec(head)?.[1]);
     case 'typescript': case 'tsx': case 'javascript': case 'jsx':
