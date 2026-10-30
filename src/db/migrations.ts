@@ -343,6 +343,16 @@ function recordMigration(db: SqliteDatabase, version: number, description: strin
 
 /**
  * Run all pending migrations
+ *
+ * Another process may be opening the same index right now and running them
+ * too (#2980), so `fromVersion`, read before, can be out of date by the time a
+ * migration runs. Each one runs in a transaction that takes the write lock up
+ * front, waiting out a process already migrating, and reads the version again
+ * there, skipping a migration that process has applied. Before, the second
+ * process applied it again and its open failed: recording the version broke
+ * the version's uniqueness, or a migration that reads first got SQLITE_BUSY.
+ * `fromVersion` stays a floor: a database built from schema.sql records only
+ * v1 and the current version, and a rewound one replays what is above it.
  */
 export function runMigrations(db: SqliteDatabase, fromVersion: number): void {
   const pending = migrations.filter((m) => m.version > fromVersion);
@@ -357,9 +367,10 @@ export function runMigrations(db: SqliteDatabase, fromVersion: number): void {
   // Run each migration in a transaction
   for (const migration of pending) {
     db.transaction(() => {
+      if (Math.max(fromVersion, getCurrentVersion(db)) >= migration.version) return;
       migration.up(db);
       recordMigration(db, migration.version, migration.description);
-    })();
+    }, { immediate: true })();
   }
 }
 

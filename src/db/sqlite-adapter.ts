@@ -27,11 +27,22 @@ export interface SqliteStatement {
   iterate(...params: any[]): IterableIterator<any>;
 }
 
+export interface TransactionOptions {
+  /**
+   * Begin with `BEGIN IMMEDIATE`, taking the write lock up front, instead of a
+   * deferred `BEGIN`. A connection that finds the lock taken then waits it out
+   * (busy_timeout); a deferred transaction that has already read gets
+   * SQLITE_BUSY at once when it comes to write, since SQLite will not wait for
+   * a lock there. No effect when nested in an open transaction.
+   */
+  immediate?: boolean;
+}
+
 export interface SqliteDatabase {
   prepare(sql: string): SqliteStatement;
   exec(sql: string): void;
   pragma(str: string, options?: { simple?: boolean }): any;
-  transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T;
+  transaction<T>(fn: (...args: any[]) => T, options?: TransactionOptions): (...args: any[]) => T;
   close(): void;
   readonly open: boolean;
   /** Undefined on a runtime without `isTransaction`; callers must then not memoize. */
@@ -153,7 +164,7 @@ class NodeSqliteAdapter implements SqliteDatabase {
     return row;
   }
 
-  transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T {
+  transaction<T>(fn: (...args: any[]) => T, options?: TransactionOptions): (...args: any[]) => T {
     return (...args: any[]) => {
       // Nested call (a transaction()-wrapped helper invoked from inside another
       // transaction): run the body directly inside the enclosing transaction.
@@ -168,7 +179,7 @@ class NodeSqliteAdapter implements SqliteDatabase {
           this._txDepth--;
         }
       }
-      this._db.exec('BEGIN');
+      this._db.exec(options?.immediate ? 'BEGIN IMMEDIATE' : 'BEGIN');
       this._txDepth = 1;
       try {
         const result = fn(...args);
