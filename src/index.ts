@@ -26,6 +26,7 @@ import {
   FindRelevantContextOptions,
   UnresolvedReference,
   IndexHealth,
+  LanguageCoverage,
   Language,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
@@ -46,7 +47,7 @@ import {
   extractFromSource,
   initGrammars,
 } from './extraction';
-import { detectLanguage, hasGrammarLoadFailure, isFileLevelOnlyLanguage } from './extraction/grammars';
+import { detectLanguage, hasGrammarLoadFailure, isFileLevelOnlyLanguage, yieldsSymbols } from './extraction/grammars';
 import {
   ReferenceResolver,
   changedRoutes,
@@ -2768,6 +2769,21 @@ export class CodeGraph {
       }
     }
     return { needsReindex, parseErrors };
+  }
+
+  /**
+   * Files found against files that yielded symbols, by language. Reported by
+   * `status`, whose `--strict` fails on a language that yielded none.
+   */
+  getLanguageCoverage(): LanguageCoverage {
+    const parsedFilesByLanguage: LanguageCoverage['parsedFilesByLanguage'] = {};
+    const unparsedLanguages: Language[] = [];
+    for (const { language, parsed } of this.queries.getParsedFileCounts()) {
+      if (!yieldsSymbols(language)) continue;
+      parsedFilesByLanguage[language] = parsed;
+      if (parsed === 0) unparsedLanguages.push(language);
+    }
+    return { parsedFilesByLanguage, unparsedLanguages };
   }
 
   // ===========================================================================

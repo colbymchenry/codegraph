@@ -273,6 +273,21 @@ export interface FileRecord {
 }
 
 /**
+ * Files found against files that yielded symbols, by language, for `status`.
+ * `GraphStats.filesByLanguage` counts files by what they are, so on its own it
+ * reads the same for a language that parsed and one that yielded nothing.
+ */
+export interface LanguageCoverage {
+  /**
+   * Files that yielded a symbol, for the languages expected to. A language
+   * tracked at file level (yaml, most xml) has no entry: nothing is missing.
+   */
+  parsedFilesByLanguage: Partial<Record<Language, number>>;
+  /** Languages expected to yield symbols that have files, none of which did. */
+  unparsedLanguages: Language[];
+}
+
+/**
  * Indexed files whose symbols are missing even though their content hash is
  * current — what a hash comparison alone calls "up to date" (#2336). Paths are
  * project-relative and sorted.

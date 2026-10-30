@@ -75,7 +75,7 @@ import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../grap
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
 import { goPackageReaderFor } from '../graph/go-package';
 import { groupFilesByPackage, packageGroupTitle, packageListingTitle } from '../graph/owning-package';
-import type { Node, Edge } from '../types';
+import type { Node, Edge, Language } from '../types';
 import { isTestPath } from '../search/query-utils';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
@@ -1092,6 +1092,11 @@ program
     }
   });
 
+/** Up to three of `paths`, and how many more there are. */
+function samplePaths(paths: string[]): string {
+  return paths.slice(0, 3).join(', ') + (paths.length > 3 ? ` (+${formatNumber(paths.length - 3)} more)` : '');
+}
+
 /**
  * The `status` warnings for indexed files whose symbols are missing although
  * their content is current (#2335, #2336): one line per group, saying what is
@@ -1099,21 +1104,19 @@ program
  */
 function describeFilesMissingSymbols(health: { needsReindex: string[]; parseErrors: string[] }): string[] {
   const dash = getGlyphs().dash;
-  const sample = (paths: string[]): string =>
-    paths.slice(0, 3).join(', ') + (paths.length > 3 ? ` (+${formatNumber(paths.length - 3)} more)` : '');
   const lines: string[] = [];
   const reindex = health.needsReindex.length;
   if (reindex > 0) {
     lines.push(
       `${formatNumber(reindex)} ${reindex === 1 ? 'file is missing its' : 'files are missing their'} symbols ${dash} ` +
-      `run "codegraph sync" to re-index ${reindex === 1 ? 'it' : 'them'}: ${sample(health.needsReindex)}`
+      `run "codegraph sync" to re-index ${reindex === 1 ? 'it' : 'them'}: ${samplePaths(health.needsReindex)}`
     );
   }
   const unparsed = health.parseErrors.length;
   if (unparsed > 0) {
     lines.push(
       `${formatNumber(unparsed)} ${unparsed === 1 ? 'file could not be parsed, so its symbols are' : 'files could not be parsed, so their symbols are'} ` +
-      `missing: ${sample(health.parseErrors)} ${dash} "codegraph files --json" shows the errors`
+      `missing: ${samplePaths(health.parseErrors)} ${dash} "codegraph files --json" shows the errors`
     );
   }
   return lines;
@@ -1126,7 +1129,8 @@ program
   .command('status [path]')
   .description('Show index status and statistics')
   .option('-j, --json', 'Output as JSON')
-  .action(async (pathArg: string | undefined, options: { json?: boolean }) => {
+  .option('--strict', 'Exit 1 unless the index is finished, up to date, and every language that should yield symbols did')
+  .action(async (pathArg: string | undefined, options: { json?: boolean; strict?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
     // The directory the user actually ran from, before walking up to the index
     // root. Used to detect when the resolved index lives in a different git
@@ -1136,6 +1140,8 @@ program
 
     try {
       if (!isInitialized(projectPath)) {
+        // A gate with no index to read has proved nothing.
+        if (options.strict) process.exitCode = 1;
         if (options.json) {
           console.log(JSON.stringify({
             initialized: false,
@@ -1183,6 +1189,24 @@ program
       // Files whose content is current but whose symbols are missing — the
       // content-hash check behind "up to date" cannot see them (#2336).
       const health = cg.getIndexHealth();
+      // Files found against files that yielded symbols: a language can be
+      // listed with its full count and have nothing in the graph.
+      const coverage = cg.getLanguageCoverage();
+
+      // Reached by every output mode below. A grammar that can't load leaves no
+      // row and no zero to count, only files the index doesn't have yet, so
+      // "up to date" is part of the gate as much as the language check is.
+      // Parse errors are not: one bad fixture shouldn't fail a whole project.
+      const totalChanges = changes.added.length + changes.modified.length + changes.removed.length;
+      if (options.strict && (
+        rebuildInProgress ||
+        indexState === 'indexing' || indexState === 'partial' || indexState === 'failed' ||
+        totalChanges > 0 ||
+        health.needsReindex.length > 0 ||
+        coverage.unparsedLanguages.length > 0
+      )) {
+        process.exitCode = 1;
+      }
 
       // JSON output mode
       if (options.json) {
@@ -1202,6 +1226,11 @@ program
           journalMode,
           nodesByKind: stats.nodesByKind,
           languages: Object.entries(stats.filesByLanguage).filter(([, count]) => count > 0).map(([lang]) => lang),
+          filesByLanguage: stats.filesByLanguage,
+          // Files that yielded a symbol, for the languages expected to.
+          parsedFilesByLanguage: coverage.parsedFilesByLanguage,
+          // Of those, the languages with files and no symbols at all.
+          unparsedLanguages: coverage.unparsedLanguages,
           pendingChanges: {
             added: changes.added.length,
             modified: changes.modified.length,
@@ -1313,7 +1342,9 @@ program
         .filter(([, count]) => count > 0)
         .sort((a, b) => b[1] - a[1]);
       for (const [lang, count] of filesByLang) {
-        console.log(`  ${lang.padEnd(15)} ${formatNumber(count)}`);
+        const parsed = coverage.parsedFilesByLanguage[lang as Language];
+        const withSymbols = parsed === undefined || parsed === count ? '' : `  (${formatNumber(parsed)} with symbols)`;
+        console.log(`  ${lang.padEnd(15)} ${formatNumber(count)}${chalk.dim(withSymbols)}`);
       }
       console.log();
 
@@ -1324,8 +1355,19 @@ program
         return;
       }
 
+      // Worded for both causes: a lone config stub with nothing to extract
+      // (a `.nvim.lua`, a comment-only `site.js`) reads exactly like a parser
+      // that isn't working, and the file names are what tell them apart.
+      if (coverage.unparsedLanguages.length > 0) {
+        const files = cg.getFiles();
+        for (const language of coverage.unparsedLanguages) {
+          const paths = files.filter((file) => file.language === language).map((file) => file.path);
+          warn(`No symbols came from any ${language} file ${getGlyphs().dash} fine if they hold no code, otherwise its parser isn't working: ${samplePaths(paths)}`);
+        }
+        console.log();
+      }
+
       // Pending changes
-      const totalChanges = changes.added.length + changes.modified.length + changes.removed.length;
       if (totalChanges > 0) {
         console.log(chalk.bold('Pending Changes:'));
         if (changes.added.length > 0) {

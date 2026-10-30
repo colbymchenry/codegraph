@@ -838,6 +838,15 @@ export function isFileLevelOnlyLanguage(language: Language): boolean {
 }
 
 /**
+ * Whether files of this language are expected to yield symbols, so that a
+ * language with none is news. Not so for the file-level languages, nor for
+ * `xml`, where only MyBatis mappers yield anything.
+ */
+export function yieldsSymbols(language: Language): boolean {
+  return !isFileLevelOnlyLanguage(language) && language !== 'xml' && language !== 'unknown';
+}
+
+/**
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {

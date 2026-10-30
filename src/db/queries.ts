@@ -5594,6 +5594,30 @@ export class QueryBuilder {
   }
 
   /**
+   * For each language, how many files it has and how many yielded a symbol: a
+   * node other than the file's own. More than one stored node settles a row, so
+   * `nodes` is only probed for the few it can't, such as a file whose one symbol
+   * came from a framework pass. Probing every row costs as much as the whole of
+   * getStats() on a 14,000-file index; this costs a tenth of that. Not part of
+   * getStats() either way, because every explore runs that.
+   */
+  getParsedFileCounts(): Array<{ language: Language; files: number; parsed: number }> {
+    return this.db
+      .prepare(`
+        SELECT f.language AS language, COUNT(*) AS files,
+          SUM(CASE
+            WHEN f.node_count > 1 THEN 1
+            WHEN EXISTS (SELECT 1 FROM nodes n WHERE n.file_path = f.path AND n.kind <> 'file') THEN 1
+            ELSE 0
+          END) AS parsed
+        FROM files f
+        GROUP BY f.language
+        ORDER BY f.language
+      `)
+      .all() as Array<{ language: Language; files: number; parsed: number }>;
+  }
+
+  /**
    * Get graph statistics
    */
   getStats(): GraphStats {

@@ -11,7 +11,7 @@ codegraph init [path]             # Initialize a project + build its graph (one 
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
 codegraph index [path]            # Full re-index from scratch (--force, --quiet, --verbose)
 codegraph sync [path]             # Incremental update (--quiet)
-codegraph status [path]           # Show statistics (--json)
+codegraph status [path]           # Show statistics (--json, --strict)
 codegraph ui [path]               # Open the browser viewer (not released yet — see below)
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
@@ -34,6 +34,20 @@ The MCP server (`codegraph serve --mcp`) is launched automatically by your agent
 ## init, index, and sync
 
 `codegraph init` creates the local `.codegraph/` directory **and** builds the full graph in one step. (The old `-i`/`--index` flag is now a no-op, accepted only so existing scripts don't break.) After that the file watcher keeps the graph current automatically — `index` (a full rebuild from scratch) and `sync` (an incremental update) are only needed when the watcher is disabled or you're scripting against the index outside an agent session.
+
+## status
+
+`codegraph status` shows what is in the index, including how many files each language has. When only some of a language's files yielded symbols, its row says how many did:
+
+```text
+Files by Language:
+  typescript      1,204
+  python          500  (420 with symbols)
+```
+
+Empty files and stubs explain most gaps. A language where no file yielded a symbol gets a warning naming its files, because that is also what a parser that isn't working looks like. Formats tracked at file level, such as YAML, never show a count.
+
+`codegraph status --strict` exits with code 1 unless the index is finished, up to date, and every language that should yield symbols did, so packaging and CI can gate on it. A dirty working tree counts as out of date, and one file that can't be parsed doesn't fail it. With `--json` the same counts are in `filesByLanguage`, `parsedFilesByLanguage` and `unparsedLanguages`.
 
 ## Query commands
 
