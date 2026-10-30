@@ -649,6 +649,332 @@ export function pythonFunctionModuleAlias(name: string, ref: UnresolvedRef, cont
   return null;
 }
 
+/**
+ * How the code around a Python reference binds `name`, the receiver of a
+ * dotted reference whose file imports that name:
+ * - `'module'`: nothing nearer does (or the function declares it `global`),
+ *   so the file's own import is what the reference reads;
+ * - `'local'`: the calling function, a function enclosing it, or the
+ *   reference's own statement binds it otherwise — a parameter, an
+ *   assignment (annotated and augmented ones too), a `for` / `with … as` /
+ *   `except … as` target, a walrus, `del`, a nested `def` or `class`, a
+ *   `case` capture, an `import` statement, or a lambda parameter or a
+ *   comprehension variable the reference sits inside;
+ * - `{ source, exportedName }`: a function-local `from source import
+ *   exportedName as name`, the one import that binds it there;
+ * - `{ module }`: a function-local `import module as name`, or `import name`
+ *   / `import name.sub` (which bind the top-level `name`).
+ * A keyword argument, an attribute or subscript store, a comparison, text in
+ * a string or a comment, and a nested function's own body bind nothing.
+ * `def by_param(other): other.update(…)` and `with open(p) as other:` read
+ * no module the file imports as `other`.
+ */
+export type PythonReceiverBinding =
+  | 'module'
+  | 'local'
+  | { source: string; exportedName: string }
+  | { module: string };
+
+export function pythonReceiverBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): PythonReceiverBinding {
+  if (ref.language !== 'python' || !/^[A-Za-z_]\w*$/.test(name)) return 'module';
+  if (pythonStatementBindsAt(name, ref, context)) return 'local';
+  // Innermost first: a closure reads the binding of the function nearest it.
+  const { functions, innermost, parent } = pythonFunctionIndex(ref.filePath, context);
+  for (let i = innermost[ref.line] ?? -1; i >= 0; i = parent[i]!) {
+    const scope = functions[i]!;
+    const binding = pythonNameScan(context, `binding\0${scope.id}\0${name}`, () => pythonScopeBinding(scope, name, context));
+    if (binding !== null) return binding;
+  }
+  return 'module';
+}
+
+/**
+ * A file's functions and methods, the innermost one around each line (-1 for
+ * none) and the one around each function's own `def` line, built once per file.
+ */
+function pythonFunctionIndex(filePath: string, context: ResolutionContext): { functions: Node[]; innermost: Int32Array; parent: Int32Array } {
+  return pythonNameScan(context, `functions\0${filePath}`, () => {
+    // Outer before inner: by start, the longer first.
+    const functions = context.getNodesInFile(filePath)
+      .filter((n) => n.kind === 'function' || n.kind === 'method')
+      .sort((a, b) => a.startLine - b.startLine || b.endLine - a.endLine);
+    const innermost = new Int32Array(functions.reduce((m, f) => Math.max(m, f.endLine), 0) + 2).fill(-1);
+    const parent = new Int32Array(functions.length).fill(-1);
+    functions.forEach((f, i) => {
+      parent[i] = innermost[f.startLine]!;
+      innermost.fill(i, f.startLine, f.endLine + 1);
+    });
+    return { functions, innermost, parent };
+  });
+}
+
+/** How the function `scope` itself binds `name`; null when it doesn't, and an enclosing scope decides. */
+function pythonScopeBinding(scope: Node, name: string, context: ResolutionContext): PythonReceiverBinding | null {
+  const { params, statements, nested } = pythonScopeText(scope, context);
+  if (statements.some((st) => pythonDeclaresGlobal(st, name))) return 'module';
+  if (params.includes(name) || nested.includes(name)) return 'local';
+  let imported: Exclude<PythonReceiverBinding, string> | null = null;
+  for (const st of statements) {
+    const binding = pythonImportBinds(st, name);
+    if (binding === undefined) {
+      if (pythonStatementBinds(st, name)) return 'local';
+    } else if (binding) {
+      // Two imports binding the name differently: which one a reference reads
+      // depends on the path the function took.
+      if (imported && JSON.stringify(imported) !== JSON.stringify(binding)) return 'local';
+      imported = binding;
+    }
+  }
+  return imported;
+}
+
+/**
+ * The parameter names of the function `scope`, the statements of its own
+ * body (continuation lines joined, strings blanked, split on `;`), and the
+ * names its nested `def`s and `class`es bind, whose bodies are not its own.
+ */
+function pythonScopeText(scope: Node, context: ResolutionContext): { params: string[]; statements: string[]; nested: string[] } {
+  return pythonNameScan(context, `scope\0${scope.id}`, () => {
+    const lines = pythonMemberLines(scope.filePath, context);
+    const last = Math.min(scope.endLine, lines.length);
+    const indent = (l: string) => l.length - l.trimStart().length;
+    const statements: string[] = [];
+    const nested: string[] = [];
+    let header: string | null = null;
+    let current: string | null = null;
+    let depth = 0;
+    let continued = false;
+    let nestedIndent = -1;
+    const flush = () => {
+      if (current === null) return;
+      if (header === null) header = current;
+      else statements.push(...current.split(';').map((s) => s.trim()).filter(Boolean));
+      current = null;
+    };
+    for (let k = scope.startLine; k <= last; k++) {
+      const raw = lines[k - 1] ?? '';
+      const blanked = pythonBlankStrings(raw);
+      const inside = depth > 0 || continued;
+      for (const c of blanked) {
+        if (c === '(' || c === '[' || c === '{') depth++;
+        else if (c === ')' || c === ']' || c === '}') depth = Math.max(0, depth - 1);
+      }
+      continued = /\\\s*$/.test(blanked);
+      if (inside) {
+        if (current !== null) current += ' ' + blanked.trim().replace(/\\$/, '');
+        continue;
+      }
+      if (!blanked.trim()) continue;
+      flush();
+      if (nestedIndent >= 0) {
+        if (indent(raw) > nestedIndent) continue;
+        nestedIndent = -1;
+      }
+      const text = blanked.trim().replace(/\\$/, '');
+      // The scope's first line is its own `def` header.
+      const def = k === scope.startLine ? null : /^(?:async\s+)?(?:def|class)\s+(\w+)/.exec(text);
+      if (def) {
+        nested.push(def[1]!);
+        nestedIndent = indent(raw);
+        continue;
+      }
+      current = text;
+    }
+    flush();
+    // `def name[T](a, *b, c: int = 1, **d)`: the names between the brackets.
+    const head = header ?? '';
+    const open = /\bdef\s+\w+\s*(?:\[[^\]]*\]\s*)?\(/.exec(head);
+    const params = open ? pythonParamNames(head.slice(open.index + open[0].length, pythonClosingParen(head, open.index + open[0].length - 1))) : [];
+    return { params, statements, nested };
+  });
+}
+
+/** The index of the bracket closing the one at `open`, or the text's end. */
+function pythonClosingParen(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return text.length;
+}
+
+/** `text` split at its top-level commas (none inside brackets). */
+function pythonTopLevelParts(text: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let from = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth = Math.max(0, depth - 1);
+    else if (c === ',' && depth === 0) {
+      parts.push(text.slice(from, i));
+      from = i + 1;
+    }
+  }
+  parts.push(text.slice(from));
+  return parts;
+}
+
+/** The names a parameter list binds: `a`, `*b`, `c: int = 1`, `**d`; never the bare `*` or `/` markers. */
+function pythonParamNames(list: string): string[] {
+  return pythonTopLevelParts(list)
+    .map((p) => /^\s*\*{0,2}\s*([A-Za-z_]\w*)/.exec(p)?.[1])
+    .filter((p): p is string => p !== undefined);
+}
+
+/** `global name` (or a list naming it). */
+function pythonDeclaresGlobal(statement: string, name: string): boolean {
+  const m = /^global\s+(.+)$/.exec(statement);
+  return !!m && m[1]!.split(',').some((n) => n.trim() === name);
+}
+
+/**
+ * What an import statement binds `name` to: the module of `import a.b as
+ * name`, or the top-level `name` of `import name` / `import name.sub`; the
+ * source and name of `from a import b as name`; null for an import that
+ * doesn't bind it, undefined for any other statement.
+ */
+function pythonImportBinds(statement: string, name: string): Exclude<PythonReceiverBinding, string> | null | undefined {
+  const plain = /^import\s+([\s\S]+)$/.exec(statement);
+  if (plain) {
+    for (const part of plain[1]!.replace(/[()]/g, ' ').split(',')) {
+      const m = /^([\w.]+)(?:\s+as\s+(\w+))?$/.exec(part.trim());
+      if (!m) continue;
+      if (m[2] === name) return { module: m[1]! };
+      if (!m[2] && m[1]!.split('.')[0] === name) return { module: name };
+    }
+    return null;
+  }
+  const from = /^from\s+(\.*[\w.]*)\s+import\s+([\s\S]+)$/.exec(statement);
+  if (!from) return undefined;
+  for (const part of from[2]!.replace(/[()]/g, ' ').split(',')) {
+    const m = /^(\w+)(?:\s+as\s+(\w+))?$/.exec(part.trim());
+    if (m && (m[2] ?? m[1]) === name) return { source: from[1]!, exportedName: m[1]! };
+  }
+  return null;
+}
+
+/** Whether one statement (strings blanked) binds `name` other than by an import. */
+function pythonStatementBinds(statement: string, name: string): boolean {
+  const n = escapeRegExp(name);
+  if (pythonAssignTargets(statement).some((t) => pythonTargetBinds(t, name))) return true;
+  // `name: T` declares a local without assigning it.
+  if (new RegExp(`^${n}\\s*:(?!=)`).test(statement)) return true;
+  const loop = /^(?:async\s+)?for\s+([\s\S]+?)\s+in\b/.exec(statement);
+  if (loop && pythonTargetBinds(loop[1]!, name)) return true;
+  // `with … as name`, `except … as name`, `case … as name`, `as (a, name)`.
+  for (const m of statement.matchAll(/\bas\s+(\([^)]*\)|[\w.]+)/g)) if (pythonTargetBinds(m[1]!, name)) return true;
+  if (new RegExp(`(?<![.\\w])${n}\\s*:=`).test(statement)) return true;
+  const del = /^del\s+([\s\S]+)$/.exec(statement);
+  if (del && pythonTopLevelParts(del[1]!).some((t) => pythonTargetBinds(t, name))) return true;
+  return pythonCaseCaptures(statement, name);
+}
+
+/**
+ * Whether a `case` clause's pattern captures `name`: written bare, not as a
+ * value pattern's dotted part (`other.MODE`), a class pattern's class
+ * (`other(…)`) or a keyword pattern's attribute (`Point(other=1)`). `case = 1`
+ * assigns a variable named `case`.
+ */
+function pythonCaseCaptures(statement: string, name: string): boolean {
+  const m = /^case\b([\s\S]*)$/.exec(statement);
+  if (!m || pythonAssignTargets(statement).length > 0) return false;
+  let depth = 0;
+  let end = -1;
+  for (let i = 0; i < m[1]!.length && end < 0; i++) {
+    const c = m[1]![i]!;
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth = Math.max(0, depth - 1);
+    else if (c === ':' && depth === 0) end = i;
+  }
+  if (end < 0) return false;
+  const pattern = m[1]!.slice(0, end).replace(/\bif\b[\s\S]*$/, '');
+  for (const hit of pattern.matchAll(new RegExp(`(?<![.\\w])${escapeRegExp(name)}\\b`, 'g'))) {
+    const after = pattern.slice(hit.index! + name.length).trimStart();
+    if (after.startsWith('.') || after.startsWith('(') || (after.startsWith('=') && !after.startsWith('=='))) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the reference sits inside a lambda whose parameters, or a
+ * comprehension whose `for` targets, bind `name` on its own statement:
+ * `lambda other: other.update(1)`, `[other.get() for other in items]`. Those
+ * bind only there, so the rest of the function still reads the module.
+ */
+function pythonStatementBindsAt(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const lines = pythonMemberLines(ref.filePath, context);
+  const starts = pythonStatementStarts(ref.filePath, context);
+  const at = ref.line - 1;
+  if (at < 0 || at >= lines.length) return false;
+  let first = at;
+  while (first > 0 && !starts[first]) first--;
+  let end = at;
+  while (end + 1 < lines.length && !starts[end + 1]) end++;
+  let text = '';
+  let offset = 0;
+  for (let i = first; i <= end; i++) {
+    if (i === at) offset = text.length + Math.max(0, ref.column ?? 0);
+    text += pythonBlankStrings(lines[i]!) + '\n';
+  }
+  if (!/\b(?:lambda|for)\b/.test(text)) return false;
+  // A lambda's body runs from its `:` to the first comma or closing bracket of
+  // its own level.
+  for (const m of text.matchAll(/\blambda\b/g)) {
+    const from = m.index! + 6;
+    let depth = 0;
+    let colon = -1;
+    for (let i = from; i < text.length && colon < 0; i++) {
+      const c = text[i]!;
+      if (c === '(' || c === '[' || c === '{') depth++;
+      else if (c === ')' || c === ']' || c === '}') { if (depth === 0) break; depth--; }
+      else if (c === ':' && depth === 0) colon = i;
+    }
+    if (colon < 0 || offset <= colon || !pythonParamNames(text.slice(from, colon)).includes(name)) continue;
+    let stop = text.length;
+    depth = 0;
+    for (let i = colon + 1; i < text.length; i++) {
+      const c = text[i]!;
+      if (c === '(' || c === '[' || c === '{') depth++;
+      else if (c === ')' || c === ']' || c === '}') { if (depth === 0) { stop = i; break; } depth--; }
+      else if (c === ',' && depth === 0) { stop = i; break; }
+    }
+    if (offset < stop) return true;
+  }
+  // A comprehension's `for` sits inside the brackets it binds in.
+  const opens: number[] = [];
+  const pairs: Array<[number, number]> = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '(' || c === '[' || c === '{') opens.push(i);
+    else if ((c === ')' || c === ']' || c === '}') && opens.length) pairs.push([opens.pop()!, i]);
+  }
+  for (const o of opens) pairs.push([o, text.length]);
+  for (const m of text.matchAll(/\bfor\b/g)) {
+    const around = pairs.filter(([o, c]) => o < m.index! && c > m.index!).sort((a, b) => b[0] - a[0])[0];
+    if (!around || offset <= around[0] || offset >= around[1]) continue;
+    const targets = /^\s*([\s\S]+?)\s+in\b/.exec(text.slice(m.index! + 3, around[1]));
+    if (targets && pythonTargetBinds(targets[1]!, name)) return true;
+  }
+  return false;
+}
+
+/**
+ * The imports binding `name` at module scope, or in a function declaring it
+ * `global`, keyed as pythonLineBindings keys them: `from a import x as name`
+ * → `a:x`, `import a.b as name` → `a.b:*`.
+ */
+export function pythonModuleImportKeys(name: string, filePath: string, context: ResolutionContext): Set<string> {
+  return new Set(pythonGlobalBindings(name, filePath, context).flatMap((b) => (b.kind === 'import' ? [b.key] : [])));
+}
+
 /** Distinct sources a file imports `name` from, at any scope (`from a import x` → `a:x`). */
 function pythonImportKeys(name: string, filePath: string, context: ResolutionContext): Set<string> {
   return pythonNameScan(context, `imports\0${filePath}\0${name}`, () => scanPythonImportKeys(name, filePath, context));

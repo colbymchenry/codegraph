@@ -30,6 +30,8 @@ import {
   tsImportedTypeFile,
   reExportSource,
   pythonFunctionModuleAlias,
+  pythonReceiverBinding,
+  pythonModuleImportKeys,
   isPythonFromImportModule,
   tsGlobalScope,
   rustPathTarget,
@@ -3127,7 +3129,7 @@ export function resolveViaImport(
   }
 
   // Use cached import mappings (avoids re-reading and re-parsing per ref)
-  const imports = context.getImportMappings(ref.filePath, ref.language);
+  let imports = context.getImportMappings(ref.filePath, ref.language);
   if (imports.length === 0 && !context.readFile(ref.filePath)) {
     return null;
   }
@@ -3157,6 +3159,9 @@ export function resolveViaImport(
   // submodule (a file), not a symbol, so the generic symbol lookup below would
   // search the *package* for `certs` instead of looking inside the module.
   if (ref.language === 'python') {
+    // Only the imports the receiver means where it is read: none of the file's
+    // when the function binds the name itself (see pythonImportsInScope).
+    imports = pythonImportsInScope(ref, imports, context);
     const pyResult = resolvePythonModuleMember(ref, imports, context);
     if (pyResult) return pyResult;
     // Absolute dotted module import: `import conduit.apps.articles.signals`
@@ -3371,6 +3376,53 @@ export function reachesAmbientModule(ref: UnresolvedRef, specifier: string, decl
     return leadsTo(binding.source, (file) => context.getImportMappings(file, ref.language).some((m) => m.source === specifier));
   }
   return LAST_NAME_KINDS.has(ref.referenceKind) && mappings.some((m) => leadsTo(m.source, () => false));
+}
+
+/**
+ * The file's import mappings as a Python dotted reference reads them. Its
+ * receiver is the module the file imports under that name only where nothing
+ * nearer binds the name: a parameter, a local, a `with … as` / `except … as` /
+ * loop target, a `case` capture, or a lambda or comprehension variable around
+ * the reference is that value instead, and none of the receiver's mappings
+ * applies there (`def by_param(other): other.update(…)` linked to the module
+ * imported as `other`). A function-local import of the name leaves only the
+ * mappings binding it the same way: the file's mappings read from-imports at
+ * any depth, so a local `from x import y as name` is listed beside the
+ * module-level import, and a local `import pkg.sub` binds the `pkg` that a
+ * module-level `import pkg` does. Other references and receivers keep every
+ * mapping.
+ */
+export function pythonImportsInScope(ref: UnresolvedRef, imports: ImportMapping[], context: ResolutionContext): ImportMapping[] {
+  if (ref.language !== 'python' || ref.referenceKind === 'imports') return imports;
+  const dot = ref.referenceName.indexOf('.');
+  if (dot <= 0) return imports;
+  const receiver = ref.referenceName.slice(0, dot);
+  // `import pkg.mod` binds `pkg`, under a mapping named after `mod`.
+  const binds = (m: ImportMapping): boolean => m.localName === receiver ||
+    (m.isNamespace && m.source.split('.')[0] === receiver && m.localName === m.source.split('.').pop());
+  if (!imports.some(binds)) return imports;
+  const binding = pythonReceiverBinding(receiver, ref, context);
+  if (binding === 'module') {
+    // Where nothing nearer binds the name, the module's own import of it
+    // does — not a from-import written inside some other function, which the
+    // mappings list too (first, ahead of the module's `import pkg.other as
+    // other`). Asked only when the receiver's mappings disagree; with no
+    // module-level one found, every mapping stays as it was.
+    const keyOf = (m: ImportMapping): string => (m.isNamespace ? `${m.source}:*` : `${m.source}:${m.exportedName}`);
+    if (new Set(imports.filter(binds).map(keyOf)).size < 2) return imports;
+    const moduleLevel = pythonModuleImportKeys(receiver, ref.filePath, context);
+    const kept = imports.filter((m) => !binds(m) || m.isNamespace || moduleLevel.has(keyOf(m)));
+    return kept.some(binds) ? kept : imports;
+  }
+  return imports.filter((m) => {
+    if (!binds(m)) return true;
+    if (binding === 'local') return false;
+    // The module a namespace mapping binds the receiver to: `import x as
+    // receiver` / `import receiver` bind its source, `import receiver.sub`
+    // the top-level `receiver`.
+    if ('module' in binding) return m.isNamespace && (m.localName === receiver ? m.source : receiver) === binding.module;
+    return !m.isNamespace && m.source === binding.source && m.exportedName === binding.exportedName;
+  });
 }
 
 /**
