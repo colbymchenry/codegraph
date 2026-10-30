@@ -10,6 +10,10 @@
 #
 # Usage: bench.sh <lang> <repo-name> <repo-url> "<question>" [headless|tmux|all]
 # Env:   CORPUS   corpus dir (default /tmp/codegraph-corpus, shared with agent-eval)
+#        CODEGRAPH_BIN  index and verify with this codegraph instead of the one on
+#                 PATH: a binary, or a build's dist/bin/codegraph.js (run with
+#                 node). Exported, so verify-extraction.mjs uses it too. The A/B's
+#                 MCP server is run-all.sh's own CG_BIN (default: codegraph on PATH).
 set -uo pipefail
 
 LANG_TOKEN="${1:?usage: bench.sh <lang> <repo-name> <repo-url> \"<question>\" [mode]}"
@@ -23,10 +27,25 @@ AGENT_EVAL="$(cd "$HARNESS/../agent-eval" && pwd)"
 CORPUS="${CORPUS:-/tmp/codegraph-corpus}"
 REPO="$CORPUS/$NAME"
 
-command -v codegraph >/dev/null || { echo "no codegraph on PATH (build + ./scripts/local-install.sh first)"; exit 1; }
+if [ -n "${CODEGRAPH_BIN:-}" ]; then
+  # A path is made absolute, since indexing runs from inside the repo.
+  if [ -e "$CODEGRAPH_BIN" ]; then
+    CODEGRAPH_BIN="$(cd "$(dirname "$CODEGRAPH_BIN")" && pwd)/$(basename "$CODEGRAPH_BIN")"
+  else
+    command -v "$CODEGRAPH_BIN" >/dev/null || { echo "CODEGRAPH_BIN not found: $CODEGRAPH_BIN"; exit 1; }
+  fi
+  export CODEGRAPH_BIN
+  # Stands in for the PATH codegraph in this script's own calls.
+  case "$CODEGRAPH_BIN" in
+    *.js|*.mjs|*.cjs) codegraph() { node "$CODEGRAPH_BIN" "$@"; } ;;
+    *) codegraph() { "$CODEGRAPH_BIN" "$@"; } ;;
+  esac
+else
+  command -v codegraph >/dev/null || { echo "no codegraph on PATH (build + ./scripts/local-install.sh first)"; exit 1; }
+fi
 
 echo "==================== add-lang bench: $NAME ($LANG_TOKEN) ===================="
-echo "codegraph: $(command -v codegraph) -> $(codegraph --version 2>/dev/null || echo '?')"
+echo "codegraph: ${CODEGRAPH_BIN:-$(command -v codegraph)} -> $(codegraph --version 2>/dev/null || echo '?')"
 
 # 1. Ensure the repo (shallow clone, reuse if present).
 mkdir -p "$CORPUS"
