@@ -329,7 +329,7 @@ describe('listing an indexed project by package', () => {
       const plain = JSON.parse(codegraph('files', '--json')) as Array<Record<string, unknown>>;
 
       expect(plain.map((file) => Object.keys(file).sort())).toEqual(
-        plain.map(() => ['errors', 'language', 'nodeCount', 'path', 'size']),
+        plain.map(() => ['errors', 'isTest', 'language', 'nodeCount', 'path', 'size']),
       );
       expect(JSON.parse(codegraph('files', '--json', '--format', 'package'))).toEqual(plain);
     });

@@ -1897,6 +1897,8 @@ program
   .option('-p, --path <path>', 'Project path')
   .option('--filter <dir>', 'Filter to files under this directory')
   .option('--pattern <glob>', 'Filter files matching this glob pattern')
+  .option('--tests', 'Show only test files')
+  .option('--no-tests', 'Exclude test files')
   .option('--format <format>', 'Output format (tree, flat, grouped, package)', 'tree')
   .option('--max-depth <number>', 'Maximum directory depth for tree format')
   .option('--no-metadata', 'Hide file metadata (language, symbol count)')
@@ -1905,6 +1907,7 @@ program
     path?: string;
     filter?: string;
     pattern?: string;
+    tests?: boolean;
     format?: string;
     maxDepth?: string;
     metadata?: boolean;
@@ -1939,6 +1942,10 @@ program
         files = files.filter(f => regex.test(f.path));
       }
 
+      if (options.tests !== undefined) {
+        files = files.filter(f => isTestPath(f.path) === options.tests);
+      }
+
       if (files.length === 0) {
         info('No files found matching the criteria.');
         cg.destroy();
@@ -1949,6 +1956,7 @@ program
       if (options.json) {
         const output = files.map(f => ({
           path: f.path,
+          isTest: isTestPath(f.path),
           language: f.language,
           nodeCount: f.nodeCount,
           size: f.size,

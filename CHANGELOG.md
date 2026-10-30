@@ -20,6 +20,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### New Features
 
 - `codegraph files --format package` and `codegraph_files` with `format: "package"` now list a project's files by the package that owns them, the nearest `package.json` or `composer.json` above each file that names one, so a monorepo splits into its workspace members with no setup and files nothing claims get a section of their own (#1871). Thanks @LuisAlbertoMK.
+- `codegraph files --json` now marks each file as a test file or not, `--tests` and `--no-tests` filter the list in any format, and `codegraph node --file` says "test file" in its header, so your own tooling can ask CodeGraph instead of keeping a copy of its naming rules. Thanks @maxmilian. (#1877)
 - `codegraph install` now sets up IBM Bob, for Bob IDE and Bob Shell: it adds the CodeGraph MCP server to `~/.bob/settings/mcp.json`, or to `.bob/mcp.json` in a project. Thanks @QuentinDstl.
 - `codegraph install` now sets up Factory Droid: it adds the CodeGraph MCP server to `~/.factory/mcp.json` or a project's `.factory/mcp.json`, plus a short CodeGraph section in `AGENTS.md`, and Droid picks it up without a restart. Thanks @Rubyj and @KrystianMarek.
 - `codegraph install` now sets up Windsurf: it adds the CodeGraph MCP server to `~/.codeium/windsurf/mcp_config.json`, which Devin, Windsurf's new name, imports by default. Thanks @SEPURI-SAI-KRISHNA.
