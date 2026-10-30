@@ -35,6 +35,8 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { PASCAL_SYSTEM_NAMES } from './languages/pascal-system';
 import { VueExtractor } from './vue-extractor';
+import { QmlExtractor } from './qml-extractor';
+import { QmldirExtractor } from './qmldir-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
@@ -931,12 +933,14 @@ export class TreeSitterExtractor {
   private sourceAsWritten: string | null = null;
   // Memoized reExportAsWritten verdict (per-extractor = per-file).
   private reExportsAsWritten: boolean | null = null;
+  // Lets an embedding extractor read the finished tree before it is freed.
+  private onTree: ((root: SyntaxNode) => void) | undefined;
 
   constructor(
     filePath: string,
     source: string,
     language?: Language,
-    options?: { sourceIsPreParsed?: boolean; sourceAsWritten?: string }
+    options?: { sourceIsPreParsed?: boolean; sourceAsWritten?: string; onTree?: (root: SyntaxNode) => void }
   ) {
     this.filePath = filePath;
     this.source = source;
@@ -944,6 +948,7 @@ export class TreeSitterExtractor {
     this.extractor = EXTRACTORS[this.language] || null;
     this.fnRefSpec = FN_REF_SPECS[this.language];
     this.sourceIsPreParsed = options?.sourceIsPreParsed === true;
+    this.onTree = options?.onTree;
     if (options?.sourceAsWritten !== undefined && options.sourceAsWritten !== source) {
       this.sourceAsWritten = options.sourceAsWritten;
     }
@@ -1066,6 +1071,7 @@ export class TreeSitterExtractor {
       this.flushFnRefCandidates();
       this.flushValueRefs();
       this.flushPascalReads();
+      this.onTree?.(this.tree.rootNode);
 
       if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
@@ -9789,6 +9795,13 @@ export function extractFromSource(
   } else if (detectedLanguage === 'vue') {
     // Use custom extractor for Vue
     const extractor = new VueExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'qml') {
+    // Use custom extractor for Qt QML declarative UI
+    const extractor = new QmlExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (fileExtension === '.qmldir' || path.basename(filePath).toLowerCase() === 'qmldir') {
+    const extractor = new QmldirExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'astro') {
     // Use custom extractor for Astro (frontmatter + template delegation)

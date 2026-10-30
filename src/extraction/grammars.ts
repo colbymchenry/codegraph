@@ -12,7 +12,7 @@ import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { ExtractionError, Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'qml' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -124,6 +124,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
+  // Qt/QML declarative UI files
+  '.qml': 'qml',
   '.sol': 'solidity',
   // CFML: .cfc/.cfm parse with the tag-aware `cfml` grammar (custom CfmlExtractor
   // dialect-switches to cfscript for bare-script content); .cfs is pure CFScript.
@@ -465,7 +467,8 @@ function resolveWasmPath(lang: GrammarLanguage): string {
  * those grammars must be loaded even when no plain .ts/.js file is in the index
  * set (e.g. a pure-.astro content site). A Vue `<script lang="tsx">` is read
  * with the TSX grammar (#2570), which nothing else loads in a project without
- * a .tsx or .js file. CFML (.cfc/.cfm) likewise delegates
+ * a .tsx or .js file. QML hands the JavaScript in its handlers and functions
+ * to the JS extractor. CFML (.cfc/.cfm) likewise delegates
  * bare-script content, <cfscript> tag bodies, and <cfquery> SQL bodies to the
  * cfscript/cfquery grammars (see injections.scm in tree-sitter-cfml).
  */
@@ -475,6 +478,9 @@ function expandGrammarLanguages(languages: Language[]): Language[] {
   }
   if (languages.includes('vue')) {
     languages = [...languages, 'tsx'];
+  }
+  if (languages.includes('qml')) {
+    languages = [...languages, 'javascript'];
   }
   if (languages.some((l) => l === 'cfml')) {
     languages = [...languages, 'cfscript', 'cfquery'];
@@ -804,6 +810,7 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'svelte') return true; // custom extractor (script block delegation)
   if (language === 'vue') return true; // custom extractor (script block delegation)
   if (language === 'astro') return true; // custom extractor (frontmatter/script block delegation)
+  if (language === 'qml') return true; // custom QML extractor (embedded JavaScript delegation)
   if (language === 'liquid') return true; // custom regex extractor
   if (language === 'razor') return true; // custom RazorExtractor (.cshtml/.razor markup)
   if (language === 'yaml') return true; // file-level tracking only; Drupal routing extraction via framework resolver
@@ -841,7 +848,7 @@ export function isFileLevelOnlyLanguage(language: Language): boolean {
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'astro', 'liquid'];
+  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'astro', 'liquid', 'qml'];
 }
 
 /**
@@ -936,6 +943,7 @@ export function getLanguageDisplayName(language: Language): string {
     twig: 'Twig',
     xml: 'XML',
     properties: 'Java properties',
+    qml: 'QML',
     cfml: 'CFML',
     cfscript: 'CFScript',
     cfquery: 'CFQuery (SQL)',

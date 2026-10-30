@@ -17,6 +17,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CodeGraph's refusal to use a sensitive folder such as `~/.ssh`, `~/.config`, `/etc` or `C:\Windows` as a project can no longer be sidestepped: a link or junction that leads to one, a differently capitalized name on Windows and macOS, a `\\?\` spelling on Windows, and a path to a missing folder inside one are now refused like the folder itself. Before, any of these let an AI agent's query read the files inside. Thanks @mixxer for finding it.
 - The MCP server no longer uses a sensitive folder such as `~/.ssh`, `~/.config` or `/etc` as a session's default project, whether the folder came from your AI agent's workspace, the folder the server was started in, or `--path`. Before, only a folder an agent asked for by path was refused, so a session started in one that held an index answered from the files inside and kept it synced; now that session has no default project, and the agent can still query any other project by path.
 
+### New Features
+
+- QML, the declarative language used with the Qt framework, is now indexed: components and nested objects, `id`s, properties, signals, functions with their JavaScript bodies, `Connections`, enums, imports and `qmldir` modules. (#759)
+- A flow that starts in QML now continues into C++: handlers link to the C++ they trigger through signals and slots, `Q_INVOKABLE` methods, `Q_PROPERTY` accessors, context properties, types registered with `QML_ELEMENT` or `qmlRegisterType`, and objects reached with `findChild` and `invokeMethod`, so `codegraph_explore` can follow an action from the UI down into C++.
+- Qt C++ classes that use macros such as `Q_OBJECT`, `signals:`, `slots:`, `Q_INVOKABLE` and `emit` now index cleanly, with every method and signal in its place. Re-index Qt projects after upgrading.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
