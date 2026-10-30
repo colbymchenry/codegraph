@@ -19,6 +19,7 @@
  *   codegraph callers <symbol>   Find what calls a function/method
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
+ *   codegraph implementations <symbol>  List the types that implement or extend a trait, interface or class
  *   codegraph affected [files]   Find test files affected by changes
  *   codegraph cycles [path]      List circular imports between files
  *   codegraph ui [path]          Open the browser viewer (alias: web; not released yet — needs CODEGRAPH_UI=1)
@@ -76,6 +77,8 @@ import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../grap
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
 import { goPackageReaderFor } from '../graph/go-package';
 import { groupFilesByPackage, packageGroupTitle, packageListingTitle } from '../graph/owning-package';
+import { buildTypeHierarchy, canHaveHierarchy, MAX_DESCENDANTS, MAX_DESCENDANT_DEPTH } from '../graph/type-hierarchy';
+import { isTestCode } from '../graph/test-code';
 import type { Node, Edge, Language } from '../types';
 import { isTestPath } from '../search/query-utils';
 
@@ -2738,6 +2741,116 @@ async function affectedFilterMatcher(pattern: string): Promise<(filePath: string
   if (!anchored && !glob.startsWith('**/')) glob = `**/${glob}`;
   return picomatch(glob, options);
 }
+
+/**
+ * codegraph implementations <symbol>
+ *
+ * The types that implement or extend a trait, interface or class (#2833): the
+ * first question when a call crosses a trait boundary, and one `impact` cannot
+ * answer, since it mixes implementors with dependents and tests under one list.
+ */
+program
+  .command('implementations <symbol>')
+  .description('List the types that implement or extend a trait, interface or class')
+  .option('-p, --path <path>', 'Project path')
+  .option('-f, --file <path>', 'Narrow definitions by file path or suffix (no match: show all with a note)')
+  .option('-d, --depth <number>', `Levels of subtypes to list, 1-${MAX_DESCENDANT_DEPTH} (1: direct implementors only)`, '1')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (symbol: string, options: { path?: string; file?: string; depth?: string; json?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const cg = await openIndexToRead(projectPath);
+      try {
+        const depth = Math.min(Math.max(parseInt(options.depth || '1', 10) || 1, 1), MAX_DESCENDANT_DEPTH);
+        const { nodes: found } = lookupSymbolNodes(cg, symbol, goPackageReaderFor(cg));
+        if (found.length === 0) {
+          info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
+          return;
+        }
+        const targets = found.filter(canHaveHierarchy);
+        if (targets.length === 0) {
+          info(`"${symbol}" is ${describeSymbolNode(found[0]!)} — not a type something can implement or extend.`);
+          return;
+        }
+
+        const { groups, filteredOut } = groupDefinitions(targets, options.file);
+        const ambiguous = groups.length > 1;
+        const note = filteredOut
+          ? `no definition of "${symbol}" matches file "${options.file}" — showing all definitions instead.`
+          : undefined;
+        // A Rust implementor is test code when it sits in a `#[cfg(test)]`
+        // module, which only its file shows; read each file once.
+        const sources = new Map<string, string | undefined>();
+        const sourceOf = (filePath: string): string | undefined => {
+          if (!sources.has(filePath)) {
+            try { sources.set(filePath, fs.readFileSync(path.join(projectPath, filePath), 'utf-8')); } catch { sources.set(filePath, undefined); }
+          }
+          return sources.get(filePath);
+        };
+        const collected = groups.map((group) => {
+          const focus = group[0]!;
+          const hierarchy = buildTypeHierarchy(cg, focus, { overrides: false });
+          const entries = (hierarchy?.descendants ?? []).filter((e) => e.depth <= depth);
+          const nameOf = new Map<string, string>([[focus.id, focus.name]]);
+          for (const e of entries) nameOf.set(e.node.id, e.node.name);
+          const implementations = entries.map((e) => ({
+            ...cliNode(e.node),
+            qualifiedName: e.node.qualifiedName,
+            language: e.node.language,
+            relation: e.relation,
+            depth: e.depth,
+            via: e.depth > 1 ? nameOf.get(e.parentId) : undefined,
+            test: isTestCode(e.node, e.node.language === 'rust' ? sourceOf(e.node.filePath) : undefined),
+            synthesized: e.synthesized,
+          }));
+          return { group, implementations, directSubtypes: hierarchy?.directSubtypes ?? 0, bounded: hierarchy?.bounded ?? false };
+        });
+
+        if (options.json) {
+          console.log(JSON.stringify({
+            symbol,
+            depth,
+            targets: groups.flat().map((node) => cliDefinition([node]).definition),
+            ambiguous,
+            file: options.file,
+            filteredOut,
+            note,
+            definitions: collected.map(({ group, implementations, directSubtypes, bounded }) => ({
+              ...cliDefinition(group),
+              directSubtypes,
+              bounded,
+              implementations,
+            })),
+          }, null, 2));
+        } else {
+          if (note) warn(note);
+          for (const { group, implementations, directSubtypes, bounded } of collected) {
+            const deeper = depth > 1 ? `, ${implementations.length} within ${depth} levels` : '';
+            console.log(chalk.bold(`\nImplementations of ${describeSymbolNode(group[0]!)} — ${directSubtypes} direct${deeper}:\n`));
+            if (implementations.length === 0) console.log(chalk.dim('  (none in the index)'));
+            for (const r of implementations) {
+              const tags = [r.test ? '[test]' : '', r.synthesized ? '[synthesized]' : ''].filter(Boolean).join(' ');
+              const via = r.via ? ` ${r.via}` : '';
+              console.log(`  ${'  '.repeat(r.depth - 1)}${chalk.dim(r.kind.padEnd(10))}${r.name}  ${chalk.dim(r.relation + via)}  ${chalk.cyan(`${r.filePath}:${r.startLine}`)}${tags ? `  ${chalk.dim(tags)}` : ''}`);
+            }
+            if (bounded) console.log(chalk.dim(`\n  …the walk stops at ${MAX_DESCENDANTS} subtypes or ${MAX_DESCENDANT_DEPTH} levels; more exist.`));
+            console.log();
+          }
+        }
+      } finally {
+        cg.destroy();
+      }
+    } catch (err) {
+      error(`implementations failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
 
 /**
  * codegraph affected [files...]

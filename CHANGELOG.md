@@ -23,6 +23,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CodeGraph's MCP server now gives agents and editors its display name and icon, so one that shows them, like the Codex app, lists CodeGraph by name and logo instead of a plain `codegraph`. Thanks @fedosov.
 - `codegraph status` now shows how many of a language's files yielded symbols when that isn't all of them, and warns when none did, so a parser that isn't working no longer looks healthy, and `codegraph status --strict` exits non-zero on that or on an index that's missing, unfinished or out of date, so packaging and CI can gate on it (#1658). Thanks @ferrine.
 - `codegraph serve --mcp --no-telemetry` turns telemetry off for one MCP server entry, so a shared MCP config can opt out without an environment variable; a background daemon that's already running for the project keeps its own setting until it exits. Thanks @danusha2345. (#1908)
+- `codegraph implementations <name>` lists the types that implement or extend a trait, interface or class, with each one's file and line, how it's tied to the type, and whether it's test code, a Rust mock in a `#[cfg(test)]` module included; `--depth` follows subclasses of subclasses. Thanks @danusha2345. (#2833)
+
 
 - New `codegraph cycles` command lists the groups of files that import each other in a circle, as text or `--json`, and exits 1 when it finds any, so it works as a pre-commit or CI check (#888). Thanks @jiangyq9 and @goutham80808.
 

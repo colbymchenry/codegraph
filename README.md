@@ -542,6 +542,7 @@ codegraph files [path]            # Show file structure (--format, --filter, --m
 codegraph callers <symbol>        # Find what calls a function/method (--limit, --json)
 codegraph callees <symbol>        # Find what a function/method calls (--limit, --json)
 codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
+codegraph implementations <symbol> # List the types that implement or extend a type (--depth, --json)
 codegraph affected [files...]     # Find test files affected by changes (see below)
 codegraph cycles [path]           # List circular imports between files (--json); exits 1 when there are any
 codegraph daemon                  # Manage background daemons — pick one to stop (alias: daemons)
