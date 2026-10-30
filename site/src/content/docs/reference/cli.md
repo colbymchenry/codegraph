@@ -47,6 +47,8 @@ codegraph impact AuthMiddleware --depth 3
 
 `explore` and `node` are the CLI faces of the `codegraph_explore` and `codegraph_node` MCP tools — same output — so subagents and non-MCP harnesses can reach the graph from a shell.
 
+`codegraph files --format package` lists files by the package that owns them: the nearest `package.json` or `composer.json` above each file that names one. A monorepo splits into its workspace members with no setup, and files nothing claims get a section of their own. The other formats are `tree` (the default), `flat` and `grouped` (by language).
+
 ## affected
 
 Traces import dependencies transitively to find which test files are affected by changed source files. See [Affected Tests in CI](/codegraph/guides/affected-tests/) for options and a CI example.

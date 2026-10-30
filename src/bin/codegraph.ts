@@ -74,6 +74,7 @@ import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
 import { goPackageReaderFor } from '../graph/go-package';
+import { groupFilesByPackage, packageGroupTitle, packageListingTitle } from '../graph/owning-package';
 import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
 
@@ -1816,7 +1817,7 @@ program
   .option('-p, --path <path>', 'Project path')
   .option('--filter <dir>', 'Filter to files under this directory')
   .option('--pattern <glob>', 'Filter files matching this glob pattern')
-  .option('--format <format>', 'Output format (tree, flat, grouped)', 'tree')
+  .option('--format <format>', 'Output format (tree, flat, grouped, package)', 'tree')
   .option('--max-depth <number>', 'Maximum directory depth for tree format')
   .option('--no-metadata', 'Hide file metadata (language, symbol count)')
   .option('-j, --json', 'Output as JSON')
@@ -1923,6 +1924,23 @@ program
             console.log();
           }
           break;
+
+        case 'package': {
+          const groups = groupFilesByPackage(projectPath, files);
+          console.log(chalk.bold(`\n${packageListingTitle(groups)}:\n`));
+          for (const group of groups) {
+            console.log(chalk.cyan(`${packageGroupTitle(group)}:`));
+            for (const file of group.files) {
+              if (includeMetadata) {
+                console.log(`  ${file.path} ${chalk.dim(`(${file.language}, ${file.nodeCount} symbols)`)}`);
+              } else {
+                console.log(`  ${file.path}`);
+              }
+            }
+            console.log();
+          }
+          break;
+        }
 
         case 'tree':
         default:

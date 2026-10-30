@@ -60,6 +60,7 @@ import { describeSynthesizedHop } from '../graph/synthesized-hop';
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
 import type { CallSiteRow } from '../graph/traversal';
 import { isCopybookInclude, MAX_COPYBOOK_INCLUDES, type NamedCopybook } from '../graph/cobol-copybooks';
+import { groupFilesByPackage, packageGroupTitle, packageListingTitle } from '../graph/owning-package';
 import {
   findAllSymbols,
   resolveNamedSymbolFlow,
@@ -1879,8 +1880,8 @@ export const tools: ToolDefinition[] = [
         },
         format: {
           type: 'string',
-          description: 'Output format: "tree" (hierarchical, default), "flat" (simple list), "grouped" (by language)',
-          enum: ['tree', 'flat', 'grouped'],
+          description: 'Output format: "tree" (hierarchical, default), "flat" (simple list), "grouped" (by language), "package" (by the nearest package.json or composer.json that names a package)',
+          enum: ['tree', 'flat', 'grouped', 'package'],
           default: 'tree',
         },
         includeMetadata: {
@@ -8596,7 +8597,7 @@ export class ToolHandler {
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const pathFilter = args.path as string | undefined;
     const pattern = args.pattern as string | undefined;
-    const format = (args.format as 'tree' | 'flat' | 'grouped') || 'tree';
+    const format = (args.format as 'tree' | 'flat' | 'grouped' | 'package') || 'tree';
     const includeMetadata = args.includeMetadata !== false;
     const maxDepth = args.maxDepth != null ? clamp(args.maxDepth as number, 1, 20) : undefined;
 
@@ -8641,6 +8642,9 @@ export class ToolHandler {
         break;
       case 'grouped':
         output = this.formatFilesGrouped(files, includeMetadata);
+        break;
+      case 'package':
+        output = this.formatFilesByPackage(cg.getProjectRoot(), files, includeMetadata);
         break;
       case 'tree':
       default:
@@ -8703,6 +8707,32 @@ export class ToolHandler {
       for (const file of langFiles.sort((a, b) => a.path.localeCompare(b.path))) {
         if (includeMetadata) {
           lines.push(`- ${file.path} (${file.nodeCount} symbols)`);
+        } else {
+          lines.push(`- ${file.path}`);
+        }
+      }
+      lines.push('');
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Format files grouped by the package that owns them
+   */
+  private formatFilesByPackage(
+    projectRoot: string,
+    files: { path: string; language: string; nodeCount: number }[],
+    includeMetadata: boolean
+  ): string {
+    const groups = groupFilesByPackage(projectRoot, files);
+    const lines: string[] = [`**${packageListingTitle(groups)}**`, ''];
+
+    for (const group of groups) {
+      lines.push(`**${packageGroupTitle(group)}**`);
+      for (const file of group.files) {
+        if (includeMetadata) {
+          lines.push(`- ${file.path} (${file.language}, ${file.nodeCount} symbols)`);
         } else {
           lines.push(`- ${file.path}`);
         }
