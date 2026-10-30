@@ -22,6 +22,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Elysia (Bun) backends now have their HTTP routes in the graph, named by the full path a request takes, with the prefixes of `new Elysia({ prefix })`, `.group()` and a `.use()` in another file included, and linked to their handlers, so `codegraph_explore` can follow a request from its route into your code. Thanks @ChampPABA for the report. (#3255)
 - PHP includes built from the web server's root, like `require $_SERVER['DOCUMENT_ROOT'] . '/inc/header.php'`, now link to their file: CodeGraph works out which folder the server serves from where your includes' paths name files, links nothing when they don't settle it rather than guess, and takes `"webRoot": "public"` in `codegraph.json` (or `"."` for the project root) when you'd rather name it yourself. Thanks @artisanya for the report. (#3298)
 - Kotlin is now read with a newer version of its grammar, so code it used to misread, such as an annotated class whose methods showed up as top-level functions, a class that delegates `by` another object, or newer syntax like `when` guards and explicit backing fields, now has its classes, functions and calls in the graph where they belong. (#3410)
+- CodeGraph now indexes **Magik** (`.magik`), the language of the Smallworld GIS platform: exemplars, methods (with the exemplar they belong to), named procedures, packages and `##` doc comments become symbols, and calls between methods and procedures are linked. Thanks @sebastiaanspeck
 
 ### Fixes
 
