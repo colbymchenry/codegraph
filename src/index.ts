@@ -31,6 +31,7 @@ import {
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
+import { logWarn } from './errors';
 import { QueryBuilder, type DeprioritizedPathMatcher } from './db/queries';
 import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
 import {
@@ -185,6 +186,18 @@ function parseNameList(value: string | null): string[] | null {
   }
 }
 
+/**
+ * CODEGRAPH_SYNTH_MIN_INTERVAL_MS: the least time between two repo-wide
+ * synthesis passes a long-lived instance's syncs run (#2911). Whole
+ * milliseconds, 1000 to 24 hours; unset, empty or out of range means no hold.
+ */
+export function parseSynthMinIntervalEnv(raw: string | undefined): number | undefined {
+  if (!raw || !raw.trim()) return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1000 || n > 86_400_000) return undefined;
+  return n;
+}
+
 export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
@@ -206,6 +219,12 @@ export class CodeGraph {
 
   // File watcher for auto-sync on file changes
   private watcher: FileWatcher | null = null;
+
+  // When this instance last rebuilt the synthesized edges, and the timer that
+  // runs a synthesis a sync put off under CODEGRAPH_SYNTH_MIN_INTERVAL_MS
+  // (#2911). Per instance: the daemon's watcher is what syncs on every edit.
+  private lastSynthesisAt = 0;
+  private deferredSynthesisTimer: NodeJS.Timeout | null = null;
 
   private constructor(
     db: DatabaseConnection,
@@ -586,6 +605,10 @@ export class CodeGraph {
    */
   close(): void {
     this.unwatch();
+    if (this.deferredSynthesisTimer) {
+      clearTimeout(this.deferredSynthesisTimer);
+      this.deferredSynthesisTimer = null;
+    }
     // Release file lock if held
     this.fileLock.release();
     this.db.close();
@@ -788,6 +811,7 @@ export class CodeGraph {
             walValve ? () => walValve!.backpressure() : undefined
           );
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolution: ${Date.now() - tResolve}ms`);
+          this.lastSynthesisAt = Date.now();
 
           // Second pass: chained calls whose method lives on a supertype the
           // receiver conforms to (protocol-extension / inherited / default-
@@ -1729,16 +1753,32 @@ export class CodeGraph {
           await this.resolver.resolveDeferredThisMemberRefs();
         }
 
+        // The synthesis passes read the whole graph, whatever this sync
+        // changed, and nearly every TypeScript or Vue file is one of their
+        // inputs, so on a large repo almost every edit paid for a whole-repo
+        // synthesis (#2911). With CODEGRAPH_SYNTH_MIN_INTERVAL_MS set, a
+        // synthesis within that long of the last one is put off, not
+        // dropped: `synthesis_pending` stays set, so a later sync runs it,
+        // and a timer runs it when the interval is up even if no edit
+        // follows. A full index is never held.
+        let synthesized = false;
         if (refreshSynthesis) {
-          await this.resolver.refreshSynthesis(this.db.getPath(), (done, total) => {
-            options.onProgress?.({ phase: 'linking', current: done, total });
-          }, backpressure);
-          this.queries.setMetadata('synthesis_pending', '0');
+          const hold = this.synthesisHoldMs();
+          if (hold > 0) {
+            this.armDeferredSynthesis(hold);
+          } else {
+            await this.resolver.refreshSynthesis(this.db.getPath(), (done, total) => {
+              options.onProgress?.({ phase: 'linking', current: done, total });
+            }, backpressure);
+            this.queries.setMetadata('synthesis_pending', '0');
+            this.lastSynthesisAt = Date.now();
+            synthesized = true;
+          }
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         // Off-thread — see indexAll's call site.
-        if (filesChanged || result.filesRemoved > 0 || orphanCount > 0 || refreshSynthesis) {
+        if (filesChanged || result.filesRemoved > 0 || orphanCount > 0 || synthesized) {
           await this.db.runMaintenance();
         }
 
@@ -1789,6 +1829,103 @@ export class CodeGraph {
    */
   isIndexing(): boolean {
     return this.indexMutex.isLocked();
+  }
+
+  /**
+   * How much longer a sync must wait before it may rebuild the synthesized
+   * edges: the rest of CODEGRAPH_SYNTH_MIN_INTERVAL_MS since this instance last
+   * did (#2911). Zero when the variable is unset or invalid, or the interval
+   * has passed.
+   */
+  private synthesisHoldMs(): number {
+    const interval = parseSynthMinIntervalEnv(process.env.CODEGRAPH_SYNTH_MIN_INTERVAL_MS);
+    if (!interval || this.lastSynthesisAt === 0) return 0;
+    return Math.max(0, this.lastSynthesisAt + interval - Date.now());
+  }
+
+  /** Run the synthesis a sync put off once the interval is up, unless a sync runs it first. */
+  private armDeferredSynthesis(delayMs: number): void {
+    if (this.deferredSynthesisTimer) return;
+    this.deferredSynthesisTimer = setTimeout(() => {
+      this.deferredSynthesisTimer = null;
+      void this.runDeferredSynthesis();
+    }, delayMs);
+    this.deferredSynthesisTimer.unref?.();
+  }
+
+  /**
+   * The put-off synthesis, under the locks a sync holds. Nothing to do when a
+   * sync ran it meanwhile. When the file lock is taken by another process,
+   * try again after the interval; `synthesis_pending` stays set throughout.
+   *
+   * It runs from a timer, so nothing above it catches a failure, and an
+   * unhandled rejection ends the process (`installFatalHandlers`): that would
+   * be the daemon every session shares, over a `database is locked`. A failure
+   * here is logged and tried again after the interval, as lock contention is.
+   */
+  private async runDeferredSynthesis(): Promise<void> {
+    const retryLater = (): void => {
+      if (!this.db.isOpen()) return;
+      this.armDeferredSynthesis(parseSynthMinIntervalEnv(process.env.CODEGRAPH_SYNTH_MIN_INTERVAL_MS) ?? 1000);
+    };
+    try {
+      await this.indexMutex.withLock(async () => {
+        if (this.queries.getMetadata('synthesis_pending') !== '1') return;
+        try {
+          this.fileLock.acquire();
+        } catch {
+          retryLater();
+          return;
+        }
+        try {
+          // A rebuild may have replaced the file meanwhile, as sync checks.
+          this.reopenReplacedDatabase();
+          if (this.queries.getMetadata('synthesis_pending') !== '1') return;
+          await this.synthesizeWithWalDeferred();
+        } finally {
+          this.fileLock.release();
+        }
+      });
+    } catch (err) {
+      logWarn(`Put-off synthesis failed, trying again after the interval: ${err instanceof Error ? err.message : String(err)}`);
+      retryLater();
+    }
+  }
+
+  /**
+   * The rebuild, with the WAL handling a sync gives it (#1231, #1248): a whole
+   * graph's edges rewritten must not be checkpointed inline on this thread by
+   * the next commit on this connection, so the valve bounds the WAL off-thread
+   * and runMaintenance folds it up.
+   */
+  private async synthesizeWithWalDeferred(): Promise<void> {
+    const deferWal = process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+    let walValve: WalCheckpointValve | null = null;
+    let priorAutocheckpoint = 1000;
+    if (deferWal) {
+      priorAutocheckpoint = this.db.getWalAutocheckpoint();
+      this.db.setWalAutocheckpoint(0);
+      walValve = new WalCheckpointValve(
+        this.db,
+        resolveWalValveMb(process.env.CODEGRAPH_WAL_VALVE_MB, this.db.getDbFileSizeBytes())
+      );
+      walValve.start();
+    }
+    try {
+      await this.resolver.refreshSynthesis(
+        this.db.getPath(),
+        undefined,
+        walValve ? () => walValve!.backpressure() : undefined
+      );
+      this.queries.setMetadata('synthesis_pending', '0');
+      this.lastSynthesisAt = Date.now();
+      await this.db.runMaintenance();
+    } finally {
+      if (walValve) { walValve.stop(); await walValve.drain(); }
+      if (deferWal) {
+        try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* connection may be closing */ }
+      }
+    }
   }
 
   // ===========================================================================
