@@ -175,6 +175,21 @@ export function sameLanguageFamily(a: string, b: string): boolean {
   const fa = LANGUAGE_FAMILY[a];
   return fa !== undefined && fa === LANGUAGE_FAMILY[b];
 }
+
+/**
+ * The languages whose files share one table of names: a C function is called
+ * by its bare name from C++ and Objective-C alike, and a `.h` file is C, C++
+ * or Objective-C only as far as sniffing its text can tell (Dear ImGui's
+ * C++ `imgui.h` reads as C), so name matching ranks them as one language.
+ * Other families keep the language itself: their files reach each other's
+ * names through imports, and a name-only pick across TypeScript and TSX, or
+ * Java and Kotlin, went to a same-named declaration in the next file more
+ * often than to the one meant (#1662).
+ */
+const C_LINKED_LANGUAGES: ReadonlySet<string> = new Set(['c', 'cpp', 'objc']);
+function sameRankingLanguage(a: string, b: string): boolean {
+  return a === b || (C_LINKED_LANGUAGES.has(a) && C_LINKED_LANGUAGES.has(b));
+}
 /** Config/markup transitions stay open; every other code language has a family. */
 const CODE_FAMILY: Record<string, string> = {
   ...LANGUAGE_FAMILY,
@@ -13283,10 +13298,11 @@ export function matchByExactName(
     return null;
   }
 
-  // If only one match, use it — but penalize cross-language matches
+  // If only one match, use it — but penalize a match in another language
+  // family (a `.tsx` component calling a `.ts` helper is not one, #1662)
   if (candidates.length === 1) {
     if (!isCrossFileReachable(candidates[0]!, ref, context)) return null;
-    const isCrossLanguage = candidates[0]!.language !== ref.language;
+    const isCrossLanguage = !sameLanguageFamily(candidates[0]!.language, ref.language);
     return {
       original: ref,
       targetNodeId: candidates[0]!.id,
@@ -13334,10 +13350,11 @@ export function matchByExactName(
     // above a proximity guess, but below a unique name or the file's own
     // definition (0.9). The candidates are those findBestMatch weighed: a
     // namesake in another language never wins while one in the reference's
-    // own language exists. The caller's own copy being the caller itself is
-    // no evidence, as for a same-file match (isDecisiveSameFileMatch).
-    const weighed = candidates.some((c) => c.language === ref.language)
-      ? candidates.filter((c) => c.language === ref.language)
+    // own language (sameRankingLanguage) exists. The caller's own copy being
+    // the caller itself is no evidence, as for a same-file match
+    // (isDecisiveSameFileMatch).
+    const weighed = candidates.some((c) => sameRankingLanguage(c.language, ref.language))
+      ? candidates.filter((c) => sameRankingLanguage(c.language, ref.language))
       : candidates;
     const confidence = isDecisiveSameFileMatch(bestMatch, ref, candidates, context)
       ? 0.9
@@ -29385,7 +29402,8 @@ function findBestMatch(
   // Prioritization rules:
   // 1. Same file > different file
   // 2. Directory proximity (same module/package > different module)
-  // 3. Same language > different language
+  // 3. Same language > different language (C, C++ and Objective-C count as
+  //    one: sameRankingLanguage), and the very language as a tie-break
   // 4. Functions/methods > classes/types (for call references)
   // 5. Exported > non-exported
 
@@ -29406,10 +29424,11 @@ function findBestMatch(
   // scoring. Cuts the candidate set to same-language size on mixed front-end +
   // back-end repos (#915). When ALL candidates are cross-language (a legitimate
   // cross-language `calls` bridge), none are skipped and behavior is unchanged.
-  const hasSameLanguage = candidates.some((c) => c.language === ref.language);
+  const hasSameLanguage = candidates.some((c) => sameRankingLanguage(c.language, ref.language));
 
   for (const candidate of candidates) {
-    if (hasSameLanguage && candidate.language !== ref.language) continue;
+    const sameLanguage = sameRankingLanguage(candidate.language, ref.language);
+    if (hasSameLanguage && !sameLanguage) continue;
 
     let score = 0;
 
@@ -29428,9 +29447,11 @@ function findBestMatch(
       score += 80;
     }
 
-    // Language matching: strongly prefer same language, penalize cross-language
-    if (candidate.language === ref.language) {
-      score += 50;
+    // Language matching: strongly prefer same language, penalize cross-language.
+    // Between C, C++ and Objective-C the very language adds one point, which
+    // only breaks a tie: a directory nearer counts 15.
+    if (sameLanguage) {
+      score += candidate.language === ref.language ? 51 : 50;
     } else {
       score -= 80;
     }
@@ -29662,7 +29683,7 @@ export function matchFuzzy(
     !(finalCandidates[0]!.kind !== 'function' && isBarePhpCall(ref, context)) &&
     isLexicallyReachable(finalCandidates[0]!, ref, context)
   ) {
-    const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
+    const isCrossLanguage = !sameLanguageFamily(finalCandidates[0]!.language, ref.language);
     return {
       original: ref,
       targetNodeId: finalCandidates[0]!.id,
