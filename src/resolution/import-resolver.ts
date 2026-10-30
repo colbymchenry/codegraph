@@ -78,6 +78,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   csharp: ['.cs'],
   php: ['.php'],
   ruby: ['.rb'],
+  crystal: ['.cr'],
   objc: ['.h', '.m', '.mm'],
   nix: ['.nix', '/default.nix'],
 };
@@ -1251,6 +1252,15 @@ function resolveRelativeImport(
   for (const ext of extensions) {
     if (relativePath === '' && !ext.startsWith('/')) continue;
     const candidatePath = relativePath === '' ? ext.slice(1) : relativePath + ext;
+    if (context.fileExists(candidatePath)) {
+      return candidatePath;
+    }
+  }
+
+  // Crystal's second lookup: `require "./store"` is `store.cr`, else the
+  // directory's own `store/store.cr`.
+  if (language === 'crystal' && relativePath !== '') {
+    const candidatePath = `${relativePath}/${path.posix.basename(relativePath)}.cr`;
     if (context.fileExists(candidatePath)) {
       return candidatePath;
     }
@@ -3040,6 +3050,13 @@ export function resolveViaImport(
   // other path is from the file the directive is in.
   if (isDartImportRef(ref)) {
     const file = dartDirectiveFile(ref.filePath, ref.referenceName, context);
+    const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
+    return fileNode ? { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' } : null;
+  }
+  // A Crystal relative `require "./models/user"` names a FILE, found the way
+  // the compiler finds it: `models/user.cr`, else `models/user/user.cr`.
+  if (ref.language === 'crystal' && ref.referenceKind === 'imports' && ref.referenceName.startsWith('.')) {
+    const file = resolveImportPath(ref.referenceName, ref.filePath, 'crystal', context);
     const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
     return fileNode ? { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' } : null;
   }
