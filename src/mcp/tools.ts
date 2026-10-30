@@ -4165,6 +4165,7 @@ export class ToolHandler {
   ): string {
     const ROOT_CAP = 5; // only the symbols the query actually targeted
     const FILE_CAP = 4; // caller files listed per symbol before "+N more"
+    const TEMPLATE_VIEW_FILE = /\.(?:cshtml|razor|vue|svelte|astro)$/i;
     const MEANINGFUL = new Set<string>([
       'function', 'method', 'class', 'interface', 'struct', 'union', 'trait', 'protocol',
       'enum', 'type_alias', 'component', 'constant', 'variable', 'property', 'field',
@@ -4193,9 +4194,17 @@ export class ToolHandler {
       const testFiles = callerFiles.filter((f) => isTestFile(f));
       const nonTest = callerFiles.filter((f) => !isTestFile(f));
 
-      const shown = nonTest.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ');
-      const more = nonTest.length > FILE_CAP ? ` +${nonTest.length - FILE_CAP} more` : '';
-      const where = nonTest.length > 0 ? ` in ${shown}${more}` : '';
+      // A view depends on a helper across a layer, and is easily outnumbered by
+      // same-language callers: one flat cap showed none of a helper's 22 views
+      // behind four `.js` files. "Which views use this?" gets its own slot.
+      const viewFiles = nonTest.filter((f) => TEMPLATE_VIEW_FILE.test(f));
+      const codeFiles = nonTest.filter((f) => !TEMPLATE_VIEW_FILE.test(f));
+      const shown = codeFiles.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ');
+      const more = codeFiles.length > FILE_CAP ? ` +${codeFiles.length - FILE_CAP} more` : '';
+      const views = viewFiles.length > 0
+        ? `${codeFiles.length > 0 ? ';' : ' in'} ${viewFiles.length} view${viewFiles.length === 1 ? '' : 's'}: ${viewFiles.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ')}${viewFiles.length > FILE_CAP ? ` +${viewFiles.length - FILE_CAP}` : ''}`
+        : '';
+      const where = (codeFiles.length > 0 ? ` in ${shown}${more}` : '') + views;
       const tests = testFiles.length > 0
         ? `; tests: ${testFiles.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ')}${testFiles.length > FILE_CAP ? ` +${testFiles.length - FILE_CAP}` : ''}`
         : this.indirectTestNote(cg, uniq, rel);

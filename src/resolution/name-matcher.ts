@@ -13557,6 +13557,8 @@ function matchEnclosingScopeMember(
 /**
  * Try to resolve a reference by exact name match
  */
+const RAZOR_VIEW = /\.(?:cshtml|razor)$/i;
+
 export function matchByExactName(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -13808,6 +13810,10 @@ export function matchByExactName(
   if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
+    // A view's `<script>` calls a global, and the page's script tags decide which
+    // file answers. nopCommerce's admin and public bundles both define
+    // `setLocation`, and a storefront view has no path nearer to either.
+    if (JS_FAMILY.has(ref.language) && RAZOR_VIEW.test(ref.filePath) && pool.some((c) => c.id !== bestMatch.id && computePathProximity(ref.filePath, c.filePath) === proximity)) return null;
     // Every candidate is a copy of one symbol and this is the caller's own
     // copy: the name itself is not ambiguous, only which copy — so rank it
     // above a proximity guess, but below a unique name or the file's own

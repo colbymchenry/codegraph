@@ -113,3 +113,45 @@ describe('codegraph_explore — blast radius', () => {
     expect(text).not.toMatch(/Blast radius[\s\S]*`lonelyLeaf`/);
   });
 });
+
+describe('codegraph_explore — views in the blast radius', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-blast-views-'));
+    const src = path.join(testDir, 'src');
+    const views = path.join(testDir, 'Views');
+    fs.mkdirSync(src, { recursive: true });
+    fs.mkdirSync(views, { recursive: true });
+    fs.writeFileSync(path.join(src, 'helper.js'), 'export function fmt(x) { return x + 1; }\n');
+    // More code callers than the cap: under one flat cap, no view would show.
+    for (const n of ['a', 'b', 'c', 'd', 'e']) {
+      fs.writeFileSync(path.join(src, `${n}.js`), `import { fmt } from './helper';\nexport function use_${n}() { return fmt(1); }\n`);
+    }
+    for (const n of ['Index', 'Edit']) {
+      fs.writeFileSync(path.join(views, `${n}.cshtml`), `<script>\nimport { fmt } from '../src/helper';\nfmt(2);\n</script>\n`);
+    }
+    cg = CodeGraph.initSync(testDir);
+    await cg.indexAll();
+  });
+
+  afterEach(() => {
+    if (cg) cg.destroy();
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('lists views in their own slot, past the cap on code callers', async () => {
+    const res = await new ToolHandler(cg).execute('codegraph_explore', { query: 'fmt' });
+    const text = res.content[0]!.text;
+    expect(text).toMatch(/\+1 more; 2 views: `Views\/(?:Edit|Index)\.cshtml`, `Views\/(?:Edit|Index)\.cshtml`/);
+  });
+
+  it('reads the same when only views depend on a symbol', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'only.js'), 'export function onlyViews() { return 1; }\n');
+    fs.writeFileSync(path.join(testDir, 'Views', 'Solo.cshtml'), "<script>\nimport { onlyViews } from '../src/only';\nonlyViews();\n</script>\n");
+    await cg.sync();
+    const res = await new ToolHandler(cg).execute('codegraph_explore', { query: 'onlyViews' });
+    expect(res.content[0]!.text).toMatch(/1 caller in 1 view: `Views\/Solo\.cshtml`/);
+  });
+});

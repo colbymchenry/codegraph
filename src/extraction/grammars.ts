@@ -479,6 +479,11 @@ function expandGrammarLanguages(languages: Language[]): Language[] {
   if (languages.some((l) => l === 'cfml')) {
     languages = [...languages, 'cfscript', 'cfquery'];
   }
+  // A view's `@code` blocks are C#, its `<script>` blocks JavaScript or
+  // TypeScript. A sync that re-reads only a view loads what the view needs.
+  if (languages.includes('razor')) {
+    languages = [...languages, 'csharp', 'typescript', 'javascript'];
+  }
   return languages;
 }
 

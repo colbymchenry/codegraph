@@ -7307,6 +7307,113 @@ describe('Razor / Blazor markup extraction', () => {
     if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  /** The files of everything that calls or references the named function. */
+  const dependents = async (name: string): Promise<string[]> => {
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    const target = cg.getNodesByKind('function').find((n) => n.name === name);
+    expect(target, name).toBeDefined();
+    return [...cg.getImpactRadius(target!.id, 1).nodes.values()].map((n) => n.filePath ?? '').filter((p) => !p.endsWith('.js') && !p.endsWith('.ts'));
+  };
+
+  it('links what a view\'s inline script calls to the JavaScript that defines it', async () => {
+    fs.writeFileSync(path.join(tempDir, 'site.js'), 'export function showToast(msg) { return msg; }\n');
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'Views/Order.cshtml'),
+      "@model OrderViewModel\n<div>Order</div>\n<script>\n  import { showToast } from '../site.js';\n  function save() { showToast('saved'); }\n</script>\n"
+    );
+    expect(await dependents('showToast')).toContain('Views/Order.cshtml');
+    const ref = cg.getOutgoingEdges(cg.getNodesByName('Order')[0]!.id).find((e) => e.kind === 'calls');
+    expect(ref?.line, 'a reference keeps its line in the view').toBe(5);
+  });
+
+  it('reads a global helper called from a script that holds Razor', async () => {
+    fs.writeFileSync(path.join(tempDir, 'common.js'), 'function displayNotice(text) { return text; }\nvar AjaxCart = { add: function add(url) { return url; } };\n');
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'Views/Cart.cshtml'), [
+      '@model CartModel',
+      '<script asp-location="Footer">',
+      '    var id = @Model.Id;',
+      "    var url = '@Url.Action(\"Add\", \"Cart\")';",
+      '    var data = @Html.Raw(Json.Serialize(Model.Items));',
+      '    @* displayNotice("a comment"); *@',
+      '    @if (Model.ShowNotice)',
+      '    {',
+      '        <text>',
+      '        displayNotice("@T("Added").Text");',
+      '        </text>',
+      '    }',
+      '    else',
+      '    {',
+      '        var hidden = Model.Compute();',
+      '    }',
+      '    $(function () { AjaxCart.add(url); });',
+      '</script>',
+    ].join('\n'));
+    expect(await dependents('displayNotice')).toContain('Views/Cart.cshtml');
+    const refs = (cg as any).db.db.prepare(`SELECT reference_name n FROM unresolved_refs WHERE file_path = 'Views/Cart.cshtml' AND language = 'javascript'`).all().map((r: { n: string }) => r.n);
+    for (const name of refs) expect(name, 'Razor reads as no JavaScript').not.toMatch(/Html|Json|Model|Url\.Action/);
+  });
+
+  it('leaves template, data and sourced script blocks alone, and calls no block\'s own function another file\'s', async () => {
+    fs.writeFileSync(path.join(tempDir, 'lib.js'), 'function fromTemplate() {}\nfunction ownName() {}\nfunction fromSrc() {}\n');
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'Views/Page.cshtml'), [
+      '<script type="text/html" id="row"><div onclick="fromTemplate()"></div></script>',
+      '<script type="application/json">{ "fromTemplate": 1 }</script>',
+      '<script src="~/js/fromSrc.js"></script>',
+      '@* <script>fromTemplate();</script> *@',
+      '<script>',
+      '  function ownName() { return 1; }',
+      '  ownName();',
+      '</script>',
+      '<script>',
+      '  ownName();',
+      '</script>',
+    ].join('\n'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    for (const name of ['fromTemplate', 'ownName', 'fromSrc']) {
+      const target = cg.getNodesByKind('function').find((n) => n.name === name)!;
+      expect(cg.getCallers(target.id).map((c) => c.node.name), name).toEqual([]);
+    }
+    expect(cg.getNodesInFile('Views/Page.cshtml').filter((n) => n.kind === 'function'), 'a view stays one component node').toEqual([]);
+  });
+
+  it('leaves a global two bundles define for the page to decide', async () => {
+    fs.mkdirSync(path.join(tempDir, 'wwwroot/js'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'wwwroot/js/admin.common.js'), 'function setLocation(url) { return url; }\nfunction onlyAdmin() {}\n');
+    fs.writeFileSync(path.join(tempDir, 'wwwroot/js/public.common.js'), 'function setLocation(url) { return url; }\n');
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'Views/Page.cshtml'), "<script>\n  setLocation('/x');\n  onlyAdmin();\n</script>\n");
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    const callees = cg.getOutgoingEdges(cg.getNodesByName('Page')[0]!.id).filter((e) => e.kind === 'calls').map((e) => cg.getNode(e.target)?.name);
+    expect(callees).toEqual(['onlyAdmin']);
+  });
+
+  it('reads a block as TypeScript when it says so', async () => {
+    fs.writeFileSync(path.join(tempDir, 'helper.ts'), 'export function typedHelper(n: number) { return n; }\n');
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'Views/Typed.cshtml'),
+      "<script lang=\"ts\">\n  import { typedHelper } from '../helper';\n  const n: number = typedHelper(1);\n</script>\n"
+    );
+    expect(await dependents('typedHelper')).toContain('Views/Typed.cshtml');
+  });
+
+  it('keeps a view\'s script links through a sync that re-reads only the view', async () => {
+    fs.writeFileSync(path.join(tempDir, 'site.js'), 'function firstHelper() {}\nfunction secondHelper() {}\n');
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'Views/Page.cshtml'), '<script>\n  firstHelper();\n</script>\n');
+    expect(await dependents('firstHelper')).toContain('Views/Page.cshtml');
+    fs.writeFileSync(path.join(tempDir, 'Views/Page.cshtml'), '<script>\n  secondHelper();\n</script>\n');
+    await cg.sync();
+    const second = cg.getNodesByKind('function').find((n) => n.name === 'secondHelper')!;
+    expect(cg.getCallers(second.id).map((c) => c.node.filePath)).toEqual(['Views/Page.cshtml']);
+  });
+
   it('links @model and Blazor component tags to their C# types; ignores HTML elements', async () => {
     fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
     fs.writeFileSync(
