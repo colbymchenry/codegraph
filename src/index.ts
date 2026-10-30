@@ -69,6 +69,7 @@ import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { ESM_IMPORT_LANGUAGES } from './resolution/import-resolver';
+import { moduleConfigLanguages, parseModuleConfigSnapshot } from './resolution';
 import { minRefsForPool } from './resolution/resolver-pool';
 
 // Re-export types for consumers
@@ -153,6 +154,8 @@ export interface IndexOptions {
 const PYTHON_ROOTS_METADATA_KEY = 'python_root_fingerprint';
 /** Metadata key: the digest of the workspace packages and path dependencies the index was resolved by. */
 const WORKSPACE_METADATA_KEY = 'js_workspace_fingerprint';
+/** The tsconfig / jsconfig and go.mod files the index was resolved by, with a digest of each (#2977). */
+const MODULE_CONFIG_METADATA_KEY = 'module_config_snapshot';
 /** Metadata key: the frameworks (sorted JSON names) the last full index extracted every file with. */
 const FRAMEWORKS_AT_INDEX_KEY = 'frameworks_at_index';
 /**
@@ -832,6 +835,7 @@ export class CodeGraph {
         // extraction stamp (the bulk would still be stale). See extraction-version.ts.
         if (result.success) this.stampPythonRootFingerprint();
         if (result.success) this.stampWorkspaceFingerprint();
+        if (result.success) this.stampModuleConfigSnapshot();
         if (result.success) this.stampIndexedFrameworks();
 
         if (result.success && result.filesIndexed > 0) {
@@ -947,6 +951,23 @@ export class CodeGraph {
   private stampPythonRootFingerprint(fingerprint = this.resolver.getPythonRootFingerprint()): void {
     try {
       this.queries.setMetadata(PYTHON_ROOTS_METADATA_KEY, fingerprint);
+    } catch { /* metadata is advisory */ }
+  }
+
+  /** Record the module-config files the index was resolved by, for a later sync to compare against (see sync). */
+  private stampModuleConfigSnapshot(): void {
+    try {
+      const stored = this.queries.getMetadata(MODULE_CONFIG_METADATA_KEY);
+      this.queries.setMetadata(MODULE_CONFIG_METADATA_KEY, JSON.stringify(this.resolver.getModuleConfigSnapshot(stored)));
+    } catch { /* metadata is advisory */ }
+  }
+
+  /** The same, only when the snapshot differs from the stored one: a config changed, or resolution read one the index had not recorded. */
+  private stampModuleConfigSnapshotIfMoved(): void {
+    try {
+      const stored = this.queries.getMetadata(MODULE_CONFIG_METADATA_KEY);
+      const now = JSON.stringify(this.resolver.getModuleConfigSnapshot(stored));
+      if (now !== stored) this.queries.setMetadata(MODULE_CONFIG_METADATA_KEY, now);
     } catch { /* metadata is advisory */ }
   }
 
@@ -1197,6 +1218,35 @@ export class CodeGraph {
         // read. The watcher's scoped syncs follow source files only and skip
         // the read: a monorepo's manifests take a walk of the tree to find.
         // An index stamped by an older engine has no digest: record one.
+        // tsconfig / jsconfig `paths` and `baseUrl`, and go.mod's module path
+        // (#2977). The resolver reads them once and keeps the maps for its
+        // lifetime, and the watcher follows source files only, so an edit to
+        // one kept resolving imports by the old mapping: in this process, and
+        // in later ones too, since a sync re-resolves only the changed files.
+        // The index carries a digest of every config file resolution read
+        // (`extends` chains included) plus the root's candidates; when one
+        // differs, the maps are dropped and every import the file governs is
+        // re-opened for the sweep below, as a moved workspace map re-opens
+        // the ES-module imports. A handful of small files, read on every sync.
+        // An index stamped by an older engine has no snapshot: record one.
+        {
+          const tConfig = Date.now();
+          const stored = this.queries.getMetadata(MODULE_CONFIG_METADATA_KEY);
+          const snapshot = this.resolver.getModuleConfigSnapshot(stored);
+          const was = parseModuleConfigSnapshot(stored);
+          const changed = stored === null ? [] : Object.keys(snapshot).filter((rel) => (was[rel] ?? 'absent') !== snapshot[rel]);
+          if (changed.length > 0) {
+            this.resolver.resetModuleConfig();
+            let reopened = 0;
+            for (const language of moduleConfigLanguages(changed)) reopened += this.orchestrator.resurrectResolutionEdgesForLanguage(language);
+            refreshSynthesis = true;
+            this.queries.setMetadata('synthesis_pending', '1');
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+              console.error(`[phase-timing] sync-module-config: ${Date.now() - tConfig}ms (${changed.join(', ')} changed, ${reopened} refs re-opened)`);
+            }
+          }
+        }
+
         if (fullReconcile) {
           const tWorkspace = Date.now();
           const before = this.queries.getMetadata(WORKSPACE_METADATA_KEY);
@@ -1657,6 +1707,9 @@ export class CodeGraph {
         this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
 
         if (fullReconcile && result.filesChecked > 0) this.pendingFullReconcile = false;
+        // The config files this sync's resolution read join the snapshot, and
+        // a changed one is recorded as it is now (#2977).
+        this.stampModuleConfigSnapshotIfMoved();
         // The whole sync, as for indexAll: resolution and linking included (#2334).
         result.durationMs = Date.now() - startedAt;
         return result;
