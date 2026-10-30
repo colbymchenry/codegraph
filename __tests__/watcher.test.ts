@@ -978,6 +978,87 @@ describe('FileWatcher', () => {
 
       watcher.stop();
     });
+
+    // These run from a timer, with no caller to catch a throw: out of flush() it
+    // is an unhandled rejection, which ends the host's process.
+    describe('one that throws', () => {
+      const unhandled: unknown[] = [];
+      const recordUnhandled = (reason: unknown) => { unhandled.push(reason); };
+      const hostBug = () => { throw new Error('host bug'); };
+      const warned = (spy: { mock: { calls: unknown[][] } }, text: string) =>
+        spy.mock.calls.some((c) => typeof c[0] === 'string' && c[0].includes(text));
+
+      beforeEach(() => {
+        unhandled.length = 0;
+        process.on('unhandledRejection', recordUnhandled);
+      });
+
+      afterEach(() => {
+        process.off('unhandledRejection', recordUnhandled);
+      });
+
+      it('leaves a failed sync to its retry when onSyncError throws', async () => {
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const syncFn = vi.fn()
+          .mockRejectedValueOnce(new Error('disk full'))
+          .mockResolvedValue({ filesChanged: 1, durationMs: 1 });
+        const onSyncComplete = vi.fn();
+        const onSyncError = vi.fn(hostBug);
+        const watcher = newWatcher(syncFn, { debounceMs: 25, onSyncComplete, onSyncError });
+
+        watcher.start();
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/retry.ts');
+
+        await waitFor(() => onSyncComplete.mock.calls.length > 0, 8000, 10);
+        expect(onSyncError).toHaveBeenCalledTimes(1);
+        expect(syncFn).toHaveBeenCalledTimes(2);
+        expect(unhandled).toEqual([]);
+        expect(warned(warnSpy, 'onSyncError')).toBe(true);
+      });
+
+      it('still stops a degrading watcher when onDegraded throws', async () => {
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const syncFn = vi.fn().mockRejectedValue(new LockUnavailableError());
+        const onDegraded = vi.fn(hostBug);
+        const watcher = newWatcher(syncFn, { debounceMs: 25, onDegraded });
+
+        watcher.start();
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/long-lock.ts');
+
+        await waitFor(() => onDegraded.mock.calls.length > 0, 8000, 10);
+        await waitFor(() => !watcher.isActive(), 1000, 10);
+        const syncs = syncFn.mock.calls.length;
+        await new Promise((resolve) => setTimeout(resolve, 150));
+
+        expect(watcher.isDegraded()).toBe(true);
+        expect(syncFn).toHaveBeenCalledTimes(syncs); // stopped means no more retries
+        expect(onDegraded).toHaveBeenCalledTimes(1);
+        expect(unhandled).toEqual([]);
+        expect(warned(warnSpy, 'onDegraded')).toBe(true);
+      });
+
+      it('keeps a sync that worked a sync that worked when onSyncComplete throws', async () => {
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 1 });
+        const onSyncComplete = vi.fn(hostBug);
+        const onSyncError = vi.fn();
+        const watcher = newWatcher(syncFn, { debounceMs: 25, onSyncComplete, onSyncError });
+
+        watcher.start();
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/ok.ts');
+
+        await waitFor(() => onSyncComplete.mock.calls.length > 0, 8000, 10);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        expect(onSyncError).not.toHaveBeenCalled();
+        expect(syncFn).toHaveBeenCalledTimes(1);
+        expect(watcher.isActive()).toBe(true);
+        expect(warned(warnSpy, 'onSyncComplete')).toBe(true);
+      });
+    });
   });
 
   describe('CodeGraph integration', () => {
