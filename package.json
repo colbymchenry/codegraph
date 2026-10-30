@@ -1,11 +1,8 @@
 {
-  "name": "@colbymchenry/codegraph",
+  "name": "@malarinv/codegraph",
   "version": "1.6.2",
   "description": "Supercharge AI coding agents with semantic code intelligence — surgical context, fewer tool calls, faster answers. 100% local.",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/colbymchenry/codegraph.git"
-  },
+  "repository": "https://github.com/malarinv/codegraph.git",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
@@ -64,5 +61,10 @@
   },
   "engines": {
     "node": ">=20.0.0 <25.0.0"
+  },
+  "homepage": "https://github.com/malarinv/codegraph",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "public"
   }
 }
