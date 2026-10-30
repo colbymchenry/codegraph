@@ -1,0 +1,82 @@
+--- a/grammar.js
++++ b/grammar.js
+@@ -153,6 +153,7 @@
+       $.while_statement,
+       $.if_statement,
+       $.case_statement,
++      $.coproc_statement,
+       $.pipeline,
+       $.list,
+       $.compound_statement,
+@@ -173,6 +174,7 @@
+       $.while_statement,
+       $.if_statement,
+       $.case_statement,
++      $.coproc_statement,
+       $.list,
+       $.compound_statement,
+       $.function_definition,
+@@ -386,6 +388,19 @@
+       field('redirect', optional($._redirect)),
+     )),
+ 
++    // Compound coprocesses need their own body: treating `coproc NAME {` as
++    // command words lets the inner `}` close an enclosing function silently.
++    coproc_statement: $ => seq(
++      'coproc',
++      choice(
++        prec(1, seq(
++          optional(field('name', $.word)),
++          field('body', choice($.compound_statement, $.subshell)),
++        )),
++        field('body', $.command),
++      ),
++    ),
++
+     compound_statement: $ => choice(
+       seq(
+         '{',
+@@ -433,6 +448,9 @@
+         prec(1, $.variable_assignment),
+         $.test_command,
+         $.subshell,
++        // `! case ... esac` is a valid pipeline negation (bash(1) SHELL GRAMMAR);
++        // e.g. `elif ! case "$x" in ... esac; then`.
++        $.case_statement,
+       ),
+     ),
+ 
+@@ -529,7 +547,8 @@
+       field('descriptor', optional($.file_descriptor)),
+       choice(
+         seq(
+-          choice('<', '>', '>>', '&>', '&>>', '<&', '>&', '>|'),
++          // '<>' opens the destination for reading and writing (bash(1) REDIRECTION).
++          choice('<', '>', '>>', '&>', '&>>', '<&', '>&', '>|', '<>'),
+           field('destination', repeat1($._literal)),
+         ),
+         seq(
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -317,13 +317,20 @@
+                 if (lexer->get_column(lexer) == 0) {
+                     // an alternative is to check the starting column of the
+                     // heredoc body and track that statefully
+-                    while (iswspace(lexer->lookahead)) {
++                    while (iswspace(lexer->lookahead) && lexer->lookahead != '\n') {
+                         if (did_advance) {
+                             advance(lexer);
+                         } else {
+                             skip(lexer);
+                         }
+                     }
++                    // A whitespace-only line (a CRLF file's blank line is one)
++                    // ends like an empty line: the newline case looks for the
++                    // delimiter on the next line, where running the loop above
++                    // past the newline would swallow it.
++                    if (lexer->lookahead == '\n') {
++                        break;
++                    }
+                     if (end_type != SIMPLE_HEREDOC_BODY) {
+                         lexer->result_symbol = middle_type;
+                         if (scan_heredoc_end_identifier(heredoc, lexer)) {

@@ -607,5 +607,28 @@
       "files": "~3390",
       "question": "How does programs.git.enable produce the final git config file in the user's home directory? Trace the flow from the git program module to the home-files machinery that links generated files into place."
     }
+  ],
+  "Bash": [
+    {
+      "name": "bats-core",
+      "repo": "https://github.com/bats-core/bats-core",
+      "size": "Medium",
+      "files": "~383",
+      "question": "When `bats test/foo.bats` runs, how does each `@test` block get executed and its result reported? Trace the flow from the bats entrypoint through test-file preprocessing to the function that runs a single test and records whether it passed."
+    },
+    {
+      "name": "bash-it",
+      "repo": "https://github.com/Bash-it/bash-it",
+      "size": "Medium",
+      "files": "~495",
+      "question": "How does `bash-it enable plugin git` make the git plugin load in every new shell? Trace the flow from the bash-it command through the enable helpers to the code that sources enabled plugins at startup."
+    },
+    {
+      "name": "dokku",
+      "repo": "https://github.com/dokku/dokku",
+      "size": "Large",
+      "files": "~1813",
+      "question": "When code is pushed with `git push dokku main`, how does dokku's git plugin turn the push into a deploy? Trace the flow from the receive-app trigger through the git plugin's functions to the code that starts the app's build."
+    }
   ]
 }
