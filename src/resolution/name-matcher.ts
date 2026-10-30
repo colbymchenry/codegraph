@@ -2367,10 +2367,14 @@ function kotlinExtensionOnImportedType(ref: UnresolvedRef, context: ResolutionCo
   const binding = context.getImportMappings(ref.filePath, ref.language).find((m) => m.localName === call[1]);
   if (!binding) return null;
   const pkg = binding.source.slice(0, binding.source.lastIndexOf('.'));
-  const extensions = context.getNodesByQualifiedName(`${binding.exportedName}::${call[2]}`).filter((n) => {
-    if (n.kind !== 'method' || n.language !== 'kotlin' || !isKotlinTopLevelVisible(n, ref, context)) return false;
-    const scope = kotlinFileScope(n.filePath, context);
-    return scope.imports.has(binding.source) || scope.stars.has(pkg);
+  const extensions = context.getNodesByName(call[2]!).filter((n) => {
+    if (n.kind !== 'method' || n.language !== 'kotlin') return false;
+    // Each file may spell the same imported receiver with a different alias.
+    const receiver = n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf('::'));
+    const declared = context.getImportMappings(n.filePath, 'kotlin').find((m) => m.localName === receiver);
+    const sameType = declared ? declared.source === binding.source
+      : receiver === binding.exportedName && kotlinFileScope(n.filePath, context).stars.has(pkg);
+    return sameType && isKotlinTopLevelVisible(n, ref, context);
   });
   const chosen = extensions.length > 1 ? extensions.filter((n) => n.filePath === ref.filePath) : extensions;
   return chosen.length === 1 ? { original: ref, targetNodeId: chosen[0]!.id, confidence: 0.9, resolvedBy: 'qualified-name' } : null;
