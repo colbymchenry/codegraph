@@ -4149,9 +4149,14 @@ export class TreeSitterExtractor {
 
           // A member of a `const ( … )` or `var ( … )` group has its own doc
           // comment beside it in the parentheses; one without keeps the group's.
+          // Exported by its own name's case, read from the spec: the
+          // declaration around it has no name, so `var Hook = …` and
+          // `const Limit = 3` read as unexported and `a.Hook()` from another
+          // package linked to nothing.
           varNode = this.createNode(node.type === 'const_declaration' ? 'constant' : 'variable', name, spec, {
             docstring: this.docstringFor(spec) ?? docstring,
             signature: initSignature,
+            isExported: this.extractor.isExported?.(spec, this.source),
           });
         }
         // Walk the initializer so composite literals and calls in a

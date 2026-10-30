@@ -216,8 +216,10 @@ export const goExtractor: LanguageExtractor = {
   },
   isExported: (node, source) => {
     // Go: a symbol is exported when its identifier starts with an uppercase letter.
-    // Look at the `name` field directly (works for function_declaration,
-    // method_declaration, type_spec, and var_spec / const_spec via extractor flow).
+    // Look at the `name` field directly: function_declaration,
+    // method_declaration, type_spec, and a var_spec / const_spec, whose first
+    // name is the one the extractor gives a node (never the declaration
+    // around a spec, which has no name).
     const nameNode = getChildByField(node, 'name');
     if (nameNode) {
       const text = getNodeText(nameNode, source);

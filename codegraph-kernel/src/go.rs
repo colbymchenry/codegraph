@@ -341,7 +341,8 @@ impl<'t> Walker<'t> {
         Some(sig)
     }
 
-    /// goExtractor.isExported: uppercase first letter of the name field.
+    /// goExtractor.isExported: uppercase first letter of the name field (a
+    /// var_spec / const_spec's first name included).
     fn is_exported(&self, node: Node) -> bool {
         if let Some(name_node) = node.child_by_field_name("name") {
             let text = self.text(name_node);
@@ -722,11 +723,14 @@ impl<'t> Walker<'t> {
                     // own doc comment beside it in the parentheses; one without
                     // keeps the group's.
                     let doc = self.docstring_of(spec).or_else(|| docstring.clone());
+                    // Exported by its own name's case, read from the spec (the
+                    // declaration around it has no name).
+                    let is_exported = Some(self.is_exported(spec));
                     var_row = self.create_node(
                         if is_const_decl { "constant" } else { "variable" },
                         &name,
                         spec,
-                        Extra { docstring: doc, signature, ..Extra::default() },
+                        Extra { docstring: doc, signature, is_exported, ..Extra::default() },
                     );
                 }
             }
