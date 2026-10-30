@@ -583,6 +583,38 @@ async function arkuiStateBuildEdges(queries: QueryBuilder, ctx: ResolutionContex
   return edges;
 }
 
+/**
+ * Cangjie FFI: a `foreign func CJ_TLS_SslHandshake(…)` declares a C function
+ * the Cangjie side calls through `unsafe { … }`. Calls resolve to that
+ * declaration, which has no body — the flow continues in the C function of the
+ * same name (`int CJ_TLS_SslHandshake(…) { … }`), which nothing linked. Bridge
+ * each foreign declaration to the C/C++ definitions bearing its exact name:
+ * the C ABI has no overloading or namespaces, so the name IS the symbol.
+ * Definitions in source files win over prototypes in headers; a name defined
+ * per platform (`_unix.c` / `_windows.c`) links each, capped.
+ */
+const CANGJIE_FFI_MAX_TARGETS = 4;
+
+async function cangjieForeignEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+  let scanned = 0;
+  const edges: Edge[] = [];
+  for (const decl of queries.iterateNodesByKindIn('function', ['cangjie'])) {
+    if ((++scanned & 255) === 0) await onYield();
+    if (!(decl.decorators ?? []).includes('foreign')) continue;
+    const natives = queries.getNodesByName(decl.name)
+      .filter((n) => (n.language === 'c' || n.language === 'cpp') && n.kind === 'function');
+    const defined = natives.filter((n) => !/\.(?:h|hh|hpp|hxx)$/i.test(n.filePath));
+    for (const target of (defined.length > 0 ? defined : natives).slice(0, CANGJIE_FFI_MAX_TARGETS)) {
+      edges.push({
+        source: decl.id, target: target.id, kind: 'calls', line: decl.startLine,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'cangjie-ffi', via: decl.name, registeredAt: `${decl.filePath}:${decl.startLine}` },
+      });
+    }
+  }
+  return edges;
+}
+
 /** Emit/subscribe call sites of HarmonyOS's `@ohos.events.emitter` bus. */
 const ARKUI_EMITTER_CALL_RE = /\bemitter\s*\.\s*(emit|on|once)\s*\(\s*([A-Za-z_$][\w$.]*|\{[^)]{0,120}?\beventId\s*:\s*[^,}]+[^)]*?\})/g;
 
@@ -854,7 +886,7 @@ async function cppOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, o
 // is often in a `.ts` file, or the other way round.
 const IFACE_OVERRIDE_LANGS = new Set([
   'java', 'kotlin', 'csharp', 'typescript', 'tsx', 'javascript', 'jsx', 'swift', 'scala', 'go', 'rust',
-  'arkts',
+  'arkts', 'cangjie',
 ]);
 /**
  * Languages whose static and instance methods override only their own kind:
@@ -5159,12 +5191,13 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'pascalEdges', gate: ALWAYS, run: (_q, c, y) => pascalFormEdges(c, y) },
   { name: 'flutterEdges', gate: (has) => has('dart'), run: (q, c, y) => flutterBuildEdges(q, c, y) },
   { name: 'arkuiStateEdges', gate: (has) => has('arkts'), run: (q, c, y) => arkuiStateBuildEdges(q, c, y) },
+  { name: 'cangjieFfiEdges', gate: (has) => has('cangjie') && has('c', 'cpp'), run: (q, _c, y) => cangjieForeignEdges(q, y) },
   { name: 'arkuiEmitter', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiEmitterEdges(c, y) },
   { name: 'arkuiRoutes', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiRouterEdges(c, y) },
   { name: 'cppEdges', gate: (has) => has('cpp'), run: (q, c, y) => cppOverrideEdges(q, c, y) },
   {
     name: 'ifaceEdges',
-    gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
+    gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', 'cangjie', ...JS_FAMILY),
     run: (q, c, y) => interfaceOverrideEdges(q, c, y),
   },
   { name: 'kotlinExpectActual', gate: (has) => has('kotlin'), run: (q, _c, y) => kotlinExpectActualEdges(q, y) },

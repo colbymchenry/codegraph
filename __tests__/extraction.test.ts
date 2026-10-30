@@ -14,6 +14,7 @@ import { extractFromSource, scanDirectory, scanDirectoryAsync, buildDefaultIgnor
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile, shopifyThemeRoot } from '../src/extraction/grammars';
 import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
+import { cangjieExtractor } from '../src/extraction/languages/cangjie';
 import { generateNodeId } from '../src/extraction/tree-sitter-helpers';
 
 beforeAll(async () => {
@@ -220,6 +221,12 @@ describe('Language Detection', () => {
     expect(detectLanguage('default.nix')).toBe('nix');
     expect(detectLanguage('pkgs/development/tools/misc/codegraph/default.nix')).toBe('nix');
     expect(isSourceFile('default.nix')).toBe(true);
+  });
+
+  it('should detect Cangjie files', () => {
+    expect(detectLanguage('src/main.cj')).toBe('cangjie');
+    expect(detectLanguage('entry/src/main/cangjie/src/index.cj')).toBe('cangjie');
+    expect(isSourceFile('src/main.cj')).toBe(true);
   });
 
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
@@ -14496,5 +14503,320 @@ describe('C++ COM interface declarations (#1519)', () => {
     const expected = source.replace('interface IDerived', 'struct    IDerived').replace('interface IStandalone', 'struct    IStandalone');
     expect(cppExtractor.preParse!(source, 'com.hpp')).toBe(expected);
     expect(Buffer.byteLength(expected)).toBe(Buffer.byteLength(source));
+  });
+});
+
+describe('Cangjie Extraction', () => {
+  const calls = (result: ReturnType<typeof extractFromSource>) =>
+    result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+
+  it('extracts declarations under the package namespace', () => {
+    const code = `package demo.app
+
+/** A shape. */
+public interface Shape {
+    func area(): Float64
+}
+
+public open class Animal {
+    protected var name: String
+    public init(name: String) {
+        this.name = name
+    }
+    public open func speak(): String {
+        return "..."
+    }
+}
+
+public class Dog <: Animal & Shape {
+    public prop size: Int64 {
+        get() { compute() }
+    }
+    public func area(): Float64 { 1.0 }
+}
+
+struct Point <: ToString {
+    let x: Int64
+    public func toString(): String { "p" }
+}
+
+enum Color {
+    | Red | Green | Blue(Int64)
+    func label(): String { "c" }
+}
+
+type Name = String
+
+let GLOBAL: Int64 = 10
+var counter = 0
+
+func helper(a: Int64, b: Int64): Int64 {
+    a + b
+}
+
+main(): Int64 {
+    return 0
+}
+`;
+    const result = extractFromSource('src/app.cj', code);
+    const find = (kind: string, name: string) => result.nodes.find((n) => n.kind === kind && n.name === name);
+
+    expect(find('namespace', 'demo.app')).toBeDefined();
+    const shape = find('interface', 'Shape');
+    expect(shape?.qualifiedName).toBe('demo.app::Shape');
+    expect(shape?.docstring).toBe('A shape.');
+    expect(find('method', 'area')?.qualifiedName).toBe('demo.app::Shape::area');
+    expect(find('class', 'Animal')?.visibility).toBe('public');
+    expect(find('field', 'name')?.qualifiedName).toBe('demo.app::Animal::name');
+    expect(find('method', 'init')?.signature).toBe('(name: String)');
+    expect(find('method', 'speak')?.signature).toBe('(): String');
+    expect(find('property', 'size')?.qualifiedName).toBe('demo.app::Dog::size');
+    expect(find('struct', 'Point')).toBeDefined();
+    expect(find('enum', 'Color')).toBeDefined();
+    expect(result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name)).toEqual(['Red', 'Green', 'Blue']);
+    expect(find('type_alias', 'Name')).toBeDefined();
+    expect(find('constant', 'GLOBAL')?.signature).toBe('Int64');
+    expect(find('variable', 'counter')).toBeDefined();
+    expect(find('function', 'helper')?.signature).toBe('(a: Int64, b: Int64): Int64');
+    expect(find('function', 'main')).toBeDefined();
+
+    // `<:` lists: a class extends (the resolver turns class→interface into
+    // implements); a struct or enum can only implement.
+    const supers = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'extends' || r.referenceKind === 'implements')
+      .map((r) => `${r.referenceKind}:${r.referenceName}`);
+    expect(supers).toEqual(expect.arrayContaining(['extends:Animal', 'extends:Shape', 'implements:ToString']));
+
+    // The property's getter is the property's own code.
+    const size = find('property', 'size')!;
+    expect(result.unresolvedReferences.find((r) => r.referenceName === 'compute')?.fromNodeId).toBe(size.id);
+  });
+
+  it('names calls the way dotted languages do', () => {
+    const code = `package demo.calls
+
+class Svc <: Base {
+    var repo: Repo = Repo()
+    init() {
+        super()
+    }
+    func run(): Unit {
+        this.helper()
+        repo.save(1)
+        this.repo.save(2)
+        getRepo().save(3)
+        a.b.c.deep(4)
+        Factory.make().build()
+        items.forEach { x => println(x) }
+        work(1) { x => x }
+        let s = "null".toArray()
+    }
+}
+`;
+    const result = extractFromSource('src/svc.cj', code);
+    const names = calls(result);
+    expect(names).toEqual(expect.arrayContaining([
+      'Repo', 'helper', 'repo.save', 'getRepo', 'getRepo().save', 'deep',
+      'Factory.make', 'Factory.make().build', 'items.forEach', 'println', 'work',
+    ]));
+    // Constructor delegation, a deep chain's receiver, and a builtin of a
+    // string literal are not calls of anything in the graph.
+    expect(names).not.toContain('super');
+    expect(names).not.toContain('a.b.c.deep');
+    expect(names.some((n) => n.endsWith('toArray'))).toBe(false);
+    // `work(1) { … }` is one call, not two.
+    expect(names.filter((n) => n === 'work')).toHaveLength(1);
+    // A field initializer's call belongs to the field.
+    const repo = result.nodes.find((n) => n.kind === 'field' && n.name === 'repo')!;
+    expect(result.unresolvedReferences.find((r) => r.referenceName === 'Repo')?.fromNodeId).toBe(repo.id);
+  });
+
+  it('names a backtick-escaped identifier by the bare word', () => {
+    const code = `package demo.esc
+
+class Meta {
+    public func \`handle\`(ctx: Int64): Unit {}
+    let \`type\`: String = ""
+}
+
+enum Kind {
+    | \`func\` | Plain
+}
+
+func run(m: Meta): Unit {
+    m.\`handle\`(1)
+}
+`;
+    const result = extractFromSource('src/esc.cj', code);
+    expect(result.nodes.find((n) => n.kind === 'method')?.name).toBe('handle');
+    expect(result.nodes.find((n) => n.kind === 'field')?.name).toBe('type');
+    expect(result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name)).toEqual(['func', 'Plain']);
+    expect(calls(result)).toContain('m.handle');
+  });
+
+  it('extracts every import form as an FQN', () => {
+    const code = `package demo.app
+
+import std.collection.*
+import std.io.{InputStream, OutputStream}
+import demo.util.Logger as Log
+internal import fountain::f_base.Strings
+`;
+    const result = extractFromSource('src/imports.cj', code);
+    const imports = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+    expect(imports).toEqual([
+      'std.collection', 'std.io.InputStream', 'std.io.OutputStream', 'demo.util.Logger', 'fountain.f_base.Strings',
+    ]);
+  });
+
+  it('joins extend members to a same-file type and gives the rest an extension node', () => {
+    const code = `package demo.ext
+
+struct Point {
+    let x: Int64
+}
+
+extend Point <: Printable {
+    func show(): String { "p" }
+}
+
+extend String <: Countable {
+    func shout(): String { this }
+}
+`;
+    const result = extractFromSource('src/ext.cj', code);
+    const show = result.nodes.find((n) => n.name === 'show');
+    expect(show?.kind).toBe('method');
+    expect(show?.qualifiedName).toBe('demo.ext::Point::show');
+    const point = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Point')!;
+    expect(result.unresolvedReferences.find((r) => r.referenceName === 'Printable')).toMatchObject({
+      fromNodeId: point.id,
+      referenceKind: 'implements',
+    });
+    // `String` is declared elsewhere (here: a builtin): an extension node,
+    // marked `extend`, holds the member and the conformance.
+    const ext = result.nodes.find((n) => n.kind === 'class' && n.name === 'String');
+    expect(ext?.decorators).toEqual(['extend']);
+    expect(result.nodes.find((n) => n.name === 'shout')?.qualifiedName).toBe('demo.ext::String::shout');
+    expect(result.unresolvedReferences.find((r) => r.referenceName === 'Countable')).toMatchObject({
+      fromNodeId: ext!.id,
+      referenceKind: 'implements',
+    });
+  });
+
+
+  it('keeps consecutive one-line annotated members and multi-line grouped imports', () => {
+    const code = `package demo.many
+
+import demo.svc.{
+    Alpha, // first
+    beta as b,
+}
+
+class Page {
+    /** Doc a. */
+    @Test func a(): Unit {
+    }
+
+    @Test func b(): Unit {
+    }
+    @Test public func c(): Unit {
+    }
+}
+`;
+    const pre = cangjieExtractor.preParse!(code);
+    expect(pre.length).toBe(code.length);
+    expect(pre.split('\n').length).toBe(code.split('\n').length);
+
+    const result = extractFromSource('src/many.cj', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method');
+    expect(methods.map((n) => [n.name, n.startLine, n.decorators])).toEqual([
+      ['a', 10, ['Test']],
+      ['b', 13, ['Test']],
+      ['c', 15, ['Test']],
+    ]);
+    expect(methods[0]!.docstring).toBe('Doc a.');
+    const imports = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+    expect(imports).toEqual(['demo.svc.Alpha', 'demo.svc.beta']);
+  });
+
+  it('marks foreign declarations', () => {
+    const code = `package demo.ffi
+
+foreign func CJ_A(x: Int32): Int32
+
+foreign {
+    func CJ_B(): Unit
+}
+
+func use(): Int32 {
+    unsafe { CJ_A(1) }
+}
+`;
+    const result = extractFromSource('src/ffi.cj', code);
+    const fn = (name: string) => result.nodes.find((n) => n.name === name);
+    expect(fn('CJ_A')?.decorators).toEqual(['foreign']);
+    expect(fn('CJ_B')?.decorators).toEqual(['foreign']);
+    expect(fn('use')?.decorators).toBeUndefined();
+    expect(calls(result)).toContain('CJ_A');
+  });
+
+  it('parses single-quoted raw strings', () => {
+    const code = "package demo.raw\n\nfunc f(): Unit {\n    let r = Regex(#'fountain\\((\\d+\\.)+\\d+\\)'#)\n    g()\n}\n\nfunc g(): Unit {}\n";
+    const result = extractFromSource('src/raw.cj', code);
+    expect(result.errors).toEqual([]);
+    expect(result.nodes.filter((n) => n.kind === 'function').map((n) => n.name)).toEqual(['f', 'g']);
+    expect(calls(result)).toEqual(expect.arrayContaining(['Regex', 'g']));
+  });
+
+  it('parses what the grammar rejects through an offset-preserving preParse', () => {
+    const code = `/* outer /* nested */ still a comment */
+package fountain::f_http.exception
+
+public interface Named {
+    /** The name. */
+    prop name: String
+    mut prop level: ?Array<Int64>
+    static prop Z: Float16
+    func f(): Unit
+}
+
+@Deprecated[message: "Use \`g\` instead."]
+public func old(): Unit {
+    let n = 0_i32
+    helper(2)
+}
+
+func helper(x: Int64): Int64 { x }
+
+func chain(b: Builder): Unit {
+    b.first()
+        .second(1)
+        // a note between the links
+        .third()
+}
+`;
+    const pre = cangjieExtractor.preParse!(code);
+    expect(pre.length).toBe(code.length);
+    expect(pre.split('\n').length).toBe(code.split('\n').length);
+    // Running it again rewrites nothing.
+    expect(cangjieExtractor.preParse!(pre)).toBe(pre);
+
+    const result = extractFromSource('src/named.cj', code);
+    expect(result.errors).toEqual([]);
+    expect(result.nodes.find((n) => n.kind === 'namespace')?.name).toBe('fountain.f_http.exception');
+    const props = result.nodes.filter((n) => n.kind === 'property').map((n) => [n.name, n.signature]);
+    expect(props).toEqual([['name', 'String'], ['level', '?Array<Int64>'], ['Z', 'Float16']]);
+    expect(result.nodes.find((n) => n.name === 'name')?.docstring).toBe('The name.');
+    expect(result.nodes.find((n) => n.kind === 'method' && n.name === 'f')).toBeDefined();
+    const old = result.nodes.find((n) => n.kind === 'function' && n.name === 'old');
+    expect(old?.startLine).toBe(13);
+    expect(old?.decorators).toEqual(['Deprecated']);
+    expect(calls(result)).toContain('helper');
+    // The chain survives its line breaks: every link is a call on `b`.
+    const chainCalls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls' && r.fromNodeId === result.nodes.find((n) => n.name === 'chain')!.id)
+      .map((r) => [r.referenceName, r.line]);
+    expect(chainCalls).toEqual([['b.first', 21], ['second', 22], ['third', 24]]);
   });
 });

@@ -10,6 +10,7 @@ import {
   Language,
   Node,
   Edge,
+  EdgeKind,
   NodeKind,
   ExtractionResult,
   ExtractionError,
@@ -28,6 +29,7 @@ import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
 import { cfmlConstructedComponent, cfmlCreatedComponent, isCfIncludeCall } from './languages/cfscript';
+import { cangjieCallees, cangjieSupertypes, isInnerPostfix } from './languages/cangjie';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -5352,6 +5354,23 @@ export class TreeSitterExtractor {
       }
     }
 
+    // Cangjie: postfix expressions nest, so the outermost node names every
+    // call in its chain (`getRepo().save(3)`) and an inner one is skipped;
+    // see cangjieCallees.
+    if (this.language === 'cangjie') {
+      if (isInnerPostfix(node)) return;
+      for (const callee of cangjieCallees(node, this.source)) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: callee.name,
+          referenceKind: 'calls',
+          line: callee.node.startPosition.row + 1,
+          column: callee.node.startPosition.column,
+        });
+      }
+      return;
+    }
+
     // VB.NET: `foo(args)` is syntactically ambiguous between a call and an
     // index read, so the grammar parses non-empty parens as
     // array_access_expression (field `array`, not `function`) — even Roslyn
@@ -7842,6 +7861,25 @@ export class TreeSitterExtractor {
    * Extract inheritance relationships
    */
   private extractInheritance(node: SyntaxNode, classId: string): void {
+    // Cangjie `class Dog <: Animal & Shape` — one `<:` list for superclass and
+    // interfaces alike; emit `extends` and let the interface-impl pass
+    // reclassify a class→interface edge as `implements` (as for Solidity).
+    // A struct/enum can only implement.
+    if (this.language === 'cangjie') {
+      const kind: EdgeKind =
+        node.type === 'structDefinition' || node.type === 'enumDefinition' ? 'implements' : 'extends';
+      for (const sup of cangjieSupertypes(node, this.source)) {
+        this.unresolvedReferences.push({
+          fromNodeId: classId,
+          referenceName: sup.name,
+          referenceKind: kind,
+          line: sup.node.startPosition.row + 1,
+          column: sup.node.startPosition.column,
+        });
+      }
+      return;
+    }
+
     // Objective-C @interface MyClass : NSObject <ProtoA, ProtoB>
     if (node.type === 'class_interface') {
       const superclass = getChildByField(node, 'superclass');
