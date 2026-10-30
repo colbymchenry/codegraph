@@ -12,6 +12,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **Cangjie** (仓颉, `.cj`), the HarmonyOS application language: functions, classes, structs, interfaces, enums, `extend` blocks, properties, fields and type aliases, with call, import and inheritance edges. Imports resolve through each file's `package` (organization-qualified `org::pkg` names included), and a call through an interface reaches every class that implements it, so `codegraph_explore` can follow a Cangjie flow end to end.
+- A Cangjie `foreign func` now links to the C function that implements it, so a flow that goes through FFI (for example a TLS handshake into its native code) can be followed from the Cangjie call all the way into C.
+
 ### Security
 
 - CodeGraph's refusal to use a sensitive folder such as `~/.ssh`, `~/.config`, `/etc` or `C:\Windows` as a project can no longer be sidestepped: a link or junction that leads to one, a differently capitalized name on Windows and macOS, a `\\?\` spelling on Windows, and a path to a missing folder inside one are now refused like the folder itself. Before, any of these let an AI agent's query read the files inside. Thanks @mixxer for finding it.
