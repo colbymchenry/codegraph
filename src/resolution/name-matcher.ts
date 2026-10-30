@@ -410,10 +410,31 @@ function pythonRefClass(name: string, ref: UnresolvedRef, context: ResolutionCon
   return classes.length === 1 ? classes[0]! : null;
 }
 
+/**
+ * A Python class's base list as written, up to its closing parenthesis, which
+ * may be lines below the `class` line: black and ruff wrap a long list one base
+ * per line. Comments in it are left out. Undefined for a class without one.
+ */
+function pythonBaseList(cls: Node, context: ResolutionContext): string | undefined {
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  const head = /^\s*class\s+\w+\s*\(/.exec(lines[cls.startLine - 1] ?? '');
+  if (!head) return undefined;
+  let list = '';
+  let depth = 1;
+  for (let i = cls.startLine - 1; i < Math.max(cls.endLine, cls.startLine); i++) {
+    const text = (i === cls.startLine - 1 ? lines[i]!.slice(head[0].length) : lines[i] ?? '').replace(/#.*$/, '');
+    for (const ch of text) {
+      if (ch === '(') depth++;
+      else if (ch === ')' && --depth === 0) return list;
+      list += ch;
+    }
+    list += ' ';
+  }
+  return undefined;
+}
+
 function pythonBases(cls: Node, ref: UnresolvedRef, context: ResolutionContext): Node[] {
-  const line = context.getFileLines?.(cls.filePath)?.[cls.startLine - 1]
-    ?? context.readFile(cls.filePath)?.split('\n')[cls.startLine - 1] ?? '';
-  let bases = line.match(/^\s*class\s+\w+\s*\(([^)]*)\)/)?.[1];
+  let bases = pythonBaseList(cls, context);
   // A parameterized base, `Base[str]` or `Pair[str, Dict[str, int]]`, names its class before the brackets.
   while (bases && /\[[^[\]]*\]/.test(bases)) bases = bases.replace(/\[[^[\]]*\]/g, '');
   return (bases?.split(',') ?? []).flatMap(name => {
@@ -21517,8 +21538,10 @@ function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[]
     // BaseManager.from_queryset(QuerySet))` — subclasses that class: the
     // qualifier is the supertype, not the method called on it.
     // A parameterized base, `Base[User]`, is `Base`: its type arguments are no supertypes.
+    // The list is read whole, as `pythonBases` reads it: black and ruff wrap a
+    // long one past the three lines `head` holds.
     case 'python': {
-      let bases = /\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1];
+      let bases = pythonBaseList(cls, context);
       while (bases && /\[[^[\]]*\]/.test(bases)) bases = bases.replace(/\[[^[\]]*\]/g, '');
       return names(bases?.replace(/\w+\s*=\s*[\w.]+/g, '').replace(/([A-Za-z_][\w.]*)\.\w+\s*\(/g, '$1 ('));
     }
