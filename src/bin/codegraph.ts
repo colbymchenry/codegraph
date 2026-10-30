@@ -76,6 +76,7 @@ import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
 import { goPackageReaderFor } from '../graph/go-package';
 import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
+import { registerScipCommands } from '../scip/cli';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -3070,6 +3071,9 @@ program
   .action(() => {
     console.log(packageJson.version);
   });
+
+// `codegraph scip …` (src/scip/cli.ts)
+registerScipCommands(program, { resolveProjectPath, isInitialized, loadCodeGraph, success, info, warn, error });
 
 // Parse and run
 program.parse();

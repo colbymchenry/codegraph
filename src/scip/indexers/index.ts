@@ -1,0 +1,163 @@
+/**
+ * SCIP indexer adapters: which projects each covers, and the command that
+ * produces its index. Optional overrides come from the `scip` block of the
+ * project's `codegraph.json`:
+ *
+ *   "scip": {
+ *     "typescript": { "cmd": "npx", "args": ["-y", "@sourcegraph/scip-typescript", "{args}"] }
+ *   }
+ *
+ * `false` disables a language; `cmd` / `args` / `env` replace the defaults.
+ * In args, an element `{args}` splices in the adapter's own arguments and
+ * `{out}` is the output path. Indexers are never auto-installed: a command
+ * that isn't on PATH is reported and skipped.
+ */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { PROJECT_CONFIG_FILENAME } from '../../project-config';
+import type { ScipLanguage } from '../store';
+import { typescriptIndexer } from './typescript';
+
+/** One indexer process: its arguments and the file it writes. */
+export interface IndexerRun {
+  /** what this run covers, for logs and warnings (`src`, `extensions/git`, …) */
+  label: string;
+  args: string[];
+  output: string;
+  /** added to the invocation's env for this run (e.g. a smaller heap for a light batch) */
+  env?: Record<string, string>;
+  /** light enough to run alongside other light runs; heavy runs always run alone */
+  light?: boolean;
+  /** runs to try instead when this one fails (a batch retried one project at a time) */
+  fallback?: IndexerRun[];
+}
+
+/**
+ * How to index one project. Usually a single run; an adapter may split a large
+ * repo into several — heavy parts alone, light parts batched and in parallel —
+ * so peak memory is bounded by the largest part. The outputs are combined into
+ * one index (see compact.ts).
+ */
+interface Invocation {
+  runs: IndexerRun[];
+  /** something the user should know about the result's quality (shown, never fatal) */
+  warning?: string;
+}
+
+/** Everything the SCIP pass knows about one language — the single place to add or change one. */
+export interface IndexerSpec {
+  lang: ScipLanguage;
+  /** `ToolInfo.name` in the indexes this language's indexers write (tells `scip import` the language) */
+  tools: readonly string[];
+  /** codegraph `files.language` values the index covers (the hash-gate snapshot) */
+  codegraphLanguages: readonly string[];
+  /** true when the project has this language's marker files */
+  detect(projectRoot: string): boolean;
+  cmd: string;
+  /** Runs writing `outFile` (or parts of it next to `outFile`). */
+  invocation(projectRoot: string, outFile: string): Invocation;
+}
+
+interface IndexerOverride {
+  cmd?: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+export const INDEXERS: Record<ScipLanguage, IndexerSpec> = {
+  typescript: typescriptIndexer,
+};
+
+/** The language an index covers, from the tool that wrote it. */
+export function languageOfTool(tool: string): ScipLanguage | undefined {
+  return Object.values(INDEXERS).find(s => s.tools.includes(tool))?.lang;
+}
+
+type ScipConfig = Partial<Record<ScipLanguage, IndexerOverride | false>>;
+
+/** The `scip` block, or an error string. No config file at all means no overrides. */
+function readScipConfig(projectRoot: string): ScipConfig | string {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(projectRoot, PROJECT_CONFIG_FILENAME), 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    return `can't read ${PROJECT_CONFIG_FILENAME}: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return `${PROJECT_CONFIG_FILENAME} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  const scip = (parsed as { scip?: unknown } | null)?.scip;
+  if (scip === undefined) return {};
+  if (typeof scip !== 'object' || scip === null || Array.isArray(scip)) return `${PROJECT_CONFIG_FILENAME} "scip" must be an object`;
+  return scip as ScipConfig;
+}
+
+const isStringRecord = (v: unknown): v is Record<string, string> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) && Object.values(v).every(x => typeof x === 'string');
+
+export interface ResolvedIndexer {
+  cmd: string;
+  runs: IndexerRun[];
+  warning?: string;
+}
+
+/**
+ * The indexer to run for `lang` in this project, or a reason it won't run.
+ * Config overrides are validated here — a malformed entry is an error, not a silent default.
+ */
+export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile: string): ResolvedIndexer | { skip: string } {
+  const spec = INDEXERS[lang];
+  const config = readScipConfig(projectRoot);
+  if (typeof config === 'string') return { skip: config };
+  const override = config[lang];
+  const at = `${PROJECT_CONFIG_FILENAME} scip.${lang}`;
+  if (override === false) return { skip: `disabled in ${PROJECT_CONFIG_FILENAME}` };
+  if (override !== undefined && (typeof override !== 'object' || override === null || Array.isArray(override))) {
+    return { skip: `${at} must be false or an object` };
+  }
+  if (override?.cmd !== undefined && (typeof override.cmd !== 'string' || override.cmd === '')) {
+    return { skip: `${at}.cmd must be a non-empty string` };
+  }
+  if (override?.args !== undefined && (!Array.isArray(override.args) || !override.args.every(a => typeof a === 'string'))) {
+    return { skip: `${at}.args must be an array of strings` };
+  }
+  if (override?.env !== undefined && !isStringRecord(override.env)) {
+    return { skip: `${at}.env must be an object of string values` };
+  }
+  if (!spec.detect(projectRoot)) return { skip: `no ${lang} project markers found` };
+  const cmd = override?.cmd ?? spec.cmd;
+  if (!onPath(cmd)) {
+    return { skip: `\`${cmd}\` not found on PATH — install it or set scip.${lang}.cmd in ${PROJECT_CONFIG_FILENAME}` };
+  }
+  // The adapter's environment (e.g. a heap size) and its split into runs
+  // apply even when the args are overridden: `{args}` / `{out}` are per run.
+  const inv = spec.invocation(projectRoot, outFile);
+  const apply = (run: IndexerRun): IndexerRun => ({
+    ...run,
+    args: override?.args
+      ? override.args.flatMap(a => (a === '{args}' ? run.args : [a.split('{out}').join(run.output)]))
+      : run.args,
+    env: { ...run.env, ...override?.env }, // the user's env wins over the adapter's
+    fallback: run.fallback?.map(apply),
+  });
+  return { cmd, runs: inv.runs.map(apply), warning: inv.warning };
+}
+
+export function onPath(cmd: string): boolean {
+  const exts = process.platform === 'win32' ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';') : [''];
+  const isExec = (p: string) => {
+    try {
+      fs.accessSync(p, fs.constants.X_OK);
+      return fs.statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (cmd.includes('/') || cmd.includes('\\')) return isExec(cmd);
+  return (process.env.PATH ?? '').split(path.delimiter).some(dir => dir && exts.some(e => isExec(path.join(dir, cmd + e))));
+}

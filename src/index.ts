@@ -72,6 +72,8 @@ import { createYielder } from './resolution/cooperative-yield';
 import { ESM_IMPORT_LANGUAGES } from './resolution/import-resolver';
 import { moduleConfigLanguages, parseModuleConfigSnapshot } from './resolution';
 import { minRefsForPool } from './resolution/resolver-pool';
+import { mergeRebuiltGraph, onSynced } from './scip';
+import type { SqliteDatabase } from './db/sqlite-adapter';
 
 // Re-export types for consumers
 export * from './types';
@@ -657,6 +659,7 @@ export class CodeGraph {
       try {
         const gitState = this.orchestrator.beginGitIndexState(true);
         const before = this.queries.getNodeAndEdgeCount();
+        let scipMergeDue = false; // set once resolution ran; merged after maintenance (below)
         // Mark the index as in-flight BEFORE any writes: a run killed
         // mid-index (OOM, SIGKILL, the #850 liveness watchdog) leaves this
         // marker behind, so `codegraph status` can tell a truncated index
@@ -800,6 +803,7 @@ export class CodeGraph {
           const tDeferred = Date.now();
           await this.resolver.resolveDeferredThisMemberRefs();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] deferredThisMember: ${Date.now() - tDeferred}ms`);
+          scipMergeDue = true;
         }
 
         // Over an existing graph the vocabulary was kept (see the top of the
@@ -824,6 +828,13 @@ export class CodeGraph {
           if (walValve) { walValve.stop(); await walValve.drain(); }
           await this.db.runMaintenance();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] maintenance: ${Date.now() - tMaint}ms`);
+        }
+
+        // SCIP: after the maintenance above, never before — its ANALYZE gives
+        // the planner statistics, and a fresh graph has none: without them the
+        // merge's per-file queries planned badly (Playwright: >2 min instead of 6 s).
+        if (scipMergeDue) {
+          await this.scipHook(() => mergeRebuiltGraph(this.db.getDb(), this.db.getPath(), this.projectRoot));
         }
 
         // The orchestrator only sees extraction-phase counts; resolution and
@@ -1735,6 +1746,11 @@ export class CodeGraph {
           this.queries.setMetadata('synthesis_pending', '0');
         }
 
+        if (result.changedFilePaths) {
+          const changed = result.changedFilePaths;
+          await this.scipHook(() => onSynced(this.db.getDb(), this.db.getPath(), this.projectRoot, changed));
+        }
+
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         // Off-thread — see indexAll's call site.
         if (filesChanged || result.filesRemoved > 0 || orphanCount > 0 || refreshSynthesis) {
@@ -1854,6 +1870,45 @@ export class CodeGraph {
     if (this.watcher) {
       this.watcher.stop();
       this.watcher = null;
+    }
+  }
+
+  // ===========================================================================
+  // SCIP — see src/scip/
+  // ===========================================================================
+
+  /** @internal Raw connection for SCIP reads (src/scip); not public API. */
+  scipReadDb(): SqliteDatabase {
+    return this.db.getDb();
+  }
+
+  /** @internal The database file, for a SCIP merge on its own connection; not public API. */
+  scipDbPath(): string {
+    return this.db.getPath();
+  }
+
+  /** @internal Runs `fn` under the same in-process mutex and cross-process lock as indexing, until what it returns settles; not public API. */
+  async scipWrite<T>(fn: (db: SqliteDatabase) => T | Promise<T>): Promise<T> {
+    return this.indexMutex.withLock(async () => {
+      this.fileLock.acquire();
+      try {
+        return await fn(this.db.getDb());
+      } finally {
+        this.fileLock.release();
+      }
+    });
+  }
+
+  /**
+   * A failed SCIP merge must never fail the index or sync that triggered it.
+   * Awaited, so the merge (off-thread when built — see scip/index.ts mergePass)
+   * finishes inside the caller's write lock while the event loop stays free.
+   */
+  private async scipHook(fn: () => Promise<unknown>): Promise<void> {
+    try {
+      await fn();
+    } catch (err) {
+      process.stderr.write(`[CodeGraph SCIP] merge skipped: ${err instanceof Error ? err.message : String(err)}\n`);
     }
   }
 
