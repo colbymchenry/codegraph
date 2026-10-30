@@ -22,16 +22,15 @@ export function parseControllerServiceRef(expr: string): { class: string; method
 
 /**
  * The classes a controller reference names, looked up by short name through
- * the name index — one query per reference, not a scan of every class. When
- * several share the short name, the ones whose namespace matches the written
- * FQCN come first.
+ * the name index — one query per reference, not a scan of every class. A
+ * written FQCN names only the class in that namespace: another namespace's
+ * class of the same short name is not it, so none is better than a wrong one.
  */
 export function findControllerClasses(controller: string, context: ResolutionContext): Node[] {
   const fqcn = controller.replace(/^\\+/, '');
   const classes = context.getNodesByName(lastFqcnSegment(fqcn)).filter((n) => n.kind === 'class');
-  if (classes.length < 2 || !fqcn.includes('\\')) return classes;
-  const namespaced = (n: Node) => `\\${n.qualifiedName.replace(/::/g, '\\')}`.endsWith(`\\${fqcn}`);
-  return [...classes.filter(namespaced), ...classes.filter((n) => !namespaced(n))];
+  if (!fqcn.includes('\\')) return classes;
+  return classes.filter((n) => `\\${n.qualifiedName.replace(/::/g, '\\')}`.endsWith(`\\${fqcn}`));
 }
 
 export function resolveControllerMethod(

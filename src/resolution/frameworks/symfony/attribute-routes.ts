@@ -26,80 +26,84 @@ export function extractAttributeRoutes(
   const tree = parser.parse(content);
   if (!tree) return { nodes, references };
 
-  walk(tree.rootNode, (cls) => {
-    if (cls.type !== 'class_declaration') return;
+  try {
+    walk(tree.rootNode, (cls) => {
+      if (cls.type !== 'class_declaration') return;
 
-    let classPrefix = '';
-    for (const attr of routeAttributes(cls)) {
-      const path = extractPath(argsText(attr));
-      if (path) {
-        classPrefix = path;
-        break;
-      }
-    }
-
-    const body = cls.childForFieldName('body');
-    for (let i = 0; body && i < body.namedChildCount; i++) {
-      const method = body.namedChild(i);
-      if (!method || method.type !== 'method_declaration') continue;
-      const methodName = method.childForFieldName('name')?.text;
-      if (!methodName) continue;
-
-      for (const attr of routeAttributes(method)) {
-        const args = argsText(attr);
-        const path = extractPath(args);
-        if (!path) continue;
-
-        const fullPath = classPrefix + path;
-        const routeMethods = extractMethods(args);
-        const httpMethods = routeMethods.length > 0 ? routeMethods : ['ANY'];
-        const routeName = extractName(args);
-        const line = attr.startPosition.row + 1;
-
-        const defaults = extractDefaults(args);
-        const requirements = extractRequirements(args);
-        const host = extractHost(args);
-        const schemes = extractSchemes(args);
-        let signature: string | undefined;
-        if (defaults || requirements || host || schemes) {
-          const meta: Record<string, unknown> = {};
-          if (defaults) meta.defaults = defaults;
-          if (requirements) meta.requirements = requirements;
-          if (host) meta.host = host;
-          if (schemes) meta.schemes = schemes;
-          signature = JSON.stringify(meta);
-        }
-
-        for (const httpMethod of httpMethods) {
-          const routeNode: Node = {
-            id: `route:${filePath}:${line}:${httpMethod}:${fullPath}`,
-            kind: 'route',
-            name: `${httpMethod} ${fullPath}`,
-            qualifiedName: routeName ? `${filePath}::${routeName}` : `${filePath}::route:${fullPath}`,
-            filePath,
-            startLine: line,
-            endLine: attr.endPosition.row + 1,
-            startColumn: attr.startPosition.column,
-            endColumn: attr.endPosition.column,
-            language: 'php',
-            updatedAt: now,
-          };
-          if (signature) routeNode.signature = signature;
-          nodes.push(routeNode);
-
-          references.push({
-            fromNodeId: routeNode.id,
-            referenceName: methodName,
-            referenceKind: 'references',
-            line,
-            column: 0,
-            filePath,
-            language: 'php',
-          });
+      let classPrefix = '';
+      for (const attr of routeAttributes(cls)) {
+        const path = extractPath(argsText(attr));
+        if (path) {
+          classPrefix = path;
+          break;
         }
       }
-    }
-  });
+
+      const body = cls.childForFieldName('body');
+      for (let i = 0; body && i < body.namedChildCount; i++) {
+        const method = body.namedChild(i);
+        if (!method || method.type !== 'method_declaration') continue;
+        const methodName = method.childForFieldName('name')?.text;
+        if (!methodName) continue;
+
+        for (const attr of routeAttributes(method)) {
+          const args = argsText(attr);
+          const path = extractPath(args);
+          if (path === null) continue;
+
+          const fullPath = classPrefix + path || '/';
+          const routeMethods = extractMethods(args);
+          const httpMethods = routeMethods.length > 0 ? routeMethods : ['ANY'];
+          const routeName = extractName(args);
+          const line = attr.startPosition.row + 1;
+
+          const defaults = extractDefaults(args);
+          const requirements = extractRequirements(args);
+          const host = extractHost(args);
+          const schemes = extractSchemes(args);
+          let signature: string | undefined;
+          if (defaults || requirements || host || schemes) {
+            const meta: Record<string, unknown> = {};
+            if (defaults) meta.defaults = defaults;
+            if (requirements) meta.requirements = requirements;
+            if (host) meta.host = host;
+            if (schemes) meta.schemes = schemes;
+            signature = JSON.stringify(meta);
+          }
+
+          for (const httpMethod of httpMethods) {
+            const routeNode: Node = {
+              id: `route:${filePath}:${line}:${httpMethod}:${fullPath}`,
+              kind: 'route',
+              name: `${httpMethod} ${fullPath}`,
+              qualifiedName: routeName ? `${filePath}::${routeName}` : `${filePath}::route:${fullPath}`,
+              filePath,
+              startLine: line,
+              endLine: attr.endPosition.row + 1,
+              startColumn: attr.startPosition.column,
+              endColumn: attr.endPosition.column,
+              language: 'php',
+              updatedAt: now,
+            };
+            if (signature) routeNode.signature = signature;
+            nodes.push(routeNode);
+
+            references.push({
+              fromNodeId: routeNode.id,
+              referenceName: methodName,
+              referenceKind: 'references',
+              line,
+              column: 0,
+              filePath,
+              language: 'php',
+            });
+          }
+        }
+      }
+    });
+  } finally {
+    tree.delete();
+  }
 
   return { nodes, references };
 }

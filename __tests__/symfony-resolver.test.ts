@@ -207,7 +207,7 @@ describe('symfonyResolver.resolve', () => {
       id: 'class:src/Controller/BlogController.php:10:BlogController:50',
       kind: 'class',
       name: 'BlogController',
-      qualifiedName: 'src/Controller/BlogController.php::BlogController',
+      qualifiedName: 'App\\Controller::BlogController',
       filePath: 'src/Controller/BlogController.php',
       language: 'php',
       startLine: 10,
@@ -250,6 +250,34 @@ describe('symfonyResolver.resolve', () => {
     expect(result?.targetNodeId).toBe(methodNode.id);
     expect(result?.confidence).toBeGreaterThanOrEqual(0.8);
     expect(result?.resolvedBy).toBe('framework');
+  });
+
+  it('leaves a FQCN unresolved when only another namespace has a class of that name', () => {
+    const other: Node = {
+      id: 'class:src/Other/Logger.php:3:Logger:0',
+      kind: 'class',
+      name: 'Logger',
+      qualifiedName: 'Other::Logger',
+      filePath: 'src/Other/Logger.php',
+      language: 'php',
+      startLine: 3,
+      endLine: 9,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: Date.now(),
+    };
+    const context = { ...baseContext, getNodesByName: (name: string) => (name === 'Logger' ? [other] : []) };
+    const ref = {
+      fromNodeId: 'file:config/services.yaml',
+      referenceName: 'External\\Logger',
+      referenceKind: 'references' as const,
+      line: 3,
+      column: 0,
+      filePath: 'config/services.yaml',
+      language: 'yaml' as const,
+    };
+    expect(symfonyResolver.resolve(ref, context as any)).toBeNull();
+    expect(symfonyResolver.resolve({ ...ref, referenceName: 'Other\\Logger' }, context as any)?.targetNodeId).toBe(other.id);
   });
 
   it('returns null for unresolvable reference', () => {
@@ -746,5 +774,32 @@ describe('symfonyResolver.extract — pathological input', () => {
     const { nodes } = symfonyResolver.extract!('src/Controller/Slow.php', src);
     expect(nodes).toEqual([]);
     expect(performance.now() - started).toBeLessThan(1000);
+  });
+});
+
+describe('symfonyResolver.extract — empty paths and compiled route arguments', () => {
+  it('keeps a method route with an empty path under the class prefix', () => {
+    const src = `<?php
+#[Route('/blog')]
+class BlogController {
+    #[Route('', name: 'blog')]
+    public function index(): Response {}
+}
+`;
+    const { nodes } = symfonyResolver.extract!('src/Controller/BlogController.php', src);
+    expect(nodes.map((n) => n.name)).toEqual(['ANY /blog']);
+  });
+
+  it('reads HTTP methods from the seventh Route argument, not the schemes', () => {
+    const src = `<?php
+class Container_XYZ extends Container {
+    private function getRoutes() {
+        \$routes->add('a', new Route('/a', ['_controller' => 'App\\\\C::a'], [], [], '', [], ['POST']));
+        \$routes->add('b', new Route('/b', ['_controller' => 'App\\\\C::b'], [], [], '', ['https'], []));
+    }
+}
+`;
+    const { nodes } = symfonyResolver.extract!('var/cache/prod/Container_XYZ.php', src);
+    expect(nodes.filter((n) => n.kind === 'route').map((n) => n.name).sort()).toEqual(['ANY /b', 'POST /a']);
   });
 });

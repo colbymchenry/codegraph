@@ -23,9 +23,9 @@ export function extractName(args: string): string | null {
 }
 
 export function extractPath(args: string): string | null {
-  const named = args.match(/\bpath:\s*['"]([^'"]+?)['"]/);
+  const named = args.match(/\bpath:\s*['"]([^'"]*)['"]/);
   if (named) return named[1]!;
-  const pos = args.match(/^['"]([^'"]+?)['"]/);
+  const pos = args.match(/^['"]([^'"]*)['"]/);
   return pos ? pos[1]! : null;
 }
 

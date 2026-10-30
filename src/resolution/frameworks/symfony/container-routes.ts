@@ -16,73 +16,79 @@ export function extractContainerRoutes(
 
   const tree = parser.parse(content);
   if (!tree) return { nodes, references };
-  walkTree(tree.rootNode, (node: SyntaxNode) => {
-    if (node.type !== 'member_call_expression') return;
+  try {
+    walkTree(tree.rootNode, (node: SyntaxNode) => {
+      if (node.type !== 'member_call_expression') return;
 
-    const obj = node.childForFieldName('object');
-    if (!obj || obj.type !== 'variable_name' || obj.text !== '$routes') return;
+      const obj = node.childForFieldName('object');
+      if (!obj || obj.type !== 'variable_name' || obj.text !== '$routes') return;
 
-    const method = node.childForFieldName('name');
-    if (!method || method.text !== 'add') return;
+      const method = node.childForFieldName('name');
+      if (!method || method.text !== 'add') return;
 
-    const args = node.childForFieldName('arguments');
-    if (!args || args.namedChildCount < 2) return;
+      const args = node.childForFieldName('arguments');
+      if (!args || args.namedChildCount < 2) return;
 
-    const nameArg = args.namedChild(0);
-    const routeName = getStringValue(nameArg);
-    if (!routeName) return;
+      const nameArg = args.namedChild(0);
+      const routeName = getStringValue(nameArg);
+      if (!routeName) return;
 
-    const routeCreation = args.namedChild(1);
-    const objCreation = routeCreation?.type === 'argument' ? routeCreation.namedChild(0) : null;
-    if (!objCreation || objCreation.type !== 'object_creation_expression') return;
+      const routeCreation = args.namedChild(1);
+      const objCreation = routeCreation?.type === 'argument' ? routeCreation.namedChild(0) : null;
+      if (!objCreation || objCreation.type !== 'object_creation_expression') return;
 
-    const className = objCreation.namedChild(0);
-    if (!className || className.text !== 'Route') return;
+      const className = objCreation.namedChild(0);
+      if (!className || className.text !== 'Route') return;
 
-    const routeArgs = objCreation.namedChild(1);
-    if (!routeArgs || routeArgs.type !== 'arguments') return;
+      const routeArgs = objCreation.namedChild(1);
+      if (!routeArgs || routeArgs.type !== 'arguments') return;
 
-    const pathArg = routeArgs.namedChild(0);
-    const path = getStringValue(pathArg);
-    if (!path) return;
+      const pathArg = routeArgs.namedChild(0);
+      const path = getStringValue(pathArg);
+      if (!path) return;
 
-    const defaultsArg = routeArgs.namedChild(1);
-    const controller = defaultsArg ? getControllerFromArray(defaultsArg) : null;
+      const defaultsArg = routeArgs.namedChild(1);
+      const controller = defaultsArg ? getControllerFromArray(defaultsArg) : null;
 
-    const methodsArg = routeArgs.namedChild(5);
-    const methods = methodsArg ? getMethodsFromArray(methodsArg) : ['ANY'];
+      // Route($path, $defaults, $requirements, $options, $host, $schemes, $methods, …)
+      const methodsArg = routeArgs.namedChild(6);
+      const listed = methodsArg ? getMethodsFromArray(methodsArg) : [];
+      const methods = listed.length > 0 ? listed : ['ANY'];
 
-    const line = node.startPosition.row + 1;
-    for (const httpMethod of methods) {
-      const routeNodeId = `route:${filePath}:${line}:${httpMethod}:${path}`;
-      const routeNode: Node = {
-        id: routeNodeId,
-        kind: 'route',
-        name: `${httpMethod} ${path}`,
-        qualifiedName: routeName ? `${filePath}::${routeName}` : `${filePath}::route:${path}`,
-        filePath,
-        startLine: line,
-        endLine: line,
-        startColumn: 0,
-        endColumn: node.endIndex - node.startIndex,
-        language: 'php',
-        updatedAt: now,
-      };
-      nodes.push(routeNode);
-
-      if (controller) {
-        references.push({
-          fromNodeId: routeNodeId,
-          referenceName: controller,
-          referenceKind: 'references',
-          line,
-          column: 0,
+      const line = node.startPosition.row + 1;
+      for (const httpMethod of methods) {
+        const routeNodeId = `route:${filePath}:${line}:${httpMethod}:${path}`;
+        const routeNode: Node = {
+          id: routeNodeId,
+          kind: 'route',
+          name: `${httpMethod} ${path}`,
+          qualifiedName: routeName ? `${filePath}::${routeName}` : `${filePath}::route:${path}`,
           filePath,
+          startLine: line,
+          endLine: line,
+          startColumn: 0,
+          endColumn: node.endIndex - node.startIndex,
           language: 'php',
-        });
+          updatedAt: now,
+        };
+        nodes.push(routeNode);
+
+        if (controller) {
+          references.push({
+            fromNodeId: routeNodeId,
+            referenceName: controller,
+            referenceKind: 'references',
+            line,
+            column: 0,
+            filePath,
+            language: 'php',
+          });
+        }
       }
-    }
-  });
+    });
+  } finally {
+    tree.delete();
+  }
 
   return { nodes, references };
 }

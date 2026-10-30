@@ -451,8 +451,8 @@ class App_KernelContainer extends Container
     protected function getRouterService(): Router
     {
         \\$routes = new RouteCollection();
-        \\$routes->add('blog_index', new Route('/', ['_controller' => 'App\\\\Controller\\\\BlogController::index'], [], [], '', ['GET'], []));
-        \\$routes->add('blog_show', new Route('/blog/{slug}', ['_controller' => 'App\\\\Controller\\\\BlogController::show'], ['slug' => '[a-z]+'], [], '', ['GET'], []));
+        \\$routes->add('blog_index', new Route('/', ['_controller' => 'App\\\\Controller\\\\BlogController::index'], [], [], '', [], ['GET']));
+        \\$routes->add('blog_show', new Route('/blog/{slug}', ['_controller' => 'App\\\\Controller\\\\BlogController::show'], ['slug' => '[a-z]+'], [], '', [], ['GET']));
         return new Router(\\$routes);
     }
 
@@ -507,7 +507,7 @@ class App_KernelContainer extends Container
     protected function getRouterService(): Router
     {
         \\$routes = new RouteCollection();
-        \\$routes->add('api_entries', new Route('/api/entries', ['_controller' => 'App\\\\Controller\\\\ApiController::list'], [], [], '', ['GET', 'POST'], []));
+        \\$routes->add('api_entries', new Route('/api/entries', ['_controller' => 'App\\\\Controller\\\\ApiController::list'], [], [], '', [], ['GET', 'POST']));
         return new Router(\\$routes);
     }
 }
