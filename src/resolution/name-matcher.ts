@@ -414,21 +414,33 @@ function pythonRefClass(name: string, ref: UnresolvedRef, context: ResolutionCon
  * A Python class's base list as written, up to its closing parenthesis, which
  * may be lines below the `class` line: black and ruff wrap a long list one base
  * per line. Comments in it are left out. Undefined for a class without one.
+ * A PEP 695 type parameter list between the name and the bases, `class
+ * Repo[T: (int, str)](Base[T]):`, is skipped whole, wrapped or not, so a
+ * constraint tuple in it is not taken for the base list.
  */
 function pythonBaseList(cls: Node, context: ResolutionContext): string | undefined {
   const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
-  const head = /^\s*class\s+\w+\s*\(/.exec(lines[cls.startLine - 1] ?? '');
+  const head = /^\s*class\s+\w+/.exec(lines[cls.startLine - 1] ?? '');
   if (!head) return undefined;
   let list = '';
-  let depth = 1;
+  let depth = 0;
+  let params = 0;
   for (let i = cls.startLine - 1; i < Math.max(cls.endLine, cls.startLine); i++) {
     const text = (i === cls.startLine - 1 ? lines[i]!.slice(head[0].length) : lines[i] ?? '').replace(/#.*$/, '');
     for (const ch of text) {
+      if (depth === 0) {
+        if (ch === '[') params++;
+        else if (ch === ']') params--;
+        else if (params === 0 && ch === '(') depth = 1;
+        // Anything else after the name and its parameters, such as `:`, means no base list.
+        else if (params === 0 && !/\s/.test(ch)) return undefined;
+        continue;
+      }
       if (ch === '(') depth++;
       else if (ch === ')' && --depth === 0) return list;
       list += ch;
     }
-    list += ' ';
+    if (depth > 0) list += ' ';
   }
   return undefined;
 }
