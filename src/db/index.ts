@@ -998,7 +998,7 @@ export const DATABASE_FILENAME = 'codegraph.db';
  * index. They sit beside the main DB file and are removed alongside it when the
  * database is discarded (see `removeDatabaseFiles`).
  */
-const WAL_SIDECAR_SUFFIXES = ['-wal', '-shm'] as const;
+export const WAL_SIDECAR_SUFFIXES = ['-wal', '-shm'] as const;
 
 /**
  * Get the default database path for a project

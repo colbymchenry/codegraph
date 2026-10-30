@@ -55,7 +55,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
-import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
+import { detectWorktreeIndexMismatch, gitMainWorktreeRoot, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 import { ansiColorsEnabled } from '../ui/color';
@@ -887,6 +887,50 @@ program
       } catch { /* non-fatal */ }
     } catch (err) {
       error(`Failed to uninitialize: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph clone [target]
+ *
+ * Seed a git worktree (or any project) with another checkout's index, so it
+ * has code intelligence after a `sync` instead of a full `init` (#1236).
+ */
+program
+  .command('clone [target]')
+  .description('Copy a CodeGraph index from another project or git worktree')
+  .option('-s, --source <path>', 'Project whose index to copy')
+  .option('--auto', 'Copy from the main checkout of the git repository the target is a worktree of')
+  .option('-f, --force', 'Replace an index the target already has')
+  .action(async (targetArg: string | undefined, options: { source?: string; auto?: boolean; force?: boolean }) => {
+    const targetPath = path.resolve(targetArg || process.cwd());
+
+    let sourcePath: string | null = null;
+    if (options.source) {
+      sourcePath = path.resolve(options.source);
+    } else if (options.auto) {
+      sourcePath = gitMainWorktreeRoot(targetPath);
+      if (!sourcePath) {
+        error(`Could not find the main git checkout for ${targetPath}.`);
+        info('Pass --source <path> to name the project to copy from.');
+        process.exit(1);
+      }
+    } else {
+      error('Name the index to copy: pass --source <path>, or --auto inside a git worktree.');
+      process.exit(1);
+    }
+
+    try {
+      const { cloneIndex } = await import('../sync/clone');
+      if ((await cloneIndex(sourcePath, targetPath, options)) === 'exists') {
+        warn(`${targetPath} already has a CodeGraph index; pass --force to replace it.`);
+        return;
+      }
+      success(`Copied the CodeGraph index from ${sourcePath} to ${targetPath}`);
+      info(`Run "codegraph sync" in ${targetPath} to bring it up to date with that checkout.`);
+    } catch (err) {
+      error(`Failed to clone the CodeGraph index: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });
