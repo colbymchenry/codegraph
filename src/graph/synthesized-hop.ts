@@ -59,6 +59,12 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
     }
     case 'event-emitter':
       return hop(`event ${quoted(m.event, 'an event')}`);
+    case 'tauri-command':
+      return hop(`Tauri command ${quoted(m.command, 'a command')}`, " — the frontend's invoke onto its Rust handler");
+    case 'tauri-event': {
+      const direction = m.tier === 'server→client' ? ' → frontend' : m.tier === 'client→server' ? ' → Rust' : '';
+      return hop(`Tauri event ${quoted(m.event, 'an event')}`, direction);
+    }
     case 'react-render':
       return hop('React re-render via setState');
     case 'jsx-render':

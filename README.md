@@ -291,6 +291,7 @@ CodeGraph's parsing engine is a **native Rust kernel**: 20 languages — TypeScr
 | **20+ Languages** | TypeScript, JavaScript, ArkTS, Python, Go, Rust, Java, C#, VB.NET, PHP, Ruby, C, C++, CUDA, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Nix, Erlang, CFML, COBOL, Solidity, Terraform/OpenTofu, Svelte, Vue, Astro, Liquid, Pascal/Delphi |
 | **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across 17 frameworks |
 | **Mixed iOS / React Native / Expo** | Closes cross-language flows that static parsing misses: Swift ↔ ObjC bridging, React Native legacy bridge + TurboModules + Fabric view components, native → JS event emitters, Expo Modules |
+| **Tauri** | Follows a desktop app across its web frontend and Rust core: `invoke('save_file')`, tauri-specta's typed `commands.saveFile()`, your own wrappers around `invoke`, and events in both directions |
 | **100% Local** | No data leaves your machine. No API keys. No external services. SQLite database only |
 
 <details>

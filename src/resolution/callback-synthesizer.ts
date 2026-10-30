@@ -41,6 +41,7 @@ import { angularTemplateEdges } from './angular-template-synthesizer';
 import { svelteKitLinkEdges, svelteKitPageComponentEdges } from './sveltekit-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
+import { hasTauriPattern, tauriEdges } from './tauri-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { cppSpecializationArguments, crossesCodeBoundary, goRefQualification, isManualMockHiddenFrom, isManualMockPath, jsCodeBindsName } from './name-matcher';
@@ -5113,7 +5114,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   // Every Go file: besides the declarations the interface passes read, a call
   // through a func field, or a function put in one, can sit in any of them.
   if (/\.go$/.test(filePath)) return true;
-  if (hasCrossTierPattern(content) || hasTestRequestPattern(filePath, content)) return true;
+  if (hasCrossTierPattern(content) || hasTestRequestPattern(filePath, content) || hasTauriPattern(filePath, content)) return true;
   if (/\b(?:render|build|setState|defineStore|createStore|createApi|Store|href|sendEvent|sendEventWithName)\b|<\/|\/>/.test(content)) return true;
   // A wrapper renders the component it wraps (jsxEdges), in a file with no markup of its own too.
   if (WRAPPER_CALL_RE.test(content)) return true;
@@ -5151,6 +5152,8 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   // Before the in-process emitter pass: the same (source, target) pair
   // keeps the more specific edge — the one that says which tier it crosses.
   { name: 'tierEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => crossTierEdges(c, y) },
+  // A Tauri frontend's `invoke('x')` onto the Rust command, and events across that seam.
+  { name: 'tauriEdges', gate: (has) => has('rust') && has('vue', 'svelte', ...JS_FAMILY), run: (q, c, y) => tauriEdges(q, c, y) },
   // A Spring / Laravel test's request (`mockMvc.perform(post("/x"))`,
   // `$this->postJson('api/x')`) onto the route it reaches, so the handler
   // counts as tested.

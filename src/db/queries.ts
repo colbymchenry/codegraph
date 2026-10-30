@@ -1627,6 +1627,13 @@ export class QueryBuilder {
     return new Set(rows.map((r) => r.language));
   }
 
+  /** Whether any function of `language` carries `decorator`: a project's marker for a framework it uses. */
+  hasDecoratedFunction(language: Language, decorator: string): boolean {
+    return !!this.db.prepare(
+      `SELECT 1 FROM nodes WHERE kind = 'function' AND language = ? AND decorators LIKE ? LIMIT 1`
+    ).get(language, `%"${decorator}"%`);
+  }
+
   /**
    * Get nodes by exact name match (uses idx_nodes_name index).
    *
