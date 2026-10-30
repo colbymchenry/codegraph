@@ -538,6 +538,25 @@ function peelSwiftCallWrappers(node: SyntaxNode, source: string): SyntaxNode {
   return cur;
 }
 
+/** Join C# dot-member fields without rewriting other operators or operands. */
+function csharpMemberPath(node: SyntaxNode, source: string): string {
+  const parts: string[] = [];
+  let current = node;
+  while (current.type === 'member_access_expression') {
+    // Recovery text such as A.*B must not become the apparently valid A.B.
+    if (current.hasError || current.isMissing) break;
+    // Pointer access shares this node kind: keep its written -> path intact.
+    if (!current.children.some((child: SyntaxNode) => child.type === '.')) break;
+    const receiver = getChildByField(current, 'expression');
+    const member = getChildByField(current, 'name');
+    if (!receiver || !member) break;
+    parts.push(getNodeText(member, source));
+    current = receiver;
+  }
+  parts.push(getNodeText(current, source));
+  return parts.reverse().join('.');
+}
+
 /**
  * A Rust callee path without its turbofish type arguments: `Vec::<u8>::new`
  * calls `Vec::new`, `Store::with_capacity::<u8>` calls `Store::with_capacity`.
@@ -6504,20 +6523,21 @@ export class TreeSitterExtractor {
           // part of the name (`Vec::<u8>::with_capacity` → `Vec::with_capacity`).
           calleeName = this.language === 'rust' ? stripRustTurbofish(getNodeText(func, this.source)) : getNodeText(func, this.source);
         } else if (this.language === 'csharp' && func.type === 'member_access_expression') {
-          // C# member call `recv.Method(...)`. When the receiver is itself a call
-          // — a chained factory `Foo.Create(args).Bar()` — encode `inner().Bar`
-          // with normalized empty parens so resolution can infer Bar's class from
-          // what `Foo.Create` RETURNS (#645/#608). A non-call receiver keeps the
-          // full member-access text (the existing `recv.Method` behavior).
+          // Build the written member path from AST fields, not raw text:
+          // `Reader /* comment */\n .Parse` is still `Reader.Parse`. Never strip
+          // whitespace inside an expression/literal receiver. Mirrored in csharp.rs.
           const recv = getChildByField(func, 'expression');
           const nameNode = getChildByField(func, 'name');
           const methodName = nameNode ? getNodeText(nameNode, this.source) : '';
+          if (nameNode) refStart = nameNode.startPosition;
           if (recv && recv.type === 'invocation_expression' && methodName) {
+            // Factory `Foo.Create(args).Bar()` → `Foo.Create().Bar` so the
+            // resolver can infer Bar's owner from Create's return type (#645/#608).
             const innerFunc = getChildByField(recv, 'function');
-            const innerCallee = innerFunc ? getNodeText(innerFunc, this.source).replace(/\s+/g, '') : '';
+            const innerCallee = innerFunc ? csharpMemberPath(innerFunc, this.source) : '';
             calleeName = innerCallee ? `${innerCallee}().${methodName}` : methodName;
           } else {
-            calleeName = getNodeText(func, this.source);
+            calleeName = csharpMemberPath(func, this.source);
           }
         } else if (TS_JS_CHAIN_LANGUAGES.has(this.language)) {
           // A callee that names nothing — a call, a function, a subscript —

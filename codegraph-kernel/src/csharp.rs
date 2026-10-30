@@ -91,9 +91,6 @@ fn is_js_space(c: char) -> bool {
             | '\u{3000}' | '\u{FEFF}'
     )
 }
-fn strip_js_ws(s: &str) -> String {
-    s.chars().filter(|c| !is_js_space(*c)).collect()
-}
 
 struct Scope {
     row: u32,
@@ -268,6 +265,34 @@ impl<'t> Walker<'t> {
     fn text(&self, node: Node) -> &'t str {
         &self.src[node.byte_range()]
     }
+    /// Join dot-member fields; other operators and expression/literal operands stay intact.
+    /// Mirrored by csharpMemberPath in tree-sitter.ts.
+    fn member_path(&self, mut node: Node<'t>) -> String {
+        let mut parts = Vec::new();
+        while node.kind() == "member_access_expression" {
+            // Recovery text such as A.*B must not become the apparently valid A.B.
+            if node.has_error() || node.is_missing() {
+                break;
+            }
+            // Pointer access shares this node kind; do not turn -> into a dot.
+            let mut cursor = node.walk();
+            let dot = node.children(&mut cursor).any(|child| child.kind() == ".");
+            if !dot {
+                break;
+            }
+            let receiver = node.child_by_field_name("expression");
+            let member = node.child_by_field_name("name");
+            let (Some(receiver), Some(member)) = (receiver, member) else {
+                break;
+            };
+            parts.push(self.text(member));
+            node = receiver;
+        }
+        parts.push(self.text(node));
+        parts.reverse();
+        parts.join(".")
+    }
+
     fn line_of(&self, node: Node) -> u32 {
         node.start_position().row as u32 + 1
     }
@@ -1140,29 +1165,30 @@ impl<'t> Walker<'t> {
         let Some(func) = func else { return };
 
         let mut callee_name: String;
+        let mut ref_node = node;
         if func.kind() == "member_access_expression" {
             let recv = func.child_by_field_name("expression");
             let name_node = func.child_by_field_name("name");
             let method_name = name_node.map(|n| self.text(n)).unwrap_or("");
+            if let Some(name_node) = name_node {
+                ref_node = name_node;
+            }
             let chained = recv
                 .map(|r| r.kind() == "invocation_expression" && !method_name.is_empty())
                 .unwrap_or(false);
             if chained {
                 // Chained factory `Foo.Create(args).Bar()` → `Foo.Create().Bar`
-                // (inner whitespace stripped, EVERY call-receiver re-encodes —
-                // no capitalization gate, unlike kotlin/scala).
+                // EVERY call-receiver re-encodes, with trivia between member
+                // fields ignored but expression/literal operands left intact.
                 let inner_func = recv.unwrap().child_by_field_name("function");
-                let inner_callee = inner_func.map(|f| strip_js_ws(self.text(f))).unwrap_or_default();
+                let inner_callee = inner_func.map(|f| self.member_path(f)).unwrap_or_default();
                 callee_name = if inner_callee.is_empty() {
                     method_name.to_string()
                 } else {
                     format!("{inner_callee}().{method_name}")
                 };
             } else {
-                // RAW full member-access text: `this.Run`, `base.Method`,
-                // `"lit".ToUpper`, multi-line fluent chains with their
-                // newlines — no SKIP_RECEIVERS, no literal filter (preserve).
-                callee_name = self.text(func).to_string();
+                callee_name = self.member_path(func);
             }
         } else {
             // Bare `Helper()`, generic `Generic<int>` kept verbatim,
@@ -1181,7 +1207,7 @@ impl<'t> Walker<'t> {
         // (template strip + fn-ptr fan-out are c/cpp-gated — not C#.)
 
         if !callee_name.is_empty() {
-            self.push_ref_at(caller, &callee_name.clone(), edge_kind_index("calls").unwrap(), node);
+            self.push_ref_at(caller, &callee_name, edge_kind_index("calls").unwrap(), ref_node);
         }
     }
 
