@@ -9,12 +9,13 @@ The interactive installer auto-detects and configures each supported agent — w
 
 - **Claude Code**
 - **Cursor**
-- **Codex CLI**
+- **Codex CLI** — the Codex IDE extension reads the same config: a global install writes `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`), and a local install writes `.codex/config.toml`, which Codex uses only in a project you've marked as trusted
 - **opencode**
 - **Hermes Agent**
 - **Gemini CLI**
 - **Antigravity IDE**
 - **Kiro**
+- **GitHub Copilot** — Copilot Chat in VS Code (`copilot-vscode`), the Copilot CLI (`copilot-cli`), and the Copilot plugin in JetBrains IDEs (`copilot-jetbrains`)
 
 Run `npx @colbymchenry/codegraph` and pick your agent(s); see [Installation](/codegraph/getting-started/installation/) for the non-interactive flags.
 
