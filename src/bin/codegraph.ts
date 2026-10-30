@@ -1091,9 +1091,14 @@ program
         }).finally(() => progress.stop());
 
         const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
+        // Sync re-reads changed files only, so a file left alone keeps what an
+        // older engine extracted from it, and the index isn't up to date however
+        // little changed. It warns and carries on: the git hooks discard this
+        // output, so a refusal would quietly stop them after every upgrade.
+        const staleIndex = cg.isIndexStale();
 
         if (totalChanges === 0 && !result.pendingRefsProcessed) {
-          clack.log.info('Already up to date');
+          clack.log.info(staleIndex ? 'No files changed' : 'Already up to date');
         } else if (totalChanges > 0) {
           clack.log.success(`Synced ${formatNumber(totalChanges)} changed files`);
           const details: string[] = [];
@@ -1107,6 +1112,10 @@ program
           const unresolved = result.pendingRefsUnresolved
             ? ` (${formatNumber(result.pendingRefsUnresolved)} unresolved)` : '';
           clack.log.info(`Resolved ${formatNumber(result.pendingRefsResolved ?? 0)} pending references${unresolved}`);
+        }
+
+        if (staleIndex) {
+          clack.log.warn('This index was built by an older CodeGraph engine, and sync only re-reads changed files. Run "codegraph index" for a full rebuild.');
         }
 
         clack.outro('Done');
