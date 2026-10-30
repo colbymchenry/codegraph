@@ -29,6 +29,34 @@ interface TraversalStep {
 }
 
 /**
+ * The edges that make one symbol another's caller. `instantiates` counts:
+ * constructing a class (`Foo(...)` / `new Foo()`) is calling its constructor,
+ * so the instantiation site is a caller of the class (#774).
+ */
+const CALL_EDGE_KINDS: EdgeKind[] = ['calls', 'references', 'imports', 'instantiates', 'navigates'];
+
+/** One edge's site: two edges are the same only on source, target, kind and position. */
+function edgeSite(e: Edge): string {
+  return `${e.source}|${e.target}|${e.kind}|${e.line ?? -1}|${e.column ?? -1}`;
+}
+
+/**
+ * A direct caller (or callee) of a symbol with every edge between them, from
+ * {@link GraphTraverser.getCallSites}.
+ */
+export interface CallSiteRow {
+  /** The caller, or for callees the callee. */
+  node: Node;
+  /**
+   * Every edge between the two, once per site, in index order. The first is
+   * the edge {@link GraphTraverser.getCallers} reports for this neighbour.
+   */
+  edges: Edge[];
+  /** The symbol calls itself: this row's node is the symbol asked about. */
+  recursive: boolean;
+}
+
+/**
  * Graph traverser for BFS and DFS traversal
  */
 export class GraphTraverser {
@@ -67,8 +95,6 @@ export class GraphTraverser {
     // Edge-identity dedup so a `direction:'both'` scan — which encounters A→B
     // from both endpoints — records each edge once.
     const seenEdges = new Set<string>();
-    const edgeKey = (e: Edge) =>
-      `${e.source}|${e.target}|${e.kind}|${e.line ?? -1}|${e.column ?? -1}`;
     const queue: TraversalStep[] = [{ node: startNode, edge: null, depth: 0 }];
 
     if (opts.includeStart) {
@@ -129,7 +155,7 @@ export class GraphTraverser {
         // adjacency scan (rather than once per dequeue) is what preserves
         // parallel edges to the same target (#1090); `nextNode` is guaranteed
         // to be in `nodes` at this point (just added, or already in-set).
-        const ek = edgeKey(adjEdge);
+        const ek = edgeSite(adjEdge);
         if (!seenEdges.has(ek)) {
           seenEdges.add(ek);
           edges.push(adjEdge);
@@ -308,7 +334,7 @@ export class GraphTraverser {
     // caller of the class. Without it, `callers <Class>` surfaced only the
     // importing file (via `imports`) and missed every construction site —
     // the opposite of "what breaks if I change this class?" (#774).
-    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'navigates']);
+    const incomingEdges = this.queries.getIncomingEdges(nodeId, CALL_EDGE_KINDS);
     if (incomingEdges.length === 0) return;
 
     // Batch-fetch all caller nodes in one round-trip instead of one
@@ -363,7 +389,7 @@ export class GraphTraverser {
     // (`Foo(...)` / `new Foo()`) has that class as a callee, so callers and
     // callees stay inverses of each other and `trace` can cross the
     // instantiation boundary (function → class → its methods) (#774).
-    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'navigates']);
+    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, CALL_EDGE_KINDS);
     if (outgoingEdges.length === 0) return;
 
     // Batch-fetch callee nodes (was N+1 — see getCallersRecursive note).
@@ -379,6 +405,42 @@ export class GraphTraverser {
       }
       this.getCalleesRecursive(calleeNode.id, maxDepth, currentDepth + 1, result, visited, reported);
     }
+  }
+
+  /**
+   * The direct callers (or callees) of a symbol, each with every edge that
+   * joins them: one row per neighbour, in the order {@link getCallers} and
+   * {@link getCallees} list them. Those keep a neighbour's first edge only and
+   * leave out the symbol itself; here a caller that calls it on two lines has
+   * both sites, and a symbol that calls itself is a row of its own, flagged
+   * `recursive`. Each of those sites is a line to edit when the symbol
+   * changes, so `codegraph callers`, codegraph_callers and codegraph_node's
+   * trail list them (#2909). The walks that rank and trace keep their own
+   * one-row-per-neighbour reading.
+   */
+  getCallSites(nodeId: string, direction: 'callers' | 'callees'): CallSiteRow[] {
+    const edges = direction === 'callers'
+      ? this.queries.getIncomingEdges(nodeId, CALL_EDGE_KINDS)
+      : this.queries.getOutgoingEdges(nodeId, CALL_EDGE_KINDS);
+    if (edges.length === 0) return [];
+    const neighbour = (e: Edge) => (direction === 'callers' ? e.source : e.target);
+    const nodes = this.queries.getNodesByIds(edges.map(neighbour));
+    const rows = new Map<string, CallSiteRow>();
+    const sites = new Set<string>();
+    for (const edge of edges) {
+      const node = nodes.get(neighbour(edge));
+      if (!node) continue;
+      const site = edgeSite(edge);
+      if (sites.has(site)) continue;
+      sites.add(site);
+      let row = rows.get(node.id);
+      if (!row) {
+        row = { node, edges: [], recursive: node.id === nodeId };
+        rows.set(node.id, row);
+      }
+      row.edges.push(edge);
+    }
+    return [...rows.values()];
   }
 
   /**

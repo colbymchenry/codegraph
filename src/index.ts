@@ -56,6 +56,7 @@ import {
 import { hasSynthesisPattern, isJsxChildCandidate } from './resolution/callback-synthesizer';
 import { createImportReader, reopenNameMatchedImports, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels, reopenReferencesThroughChangedDefaults, reopenReferencesThroughDeclaredPackages, reopenReferencesThroughRetargetedModules } from './resolution/module-importers';
 import { GraphTraverser, GraphQueryManager } from './graph';
+import type { CallSiteRow } from './graph';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock, escapesRoot } from './utils';
@@ -2861,6 +2862,18 @@ export class CodeGraph {
    */
   getCallees(nodeId: string, maxDepth: number = 1): Array<{ node: Node; edge: Edge }> {
     return this.traverser.getCallees(nodeId, maxDepth);
+  }
+
+  /**
+   * Direct callers or callees of a function/method, each with every site that
+   * joins them, the symbol itself included when it calls itself
+   *
+   * @param nodeId - ID of the function/method node
+   * @param direction - `'callers'` or `'callees'`
+   * @returns One row per neighbour, in the order getCallers / getCallees list them
+   */
+  getCallSites(nodeId: string, direction: 'callers' | 'callees'): CallSiteRow[] {
+    return this.traverser.getCallSites(nodeId, direction);
   }
 
   /**
