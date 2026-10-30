@@ -2717,7 +2717,11 @@ export class ExtractionOrchestrator {
         } catch (parseErr) {
           completed.set(seq, { ok: false, filePath, content, stats, err: parseErr });
         }
-        flushOrdered();
+        // Deliberately not awaited: each arrival appends to the serial commit
+        // chain, and awaiting here would let ordering be decided by whichever
+        // parse settles first. `flushChain` cannot reject — its body catches into
+        // `flushError`, which the drain below re-throws — so nothing floats.
+        void flushOrdered();
       })();
       const tracked = p.finally(() => { inFlight.delete(tracked); });
       inFlight.add(tracked);

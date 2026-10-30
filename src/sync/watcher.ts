@@ -1043,8 +1043,27 @@ export class FileWatcher {
     const delay = this.pendingFiles.size <= QUICK_SYNC_MAX_PENDING ? quickMs : this.debounceMs;
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
-      this.flush();
+      this.runFlush();
     }, delay);
+  }
+
+  /**
+   * Fire `flush()` from a timer, where nobody can await it.
+   *
+   * `flush()` already handles a failed sync (backoff, degrade, and onSyncError),
+   * so a rejection escaping here comes from its own `finally`: a reschedule that
+   * throws, or an embedder `onSyncComplete` callback that does. Left floating it
+   * would reach the process-wide `unhandledRejection` handler, which exits
+   * non-zero (see `src/bin/fatal-handler.ts`) — taking the MCP server down over a
+   * watcher that merely failed to reschedule. Only log here: `onSyncError` may
+   * itself be what threw, so calling it again would just re-throw inside this
+   * handler and float a second rejection.
+   */
+  private runFlush(): void {
+    this.flush().catch((err: unknown) => {
+      const error = err instanceof Error ? err : new Error(String(err));
+      logWarn('File watcher flush failed outside its own error handling', { error: error.message });
+    });
   }
 
   /**
@@ -1058,7 +1077,7 @@ export class FileWatcher {
     }
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
-      this.flush();
+      this.runFlush();
     }, delayMs);
   }
 

@@ -130,7 +130,12 @@ function makeFallbackEngine(root: string): MCPEngine {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT') {
-      throw new Error(`The daemon lock could not be read (${code ?? 'unknown error'}); refusing an in-process fallback.`);
+      // `code` alone cannot say why the read failed (EACCES, EISDIR, a decode
+      // error); keep the original error as `cause` so the log still carries it.
+      throw new Error(
+        `The daemon lock could not be read (${code ?? 'unknown error'}); refusing an in-process fallback.`,
+        { cause: err }
+      );
     }
   }
   if (
@@ -584,6 +589,27 @@ export class MCPServer {
     process.exit(0);
   }
 
+  /**
+   * Request shutdown from a timer or signal handler, where no caller can await
+   * {@link stop}.
+   *
+   * `stop()` ends in `process.exit(0)`, so anything it awaits can now only
+   * fail *on the way out* — a worker that will not stop, a lease that cannot be
+   * released. Floating that rejection would leave the process alive with its
+   * handles intact (stdin, sockets, both watchdogs), because the `exit(0)` after
+   * the failing `await` is never reached; it would also reach the process-wide
+   * `unhandledRejection` handler, which reports a shutdown as a fatal error. Say
+   * what failed and exit anyway: shutdown was requested, and the alternative is
+   * a process nobody can reap.
+   */
+  private shutdownFromTimer(): void {
+    this.stop().catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[CodeGraph MCP] Shutdown could not finish cleanly (${message}); exiting anyway.\n`);
+      process.exit(0);
+    });
+  }
+
   /** Single-process stdio MCP session — the pre-issue-#411 code path. */
   private async startDirect(reason: string): Promise<void> {
     if (reason && process.env.CODEGRAPH_MCP_DEBUG) {
@@ -605,7 +631,7 @@ export class MCPServer {
     }
 
     this.engine = new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
-    const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
+    const transport = new StdioTransport({ exitOnClose: false, onClose: () => { this.shutdownFromTimer(); } });
     this.session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.projectPath,
     });
@@ -623,7 +649,7 @@ export class MCPServer {
     // Also treat a stdin `'error'` (a socket-backed stdin can fail with
     // ECONNRESET/hangup instead of a clean close) as shutdown, and destroy the
     // stream so a hung fd can't busy-spin the event loop (#799).
-    treatStdinFailureAsShutdown(() => this.stop());
+    treatStdinFailureAsShutdown(() => this.shutdownFromTimer());
     // Backstop for a launch abandoned during startup (#1185): launcher killed
     // before EARLY_PPID could see it + host holding our pipes open. A server
     // that never receives a byte of MCP traffic isn't serving anyone. Armed
@@ -633,7 +659,7 @@ export class MCPServer {
         '[CodeGraph MCP] No MCP traffic since startup; assuming an abandoned launch and shutting down (#1185). ' +
         'Tune with CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS (0 disables).\n'
       );
-      this.stop();
+      this.shutdownFromTimer();
     });
 
     this.mode = 'direct';
@@ -780,8 +806,8 @@ export class MCPServer {
 
   /** Standard SIGINT/SIGTERM handlers that route to our `stop()` (direct mode). */
   private installSignalHandlers(): void {
-    process.on('SIGINT', () => this.stop());
-    process.on('SIGTERM', () => this.stop());
+    process.on('SIGINT', () => this.shutdownFromTimer());
+    process.on('SIGTERM', () => this.shutdownFromTimer());
   }
 
   /**
@@ -804,7 +830,7 @@ export class MCPServer {
         process.stderr.write(
           `[CodeGraph MCP] Parent process exited (${reason}); shutting down.\n`
         );
-        this.stop();
+        this.shutdownFromTimer();
       }
     }, pollMs);
     this.ppidWatchdog.unref();

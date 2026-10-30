@@ -504,10 +504,13 @@ export class CodeGraph {
       // live daemon/MCP server still holds the database. Turn the raw EBUSY into
       // an actionable instruction instead of a generic failure.
       const reason = err instanceof Error ? err.message : String(err);
+      // `reason` is the message only; `cause` keeps the errno (`EBUSY`/`EPERM`)
+      // and the failing path for anyone diagnosing this after the fact.
       throw new Error(
         `Could not rebuild the index — the database file is in use (${reason}). ` +
           `Stop any running CodeGraph MCP server/daemon for this project and retry, ` +
-          `or remove the ${getCodeGraphDir(resolvedRoot)} directory and run "codegraph init".`
+          `or remove the ${getCodeGraphDir(resolvedRoot)} directory and run "codegraph init".`,
+        { cause: err }
       );
     }
 

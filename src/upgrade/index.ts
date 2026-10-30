@@ -457,14 +457,16 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
   let code: number;
   switch (method.kind) {
     case 'bundle':
-      code = await (method.os === 'windows'
+      // Both bundle upgraders run their installer synchronously and hand back
+      // the exit code, so awaiting the result only adds a microtask.
+      code = method.os === 'windows'
         ? upgradeWindowsBundle(method, latest, deps)
-        : upgradeUnixBundle(method, opts.version ? latest : undefined, deps));
+        : upgradeUnixBundle(method, opts.version ? latest : undefined, deps);
       break;
     case 'npm':
       // npm version specs have no leading "v" (`@0.9.8`, not `@v0.9.8` — the
       // latter resolves as a nonexistent dist-tag).
-      code = await upgradeNpm(method, opts.version ? stripV(latest) : 'latest', deps);
+      code = upgradeNpm(method, opts.version ? stripV(latest) : 'latest', deps);
       break;
     case 'npx':
       deps.log(c.green('npx always runs the latest version on demand — nothing to upgrade.'));

@@ -3039,7 +3039,9 @@ export class ToolHandler {
         if (typeof check === 'object' && check !== undefined) return check;
       }
 
-      const project = await this.getCodeGraph(args.projectPath as string | undefined);
+      // getCodeGraph resolves nothing: it returns the cached (or freshly opened)
+      // instance synchronously and throws when the project is not indexed.
+      const project = this.getCodeGraph(args.projectPath as string | undefined);
       await this.awaitIndexRecovery(project);
       // Recover a watcher disabled by prolonged lock contention on the next call.
       // The stale banner remains until the watcher finishes its full scan;
