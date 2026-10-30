@@ -7,6 +7,7 @@ import CodeGraph from '../../src/index';
 import type { SqliteDatabase } from '../../src/db/sqlite-adapter';
 import { importScipFile, runScipPass } from '../../src/scip';
 import { referenceSites } from '../../src/scip/sites';
+import { trustProject } from '../../src/scip/trust';
 
 export const FIXTURES = path.join(__dirname, '..', 'fixtures');
 
@@ -32,8 +33,9 @@ export async function indexedFixture(fixture: string): Promise<FixtureProject> {
   };
 }
 
-/** `scip import` of the fixture's prebuilt index, "built" now — after the sources were copied in — as the CLI runs it. */
+/** `scip import` of the fixture's prebuilt index, "built" now — after the sources were copied in — as the CLI runs it, trusted. */
 export function importFixtureIndex(p: FixtureProject, fixture: string): ReturnType<typeof importScipFile> {
+  trustProject(p.dir);
   const copy = path.join(p.dir, 'built-index.scip');
   fs.copyFileSync(path.join(FIXTURES, fixture, 'index.scip'), copy);
   return importScipFile(p.dir, copy, undefined, referenceSites(p.cg.scipReadDb()));
@@ -53,9 +55,10 @@ export function edgesBetween(db: SqliteDatabase, src: string, tgt: string, kinds
     .all(src, tgt, ...(kinds ?? [])) as EdgeRow[];
 }
 
-/** A project's `codegraph.json` with this `scip` section. */
-export function writeConfig(dir: string, scip: unknown): void {
+/** A project's `codegraph.json` with this `scip` section; trusted to run it unless `trusted` is false (see src/scip/trust.ts). */
+export function writeConfig(dir: string, scip: unknown, trusted = true): void {
   fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip }));
+  if (trusted) trustProject(dir);
 }
 
 /** A fake TypeScript indexer: copies the TS fixture's `index` to `{out}`, and counts its runs (`fakeRuns`). */

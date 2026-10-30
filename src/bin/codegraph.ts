@@ -3073,7 +3073,15 @@ program
   });
 
 // `codegraph scip …` (src/scip/cli.ts)
-registerScipCommands(program, { resolveProjectPath, isInitialized, loadCodeGraph, success, info, warn, error });
+registerScipCommands(program, {
+  resolveProjectPath, isInitialized, loadCodeGraph, success, info, warn, error,
+  async confirm(message) {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) return null;
+    const clack = await importESM('@clack/prompts');
+    const yes = await clack.confirm({ message, initialValue: false });
+    return !clack.isCancel(yes) && yes === true;
+  },
+});
 
 // Parse and run
 program.parse();

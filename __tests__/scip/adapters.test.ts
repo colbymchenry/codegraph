@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { resolveIndexer } from '../../src/scip/indexers';
 import { planRuns, projectWeights, tsProjects } from '../../src/scip/indexers/typescript';
+import { writeConfig } from './helpers';
 
 /** How the indexer is found and run: the commands, and the runs a repo splits into. */
 
@@ -16,7 +17,7 @@ describe('scip-typescript adapter', () => {
     const out = path.join(dir, 'out.tmp');
     fs.writeFileSync(path.join(dir, 'package.json'), '{}');
     fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{}');
-    fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip: { typescript: { cmd: process.execPath } } }));
+    writeConfig(dir, { typescript: { cmd: process.execPath } });
     expect(resolveIndexer(dir, 'typescript', out)).toMatchObject({ runs: [{ label: 'typescript', output: out }] });
 
     for (const p of ['src', 'extensions/git', 'extensions/web', 'node_modules/dep']) fs.mkdirSync(path.join(dir, p), { recursive: true });
@@ -57,7 +58,7 @@ describe('scip-typescript adapter', () => {
       return r.warning;
     };
     fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{}');
-    fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip: { typescript: { cmd: process.execPath } } }));
+    writeConfig(dir, { typescript: { cmd: process.execPath } });
     fs.writeFileSync(path.join(dir, 'pnpm-lock.yaml'), '');
     fs.mkdirSync(path.join(dir, 'node_modules'));
     expect(warning()).toBeUndefined(); // installed
@@ -67,9 +68,7 @@ describe('scip-typescript adapter', () => {
 
   it('an `{args}` override element splices in the adapter arguments', () => {
     fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{}');
-    fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({
-      scip: { typescript: { cmd: process.execPath, args: ['-y', '@sourcegraph/scip-typescript', '{args}'] } },
-    }));
+    writeConfig(dir, { typescript: { cmd: process.execPath, args: ['-y', '@sourcegraph/scip-typescript', '{args}'] } });
     const r = resolveIndexer(dir, 'typescript', path.join(dir, '.codegraph', 'scip', 'out.tmp'));
     expect('skip' in r ? r.skip : r.runs[0]!.args.slice(0, 3)).toEqual(['-y', '@sourcegraph/scip-typescript', 'index']);
   });

@@ -26,6 +26,7 @@ import {
   MergedDocument, ScipLanguage, SCIP_LANGUAGES, availableIndexes, coveredFiles, indexPath,
   forgetMerges, indexedHashes, installIndex, mergedDocumentCounts, needsMerge, readHashed, recordMergedDocuments,
 } from './store';
+import { trustState } from './trust';
 import { SILENT_EDGE, STALE_EDGE, VERIFIED_EDGE } from './verdict';
 
 export { ScipLanguage, SCIP_LANGUAGES } from './store';
@@ -57,11 +58,13 @@ export function mergeInstalled(host: ScipHost, results: readonly ProduceResult[]
  * process. Every merge a caller awaits goes through here: a vscode merge
  * blocks for minutes, which the liveness watchdog (#850) takes for a wedged
  * process and kills — after `codegraph index`, the graph was left unmerged.
- * Null, and no thread started, when the project has no installed index. Must
- * run with the write lock held, as runScipPass does.
+ * Null, and no thread started, when the project has no installed index or is
+ * not trusted (trust.ts): an index shipped inside an untrusted project never
+ * reaches its graph. Must run with the write lock held, as runScipPass does.
  */
 export function mergePass(db: SqliteDatabase, dbPath: string, projectRoot: string): Promise<ScipPassReport | null> {
   if (availableIndexes(projectRoot).length === 0) return Promise.resolve(null); // no thread for a project without SCIP
+  if (trustState(projectRoot) !== 'trusted') return Promise.resolve(null);
   return passOffThread(dbPath, projectRoot) ?? Promise.resolve(runScipPass(db, projectRoot));
 }
 

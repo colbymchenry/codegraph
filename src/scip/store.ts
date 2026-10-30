@@ -144,7 +144,7 @@ export function tryReindexLock(projectRoot: string): FileLock | null {
 }
 
 /** Atomic write: a concurrent reader sees the old file or the new one, never half of either. */
-function writeFileAtomic(file: string, data: string | Buffer): void {
+export function writeFileAtomic(file: string, data: string | Buffer): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, data);

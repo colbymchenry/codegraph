@@ -10,13 +10,15 @@
  * `false` disables a language; `cmd` / `args` / `env` replace the defaults.
  * In args, an element `{args}` splices in the adapter's own arguments and
  * `{out}` is the output path. Indexers are never auto-installed: a command
- * that isn't on PATH is reported and skipped.
+ * that isn't on PATH is reported and skipped. Nothing runs in a project the
+ * user hasn't trusted with this block (see trust.ts).
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { PROJECT_CONFIG_FILENAME } from '../../project-config';
 import type { ScipLanguage } from '../store';
+import { ScipBlock, readScipBlock, trustState, untrustedReason } from '../trust';
 import { typescriptIndexer } from './typescript';
 
 /** One indexer process: its arguments and the file it writes. */
@@ -76,25 +78,27 @@ export function languageOfTool(tool: string): ScipLanguage | undefined {
 
 type ScipConfig = Partial<Record<ScipLanguage, IndexerOverride | false>>;
 
-/** The `scip` block, or an error string. No config file at all means no overrides. */
-function readScipConfig(projectRoot: string): ScipConfig | string {
-  let raw: string;
-  try {
-    raw = fs.readFileSync(path.join(projectRoot, PROJECT_CONFIG_FILENAME), 'utf8');
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
-    return `can't read ${PROJECT_CONFIG_FILENAME}: ${err instanceof Error ? err.message : String(err)}`;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    return `${PROJECT_CONFIG_FILENAME} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`;
-  }
-  const scip = (parsed as { scip?: unknown } | null)?.scip;
+/** The `scip` block as `read` (trust.ts readScipBlock), or why it is unusable. No block means no overrides. */
+function scipConfig(read: ScipBlock): ScipConfig | string {
+  if ('error' in read) return read.error;
+  const scip = read.block;
   if (scip === undefined) return {};
   if (typeof scip !== 'object' || scip === null || Array.isArray(scip)) return `${PROJECT_CONFIG_FILENAME} "scip" must be an object`;
   return scip as ScipConfig;
+}
+
+/** What `scip index` would run here, one line per language, for the user to review before trusting the project. */
+export function describeIndexers(projectRoot: string, read: ScipBlock = readScipBlock(projectRoot)): string[] {
+  const config = scipConfig(read);
+  if (typeof config === 'string') return [config];
+  const lines: string[] = [];
+  for (const spec of Object.values(INDEXERS)) {
+    const override = config[spec.lang];
+    if (override === false) lines.push(`${spec.lang}: disabled in ${PROJECT_CONFIG_FILENAME}`);
+    else if (override !== undefined) lines.push(`${spec.lang}: set in ${PROJECT_CONFIG_FILENAME}: ${JSON.stringify(override)}`);
+    else if (spec.detect(projectRoot)) lines.push(`${spec.lang}: \`${spec.cmd}\` from PATH (default)`);
+  }
+  return lines;
 }
 
 const isStringRecord = (v: unknown): v is Record<string, string> =>
@@ -112,8 +116,16 @@ export interface ResolvedIndexer {
  */
 export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile: string): ResolvedIndexer | { skip: string } {
   const spec = INDEXERS[lang];
-  const config = readScipConfig(projectRoot);
+  const read = readScipBlock(projectRoot);
+  const config = scipConfig(read);
   if (typeof config === 'string') return { skip: config };
+  let trust: ReturnType<typeof trustState>;
+  try {
+    trust = trustState(projectRoot, read);
+  } catch (err) {
+    return { skip: err instanceof Error ? err.message : String(err) };
+  }
+  if (trust !== 'trusted') return { skip: untrustedReason(trust) };
   const override = config[lang];
   const at = `${PROJECT_CONFIG_FILENAME} scip.${lang}`;
   if (override === false) return { skip: `disabled in ${PROJECT_CONFIG_FILENAME}` };
