@@ -149,7 +149,11 @@ export interface SyncResult {
    */
   durationMs: number;
   changedFilePaths?: string[];
-  /** The part of `changedFilePaths` that was not indexed before this sync. */
+  /**
+   * The part of `changedFilePaths` that had nothing indexed before this sync:
+   * new files, and tracked ones that had no nodes (over the size limit, or a
+   * parse failure) and now do. The latter are still counted as modified.
+   */
   addedFilePaths?: string[];
   /** Paths not absorbed because reading or extraction failed; retain for status/retry. */
   failedFilePaths?: string[];
@@ -3748,6 +3752,10 @@ export class ExtractionOrchestrator {
     let nodesUpdated = 0;
     const changedFilePaths: string[] = [];
     const addedFilePaths: string[] = [];
+    // Tracked with no nodes and the reason recorded (over the size limit, a
+    // parse or grammar failure): if this sync stores nodes for one, it is new
+    // to its importers, so it joins `addedFilePaths` once stored.
+    const indexedFromSkip: string[] = [];
     const removedFilePaths: string[] = [];
     // `file\0name` definition pairs for the files this sync touches, sampled
     // BEFORE their nodes are replaced/deleted. Compared against the post-store
@@ -3952,6 +3960,7 @@ export class ExtractionOrchestrator {
         onFileChange?.(filePath, content);
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
+        if (tracked.nodeCount === 0 && (tracked.errors?.length ?? 0) > 0) indexedFromSkip.push(filePath);
         filesModified++;
       }
     }
@@ -3999,6 +4008,10 @@ export class ExtractionOrchestrator {
 
       const pause = backpressure?.();
       if (pause) await pause;
+    }
+
+    for (const filePath of indexedFromSkip) {
+      if ((this.queries.getFileByPath(filePath)?.nodeCount ?? 0) > 0) addedFilePaths.push(filePath);
     }
 
     // Names whose definition set this sync changed: a `file\0name` pair present
