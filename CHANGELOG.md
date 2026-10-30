@@ -19,6 +19,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- CodeGraph now indexes **Bash** and shell scripts — `.sh`, `.bash`, `.bats` and extensionless scripts whose first line names `bash` or `sh` — with their functions, variables, calls between scripts, the files they `source` or run (including paths built from the script's own directory, like `"$(dirname "$0")/lib.sh"`), and each Bats `@test` as its own symbol with the helpers it `load`s. Thanks @Omar-Elwazeery, @Adam0120 and @danielmevit. (#1203, #1217)
 - `codegraph files --format package` and `codegraph_files` with `format: "package"` now list a project's files by the package that owns them, the nearest `package.json` or `composer.json` above each file that names one, so a monorepo splits into its workspace members with no setup and files nothing claims get a section of their own (#1871). Thanks @LuisAlbertoMK.
 
 ### Fixes
