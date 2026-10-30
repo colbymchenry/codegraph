@@ -28,7 +28,7 @@ import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { treatStdoutFailureAsShutdown } from './stdout-teardown';
 import { CodeGraphPackageVersion, isOlderRelease } from './version';
-import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions } from './session';
+import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions, toolCallArguments, TOOL_ARGUMENTS_NOT_OBJECT } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
 import { ErrorCodes } from './transport';
@@ -361,10 +361,15 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
     let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { return; }
     const id = msg.id;
     if (msg.method === 'tools/call' && id !== undefined) {
+      const params = (msg.params || {}) as { name: string; arguments?: unknown };
+      const args = toolCallArguments(params);
+      if (!args) {
+        writeClient({ jsonrpc: '2.0', id, error: { code: ErrorCodes.InvalidParams, message: TOOL_ARGUMENTS_NOT_OBJECT } });
+        return;
+      }
       try {
         const local = await ensureEngine();
-        const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
-        const result = await local.getToolHandler().execute(params.name, params.arguments || {}, exploreSession);
+        const result = await local.getToolHandler().execute(params.name, args, exploreSession);
         writeClient({ jsonrpc: '2.0', id, result });
         getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
       } catch (err) {
