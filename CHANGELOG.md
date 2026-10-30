@@ -24,6 +24,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph status` now shows how many of a language's files yielded symbols when that isn't all of them, and warns when none did, so a parser that isn't working no longer looks healthy, and `codegraph status --strict` exits non-zero on that or on an index that's missing, unfinished or out of date, so packaging and CI can gate on it (#1658). Thanks @ferrine.
 - `codegraph serve --mcp --no-telemetry` turns telemetry off for one MCP server entry, so a shared MCP config can opt out without an environment variable; a background daemon that's already running for the project keeps its own setting until it exits. Thanks @danusha2345. (#1908)
 
+- New `codegraph cycles` command lists the groups of files that import each other in a circle, as text or `--json`, and exits 1 when it finds any, so it works as a pre-commit or CI check (#888). Thanks @jiangyq9 and @goutham80808.
 
 ### Fixes
 

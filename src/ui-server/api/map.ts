@@ -36,6 +36,7 @@
 
 import type { CodeGraph } from '../../index';
 import type { EdgeKind, Language } from '../../types';
+import { findFileCycles } from '../../graph/file-cycles';
 import { isTestFile } from '../../search/query-utils';
 import { badRequest } from './respond';
 import { UNCERTAIN_BELOW, toPosixPath, wireList, type WireList } from './wire';
@@ -719,11 +720,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
     }
   }
 
-  // ONE fetch of the file edge list, read twice: the cycle finder and the
-  // dependent counts are both questions about it, and it is the expensive query
-  // on this screen.
-  const filePairs = cg.getFileDependencyPairs(UNCERTAIN_BELOW);
-  const dependents = countDependents(filePairs, moduleOfFile);
+  const dependents = countDependents(cg.getFileDependencyPairs(UNCERTAIN_BELOW), moduleOfFile);
 
   const payload: WireMapPayload = {
     root,
@@ -756,7 +753,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
     links: [...links.values()].sort(
       (a, b) => a.source.localeCompare(b.source) || a.target.localeCompare(b.target)
     ),
-    cycles: fileCycles(filePairs, moduleOfFile),
+    cycles: fileCycles(cg.getFileImportPairs(), moduleOfFile),
     excluded: { uncertainEdges, confidenceBelow: UNCERTAIN_BELOW },
     index: {
       lastIndexedAt: cg.getLastIndexedAt(),
@@ -807,34 +804,19 @@ function countDependents(
 }
 
 /**
- * File-level circular dependencies, as strongly connected components.
+ * The circular imports inside the chosen root (see {@link findFileCycles}).
  *
- * Tarjan over the one-query file edge list. Components of size 1 are not
- * cycles (a file depending on itself is a same-file edge, already excluded),
- * and a component longer than {@link MAX_CYCLE_LENGTH} is reported truncated
- * rather than printed — a 200-file knot is a fact about the repository, not a
- * list anybody reads.
+ * A component longer than {@link MAX_CYCLE_LENGTH} is reported truncated rather
+ * than printed — a 200-file knot is a fact about the repository, not a list
+ * anybody reads.
  */
 function fileCycles(
   pairs: ReadonlyArray<{ source: string; target: string }>,
   moduleOfFile: Map<string, string>
 ): WireMapPayload['cycles'] {
-  const adjacency = new Map<string, string[]>();
-  for (const pair of pairs) {
-    if (!moduleOfFile.has(pair.source) || !moduleOfFile.has(pair.target)) continue;
-    let out = adjacency.get(pair.source);
-    if (!out) adjacency.set(pair.source, (out = []));
-    out.push(pair.target);
-  }
-  // Deterministic iteration: SQLite's DISTINCT ordering is not a contract.
-  const nodes = [...new Set([...adjacency.keys(), ...[...adjacency.values()].flat()])].sort();
-  for (const list of adjacency.values()) list.sort();
-
-  const components = tarjan(nodes, (id) => adjacency.get(id) ?? []);
-  const cycles = components
-    .filter((component) => component.length > 1)
-    .map((component) => component.slice().sort())
-    .sort((a, b) => a.length - b.length || (a[0] ?? '').localeCompare(b[0] ?? ''));
+  const cycles = findFileCycles(
+    pairs.filter((pair) => moduleOfFile.has(pair.source) && moduleOfFile.has(pair.target))
+  );
 
   const items = cycles.slice(0, MAX_FILE_CYCLES).map((files) => ({
     size: files.length,
@@ -847,63 +829,6 @@ function fileCycles(
     truncated: cycles.length > items.length,
     items,
   };
-}
-
-/** Tarjan's strongly connected components, iterative so a deep graph cannot blow the stack. */
-function tarjan(nodes: readonly string[], edgesOf: (id: string) => readonly string[]): string[][] {
-  const index = new Map<string, number>();
-  const low = new Map<string, number>();
-  const onStack = new Set<string>();
-  const stack: string[] = [];
-  const out: string[][] = [];
-  let counter = 0;
-
-  for (const start of nodes) {
-    if (index.has(start)) continue;
-    const work: Array<{ id: string; edges: readonly string[]; at: number }> = [
-      { id: start, edges: edgesOf(start), at: 0 },
-    ];
-    index.set(start, counter);
-    low.set(start, counter);
-    counter += 1;
-    stack.push(start);
-    onStack.add(start);
-
-    while (work.length > 0) {
-      const frame = work[work.length - 1];
-      if (frame === undefined) break;
-      if (frame.at < frame.edges.length) {
-        const next = frame.edges[frame.at]!;
-        frame.at += 1;
-        if (!index.has(next)) {
-          index.set(next, counter);
-          low.set(next, counter);
-          counter += 1;
-          stack.push(next);
-          onStack.add(next);
-          work.push({ id: next, edges: edgesOf(next), at: 0 });
-        } else if (onStack.has(next)) {
-          low.set(frame.id, Math.min(low.get(frame.id) ?? 0, index.get(next) ?? 0));
-        }
-        continue;
-      }
-      work.pop();
-      if (low.get(frame.id) === index.get(frame.id)) {
-        const component: string[] = [];
-        for (;;) {
-          const popped = stack.pop();
-          if (popped === undefined) break;
-          onStack.delete(popped);
-          component.push(popped);
-          if (popped === frame.id) break;
-        }
-        out.push(component);
-      }
-      const parent = work[work.length - 1];
-      if (parent) low.set(parent.id, Math.min(low.get(parent.id) ?? 0, low.get(frame.id) ?? 0));
-    }
-  }
-  return out;
 }
 
 /**

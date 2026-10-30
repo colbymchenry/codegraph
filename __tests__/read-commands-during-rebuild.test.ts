@@ -57,6 +57,7 @@ const READ_COMMANDS: ReadCommand[] = [
   { name: 'context', args: ['context', 'getUserProfile', 'loadOrderState'], answer: /loadOrderState/ },
   { name: 'explore', args: ['explore', 'getUserProfile', 'loadOrderState'], answer: /src\/order\.ts/ },
   { name: 'affected', args: ['affected', 'src/order.ts'], answer: /src\/user\.test\.ts/ },
+  { name: 'cycles', args: ['cycles'], answer: /No circular imports found/ },
   { name: 'prompt-hook', args: ['prompt-hook'], prompt: 'how does getUserProfile reach loadOrderState?', answer: /<codegraph_context[\s\S]*loadOrderState/ },
   { name: 'prompt-hook, segment tier', args: ['prompt-hook'], prompt: 'the order state machine keeps resetting', answer: /<codegraph_context[\s\S]*OrderStateMachine/ },
 ];

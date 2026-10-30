@@ -20,6 +20,7 @@
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph affected [files]   Find test files affected by changes
+ *   codegraph cycles [path]      List circular imports between files
  *   codegraph ui [path]          Open the browser viewer (alias: web; not released yet — needs CODEGRAPH_UI=1)
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
@@ -2874,6 +2875,60 @@ program
       cg.destroy();
     } catch (err) {
       error(`Affected analysis failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/** Files `codegraph cycles` prints per group; `--json` lists them all. */
+const CLI_CYCLE_FILES_SHOWN = 12;
+
+/**
+ * codegraph cycles [path]
+ *
+ * List groups of files that all import each other, directly or through others.
+ * Exits 1 when there are any, so it works as a pre-commit or CI check:
+ *
+ *   codegraph cycles || exit 1
+ */
+program
+  .command('cycles [path]')
+  .description('List circular imports between files (exits 1 when there are any)')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (pathArg: string | undefined, options: { json?: boolean }) => {
+    const projectPath = resolveProjectPath(pathArg);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const cg = await openIndexToRead(projectPath);
+      try {
+        const cycles = cg.findCircularDependencies();
+        if (options.json) {
+          console.log(JSON.stringify({ count: cycles.length, cycles }, null, 2));
+        } else if (cycles.length === 0) {
+          success('No circular imports found');
+        } else {
+          const files = cycles.reduce((sum, group) => sum + group.length, 0);
+          console.log(chalk.bold(`\nCircular imports: ${cycles.length} group${cycles.length === 1 ? '' : 's'}, ${files} files\n`));
+          cycles.forEach((group, i) => {
+            console.log(chalk.cyan(`${i + 1}. ${group.length} files`));
+            for (const file of group.slice(0, CLI_CYCLE_FILES_SHOWN)) console.log(`   ${file}`);
+            if (group.length > CLI_CYCLE_FILES_SHOWN) {
+              console.log(chalk.dim(`   ... and ${group.length - CLI_CYCLE_FILES_SHOWN} more (--json lists them all)`));
+            }
+            console.log();
+          });
+        }
+        // exitCode, not exit(): a piped --json has to reach its reader whole.
+        if (cycles.length > 0) process.exitCode = 1;
+      } finally {
+        cg.destroy();
+      }
+    } catch (err) {
+      error(`cycles failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });

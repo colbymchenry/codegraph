@@ -2341,11 +2341,19 @@ export class CodeGraph {
   }
 
   /**
-   * Every ordered pair of files where one reaches into the other — the edge
-   * list a cycle finder runs on. See {@link QueryBuilder.getCrossFileDependencyPairs}.
+   * Every ordered pair of files where one reaches into the other. See
+   * {@link QueryBuilder.getCrossFileDependencyPairs}.
    */
   getFileDependencyPairs(minConfidence = 0): Array<{ source: string; target: string }> {
     return this.queries.getCrossFileDependencyPairs(minConfidence);
+  }
+
+  /**
+   * Every ordered pair of files where one imports the other — the edge list
+   * circular imports are found on. See {@link QueryBuilder.getFileImportPairs}.
+   */
+  getFileImportPairs(): Array<{ source: string; target: string }> {
+    return this.queries.getFileImportPairs();
   }
 
   /**
@@ -2962,9 +2970,10 @@ export class CodeGraph {
   }
 
   /**
-   * Find circular dependencies in the codebase
+   * Find circular imports between files
    *
-   * @returns Array of cycles, each cycle is an array of file paths
+   * @returns Groups of file paths that all reach each other through imports,
+   *   smallest group first
    */
   findCircularDependencies(): string[][] {
     return this.graphManager.findCircularDependencies();

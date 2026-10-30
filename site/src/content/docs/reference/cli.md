@@ -22,6 +22,7 @@ codegraph callers <symbol>        # Find what calls a function/method (--limit, 
 codegraph callees <symbol>        # Find what a function/method calls (--limit, --json)
 codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
 codegraph affected [files...]     # Find test files affected by changes (see below)
+codegraph cycles [path]           # List circular imports between files (--json); exits 1 when there are any
 codegraph daemon                  # Manage background daemons — pick one to stop (alias: daemons)
 codegraph telemetry [on|off]      # Show or change anonymous usage telemetry
 codegraph upgrade [version]       # Update to the latest release (--check, --force)
@@ -66,6 +67,18 @@ codegraph impact AuthMiddleware --depth 3
 ## affected
 
 Traces import dependencies transitively to find which test files are affected by changed source files. See [Affected Tests in CI](/codegraph/guides/affected-tests/) for options and a CI example.
+
+## cycles
+
+Lists circular imports: groups of files that all import each other, directly or through others. Each group is reported once with every file in it, smallest group first, and `--json` prints the whole list.
+
+```bash
+codegraph cycles                 # the project you're standing in
+codegraph cycles --json          # { "count": 2, "cycles": [["src/a.ts", "src/b.ts"], ...] }
+codegraph cycles || exit 1       # as a pre-commit or CI check
+```
+
+It exits 1 when there are any and 0 when there are none. Only import statements count, type-only imports included. Two files that merely call each other, like the files of one Go package, are not a circular import.
 
 ## ui
 
