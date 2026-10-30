@@ -2680,24 +2680,28 @@ program
         const collected = groups.map((group) => {
           const nodes = new Map<string, Node>();
           const edges = new Map<string, Edge>();
+          let truncated = false;
           for (const target of group) {
             const impact = cg.getImpactRadius(target.id, depth);
+            truncated ||= impact.truncated === true;
             for (const [id, node] of impact.nodes) nodes.set(id, node);
             for (const edge of impact.edges) edges.set(`${edge.source}->${edge.target}:${edge.kind}`, edge);
           }
-          return { group, nodes, edges };
+          return { group, nodes, edges, truncated };
         });
+        const truncated = collected.some((c) => c.truncated);
 
         if (options.json) {
           const unionNodes = new Map<string, Node>();
           const unionEdges = new Map<string, Edge>();
-          const definitions = collected.map(({ group, nodes, edges }) => {
+          const definitions = collected.map(({ group, nodes, edges, truncated }) => {
             for (const [id, node] of nodes) unionNodes.set(id, node);
             for (const [key, edge] of edges) unionEdges.set(key, edge);
             return {
               ...cliDefinition(group),
               nodeCount: nodes.size,
               edgeCount: edges.size,
+              ...(truncated ? { truncated } : {}),
               affected: [...nodes.values()].map((node) => ({ id: node.id, ...cliNode(node) })),
               edges: [...edges.values()],
             };
@@ -2714,6 +2718,7 @@ program
             definitions,
             nodeCount: unionNodes.size,
             edgeCount: unionEdges.size,
+            ...(truncated ? { truncated } : {}),
             affected: [...unionNodes.values()].map(cliNode),
           }, null, 2));
         } else {
@@ -2743,6 +2748,7 @@ program
               console.log();
             }
           }
+          if (truncated) warn('Result truncated at the safety limit. Narrow it with --file or a smaller --depth.');
         }
       } finally {
         cg.destroy();
