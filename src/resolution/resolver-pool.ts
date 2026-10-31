@@ -138,7 +138,7 @@ export class ResolverPool {
    * otherwise. `CODEGRAPH_RESOLVE_WORKERS` overrides the computed size
    * (0 disables the pool; values are capped at 16).
    */
-  static tryCreate(dbPath: string, projectRoot: string): ResolverPool | null {
+  static tryCreate(dbPath: string, projectRoot: string, frameworks?: readonly string[]): ResolverPool | null {
     if (process.env.CODEGRAPH_NO_PARALLEL_RESOLVE === '1') return null;
     const workerScript = path.join(__dirname, 'resolver-worker.js');
     if (!fs.existsSync(workerScript)) return null;
@@ -163,13 +163,13 @@ export class ResolverPool {
     }
     if (size === null) return null;
     try {
-      return new ResolverPool(workerScript, dbPath, projectRoot, size);
+      return new ResolverPool(workerScript, dbPath, projectRoot, size, frameworks);
     } catch {
       return null;
     }
   }
 
-  private constructor(workerScript: string, dbPath: string, projectRoot: string, size: number) {
+  private constructor(workerScript: string, dbPath: string, projectRoot: string, size: number, frameworks?: readonly string[]) {
     for (let i = 0; i < size; i++) {
       const worker = new Worker(workerScript);
       const started = workerStarted(worker);
@@ -229,7 +229,7 @@ export class ResolverPool {
           readyReject(this.failed!);
         }
       });
-      worker.postMessage({ type: 'open', dbPath, projectRoot });
+      worker.postMessage({ type: 'open', dbPath, projectRoot, frameworks });
       this.workers.push(pw);
     }
   }

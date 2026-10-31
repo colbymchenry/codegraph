@@ -39,7 +39,7 @@ let queries: QueryBuilder | null = null;
 let resolver: ReferenceResolver | null = null;
 
 type InMessage =
-  | { type: 'open'; dbPath: string; projectRoot: string }
+  | { type: 'open'; dbPath: string; projectRoot: string; frameworks?: string[] }
   | { type: 'recycle'; id: number }
   | { type: 'resolve'; id: number; refs: UnresolvedReference[] }
   | { type: 'synth'; id: number; pass: string }
@@ -60,7 +60,7 @@ port.on('message', (msg: InMessage) => {
         const tDb = Date.now();
         queries = new QueryBuilder(db);
         resolver = new ReferenceResolver(msg.projectRoot, queries);
-        resolver.initialize();
+        resolver.initialize(msg.frameworks);
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker open: db=${tDb - tOpen}ms init=${Date.now() - tDb}ms`);
         port.postMessage({ type: 'ready' });
         break;

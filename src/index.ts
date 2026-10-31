@@ -814,7 +814,9 @@ export class CodeGraph {
                 total: totalPasses,
               });
             },
-            walValve ? () => walValve!.backpressure() : undefined
+            walValve ? () => walValve!.backpressure() : undefined,
+            true,
+            true
           );
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolution: ${Date.now() - tResolve}ms`);
           this.lastSynthesisAt = Date.now();
@@ -2224,10 +2226,14 @@ export class CodeGraph {
     // continuous reads keep perpetually partial — the WAL then accretes the
     // whole phase's write volume (22GB on a 4.6GB DB at kernel scale).
     backpressure?: () => Promise<void> | null,
-    synthesize: boolean = true
+    synthesize: boolean = true,
+    // The caller has just re-detected the frameworks on this index, so the
+    // resolver pool's workers needn't each read the project again to do it.
+    frameworksCurrent: boolean = false
   ): Promise<ResolutionResult> {
     return this.resolver.resolveAndPersistBatched(onProgress, undefined, onSynthesisProgress, {
       dbPath: this.db.getPath(),
+      shareFrameworks: frameworksCurrent,
       // Bulk-edge-load hooks: on big runs the resolver drops the non-unique
       // edge indexes for the batch loop and recreates them before synthesis
       // (which reads kind-keyed). Concurrent readers (a daemon serving this

@@ -452,6 +452,20 @@ export function isTestFile(filePath: string): boolean {
  * that contains them is telling the reader something untrue.
  */
 export function isTestPath(filePath: string): boolean {
+  let known = TEST_PATHS.get(filePath);
+  if (known === undefined) {
+    known = readsAsTestPath(filePath);
+    if (TEST_PATHS.size >= TEST_PATHS_KEEP) TEST_PATHS.clear();
+    TEST_PATHS.set(filePath, known);
+  }
+  return known;
+}
+
+/** Resolving asks about the same paths for every reference and candidate, and the answer takes seven patterns. */
+const TEST_PATHS = new Map<string, boolean>();
+const TEST_PATHS_KEEP = 100_000;
+
+function readsAsTestPath(filePath: string): boolean {
   const lower = filePath.toLowerCase();
   const fileName = path.basename(filePath);   // original case — needed for camelCase boundaries
   const lowerName = fileName.toLowerCase();

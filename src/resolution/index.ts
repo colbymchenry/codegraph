@@ -45,7 +45,7 @@ import { matchRubyConstantPathRef } from './ruby-constant-paths';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
-import { detectFrameworks, getResolvingFrameworks } from './frameworks';
+import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } from './frameworks';
 import { clearDeclaredDependencies } from './frameworks/package-deps';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
@@ -443,9 +443,12 @@ export class ReferenceResolver {
   }
 
   /**
-   * Initialize the resolver (detect frameworks, etc.)
+   * Initialize the resolver (detect frameworks, etc.). `frameworks` are the
+   * names detection gave in the process's main thread, for a worker starting
+   * on the same index: a detector may read every source file (Spring, in a
+   * project with none of it), and each worker doing that again added up.
    */
-  initialize(): void {
+  initialize(frameworks?: readonly string[]): void {
     // A full index resolves by the package.json files on disk now, as the
     // fingerprint it stamps says, even in a process that read them earlier.
     this.workspacePackages = undefined;
@@ -453,7 +456,9 @@ export class ReferenceResolver {
     // declared dependencies): clear them first, or a process that read the
     // manifests earlier detects by what they said then (#2519).
     this.clearCaches();
-    this.frameworks = detectFrameworks(this.context);
+    this.frameworks = frameworks
+      ? getAllFrameworkResolvers().filter((f) => frameworks.includes(f.name))
+      : detectFrameworks(this.context);
     this.frameworksByLanguage.clear();
   }
 
@@ -2582,6 +2587,8 @@ export class ReferenceResolver {
     // a 22GB WAL on a 4.6GB DB (migration plan §7a.1).
     parallel?: {
       dbPath: string;
+      /** The workers may take this resolver's frameworks, detected on this same index. */
+      shareFrameworks?: boolean;
       bulkEdgeLoad?: {
         begin: () => void;
         end: () => void | Promise<void>;
@@ -2645,7 +2652,7 @@ export class ReferenceResolver {
     const createPool = (t0: number, why: string): ResolverPool | null => {
       poolEngageTried = true;
       if (!parallel) return null;
-      const p = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot);
+      const p = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot, parallel.shareFrameworks ? this.getDetectedFrameworks() : undefined);
       p?.ready().then(
         () => {
           poolReady = true;
