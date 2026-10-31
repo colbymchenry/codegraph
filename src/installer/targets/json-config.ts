@@ -40,7 +40,7 @@ function isObject(value: unknown): value is Record<string, any> {
 }
 
 function parseConfig(text: string): { config: Record<string, any>; valid: boolean } {
-  const body = text.replace(/^﻿/, '');
+  const body = text.replace(/^\uFEFF/, '');
   if (body.trim() === '') return { config: {}, valid: true };
   const errors: ParseError[] = [];
   const value: unknown = parse(body, errors, { allowTrailingComma: true });

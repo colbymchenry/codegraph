@@ -547,7 +547,7 @@ describe('spec paths', () => {
 
   it('resolves a map by platform and a token by the environment, and says why it cannot', () => {
     const env = { CG_ROOT: '/roots/here' };
-    expect(resolveSpecDir({ linux: '/a', darwin: '/b' }, 'linux', env)).toEqual({ dir: '/a' });
+    expect(resolveSpecDir({ linux: '/a', darwin: '/b' }, 'linux', env)).toEqual({ dir: path.resolve('/a') });
     expect(resolveSpecDir({ linux: '/a' }, 'darwin', env)).toEqual({ dir: null, reason: 'no config dir is declared for this platform (darwin)' });
     expect(resolveSpecDir('${CG_ROOT}/agent', 'linux', env)).toEqual({ dir: path.resolve('/roots/here/agent') });
     expect(resolveSpecDir('${CG_ROOT}', 'linux', env)).toEqual({ dir: path.resolve('/roots/here') });
