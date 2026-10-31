@@ -3921,8 +3921,10 @@ function useTmpDirs(label: string): { home: () => string; cwd: () => string } {
   let homeRestore: { restore: () => void };
 
   beforeEach(() => {
-    tmpHome = mkTmpDir(`${label}-home`);
-    tmpCwd = mkTmpDir(`${label}-cwd`);
+    // Resolved, so a path built from the dir matches one built from
+    // `process.cwd()`, which macOS reports as `/private/var/...` for `/var/...`.
+    tmpHome = fs.realpathSync(mkTmpDir(`${label}-home`));
+    tmpCwd = fs.realpathSync(mkTmpDir(`${label}-cwd`));
     origCwd = process.cwd();
     process.chdir(tmpCwd);
     homeRestore = setHome(tmpHome);
