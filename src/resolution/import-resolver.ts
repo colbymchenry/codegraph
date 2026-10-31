@@ -616,6 +616,37 @@ const PYTHON_NON_PROJECT_DIRS = new Set([
   'tests', 'test', 'testing', 'fixtures', 'testdata', 'examples', 'example', 'samples', 'vendor', 'third_party',
 ]);
 
+/**
+ * `sys.stdlib_module_names`, less the private `_x` modules. A folder only a
+ * script has on its path never takes one of these: `from html import escape` in
+ * `django/utils/text.py` is the stdlib's, though `django/utils/html.py` beside it
+ * defines `escape`. CPython's own `test` package isn't one, as Python leaves it
+ * out too, so `from test import TestCase` stays open to a project's runner.
+ */
+const PYTHON_STDLIB_MODULES = new Set([
+  '__future__', 'abc', 'annotationlib', 'antigravity', 'argparse', 'array', 'ast', 'asyncio', 'atexit',
+  'base64', 'bdb', 'binascii', 'bisect', 'builtins', 'bz2', 'cProfile', 'calendar', 'cmath', 'cmd', 'code',
+  'codecs', 'codeop', 'collections', 'colorsys', 'compileall', 'compression', 'concurrent', 'configparser',
+  'contextlib', 'contextvars', 'copy', 'copyreg', 'csv', 'ctypes', 'curses', 'dataclasses', 'datetime',
+  'dbm', 'decimal', 'difflib', 'dis', 'doctest', 'email', 'encodings', 'ensurepip', 'enum', 'errno',
+  'faulthandler', 'fcntl', 'filecmp', 'fileinput', 'fnmatch', 'fractions', 'ftplib', 'functools', 'gc',
+  'genericpath', 'getopt', 'getpass', 'gettext', 'glob', 'graphlib', 'grp', 'gzip', 'hashlib', 'heapq',
+  'hmac', 'html', 'http', 'idlelib', 'imaplib', 'importlib', 'inspect', 'io', 'ipaddress', 'itertools',
+  'json', 'keyword', 'linecache', 'locale', 'logging', 'lzma', 'mailbox', 'marshal', 'math', 'mimetypes',
+  'mmap', 'modulefinder', 'msvcrt', 'multiprocessing', 'netrc', 'nt', 'ntpath', 'nturl2path', 'numbers',
+  'opcode', 'operator', 'optparse', 'os', 'pathlib', 'pdb', 'pickle', 'pickletools', 'pkgutil', 'platform',
+  'plistlib', 'poplib', 'posix', 'posixpath', 'pprint', 'profile', 'profiling', 'pstats', 'pty', 'pwd',
+  'py_compile', 'pyclbr', 'pydoc', 'pydoc_data', 'pyexpat', 'queue', 'quopri', 'random', 're', 'readline',
+  'reprlib', 'resource', 'rlcompleter', 'runpy', 'sched', 'secrets', 'select', 'selectors', 'shelve',
+  'shlex', 'shutil', 'signal', 'site', 'smtplib', 'socket', 'socketserver', 'sqlite3', 'ssl', 'stat',
+  'statistics', 'string', 'stringprep', 'struct', 'subprocess', 'symtable', 'sys', 'sysconfig', 'syslog',
+  'tabnanny', 'tarfile', 'tempfile', 'termios', 'textwrap', 'this', 'threading', 'time', 'timeit',
+  'tkinter', 'token', 'tokenize', 'tomllib', 'trace', 'traceback', 'tracemalloc', 'tty', 'turtle',
+  'turtledemo', 'types', 'typing', 'unicodedata', 'unittest', 'urllib', 'uuid', 'venv', 'warnings', 'wave',
+  'weakref', 'webbrowser', 'winreg', 'winsound', 'wsgiref', 'xml', 'xmlrpc', 'zipapp', 'zipfile',
+  'zipimport', 'zlib', 'zoneinfo',
+]);
+
 /** A def at module level — what `from mod import name` can bind. */
 function isPythonModuleLevelDef(n: Node): boolean {
   return PYTHON_MODULE_LEVEL_KINDS.has(n.kind) && !n.qualifiedName.includes('::');
@@ -903,20 +934,25 @@ function resolvePythonModule(
     if (found !== null && found !== hit) return null;
     found = hit;
   }
-  return found ?? pythonModuleAboveScript(specifier, relPath, fromFile, importerDir, index, context);
+  return found ?? pythonModuleOfScript(specifier, relPath, fromFile, importerDir, index, context);
 }
 
 /**
- * The module in a folder above a script that no root provides: `from test
- * import TestCase` in `modules/vs/tests/with_a.py`, with the runner
- * `modules/vs/test.py` whose folder is first on `sys.path`. Nothing in the tree
- * says that folder is a root, and a name like `test` or `utils` may just as
- * well be the stdlib's, so what proves the module is what the importer takes
- * from it: every name must be one the file defines at module level. A plain
- * `import utils` or a star import takes no name, so it proves nothing and stays
- * unresolved. Nearest folder first; a package is no root, so it is passed over.
+ * The module only a script's own `sys.path[0]` provides, which no root does:
+ * `from test import TestCase` in `modules/vs/tests/with_a.py`, with the runner
+ * `modules/vs/test.py` above it, or `from pysim import HashTable` in
+ * `tools/an/pysim_test.py`, beside `tools/an/pysim.py` in a folder that also
+ * holds an `__init__.py`. Nothing in the tree says such a folder is on the path,
+ * and a file of a real package means the top-level module instead, so the folder
+ * has to earn it. A stdlib name never does. A module that imports its own name
+ * wraps the real one, which that name then means, for its neighbours and for
+ * itself. Otherwise what proves the module is what the importer takes from it:
+ * every name must be one the file defines at module level. A plain `import
+ * utils` or a star import takes no name, so it proves nothing and stays
+ * unresolved. Nearest folder first, the importer's own included; a package above
+ * it is no root, so it is passed over.
  */
-function pythonModuleAboveScript(
+function pythonModuleOfScript(
   specifier: string,
   relPath: string,
   fromFile: string,
@@ -924,14 +960,15 @@ function pythonModuleAboveScript(
   index: PythonModuleIndex,
   context: ResolutionContext
 ): string | null {
+  if (PYTHON_STDLIB_MODULES.has(specifier.split('.')[0]!)) return null;
   const taken = context.getImportMappings(fromFile, 'python')
     .filter((imp) => imp.source === specifier && !imp.isNamespace)
     .map((imp) => imp.exportedName);
   if (taken.length === 0) return null;
-  for (let dir = parentDir(importerDir); dir; dir = parentDir(dir)) {
-    if (index.packageDirs.has(dir)) continue;
+  for (let dir = importerDir; dir; dir = parentDir(dir)) {
+    if (dir !== importerDir && index.packageDirs.has(dir)) continue;
     const file = pythonModuleUnder(dir, relPath, index);
-    if (!file) continue;
+    if (!file || context.getImportMappings(file, 'python').some((imp) => imp.source === specifier)) continue;
     const defined = new Set(context.getNodesInFile(file).filter(isPythonModuleLevelDef).map((n) => n.name));
     if (taken.every((name) => defined.has(name))) return file;
   }
@@ -1006,11 +1043,13 @@ export function pythonReopenScope(
 
 /**
  * What an edit of these Python files can move through
- * {@link pythonModuleAboveScript}: such a module binds only while it defines
- * the names its importers take, so an edit links or unlinks them though no file
- * appeared or vanished. Only a module in a folder that is neither a package nor
- * a root, with Python folders below it, can be one, so any other edit re-opens
- * nothing.
+ * {@link pythonModuleOfScript}: such a module binds only while it defines the
+ * names its importers take, so an edit links or unlinks them though no file
+ * appeared or vanished. Import nodes are named by their specifier, so each folder
+ * above a module asks for the spelling that reaches it from there: a file in a
+ * package folder, or a file anywhere below a plain folder that isn't a root. An
+ * edit nobody imports that way re-opens nothing, however many other importers
+ * the module has: `from types import ModuleType` beside `mypy/types.py` never does.
  */
 export function pythonScriptModuleScope(
   context: ResolutionContext,
@@ -1021,12 +1060,23 @@ export function pythonScriptModuleScope(
   const moduleLeaves: string[] = [];
   for (const raw of editedFiles) {
     const file = raw.replace(/\\/g, '/');
-    const dir = parentDir(file);
-    if (!PYTHON_MODULE_FILE.test(file) || !dir || index.packageDirs.has(dir) ||
-        index.projectRoots.has(dir) || index.localRoots.has(dir)) continue;
-    if (![...index.dirs].some((d) => d.startsWith(`${dir}/`))) continue;
-    targetFiles.push(file);
-    moduleLeaves.push(file.slice(dir.length + 1, -'.py'.length));
+    if (!PYTHON_MODULE_FILE.test(file)) continue;
+    const mod = file.replace(/(?:^|\/)__init__\.py$/, '').replace(/\.py$/, '');
+    for (let dir = parentDir(mod); dir; dir = parentDir(dir)) {
+      const specifier = mod.slice(dir.length + 1).replace(/\//g, '.');
+      if (PYTHON_STDLIB_MODULES.has(specifier.split('.')[0]!)) continue;
+      const importers = context.getNodesByName(specifier)
+        .filter((n) => n.kind === 'import' && PYTHON_MODULE_FILE.test(n.filePath))
+        .map((n) => parentDir(n.filePath));
+      const reached = index.packageDirs.has(dir)
+        ? importers.includes(dir)
+        : !index.projectRoots.has(dir) && !index.localRoots.has(dir) &&
+          importers.some((d) => d.startsWith(`${dir}/`));
+      if (!reached) continue;
+      targetFiles.push(file);
+      moduleLeaves.push(mod.slice(mod.lastIndexOf('/') + 1));
+      break;
+    }
   }
   return { targetFiles, sourceDirs: [], moduleLeaves };
 }

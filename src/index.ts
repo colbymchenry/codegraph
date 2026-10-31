@@ -1680,8 +1680,8 @@ export class CodeGraph {
               this.resolver.clearCaches();
               for (const f of this.orchestrator.resurrectPythonPackageImporters(this.resolver.getPythonPackageImporters(editedInits))) reopened.add(f);
             }
-            // An edit can give a module above a script the names its importers
-            // take from it, or take them away.
+            // An edit can give a module that only a script's folder provides the
+            // names its importers take from it, or take them away.
             const scriptModules = this.resolver.getPythonScriptModuleScope(
               (result.changedFilePaths ?? []).filter((f) => pythonFilesBefore.has(f) && after.has(f))
             );
