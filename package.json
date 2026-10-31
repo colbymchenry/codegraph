@@ -27,7 +27,7 @@
     }
   },
   "scripts": {
-    "build": "tsc && npm run copy-assets && npm run build:ui && node -e \"require('fs').chmodSync('dist/bin/codegraph.js', 0o755)\"",
+    "build": "tsc && tsc --emitDeclarationOnly --noCheck --removeComments false && npm run copy-assets && npm run build:ui && node -e \"require('fs').chmodSync('dist/bin/codegraph.js', 0o755)\"",
     "build:ui": "cd ui && npm run build && cd .. && node scripts/check-ui-build.mjs",
     "build:lib": "cd ui && npm run build:lib",
     "preuninstall": "node dist/bin/uninstall.js",

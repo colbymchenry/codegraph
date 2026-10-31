@@ -6,6 +6,7 @@
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
+    "removeComments": true,
     "outDir": "./dist",
     "rootDir": "./src",
     "strict": true,
