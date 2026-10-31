@@ -8,10 +8,7 @@
 // Compile cache FIRST: the worker's boot cost is dominated by re-requiring
 // the extraction module graph; the persistent V8 cache (Node ≥22.8) makes
 // that a bytecode load instead of a recompile. Safe no-op when unavailable.
-try {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  (require('node:module') as { enableCompileCache?: () => void }).enableCompileCache?.();
-} catch { /* cache is best-effort */ }
+import '../compile-cache';
 
 import { parentPort } from 'worker_threads';
 import { extractFromSource } from './tree-sitter';

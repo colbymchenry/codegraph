@@ -43,14 +43,10 @@ import { requestedViewerCommand, viewerEnabled } from './viewer-gate';
   }
 }
 
-// Persist V8 compile artifacts across runs (Node ≥22.8). Every invocation —
-// and every worker thread, which re-requires the whole extraction module
-// graph — skips recompiling unchanged sources. Worth hundreds of ms of
-// worker-boot latency per bulk index; harmless no-op when unavailable.
-try {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  (require('node:module') as { enableCompileCache?: () => void }).enableCompileCache?.();
-} catch { /* cache is best-effort */ }
+// Persist V8 compile artifacts across runs. Every invocation — and every worker
+// thread, which re-requires the whole extraction module graph — skips
+// recompiling unchanged sources.
+import '../compile-cache';
 
 import { Command } from 'commander';
 import * as path from 'path';
