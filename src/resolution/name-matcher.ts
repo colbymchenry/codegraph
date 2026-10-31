@@ -3699,6 +3699,25 @@ function javaFileScope(file: string, context: ResolutionContext): { pkg: string;
   return scope;
 }
 
+/**
+ * Whether the file a Java `Receiver.member` call is written in can see the
+ * class the receiver names — the file's own package, an explicit import, or
+ * a package an on-demand import covers (#2976) — the same visibility the
+ * `new` path applies to a bare type name (isJavaTypeVisible). A class in a
+ * package the file neither is in nor imports is no candidate for the call.
+ * The call sites judge a SIMPLE receiver only: a fully-qualified one
+ * (`com.x.b.Util.log`) names its class without an import.
+ */
+function javaReceiverClassVisible(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'java' || candidate.language !== 'java') return true;
+  if (candidate.filePath === ref.filePath) return true;
+  const pkg = javaFileScope(candidate.filePath, context).pkg;
+  const here = javaFileScope(ref.filePath, context);
+  if (pkg === here.pkg) return true;
+  const top = candidate.qualifiedName.split('::')[pkg ? 1 : 0] ?? '';
+  return here.single.has(`${pkg}.${top}`) || here.demand.has(pkg);
+}
+
 /** The simple names of the Java types `qn` extends or implements, a few levels up. */
 function javaAncestorNames(qn: string, context: ResolutionContext, depth = 0): Set<string> {
   let memo = JAVA_ANCESTORS.get(context);
@@ -14029,7 +14048,15 @@ export function matchByQualifiedName(
     const partialCandidates = cppQualifierSpecializationPool(cppSpecializationPool(keepForRef(context.getNodesByName(lastName))
       .filter((candidate) => endsAtScopeBoundary(candidate.qualifiedName, ref.referenceName)), ref, context), ref, context);
     const ownLanguage = partialCandidates.filter((candidate) => sameLanguageFamily(candidate.language, ref.language));
-    const pool = ownLanguage.length > 0 ? ownLanguage : partialCandidates;
+    let pool = ownLanguage.length > 0 ? ownLanguage : partialCandidates;
+    // A Java static call resolves on the class its file can see: its own
+    // package, an explicit import, a wildcard import's package (#2976) —
+    // the visibility the `new` path applies, which the receiver's class
+    // must pass before a same-tail candidate is picked.
+    if (ref.language === 'java' && parts.length === 2 && /^[A-Z]/.test(parts[0]!)) {
+      const visible = pool.filter((c) => javaReceiverClassVisible(c, ref, context));
+      if (visible.length > 0) pool = visible;
+    }
     const chosen = preferCallSiteFile(pool, ref.filePath)[0];
     if (chosen) {
       return {
@@ -23487,6 +23514,13 @@ export function matchMethodCall(
     // A VB.NET type declared in two projects is the caller's own project's:
     // staxrip's `FrameServerFactory.Create(…)` went to its AutoCrop tool's copy.
     if (ref.language === 'vbnet') classCandidates = preferVbProject(classCandidates, ref, context);
+    // A Java class the file can see by its simple name — its own package, an
+    // explicit import, a wildcard import's package — before one it cannot
+    // (#2976), the visibility the `new` path applies to a bare type name.
+    if (ref.language === 'java' && !objectOrClass!.includes('.') && /^[A-Z]/.test(objectOrClass!)) {
+      const visible = classCandidates.filter((c) => javaReceiverClassVisible(c, ref, context));
+      if (visible.length > 0) classCandidates = [...visible, ...classCandidates.filter((c) => !visible.includes(c))];
+    }
 
     const productionCaller = !isTestPath(ref.filePath);
     for (const classNode of classCandidates) {
