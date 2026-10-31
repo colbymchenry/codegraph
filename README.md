@@ -833,6 +833,15 @@ agents learn the `codegraph explore` command:
 - **Qoder CLI** (`qoder`) — `$QODER_CONFIG_DIR/settings.json` (default `~/.qoder`), or `.qoder/settings.local.json`; in the Qoder IDE, add the server under Settings > MCP
 - **Pi** (`pi`) — `mcp.json` in Pi's agent directory (default `~/.pi/agent`), or `.pi/mcp.json`, which Pi reads once you trust the project; `exposure: "direct"` keeps `codegraph_explore` on the model's tool list
 
+**Any other agent** whose config has one of those shapes can be added without waiting for a release. Describe it once, then install it like the agents above:
+
+```bash
+codegraph targets add '{"id":"zcode","family":"mcp-json","configDir":"~/.zcode/cli","configFileName":"config.json","localConfigDir":".zcode","serversKey":"mcp.servers","instructionsFile":null}'
+codegraph install --target zcode
+```
+
+Three shapes are supported: `mcp-json` for a JSON file with a map of servers (the shape Claude Code, Cursor, VS Code, Zed, Devin and ZCode read), `toml` for a Codex style `config.toml`, and `opencode` for an opencode fork. `codegraph targets list` shows what is registered and the files each one writes; `codegraph targets remove <id>` forgets one. The spec names where to write, never what, and every value is checked. See [the design note](docs/design/custom-installer-targets.md) for the keys.
+
 ## Supported Languages
 
 | Language | Extension | Status |
