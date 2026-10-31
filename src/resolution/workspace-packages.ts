@@ -618,6 +618,23 @@ const GLOBSTAR_MAX_DEPTH = 8;
 const GLOB_DIR_BUDGET = 10_000;
 
 /**
+ * Whether a workspace entry names a folder of the project. Workspaces are
+ * relative to their root and never leave it: an entry with a `..` segment
+ * (`../sibling`, `packages/../sibling`), a glob that would walk from outside
+ * it (`../*`), or an absolute path names no member. Left in, an outside
+ * folder's package.json would register its name as a member, an import of
+ * that name would stop looking external, and name matching could bind the
+ * call to an unrelated project symbol instead of leaving it unresolved
+ * (#3093).
+ */
+function workspaceEntryInProject(projectRoot: string, entry: string): boolean {
+  const normalized = entry.replace(/\\/g, '/');
+  if (path.isAbsolute(normalized) || normalized.split('/').includes('..')) return false;
+  const relative = path.relative(projectRoot, path.resolve(projectRoot, normalized));
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+/**
  * Expand a workspace glob to the member directories it matches, nearest
  * first: `packages/*`, `packages/plugin-*`, `apps/*\/web`, `{apps,libs}/*`,
  * and the nested members of pnpm's `packages/**\/*` or npm's `libs/**\/*`
@@ -629,6 +646,7 @@ const GLOB_DIR_BUDGET = 10_000;
  */
 function expandWorkspaceGlob(projectRoot: string, pattern: string): string[] {
   const norm = pattern.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (!workspaceEntryInProject(projectRoot, norm)) return [];
   const glob = compileGlob(norm);
   const first = glob.findIndex((seg) => seg.wildcard);
   if (first === -1) return [norm]; // exact directory
