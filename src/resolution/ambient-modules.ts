@@ -17,6 +17,15 @@
  * position inside it. A wildcard pattern (`declare module '*.svg'`) applies
  * only once a specifier fails to resolve to a file, and a shorthand `declare
  * module 'x';` declares nothing to bind; no import is bound to either.
+ *
+ * A block is in force only where the checker sees it, and each package of a
+ * monorepo has a program of its own, so it answers its own package and the ones
+ * that read its typings, not a sibling's (see reachesProgram). And it only
+ * describes a module this repository implements itself: an import of a
+ * workspace package's module is that module (see isRepositoryModule in
+ * ./import-resolver), which is what runs. React's ESLint plugin stubs
+ * `shared/ReactFeatureFlags` for tsc; the reconciler's import of that name, and
+ * its own, are `packages/shared`'s.
  */
 import type { Node } from '../types';
 import type { ResolutionContext, UnresolvedRef } from './types';
@@ -592,6 +601,8 @@ interface Memo {
   merged: Map<string, boolean>;
   /** Each read file's namespace blocks (see namespaceBlocks). */
   namespaces: Map<string, readonly NamespaceBlock[]>;
+  /** The package directly in each folder asked about (see packageManifest). */
+  manifests: Map<string, PackageManifest | null>;
 }
 
 const MEMO = new WeakMap<ResolutionContext, Memo>();
@@ -603,7 +614,7 @@ export function clearAmbientModuleMemos(context: ResolutionContext): void {
 
 function memoFor(context: ResolutionContext): Memo {
   let memo = MEMO.get(context);
-  if (!memo) MEMO.set(context, (memo = { scanned: null, members: new Map(), declarationIds: null, otherBlocks: new Map(), declarations: new Map(), merged: new Map(), namespaces: new Map() }));
+  if (!memo) MEMO.set(context, (memo = { scanned: null, members: new Map(), declarationIds: null, otherBlocks: new Map(), declarations: new Map(), merged: new Map(), namespaces: new Map(), manifests: new Map() }));
   return memo;
 }
 
@@ -692,12 +703,76 @@ function blockMembers(mod: AmbientModule, context: ResolutionContext): Map<strin
 /** A path that is not the program's own: a test, a fixture, an example (see search/query-utils). */
 const isTestCode = (file: string): boolean => isTestFile(file);
 
+const dirOf = (file: string): string => file.slice(0, Math.max(0, file.lastIndexOf('/')));
+
+/** What a package.json says of its package. */
+interface PackageManifest {
+  name: string | null;
+  dependencies: Set<string>;
+}
+
+const DEPENDENCY_FIELDS = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'];
+
+/** The package whose package.json is `text`; null for none, as for a `{"type":"module"}`, which says how Node reads a folder. */
+function parseManifest(text: string | null): PackageManifest | null {
+  if (!text) return null;
+  try {
+    const json = JSON.parse(text) as Record<string, unknown> | null;
+    if (!json || typeof json !== 'object') return null;
+    const name = typeof json.name === 'string' && json.name ? json.name : null;
+    const dependencies = new Set(DEPENDENCY_FIELDS.flatMap((field) => Object.keys((json[field] ?? {}) as object)));
+    return name !== null || dependencies.size > 0 ? { name, dependencies } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The package whose package.json is directly in the folder `dir`, if any. */
+function packageManifest(dir: string, context: ResolutionContext): PackageManifest | null {
+  const memo = memoFor(context).manifests;
+  let manifest = memo.get(dir);
+  if (manifest === undefined) {
+    manifest = parseManifest(context.readFile(dir ? `${dir}/package.json` : 'package.json'));
+    memo.set(dir, manifest);
+  }
+  return manifest;
+}
+
+/** The folder of the package `dir` is in: the nearest at or above it with a package of its own, '' for the repository's. */
+function packageFolder(dir: string, context: ResolutionContext): string {
+  return dir === '' || packageManifest(dir, context) ? dir : packageFolder(dirOf(dir), context);
+}
+
 /**
- * The script declarations of `specifier` an import in `fromFile` can mean,
- * the files nearest it first. One a test or a fixture keeps counts only for a
- * test's imports: copies of vscode's API typings under copilot's
- * `test/fixtures` are left out of its build and shadow nothing.
+ * Whether a `declare module` in `file` can be in the program `fromFile` is in.
+ * Each package of a monorepo has a program of its own, so it can if `fromFile`
+ * is in the package `file` is in, or in a package nested under that one:
+ * vscode's extensions are packages of their own, and each has its tsconfig read
+ * `src/vscode-dts/vscode.d.ts`, the root package's. It can too if `fromFile`'s
+ * package depends on `file`'s, whose typings it reads: `import … from
+ * 'astro:assets'` in an Astro project, a dependent of `astro`, is the module
+ * `astro/client.d.ts` declares. No other package's: react's
+ * `packages/eslint-plugin-react-hooks` stubs `shared/ReactFeatureFlags` for itself.
+ *
+ * One a test or a fixture keeps counts only for a test's imports, and only in
+ * its own package, as no dependent ever reads it: copies of vscode's API typings
+ * under copilot's `test/fixtures` are left out of its build and shadow nothing.
  */
+function reachesProgram(file: string, test: boolean, fromFile: string, fromTest: boolean, context: ResolutionContext): boolean {
+  if (test && !fromTest) return false;
+  const folder = packageFolder(dirOf(file), context);
+  if (folder === '' || fromFile.startsWith(`${folder}/`)) return true;
+  if (test) return false;
+  const name = packageManifest(folder, context)?.name;
+  return !!name && !!packageManifest(packageFolder(dirOf(fromFile), context), context)?.dependencies.has(name);
+}
+
+/** Whether a `declare module` in `declaringFile` counts for a file in `fromFile` (see reachesProgram). */
+export function declaringFileAnswers(declaringFile: string, fromFile: string, context: ResolutionContext): boolean {
+  return reachesProgram(declaringFile, isTestCode(declaringFile), fromFile, isTestCode(fromFile), context);
+}
+
+/** The script declarations of `specifier` an import in `fromFile` can mean (see reachesProgram), the files nearest it first. */
 function declarationsFor(specifier: string, fromFile: string, context: ResolutionContext): AmbientModule[] {
   const all = scanned(context).bySpecifier.get(specifier);
   if (!all) return [];
@@ -707,7 +782,7 @@ function declarationsFor(specifier: string, fromFile: string, context: Resolutio
   if (cached) return cached;
   const fromTest = isTestCode(fromFile);
   const dir = fromFile.slice(0, fromFile.lastIndexOf('/') + 1);
-  const usable = all.filter((m) => m.script && (fromTest || !m.test));
+  const usable = all.filter((m) => m.script && reachesProgram(m.file, m.test, fromFile, fromTest, context));
   const from = dir.split('/');
   const shared = (file: string): number => {
     const parts = file.split('/');

@@ -477,7 +477,9 @@ interface OutrankedImport {
  * file of the package an added file is in: the entry its manifest declares
  * (`./src/index.ts`, or the source of `./dist/index.js`), or the source of a
  * path into its build output, outranks the file an import fell back to while
- * it was missing, such as the folder's own index (#2502).
+ * it was missing, such as the folder's own index (#2502). And the imports into
+ * a declaration file: a module of the project's own package outranks a
+ * `declare module` of its name (see ./ambient-modules).
  */
 function outrankedImports(
   queries: QueryBuilder,
@@ -487,6 +489,12 @@ function outrankedImports(
 ): OutrankedImport[] {
   const out: OutrankedImport[] = [];
   const packageImports = new Map<string, ReturnType<QueryBuilder['getModuleImportsUnder']>>();
+  let intoDeclarations: ReturnType<QueryBuilder['getModuleImportsIntoDeclarationFiles']> | undefined;
+  type ModuleImport = ReturnType<QueryBuilder['getModuleImportsUnder']>[number];
+  const byName = (edge: ModuleImport): boolean => {
+    const specifier = edge.metadata?.refName;
+    return typeof specifier === 'string' && !specifier.startsWith('.') && !specifier.startsWith('/');
+  };
   for (const file of added) {
     if (!BINDING_LANGUAGES.has(file.language)) continue;
     const { dir, name } = importedName(file.path);
@@ -495,14 +503,16 @@ function outrankedImports(
     if (packageDir) {
       let imports = packageImports.get(packageDir);
       if (!imports) {
-        imports = queries.getModuleImportsUnder(packageDir).filter((edge) => {
-          const specifier = edge.metadata?.refName;
-          return typeof specifier === 'string' && !specifier.startsWith('.') && !specifier.startsWith('/');
-        });
+        imports = queries.getModuleImportsUnder(packageDir).filter(byName);
         packageImports.set(packageDir, imports);
       }
+      intoDeclarations ??= queries.getModuleImportsIntoDeclarationFiles().filter(byName);
       const seen = new Set(edges.map((edge) => edge.edgeId));
-      for (const edge of imports) if (!seen.has(edge.edgeId)) edges.push(edge);
+      for (const edge of [...imports, ...intoDeclarations]) {
+        if (seen.has(edge.edgeId)) continue;
+        seen.add(edge.edgeId);
+        edges.push(edge);
+      }
     }
     for (const edge of edges) {
       const specifier = edge.metadata?.refName;

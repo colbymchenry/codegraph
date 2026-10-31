@@ -28,6 +28,10 @@
  * shorthand `declare module 'x';` declares nothing to bind. Ambient function
  * signatures are extracted by both the native kernel (when built) and the wasm
  * extractor, which must agree.
+ *
+ * A declaration counts where the checker can see it: its own package, one
+ * nested under that, one depending on that. And an import of a module of the
+ * repository's own packages is that module, whatever `.d.ts` stubs its name.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -662,6 +666,318 @@ declare module 'typescript-lib' {
   }, 60_000);
 });
 
+describe('a declare module answers the package it is in', () => {
+  /** React's shape: the ESLint plugin stubs a Flow file of the `shared` package for tsc alone. */
+  const FLAGS: Files = {
+    'package.json': JSON.stringify({ name: 'root', private: true, workspaces: ['packages/*'] }),
+    'packages/eslint/package.json': JSON.stringify({ name: 'eslint-plugin' }),
+    'packages/eslint/src/shared/ReactFeatureFlags.d.ts': `declare module 'shared/ReactFeatureFlags' {
+  export const enableFoo: boolean;
+  export const onlyDeclared: boolean;
+}
+`,
+    'packages/eslint/src/rule.ts': "import { enableFoo, onlyDeclared } from 'shared/ReactFeatureFlags';\nexport const on = enableFoo && onlyDeclared;\n",
+    'packages/reconciler/package.json': JSON.stringify({ name: 'reconciler' }),
+    'packages/reconciler/src/work.js': `import { enableFoo, flagName, onlyDeclared } from 'shared/ReactFeatureFlags';
+export function work() {
+  return enableFoo && onlyDeclared ? flagName() : null;
+}
+`,
+    'packages/shared/package.json': JSON.stringify({ name: 'shared' }),
+    'packages/shared/ReactFeatureFlags.js': "export const enableFoo = true;\nexport function flagName() { return 'foo'; }\n",
+  };
+
+  it('never takes a real module of the repository from another package', async () => {
+    const root = tempRoot();
+    write(root, FLAGS);
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      const edges = edgesFrom(cg, 'packages/reconciler/src/work.js');
+      expect(edges).toEqual(expect.arrayContaining([
+        'imports packages/shared/ReactFeatureFlags.js:enableFoo',
+        'imports packages/shared/ReactFeatureFlags.js:flagName',
+        'calls packages/shared/ReactFeatureFlags.js:flagName',
+      ]));
+      // Nothing, not even a name only the stub declares, crosses into the ESLint package.
+      expect(edges.filter((e) => e.includes('packages/eslint/'))).toEqual([]);
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
+  it('gives way to the real module in its own package too, and answers what only it declares', async () => {
+    const root = tempRoot();
+    write(root, FLAGS);
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      const edges = edgesFrom(cg, 'packages/eslint/src/rule.ts');
+      expect(edges).toContain('imports packages/shared/ReactFeatureFlags.js:enableFoo');
+      expect(edges).not.toContain('imports packages/eslint/src/shared/ReactFeatureFlags.d.ts:enableFoo');
+      expect(edges).toContain('imports packages/eslint/src/shared/ReactFeatureFlags.d.ts:onlyDeclared');
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
+  it('keeps TypeScript’s order against a package whose module is only a declaration file', async () => {
+    const root = tempRoot();
+    write(root, {
+      'package.json': JSON.stringify({ name: 'root', private: true, workspaces: ['packages/*'] }),
+      'packages/types-only/package.json': JSON.stringify({ name: 'types-only', types: 'index.d.ts' }),
+      'packages/types-only/index.d.ts': 'export function make(): string;\n',
+      'packages/app/package.json': JSON.stringify({ name: 'app' }),
+      'packages/app/typings/own.d.ts': "declare module 'types-only' {\n  export function make(): number;\n}\n",
+      'packages/app/src/use.ts': "import { make } from 'types-only';\nexport const made = make();\n",
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      expect(edgesFrom(cg, 'packages/app/src/use.ts')).toEqual([
+        'calls packages/app/typings/own.d.ts:make',
+        'imports packages/app/typings/own.d.ts:make',
+        'imports packages/app/typings/own.d.ts:packages/app/typings/own.d.ts',
+      ]);
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
+  it('links a module imported whole to the real file, and a namespace import’s members', async () => {
+    const root = tempRoot();
+    write(root, {
+      ...FLAGS,
+      'packages/eslint/src/whole.ts': "import * as flags from 'shared/ReactFeatureFlags';\nimport 'shared/ReactFeatureFlags';\nexport const name = flags.flagName();\n",
+      'packages/reconciler/src/whole.js': "import * as flags from 'shared/ReactFeatureFlags';\nexport const name = flags.flagName();\n",
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      for (const file of ['packages/eslint/src/whole.ts', 'packages/reconciler/src/whole.js']) {
+        const edges = edgesFrom(cg, file);
+        expect(edges, file).toEqual(expect.arrayContaining([
+          'imports packages/shared/ReactFeatureFlags.js:packages/shared/ReactFeatureFlags.js',
+          'calls packages/shared/ReactFeatureFlags.js:flagName',
+        ]));
+        expect(edges.filter((e) => e.includes('.d.ts')), file).toEqual([]);
+      }
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
+  it('keeps a test’s stub to the tests of its own package, behind the real module', async () => {
+    // `packages/react/src/__tests__/testDefinitions/` declares `react`, the
+    // workspace's own package, and `prop-types`, an npm one, for a TypeScript test.
+    const root = tempRoot();
+    write(root, {
+      'package.json': JSON.stringify({ name: 'root', private: true, workspaces: ['packages/*'] }),
+      'packages/react/package.json': JSON.stringify({ name: 'react', main: 'index.js' }),
+      'packages/react/index.js': "export function createElement() { return null; }\n",
+      'packages/react/src/__tests__/testDefinitions/React.d.ts': "declare module 'react' {\n  export function createElement(): unknown;\n}\n",
+      'packages/react/src/__tests__/testDefinitions/PropTypes.d.ts': "declare module 'prop-types' {\n  export function string(): unknown;\n}\n",
+      'packages/react/src/__tests__/Own-test.ts': "import { createElement } from 'react';\nimport { string } from 'prop-types';\nexport const made = [createElement(), string()];\n",
+      'packages/dom/package.json': JSON.stringify({ name: 'dom', peerDependencies: { react: '*' } }),
+      'packages/dom/src/__tests__/Dom-test.js': "import { createElement } from 'react';\nimport { string } from 'prop-types';\nexport const made = [createElement(), string()];\n",
+      'packages/dom/src/render.js': "import { string } from 'prop-types';\nexport const made = string();\n",
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      const own = edgesFrom(cg, 'packages/react/src/__tests__/Own-test.ts');
+      expect(own).toContain('calls packages/react/index.js:createElement');
+      expect(own).toContain('calls packages/react/src/__tests__/testDefinitions/PropTypes.d.ts:string');
+      expect(own.filter((e) => e.includes('React.d.ts'))).toEqual([]);
+      const other = edgesFrom(cg, 'packages/dom/src/__tests__/Dom-test.js');
+      expect(other).toContain('calls packages/react/index.js:createElement');
+      expect(other.filter((e) => e.includes('testDefinitions'))).toEqual([]);
+      expect(edgesFrom(cg, 'packages/dom/src/render.js')).toEqual([]);
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
+  it('is no rival to a real namesake where it does not count', async () => {
+    // `createRef` passes through `packages/react`'s barrels as a binding the
+    // import resolver doesn't follow; a name match finds it, and a stub's
+    // bodiless `createRef` in another package must not stand in its way.
+    const root = tempRoot();
+    write(root, {
+      'package.json': JSON.stringify({ name: 'root', private: true, workspaces: ['packages/*'] }),
+      'packages/react/package.json': JSON.stringify({ name: 'react', main: 'index.js' }),
+      'packages/react/index.js': "export { createRef } from './src/ReactClient';\n",
+      'packages/react/src/ReactClient.js': "import { createRef } from './ReactCreateRef';\nexport { createRef };\n",
+      // A `@flow` file is read as TSX, which ranks with the stub's TypeScript.
+      'packages/react/src/ReactCreateRef.js': '/** @flow */\nexport function createRef() { return { current: null }; }\n',
+      'packages/react/src/__tests__/testDefinitions/React.d.ts': "declare module 'react' {\n  export function createRef(): unknown;\n}\n",
+      'fixtures/clock/package.json': JSON.stringify({ name: 'clock', dependencies: { react: '^19.0.0' } }),
+      'fixtures/clock/src/Clock.js': "import { createRef } from 'react';\nexport const faceRef = createRef();\n",
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      const edges = edgesFrom(cg, 'fixtures/clock/src/Clock.js');
+      expect(edges).toContain('calls packages/react/src/ReactCreateRef.js:createRef');
+      expect(edges.filter((e) => e.includes('.d.ts'))).toEqual([]);
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
+  it('answers its own package when it is the only answer, and no sibling', async () => {
+    const stub = "declare module 'untyped-lib' {\n  export function make(): string;\n  export interface Made { id: string }\n}\n";
+    const use = "import { make, Made } from 'untyped-lib';\nexport const made: Made = make();\n";
+    const root = tempRoot();
+    write(root, {
+      'package.json': JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
+      'packages/typed/package.json': JSON.stringify({ name: 'typed', dependencies: { 'untyped-lib': '^1.0.0' } }),
+      'packages/typed/typings/lib.d.ts': stub,
+      'packages/typed/src/use.ts': use,
+      'packages/typed/src/deep/nested/use.ts': use,
+      'packages/listed/package.json': JSON.stringify({ name: 'listed', dependencies: { 'untyped-lib': '^1.0.0' } }),
+      'packages/listed/src/use.ts': use,
+      'packages/unlisted/package.json': JSON.stringify({ name: 'unlisted' }),
+      'packages/unlisted/src/use.ts': use,
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      for (const file of ['packages/typed/src/use.ts', 'packages/typed/src/deep/nested/use.ts']) {
+        expect(edgesFrom(cg, file), file).toEqual([
+          'calls packages/typed/typings/lib.d.ts:make',
+          'imports packages/typed/typings/lib.d.ts:Made',
+          'imports packages/typed/typings/lib.d.ts:make',
+          'imports packages/typed/typings/lib.d.ts:packages/typed/typings/lib.d.ts',
+          'references packages/typed/typings/lib.d.ts:Made',
+        ]);
+      }
+      expect(edgesFrom(cg, 'packages/listed/src/use.ts')).toEqual([]);
+      expect(edgesFrom(cg, 'packages/unlisted/src/use.ts')).toEqual([]);
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
+  it('answers a package that depends on the one it is in', async () => {
+    // Astro's `client.d.ts` declares `astro:assets`, and each project on `astro` reads it.
+    const use = "import { getImage } from 'astro:assets';\nexport const image = getImage();\n";
+    const root = tempRoot();
+    write(root, {
+      'package.json': JSON.stringify({ name: 'astro-monorepo', private: true, workspaces: ['packages/*', 'examples/*'] }),
+      'packages/astro/package.json': JSON.stringify({ name: 'astro' }),
+      'packages/astro/client.d.ts': "declare module 'astro:assets' {\n  export function getImage(): string;\n}\n",
+      'packages/astro/src/own.ts': use,
+      'packages/mdx/package.json': JSON.stringify({ name: '@astrojs/mdx', peerDependencies: { astro: '^7.0.0' } }),
+      'packages/mdx/src/server.ts': use,
+      'examples/blog/package.json': JSON.stringify({ name: '@example/blog', dependencies: { astro: '^7.0.0' } }),
+      'examples/blog/src/pages/deep/index.ts': use,
+      'examples/plain/package.json': JSON.stringify({ name: '@example/plain', dependencies: { other: '^1.0.0' } }),
+      'examples/plain/src/index.ts': use,
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      for (const file of ['packages/astro/src/own.ts', 'packages/mdx/src/server.ts', 'examples/blog/src/pages/deep/index.ts']) {
+        expect(edgesFrom(cg, file), file).toContain('calls packages/astro/client.d.ts:getImage');
+      }
+      expect(edgesFrom(cg, 'examples/plain/src/index.ts')).toEqual([]);
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
+  it('answers the packages nested under the one it is in', async () => {
+    // VS Code's `src/vscode-dts/vscode.d.ts` is the root package's; each extension
+    // is a package of its own that its tsconfig points at the file.
+    const root = tempRoot();
+    write(root, {
+      'package.json': JSON.stringify({ name: 'code-oss' }),
+      'src/vscode-dts/vscode.d.ts': "declare module 'vscode' {\n  export class Disposable { dispose(): void; }\n  export namespace window { export const active: string; }\n}\n",
+      'extensions/git/package.json': JSON.stringify({ name: 'git' }),
+      'extensions/git/src/main.ts': "import { Disposable } from 'vscode';\nexport const held = new Disposable();\n",
+      'extensions/git/test/fixtures/app/package.json': JSON.stringify({ name: 'fixture-app' }),
+      'extensions/git/test/fixtures/app/use.ts': "import { Disposable } from 'vscode';\nexport const held = new Disposable();\n",
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      for (const file of ['extensions/git/src/main.ts', 'extensions/git/test/fixtures/app/use.ts']) {
+        expect(edgesFrom(cg, file), file).toEqual(expect.arrayContaining([
+          'imports src/vscode-dts/vscode.d.ts:Disposable',
+          'instantiates src/vscode-dts/vscode.d.ts:Disposable',
+        ]));
+      }
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
+  it('takes a marker package.json for no package', async () => {
+    // `{"type":"commonjs"}` says how Node reads a folder, as vscode's `scripts/` and `test/` do.
+    const root = tempRoot();
+    write(root, {
+      'package.json': JSON.stringify({ name: 'app', dependencies: { 'untyped-lib': '^1.0.0' } }),
+      'src/esm/package.json': JSON.stringify({ type: 'module' }),
+      'src/esm/lib.d.ts': "declare module 'untyped-lib' {\n  export function make(): string;\n}\n",
+      'src/use.ts': "import { make } from 'untyped-lib';\nexport const made = make();\n",
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      expect(edgesFrom(cg, 'src/use.ts')).toContain('calls src/esm/lib.d.ts:make');
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
+  it('takes the nearest declaration a package can see, past a sibling’s nearer one', async () => {
+    const root = tempRoot();
+    write(root, {
+      'package.json': JSON.stringify({ name: 'mono', private: true, workspaces: ['apps/*'] }),
+      'typings/lib.d.ts': "declare module 'untyped-lib' {\n  export function make(): string;\n}\n",
+      'apps/a/package.json': JSON.stringify({ name: 'a' }),
+      'apps/a/src/deep/lib.d.ts': "declare module 'untyped-lib' {\n  export function make(): number;\n}\n",
+      'apps/a/src/deep/use.ts': "import { make } from 'untyped-lib';\nexport const made = make();\n",
+      'apps/b/package.json': JSON.stringify({ name: 'b' }),
+      'apps/b/src/deep/use.ts': "import { make } from 'untyped-lib';\nexport const made = make();\n",
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      expect(edgesFrom(cg, 'apps/a/src/deep/use.ts')).toContain('calls apps/a/src/deep/lib.d.ts:make');
+      expect(edgesFrom(cg, 'apps/b/src/deep/use.ts')).toContain('calls typings/lib.d.ts:make');
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
+  it('merges a block only with the blocks its package can see', async () => {
+    const root = tempRoot();
+    write(root, {
+      'package.json': JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
+      'packages/a/package.json': JSON.stringify({ name: 'a' }),
+      // A class is a candidate of the fuzzy match too, which the gate on its answer stops.
+      'packages/a/lib.d.ts': "declare module 'untyped-lib' {\n  export interface Made extends Base {}\n  export class Built extends Core {}\n}\n",
+      'packages/b/package.json': JSON.stringify({ name: 'b' }),
+      'packages/b/lib.d.ts': "declare module 'untyped-lib' {\n  export interface Base { id: string }\n  export class Core {}\n}\n",
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      expect(edgesFrom(cg, 'packages/a/lib.d.ts')).toEqual([]);
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+
+  it('still takes a package’s declaration through a file that reaches it', async () => {
+    // Importing the declaring file brings its block into the program, wherever it lives.
+    const root = tempRoot();
+    write(root, {
+      'package.json': JSON.stringify({ name: 'mono', private: true, workspaces: ['packages/*'] }),
+      'packages/a/package.json': JSON.stringify({ name: 'a' }),
+      'packages/a/lib.d.ts': "declare module 'untyped-lib' {\n  export interface Made { id: string }\n}\n",
+      'packages/b/package.json': JSON.stringify({ name: 'b' }),
+      'packages/b/src/use.ts': "import type { Made } from '../../a/lib';\nexport function id(made: Made): string { return made.id; }\n",
+    });
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      expect(edgesFrom(cg, 'packages/b/src/use.ts')).toContain('references packages/a/lib.d.ts:Made');
+    } finally {
+      cg.close();
+    }
+  }, 60_000);
+});
+
 /** Every edge, by its ends' natural keys, with where it is written and how it resolved. */
 function edgesOf(cg: CodeGraph): string[] {
   const keys = new Map(
@@ -748,4 +1064,83 @@ export function run(options: MammothOptions): void {
       cg.close();
     }
   }, 120_000);
+
+  describe('beside a module of the repository', () => {
+    const packages: Files = {
+      'package.json': JSON.stringify({ name: 'root', private: true, workspaces: ['packages/*'] }),
+      'packages/eslint/package.json': JSON.stringify({ name: 'eslint-plugin' }),
+      'packages/eslint/src/flags.d.ts': "declare module 'shared/flags' {\n  export const enableFoo: boolean;\n}\n",
+      'packages/eslint/src/rule.ts': "import { enableFoo } from 'shared/flags';\nexport const on = enableFoo;\n",
+      'packages/reconciler/package.json': JSON.stringify({ name: 'reconciler' }),
+      'packages/reconciler/src/work.js': "import { enableFoo } from 'shared/flags';\nexport const on = enableFoo;\n",
+      'packages/shared/package.json': JSON.stringify({ name: 'shared' }),
+      'packages/shared/other.js': 'export const other = 1;\n',
+    };
+    const real: Files = { 'packages/shared/flags.js': 'export const enableFoo = true;\n' };
+
+    it('moves its package’s importers to a real module that appears', async () => {
+      const root = tempRoot();
+      write(root, packages);
+      const cg = await CodeGraph.init(root, { index: true });
+      try {
+        expect(edgesFrom(cg, 'packages/eslint/src/rule.ts')).toContain('imports packages/eslint/src/flags.d.ts:enableFoo');
+        expect(edgesFrom(cg, 'packages/reconciler/src/work.js')).toEqual([]);
+        write(root, real);
+        await cg.sync();
+        expect(edgesFrom(cg, 'packages/eslint/src/rule.ts')).toContain('imports packages/shared/flags.js:enableFoo');
+        expect(edgesFrom(cg, 'packages/reconciler/src/work.js')).toContain('imports packages/shared/flags.js:enableFoo');
+        expect(edgesOf(cg)).toEqual(await fullIndexOf({ ...packages, ...real }));
+      } finally {
+        cg.close();
+      }
+    }, 120_000);
+
+    it('moves its package’s importers to a package that appears', async () => {
+      const root = tempRoot();
+      const { 'packages/shared/package.json': manifest, 'packages/shared/other.js': other, ...withoutPackage } = packages;
+      write(root, withoutPackage);
+      const cg = await CodeGraph.init(root, { index: true });
+      try {
+        expect(edgesFrom(cg, 'packages/eslint/src/rule.ts')).toContain('imports packages/eslint/src/flags.d.ts:enableFoo');
+        write(root, { 'packages/shared/package.json': manifest!, 'packages/shared/other.js': other!, ...real });
+        await cg.sync();
+        expect(edgesFrom(cg, 'packages/eslint/src/rule.ts')).toContain('imports packages/shared/flags.js:enableFoo');
+        expect(edgesOf(cg)).toEqual(await fullIndexOf({ ...packages, ...real }));
+      } finally {
+        cg.close();
+      }
+    }, 120_000);
+
+    it('takes its package’s importers back when the real module goes', async () => {
+      const root = tempRoot();
+      write(root, { ...packages, ...real });
+      const cg = await CodeGraph.init(root, { index: true });
+      try {
+        expect(edgesFrom(cg, 'packages/eslint/src/rule.ts')).toContain('imports packages/shared/flags.js:enableFoo');
+        fs.rmSync(path.join(root, 'packages/shared/flags.js'));
+        await cg.sync();
+        expect(edgesFrom(cg, 'packages/eslint/src/rule.ts')).toContain('imports packages/eslint/src/flags.d.ts:enableFoo');
+        expect(edgesFrom(cg, 'packages/reconciler/src/work.js')).toEqual([]);
+        expect(edgesOf(cg)).toEqual(await fullIndexOf(packages));
+      } finally {
+        cg.close();
+      }
+    }, 120_000);
+
+    it('leaves the real module’s importers on it when a stub is added', async () => {
+      const root = tempRoot();
+      const { 'packages/eslint/src/flags.d.ts': stub, ...withoutStub } = packages;
+      write(root, { ...withoutStub, ...real });
+      const cg = await CodeGraph.init(root, { index: true });
+      try {
+        write(root, { 'packages/eslint/src/flags.d.ts': stub! });
+        await cg.sync();
+        expect(edgesFrom(cg, 'packages/eslint/src/rule.ts')).toContain('imports packages/shared/flags.js:enableFoo');
+        expect(edgesFrom(cg, 'packages/reconciler/src/work.js')).toContain('imports packages/shared/flags.js:enableFoo');
+        expect(edgesOf(cg)).toEqual(await fullIndexOf({ ...packages, ...real }));
+      } finally {
+        cg.close();
+      }
+    }, 120_000);
+  });
 });

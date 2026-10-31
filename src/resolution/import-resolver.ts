@@ -15,7 +15,7 @@ import { resolveWorkspaceImport, workspaceImportTargets, type WorkspaceImportTar
 import { stripCommentsForRegex, templateLiteralTextAt } from './strip-comments';
 import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
-import { ambientModuleDeclares, findAmbientModuleExport, findAmbientModuleFile, inBlock, isInModuleBlock, namespaceBlocks, type NamespaceBlock } from './ambient-modules';
+import { ambientModuleDeclares, declaringFileAnswers, findAmbientModuleExport, findAmbientModuleFile, inBlock, isDeclarationFile, isInModuleBlock, namespaceBlocks, type NamespaceBlock } from './ambient-modules';
 import { isTestFile } from '../search/query-utils';
 import { moduleReferenceKeys, moduleTail } from '../db/reference-tail';
 import {
@@ -2839,12 +2839,8 @@ function isJsBareModuleRef(ref: UnresolvedRef, context: ResolutionContext): bool
  */
 export function jsModuleFile(ref: UnresolvedRef, context: ResolutionContext): string | null {
   if (!isJsPathImportRef(ref) && !isJsBareModuleRef(ref, context)) return null;
-  // A package the repository declares itself is the file that declares it,
-  // whatever file its specifier resolves to (see ./ambient-modules).
-  if (isBareModuleSpecifier(ref.referenceName, ref.language)) {
-    const declaring = findAmbientModuleFile(ref.referenceName, ref.filePath, context);
-    if (declaring) return declaring.filePath;
-  }
+  const declaring = declaredModuleFile(ref.referenceName, ref, context);
+  if (declaring) return declaring.filePath;
   const file = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
   return file && file !== ref.filePath ? file : null;
 }
@@ -2991,19 +2987,16 @@ function typeQualifier(ref: UnresolvedRef, context: ResolutionContext): string[]
  */
 function importedTypeMember(imp: ImportMapping, path: string[], ref: UnresolvedRef, context: ResolutionContext): Node | null | undefined {
   const file = resolveImportPath(imp.source, ref.filePath, ref.language, context);
-  const bare = isBareModuleSpecifier(imp.source, ref.language);
   let found: Node | undefined;
   let rest: string[];
   if (imp.isNamespace) {
     const want = { isDefault: false, isNamespace: true, exportedName: path[0]!, memberName: path[0]! };
-    found = (bare ? findAmbientModuleExport(imp.source, want, ref, context) : undefined) ??
-      (file ? findExportedSymbol(file, want, ref.language, context, new Set()) : undefined);
+    found = findImportedExport(imp.source, file, want, ref, context);
     if (found && path.length === 1) return found;
     rest = path.slice(1);
   } else {
     const want = { isDefault: imp.isDefault, isNamespace: false, exportedName: imp.isDefault ? 'default' : imp.exportedName, memberName: null };
-    found = (bare ? findAmbientModuleExport(imp.source, want, ref, context) : undefined) ??
-      (file ? findExportedSymbol(file, want, ref.language, context, new Set()) : undefined);
+    found = findImportedExport(imp.source, file, want, ref, context);
     rest = path;
   }
   if (found) {
@@ -3382,20 +3375,15 @@ export function resolveViaImport(
         context
       );
 
-      // A package the repository declares itself, as cord-field's
-      // `typings/mammoth/index.d.ts` declares `declare module 'mammoth'`:
-      // TypeScript takes that declaration before any file the specifier
-      // resolves to (see ./ambient-modules).
-      const bare = isBareModuleSpecifier(imp.source, ref.language);
-      if (resolvedPath || bare) {
+      // A package the repository declares itself may resolve to no file at all.
+      if (resolvedPath || isBareModuleSpecifier(imp.source, ref.language)) {
         const exportedName = imp.isDefault ? 'default' : imp.exportedName;
         const memberName = imp.isNamespace
           ? ref.referenceName.replace(imp.localName + '.', '')
           : null;
         const want = { isDefault: imp.isDefault, isNamespace: imp.isNamespace, exportedName, memberName };
 
-        const targetNode = (bare ? findAmbientModuleExport(imp.source, want, ref, context) : undefined) ??
-          (resolvedPath ? findExportedSymbol(resolvedPath, want, ref.language, context, new Set()) : undefined);
+        const targetNode = findImportedExport(imp.source, resolvedPath, want, ref, context);
 
         if (targetNode) {
           // `Foo.bar()` / `Foo.CONST` — a NAMED (non-namespace) class import
@@ -3490,6 +3478,55 @@ function isBareModuleSpecifier(source: string, language: Language): boolean {
 }
 
 /**
+ * Whether `specifier`, resolving to `file` from `ref`'s file, names a module of
+ * a package this repository holds: a workspace member or a path dependency.
+ * That module is implemented here, and a `declare module` of its name only
+ * describes it to the type checker: react's ESLint plugin stubs
+ * `shared/ReactFeatureFlags` because tsc can't read that Flow file, and what
+ * runs is the file. A file a `paths` alias names is another matter: the checker
+ * takes the declared module first and never reads it, as copilot's shim of
+ * `vscode` for its test runner.
+ */
+function isRepositoryModule(specifier: string, file: string | null, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (file === null || isDeclarationFile(file)) return false;
+  const workspaces = context.getWorkspacePackages?.();
+  return !!workspaces && workspaceImportTargets(specifier, workspaces, ref.filePath) !== null;
+}
+
+/**
+ * What an import of `want` from `source` names, `file` being where `source`
+ * resolves to, if anywhere: the export of a module of the repository's own
+ * packages, then the repository's own `declare module` of the package, as
+ * cord-field's `typings/mammoth/index.d.ts` declares `mammoth`, then the export
+ * of any other file, which TypeScript takes the declaration before (see
+ * ./ambient-modules).
+ */
+function findImportedExport(
+  source: string,
+  file: string | null,
+  want: { isDefault: boolean; isNamespace: boolean; exportedName: string; memberName: string | null },
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): Node | undefined {
+  const inFile = (): Node | undefined => (file ? findExportedSymbol(file, want, ref.language, context, new Set()) : undefined);
+  const declared = isBareModuleSpecifier(source, ref.language) ? findAmbientModuleExport(source, want, ref, context) : undefined;
+  if (!declared) return inFile();
+  return (isRepositoryModule(source, file, ref, context) ? inFile() : undefined) ?? declared;
+}
+
+/**
+ * The file that declares `specifier` as a module, for `ref`'s file (see
+ * ./ambient-modules): the module, whatever file the specifier resolves to,
+ * short of a module of the repository's own packages.
+ */
+function declaredModuleFile(specifier: string, ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  if (!isBareModuleSpecifier(specifier, ref.language)) return undefined;
+  const declaring = findAmbientModuleFile(specifier, ref.filePath, context);
+  if (!declaring) return undefined;
+  return isRepositoryModule(specifier, resolveImportPath(specifier, ref.filePath, ref.language, context), ref, context) ? undefined : declaring;
+}
+
+/**
  * Reference kinds the extractor records by a qualified name's last part: a
  * type position (`doc: vscode.TextDocument`) and a construction (`new
  * vscode.EventEmitter<T>()`). A call keeps what it is called through.
@@ -3514,13 +3551,16 @@ const LAST_NAME_KINDS: ReadonlySet<string> = new Set(['references', 'extends', '
  * A name bound to another package (an LSP `TextDocument`), to Node's own
  * modules (`fs`), or to a project file that doesn't import the module, or a
  * bare name a file reaching no such module writes, is not one of the module's.
+ * Neither is one the module's name alone leads to, in a block that doesn't
+ * count for the file (see declaringFileAnswers).
  */
 export function reachesAmbientModule(ref: UnresolvedRef, specifier: string, declaringFile: string, context: ResolutionContext): boolean {
-  if (isInModuleBlock(ref.filePath, ref.line, ref.column ?? 0, specifier, context)) return true;
+  const answers = declaringFileAnswers(declaringFile, ref.filePath, context);
+  if (answers && isInModuleBlock(ref.filePath, ref.line, ref.column ?? 0, specifier, context)) return true;
   const mappings = context.getImportMappings(ref.filePath, ref.language);
   const relative = (source: string): boolean => source.startsWith('.') || source.startsWith('/');
   const leadsTo = (source: string, through: (file: string) => boolean): boolean => {
-    if (source === specifier) return true;
+    if (source === specifier) return answers;
     if (!relative(source)) return false;
     const file = resolveImportPath(source, ref.filePath, ref.language, context);
     return file !== null && (file === declaringFile || through(file));
@@ -3850,12 +3890,8 @@ function resolveModuleImportToFile(
       continue;
     }
 
-    // A package the repository declares itself in a script `.d.ts`: that file
-    // is the module, whatever file the specifier resolves to (see ./ambient-modules).
-    if (isBareModuleSpecifier(modulePath, ref.language)) {
-      const declaring = findAmbientModuleFile(modulePath, ref.filePath, context);
-      if (declaring) return { original: ref, targetNodeId: declaring.id, confidence: 0.9, resolvedBy: 'import' };
-    }
+    const declaring = declaredModuleFile(modulePath, ref, context);
+    if (declaring) return { original: ref, targetNodeId: declaring.id, confidence: 0.9, resolvedBy: 'import' };
 
     const resolvedPath = resolveImportPath(modulePath, ref.filePath, ref.language, context);
     if (resolvedPath && resolvedPath !== ref.filePath) {
