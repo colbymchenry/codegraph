@@ -46,6 +46,146 @@ export function isConstDeclaration(node: SyntaxNode): boolean {
 /** C and C++ specifiers that define a class-like type, or an enum, when they carry a body (C has no `class_specifier`). */
 const CLASS_LIKE_SPECIFIERS = new Set(['class_specifier', 'struct_specifier', 'union_specifier', 'enum_specifier']);
 
+/** Conditional compilation a class body can hold members in. */
+const MEMBER_CONDITIONALS = new Set(['preproc_if', 'preproc_ifdef', 'preproc_else', 'preproc_elif', 'preproc_elifdef']);
+
+/** A type the program computes (`decltype(x)`, `auto`), which names no declaration. */
+const COMPUTED_TYPE_SPECIFIERS = new Set(['decltype', 'placeholder_type_specifier']);
+
+/**
+ * A name of the C++ standard library, or a type C itself gives a name the
+ * grammars read like any other. A project's copy of one is a compiler shim
+ * (jemalloc's msvc_compat/C99/stdbool.h), which code elsewhere never means.
+ */
+const C_STANDARD_TYPE_NAME = /^(?:(?:::\s*)?std\s*::|(?:_Bool|_Complex|wchar_t|char(?:8|16|32)_t|u?intmax_t|u?int_(?:least|fast)\d+_t|max_align_t|nullptr_t)$)/;
+
+/** What a declarator's next part is: a field where the grammar gives one, the first named child where it doesn't. */
+function innerDeclarator(declarator: SyntaxNode): SyntaxNode | null {
+  return getChildByField(declarator, 'declarator') ?? declarator.namedChild(0);
+}
+
+/**
+ * Whether a member declarator declares a member function (`Status Get(int);`,
+ * `Foo* Make();`, `Slice operator[](int);`), rather than data, which may be a
+ * pointer to a function (`void (*cb)(int);`), whose function declarator wraps
+ * a parenthesized one.
+ */
+function declaresMemberFunction(declarator: SyntaxNode): boolean {
+  let d: SyntaxNode | null = declarator;
+  while (d && (d.type === 'pointer_declarator' || d.type === 'reference_declarator')) d = innerDeclarator(d);
+  return d?.type === 'function_declarator' && getChildByField(d, 'declarator')?.type !== 'parenthesized_declarator';
+}
+
+/** Is this class-like specifier an unnamed member of another (`struct S { union { … } u; };`)? */
+export function isUnnamedMemberType(specifier: SyntaxNode): boolean {
+  return !getChildByField(specifier, 'name') && specifier.parent?.type === 'field_declaration';
+}
+
+/** A type name a declaration writes: the name as references carry it, and the node it is read at. */
+export interface CTypeName {
+  name: string;
+  node: SyntaxNode;
+}
+
+/**
+ * The type names a C or C++ class, struct or union's members are declared
+ * with, in source order: `pause_event` in `pause_event by_value;`, `*p`, `a[3]`
+ * or `(*cb)(pause_event *)`, the `struct` or `enum` a member names by its tag
+ * (`struct client *c`), and whatever a template's arguments name, in
+ * `std::vector<Foo>` too. `specifier` is the class's own, carrying the body;
+ * `ownName` is what the index calls it, which a typedef may decide.
+ *
+ * A name inside an unnamed member (`union { Foo a; }`, `struct { Foo a; } s;`)
+ * is the holder's: its members are members of the holder, and nothing can name
+ * the unnamed type (isUnnamedMemberType). A member function's return type
+ * counts, since a member a macro trails reads the same (`Version* v GUARDED_BY(mu);`),
+ * but not its parameters. Not read: builtins; a type of `std`, though its
+ * template arguments are; the class's own name, which a list's `next` writes;
+ * a type the program computes; a nested definition that declares no member
+ * (`class Rep;`, `struct Node { … };`).
+ *
+ * Mirrored in the kernel (ccpp/mod.rs).
+ */
+export function cMemberTypeNames(specifier: SyntaxNode, ownName: string, source: string): CTypeName[] {
+  const names: CTypeName[] = [];
+  const own = new Set([ownName]);
+  const tag = getChildByField(specifier, 'name');
+  if (tag) own.add(stripCppTemplateArgs(getNodeText(tag, source)));
+  const body = getChildByField(specifier, 'body');
+  if (body) collectMemberTypeNames(body, own, source, names);
+  return names;
+}
+
+/**
+ * The type names a C or C++ alias is declared with: `redisObject` in `typedef
+ * struct redisObject robj;`, `Foo` in `using Foos = std::vector<Foo>;`. Code
+ * names the alias, so this is how a change to the type reaches what holds one.
+ * Skipped as in cMemberTypeNames: `typedef struct dict dict;` names no other type.
+ */
+export function cAliasTypeNames(alias: SyntaxNode, ownName: string, source: string): CTypeName[] {
+  const names: CTypeName[] = [];
+  const own = new Set([ownName]);
+  const type = getChildByField(alias, 'type');
+  if (type) collectCTypeNames(type, own, source, names);
+  for (const declarator of alias.childrenForFieldName('declarator')) {
+    if (declarator) collectDeclaratorTypeNames(declarator, own, source, names);
+  }
+  return names;
+}
+
+function collectMemberTypeNames(list: SyntaxNode, own: ReadonlySet<string>, source: string, names: CTypeName[]): void {
+  for (const child of list.namedChildren) {
+    if (MEMBER_CONDITIONALS.has(child.type)) {
+      collectMemberTypeNames(child, own, source, names);
+      continue;
+    }
+    if (child.type !== 'field_declaration') continue;
+    const type = getChildByField(child, 'type');
+    if (!type) continue;
+    const declarators = child.childrenForFieldName('declarator').filter((d: SyntaxNode | null): d is SyntaxNode => !!d);
+    const unnamedBody = CLASS_LIKE_SPECIFIERS.has(type.type) && !getChildByField(type, 'name')
+      ? getChildByField(type, 'body')
+      : null;
+    if (unnamedBody) collectMemberTypeNames(unnamedBody, own, source, names);
+    else if (declarators.length > 0) collectCTypeNames(type, own, source, names);
+    for (const declarator of declarators) {
+      if (!declaresMemberFunction(declarator)) collectDeclaratorTypeNames(declarator, own, source, names);
+    }
+  }
+}
+
+/** The types a declarator names, past the type written before it: a function pointer's parameters. */
+function collectDeclaratorTypeNames(declarator: SyntaxNode, own: ReadonlySet<string>, source: string, names: CTypeName[]): void {
+  if (declarator.type === 'function_declarator') {
+    const parameters = getChildByField(declarator, 'parameters');
+    if (parameters) collectCTypeNames(parameters, own, source, names);
+  }
+  if (!declarator.type.endsWith('declarator')) return;
+  const inner = innerDeclarator(declarator);
+  if (inner) collectDeclaratorTypeNames(inner, own, source, names);
+}
+
+/** Collects the type names under `node` onto `names`, in source order. */
+function collectCTypeNames(node: SyntaxNode, own: ReadonlySet<string>, source: string, names: CTypeName[]): void {
+  if (COMPUTED_TYPE_SPECIFIERS.has(node.type)) return;
+  if (node.type === 'type_identifier' || node.type === 'qualified_identifier' || node.type === 'template_type') {
+    const name = stripCppTemplateArgs(getNodeText(node, source)).trim();
+    if (name && !own.has(name) && !C_STANDARD_TYPE_NAME.test(name)) names.push({ name, node });
+    collectTemplateArguments(node, own, source, names);
+    return;
+  }
+  const tag = CLASS_LIKE_SPECIFIERS.has(node.type) ? getChildByField(node, 'name') : null;
+  for (const c of tag ? [tag] : node.namedChildren) collectCTypeNames(c, own, source, names);
+}
+
+/** The types the template arguments of a written name name, wherever in the name they are. */
+function collectTemplateArguments(node: SyntaxNode, own: ReadonlySet<string>, source: string, names: CTypeName[]): void {
+  for (const c of node.namedChildren) {
+    if (c.type === 'template_argument_list') collectCTypeNames(c, own, source, names);
+    else if (c.type === 'qualified_identifier' || c.type === 'template_type') collectTemplateArguments(c, own, source, names);
+  }
+}
+
 /**
  * Whether a C/C++ type specifier defines a class, struct, union or enum, as
  * opposed to naming one (`struct Foo *p`, the forward declaration `class Foo;`).

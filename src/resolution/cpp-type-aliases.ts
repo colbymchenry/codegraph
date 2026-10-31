@@ -305,7 +305,9 @@ type Declared =
   | { alias: Node }
   /** A class, struct or union, by its qualified name. */
   | { cls: string }
-  /** An enum, namespace or other non-class type. */
+  /** An enum, by its declarations. */
+  | { enums: Node[] }
+  /** A namespace or other non-class type. */
   | 'other'
   /**
    * Aliases naming different types, none of them the calling file's: rocksdb's
@@ -338,6 +340,8 @@ function declaredIn(
   if (here.length === 0) return undefined;
   // `typedef struct Node Node;` declares the struct as well.
   if (here.some((n) => CLASS_KINDS.has(n.kind))) return { cls: qualified };
+  const enums = here.filter((n) => n.kind === 'enum');
+  if (enums.length > 0) return { enums };
   if (here.some((n) => n.kind !== 'type_alias')) return 'other';
   const alias = pickAlias(here, ref, context);
   return alias ? { alias } : { ambiguous: here };
@@ -664,9 +668,43 @@ export function cppClassNamed(
 ): CppNamedClass {
   const name = cppTypeName(written);
   if (!name) return null;
-  const { found, next } = lookupSegments(name, scopes, ref, context, visible);
+  return classFound(name, lookupSegments(name, scopes, ref, context, visible), ref, context);
+}
+
+/** What a C or C++ type name names when it is looked up for what it declares (see cppTypeNamed). */
+export type CppNamedType = CppNamedClass | { enums: Node[] };
+
+/**
+ * What a C or C++ type written as `written` declares, looked up as cppClassNamed
+ * looks it up: the class, an enum, or the alias the name ends on, not followed
+ * to the type it names, so an edge says what the code wrote.
+ */
+export function cppTypeNamed(
+  written: string,
+  scopes: readonly string[],
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  visible?: Visible,
+): CppNamedType {
+  const name = cppTypeName(written);
+  if (!name) return null;
+  // (A reference carries its name without template arguments, so an alias
+  // template can't be told by them. A name that finds one was written with them.)
+  const lookup = lookupSegments({ ...name, templated: name.names.map(() => true) }, scopes, ref, context, visible);
+  const { found, next } = lookup;
+  if (found && typeof found === 'object' && ('enums' in found || ('alias' in found && next === name.names.length))) return found;
+  return classFound(name, lookup, ref, context);
+}
+
+/** The class a lookup of `name` found, followed through the alias it reached. */
+function classFound(
+  name: TypeName,
+  { found, next }: { found: Declared; next: number },
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): CppNamedClass {
   if (found === undefined) return undefined;
-  if (typeof found !== 'object') return null;
+  if (typeof found !== 'object' || 'enums' in found) return null;
   if ('cls' in found) return found;
   if ('ambiguous' in found) {
     // An alias each `#if` arm declares differently: the first declaration, by
@@ -708,7 +746,7 @@ export function cppAliasedTypeWritten(
   const name = cppTypeName(written);
   if (!name) return undefined;
   const { found, next } = lookupSegments(name, scopesFor(name, scopes), ref, context);
-  if (!found || typeof found !== 'object' || 'cls' in found) return undefined;
+  if (!found || typeof found !== 'object' || 'cls' in found || 'enums' in found) return undefined;
   if ('ambiguous' in found || next !== name.names.length || isAliasTemplate(found.alias, context)) return null;
   const text = declarationText(found.alias, context);
   const aliased = text ? aliasedTypeIn(text, found.alias.name) : null;

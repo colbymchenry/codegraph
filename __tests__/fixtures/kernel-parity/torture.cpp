@@ -171,3 +171,35 @@ T Twice(T v) requires std::integral<T> {
   return v * 2;
 }
 }  // namespace clauses
+// Members: the types each is declared with are references from its holder, or
+// from the alias they are named through.
+namespace members {
+class Slice {};
+template <typename K, typename V> class Map {};
+using Rows = std::vector<Slice*>;
+typedef Map<int, Slice> SliceMap;
+template <class T>
+class Holder {
+ public:
+  Slice Get(const Slice& key);
+  virtual Rows* Scan(const Slice& from) = 0;
+  const Slice& Peek() const;
+ private:
+  Slice by_value;
+  const Slice& by_reference;
+  members::Slice* qualified;
+  ::members::Slice* global;
+  std::vector<Slice> items;
+  std::unique_ptr<Map<int, T>> owner;
+  Outer<T>::Inner<Slice>* nested;
+  typename T::value_type element;
+  std::function<void(Slice*)> done;
+  void (*callback)(const Slice* key, Rows rows);
+  decltype(1) computed;
+  Holder<T>* next;
+  enum class Mode : int { A, B } mode;
+  class Fwd;
+  union { Slice left; int right; };
+  struct Node { SliceMap* map; };
+};
+}  // namespace members

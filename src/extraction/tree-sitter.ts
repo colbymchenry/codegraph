@@ -21,7 +21,7 @@ import { FN_REF_SPECS, captureFnRefCandidates, goScopedFnRefScopes, type FnRefSp
 import { isGeneratedFile, isMinifiedContent } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
-import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifier, isClassLikeDefinition } from './languages/c-cpp';
+import { stripCppTemplateArgs, isCppConstructorDeclaration, cAliasTypeNames, cDeclaratorIdentifier, cMemberTypeNames, isClassLikeDefinition, isUnnamedMemberType, type CTypeName } from './languages/c-cpp';
 import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
@@ -2752,6 +2752,7 @@ export class TreeSitterExtractor {
 
     // Extract extends/implements
     this.extractInheritance(node, classNode.id);
+    this.extractCMemberTypeRefs(node, classNode);
 
     // C# primary-constructor parameter dependencies (`class Svc(IRepo r, …)`).
     this.extractCsharpPrimaryCtorParamRefs(node, classNode.id);
@@ -2983,6 +2984,7 @@ export class TreeSitterExtractor {
 
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
     this.extractInheritance(node, aggregateNode.id);
+    this.extractCMemberTypeRefs(node, aggregateNode);
 
     // C# primary-constructor parameter dependencies (`struct P(int x)`, and
     // `record struct M(decimal Amount)` which the grammar nests here).
@@ -2999,6 +3001,29 @@ export class TreeSitterExtractor {
         }
       }
       this.nodeStack.pop();
+    }
+  }
+
+  /**
+   * A C or C++ class, struct or union references the types its members are
+   * declared with, as the class: members mint no nodes, and impact never climbs
+   * from a member to its container (Go's and Dart's fields are the same, #2655,
+   * #2327). Mirrored in the kernel (ccpp/mod.rs).
+   */
+  private extractCMemberTypeRefs(specifier: SyntaxNode, owner: Node): void {
+    if ((this.language !== 'c' && this.language !== 'cpp') || isUnnamedMemberType(specifier)) return;
+    this.pushCTypeRefs(cMemberTypeNames(specifier, owner.name, this.source), owner);
+  }
+
+  private pushCTypeRefs(types: readonly CTypeName[], owner: Node): void {
+    for (const { name, node } of types) {
+      this.unresolvedReferences.push({
+        fromNodeId: owner.id,
+        referenceName: name,
+        referenceKind: 'references',
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column,
+      });
     }
   }
 
@@ -4471,6 +4496,7 @@ export class TreeSitterExtractor {
       if (typeChild) {
         // Extract struct embedding (e.g. Go: `type DB struct { *Head; Queryable }`)
         this.extractInheritance(typeChild, aggregateNode.id);
+        this.extractCMemberTypeRefs(typeChild, aggregateNode);
         // A Go struct references the types its fields are declared with, as
         // the struct: Go fields mint no nodes, and impact never climbs from a
         // member to its container (Dart's fields are the same, #2327).
@@ -4550,6 +4576,12 @@ export class TreeSitterExtractor {
       // through a path, never bare (isRustAssociatedItem).
       ...(owner !== undefined ? { qualifiedName: `${owner}::${name}` } : {}),
     });
+
+    // A C or C++ alias references what it names, so a change to a struct
+    // reaches the members declared through `typedef struct redisObject robj;`.
+    if (typeAliasNode && (this.language === 'c' || this.language === 'cpp')) {
+      this.pushCTypeRefs(cAliasTypeNames(node, name, this.source), typeAliasNode);
+    }
 
     // Extract type references from the alias value (e.g., `type X = ITextModel | null`)
     if (typeAliasNode && this.TYPE_ANNOTATION_LANGUAGES.has(this.language)) {

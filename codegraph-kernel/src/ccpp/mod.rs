@@ -44,6 +44,10 @@
 //!    (`static struct { … } SPT;` → `SPT`, in function bodies too), and the
 //!    comment above the declaration is its docstring (c/cpp
 //!    getDeclarationWrapper).
+//!  - the types a class's members are declared with (cMemberTypeNames) and an
+//!    alias's (cAliasTypeNames) are `references` from the class or alias,
+//!    written on the name: fields mint no nodes. An unnamed member type's
+//!    members are its holder's.
 //!  - static-member/value-read pass (cpp only): `field_expression` is in
 //!    MEMBER_ACCESS_TYPES (listed for Scala, same node kind in cpp), so
 //!    `Capitalized.member` / `Capitalized->member` VALUE reads emit
@@ -93,6 +97,14 @@ const MAX_VALUE_REF_NODES: usize = 20_000;
 
 // --- compiled regexes (JS \w/\s spelled as ASCII classes for parity) ---------
 
+/// C_STANDARD_TYPE_NAME (languages/c-cpp.ts).
+fn c_standard_type_name_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^(?:(?:::\s*)?std\s*::|(?:_Bool|_Complex|wchar_t|char(?:8|16|32)_t|u?intmax_t|u?int_(?:least|fast)\d+_t|max_align_t|nullptr_t)$)")
+            .unwrap()
+    })
+}
 /// recoverCppMacroDefinedName: macro-shaped parsed name.
 fn macro_shaped_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -1386,6 +1398,7 @@ impl<'t> Walker<'t> {
         let scope = Scope { row, kind: "class", name, qualified: scoped };
         self.open_class_scope(&scope, body);
         self.extract_inheritance(node, row);
+        self.push_member_type_refs(node, row, &scope.name);
         self.stack.push(scope);
         for i in 0..body.named_child_count() {
             if let Some(c) = body.named_child(i) {
@@ -1412,6 +1425,7 @@ impl<'t> Walker<'t> {
         let scope = Scope { row, kind, name, qualified: scoped };
         self.open_class_scope(&scope, body);
         self.extract_inheritance(node, row);
+        self.push_member_type_refs(node, row, &scope.name);
         self.stack.push(scope);
         for i in 0..body.named_child_count() {
             if let Some(c) = body.named_child(i) {
@@ -1493,13 +1507,16 @@ impl<'t> Walker<'t> {
             ) else {
                 return true;
             };
-            self.stack.push(Scope { row, kind, name, qualified: None });
             let type_child = node
                 .child_by_field_name("type")
                 .or_else(|| self.find_child_by_kind(node, "struct_specifier"))
                 .or_else(|| self.find_child_by_kind(node, "union_specifier"));
             if let Some(tc) = type_child {
                 self.extract_inheritance(tc, row);
+                self.push_member_type_refs(tc, row, &name);
+            }
+            self.stack.push(Scope { row, kind, name, qualified: None });
+            if let Some(tc) = type_child {
                 let body = tc.child_by_field_name("body").unwrap_or(tc);
                 for i in 0..body.named_child_count() {
                     if let Some(c) = body.named_child(i) {
@@ -1538,7 +1555,10 @@ impl<'t> Walker<'t> {
             return true;
         }
 
-        self.create_node("type_alias", &name, node, Extra { docstring, ..Extra::default() });
+        if let Some(row) = self.create_node("type_alias", &name, node, Extra { docstring, ..Extra::default() }) {
+            let names = self.alias_type_names(node, &name);
+            self.push_type_refs(names, row);
+        }
         false
     }
 
@@ -2157,6 +2177,142 @@ impl<'t> Walker<'t> {
         }
     }
 
+    // --- the types members and aliases are declared with --------------------
+
+    /// extractCMemberTypeRefs (tree-sitter.ts): a class, struct or union
+    /// references the types its members are declared with, as the class:
+    /// members mint no nodes, and impact never climbs from a member to its
+    /// container.
+    fn push_member_type_refs(&mut self, specifier: Node<'t>, row: u32, own_name: &str) {
+        if is_unnamed_member_type(specifier) {
+            return;
+        }
+        let names = self.member_type_names(specifier, own_name);
+        self.push_type_refs(names, row);
+    }
+
+    fn push_type_refs(&mut self, names: Vec<(String, Node<'t>)>, row: u32) {
+        let references = edge_kind_index("references").unwrap();
+        for (name, node) in names {
+            self.push_ref_at(row, &name, references, node);
+        }
+    }
+
+    /// cMemberTypeNames (languages/c-cpp.ts): the type names a class, struct or
+    /// union's members are declared with, in source order, each with the node
+    /// it is read at.
+    fn member_type_names(&self, specifier: Node<'t>, own_name: &str) -> Vec<(String, Node<'t>)> {
+        let mut names = Vec::new();
+        let mut own = HashSet::from([own_name.to_string()]);
+        if let Some(tag) = specifier.child_by_field_name("name") {
+            own.insert(strip_cpp_template_args(self.text(tag)));
+        }
+        if let Some(body) = specifier.child_by_field_name("body") {
+            self.collect_member_type_names(body, &own, &mut names);
+        }
+        names
+    }
+
+    /// cAliasTypeNames (languages/c-cpp.ts): the type names an alias is
+    /// declared with.
+    fn alias_type_names(&self, alias: Node<'t>, own_name: &str) -> Vec<(String, Node<'t>)> {
+        let mut names = Vec::new();
+        let own = HashSet::from([own_name.to_string()]);
+        if let Some(ty) = alias.child_by_field_name("type") {
+            self.collect_type_names(ty, &own, &mut names);
+        }
+        let mut cursor = alias.walk();
+        for declarator in alias.children_by_field_name("declarator", &mut cursor) {
+            self.collect_declarator_type_names(declarator, &own, &mut names);
+        }
+        names
+    }
+
+    fn collect_member_type_names(&self, list: Node<'t>, own: &HashSet<String>, names: &mut Vec<(String, Node<'t>)>) {
+        stack_guard!();
+        for child in (0..list.named_child_count()).filter_map(|i| list.named_child(i)) {
+            if is_member_conditional(child.kind()) {
+                self.collect_member_type_names(child, own, names);
+                continue;
+            }
+            if child.kind() != "field_declaration" {
+                continue;
+            }
+            let Some(ty) = child.child_by_field_name("type") else { continue };
+            let mut cursor = child.walk();
+            let declarators: Vec<Node<'t>> = child.children_by_field_name("declarator", &mut cursor).collect();
+            let unnamed_body = if is_class_like_specifier(ty.kind()) && ty.child_by_field_name("name").is_none() {
+                ty.child_by_field_name("body")
+            } else {
+                None
+            };
+            if let Some(body) = unnamed_body {
+                self.collect_member_type_names(body, own, names);
+            } else if !declarators.is_empty() {
+                self.collect_type_names(ty, own, names);
+            }
+            for declarator in declarators {
+                if !declares_member_function(declarator) {
+                    self.collect_declarator_type_names(declarator, own, names);
+                }
+            }
+        }
+    }
+
+    /// collectDeclaratorTypeNames (languages/c-cpp.ts): those of a function
+    /// pointer's parameters.
+    fn collect_declarator_type_names(&self, declarator: Node<'t>, own: &HashSet<String>, names: &mut Vec<(String, Node<'t>)>) {
+        stack_guard!();
+        if declarator.kind() == "function_declarator" {
+            if let Some(parameters) = declarator.child_by_field_name("parameters") {
+                self.collect_type_names(parameters, own, names);
+            }
+        }
+        if !declarator.kind().ends_with("declarator") {
+            return;
+        }
+        if let Some(inner) = inner_declarator(declarator) {
+            self.collect_declarator_type_names(inner, own, names);
+        }
+    }
+
+    /// collectCTypeNames (languages/c-cpp.ts).
+    fn collect_type_names(&self, node: Node<'t>, own: &HashSet<String>, names: &mut Vec<(String, Node<'t>)>) {
+        stack_guard!();
+        if matches!(node.kind(), "decltype" | "placeholder_type_specifier") {
+            return;
+        }
+        if matches!(node.kind(), "type_identifier" | "qualified_identifier" | "template_type") {
+            let name = strip_cpp_template_args(self.text(node)).trim().to_string();
+            if !name.is_empty() && !own.contains(&name) && !c_standard_type_name_re().is_match(&name) {
+                names.push((name, node));
+            }
+            self.collect_template_arguments(node, own, names);
+            return;
+        }
+        if is_class_like_specifier(node.kind()) {
+            if let Some(tag) = node.child_by_field_name("name") {
+                self.collect_type_names(tag, own, names);
+                return;
+            }
+        }
+        for c in (0..node.named_child_count()).filter_map(|i| node.named_child(i)) {
+            self.collect_type_names(c, own, names);
+        }
+    }
+
+    /// collectTemplateArguments (languages/c-cpp.ts).
+    fn collect_template_arguments(&self, node: Node<'t>, own: &HashSet<String>, names: &mut Vec<(String, Node<'t>)>) {
+        stack_guard!();
+        for c in (0..node.named_child_count()).filter_map(|i| node.named_child(i)) {
+            match c.kind() {
+                "template_argument_list" => self.collect_type_names(c, own, names),
+                "qualified_identifier" | "template_type" => self.collect_template_arguments(c, own, names),
+                _ => {}
+            }
+        }
+    }
+
     // --- fn-ref capture (#756, cFamilySpec) ----------------------------------
 
     /// maybeCaptureFnRefs + captureFnRefCandidates for the cFamily dispatch:
@@ -2506,12 +2662,43 @@ fn c_declarator_identifier(node: Node) -> Option<Node> {
     None
 }
 
+/// CLASS_LIKE_SPECIFIERS (languages/c-cpp.ts).
+fn is_class_like_specifier(kind: &str) -> bool {
+    matches!(kind, "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier")
+}
+
 /// isClassLikeDefinition (languages/c-cpp.ts): a class/struct/union/enum
 /// specifier that carries a body defines the type; `struct Foo *p` and the
 /// forward declaration `class Foo;` only name it.
 fn is_class_like_definition(node: Node) -> bool {
-    matches!(node.kind(), "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier")
-        && node.child_by_field_name("body").is_some()
+    is_class_like_specifier(node.kind()) && node.child_by_field_name("body").is_some()
+}
+
+/// isUnnamedMemberType (languages/c-cpp.ts): its members are its holder's.
+fn is_unnamed_member_type(specifier: Node) -> bool {
+    specifier.child_by_field_name("name").is_none()
+        && specifier.parent().map(|p| p.kind() == "field_declaration").unwrap_or(false)
+}
+
+/// MEMBER_CONDITIONALS (languages/c-cpp.ts).
+fn is_member_conditional(kind: &str) -> bool {
+    matches!(kind, "preproc_if" | "preproc_ifdef" | "preproc_else" | "preproc_elif" | "preproc_elifdef")
+}
+
+/// innerDeclarator (languages/c-cpp.ts).
+fn inner_declarator(declarator: Node) -> Option<Node> {
+    declarator.child_by_field_name("declarator").or_else(|| declarator.named_child(0))
+}
+
+/// declaresMemberFunction (languages/c-cpp.ts).
+fn declares_member_function(declarator: Node) -> bool {
+    let mut d = Some(declarator);
+    while let Some(n) = d.filter(|n| matches!(n.kind(), "pointer_declarator" | "reference_declarator")) {
+        d = inner_declarator(n);
+    }
+    d.filter(|n| n.kind() == "function_declarator")
+        .map(|n| n.child_by_field_name("declarator").map(|i| i.kind()) != Some("parenthesized_declarator"))
+        .unwrap_or(false)
 }
 
 /// definingDeclaration (languages/c-cpp.ts): the `declaration` a class-like
