@@ -891,7 +891,39 @@ function resolvePythonModule(
     if (found !== null && found !== hit) return null;
     found = hit;
   }
-  return found;
+  return found ?? pythonModuleAboveScript(specifier, relPath, fromFile, importerDir, index, context);
+}
+
+/**
+ * The module in a folder above a script that no root provides: `from test
+ * import TestCase` in `modules/vs/tests/with_a.py`, with the runner
+ * `modules/vs/test.py` whose folder is first on `sys.path`. Nothing in the tree
+ * says that folder is a root, and a name like `test` or `utils` may just as
+ * well be the stdlib's, so what proves the module is what the importer takes
+ * from it: every name must be one the file defines at module level. A plain
+ * `import utils` or a star import takes no name, so it proves nothing and stays
+ * unresolved. Nearest folder first; a package is no root, so it is passed over.
+ */
+function pythonModuleAboveScript(
+  specifier: string,
+  relPath: string,
+  fromFile: string,
+  importerDir: string,
+  index: PythonModuleIndex,
+  context: ResolutionContext
+): string | null {
+  const taken = context.getImportMappings(fromFile, 'python')
+    .filter((imp) => imp.source === specifier && !imp.isNamespace)
+    .map((imp) => imp.exportedName);
+  if (taken.length === 0) return null;
+  for (let dir = parentDir(importerDir); dir; dir = parentDir(dir)) {
+    if (index.packageDirs.has(dir)) continue;
+    const file = pythonModuleUnder(dir, relPath, index);
+    if (!file) continue;
+    const defined = new Set(context.getNodesInFile(file).filter(isPythonModuleLevelDef).map((n) => n.name));
+    if (taken.every((name) => defined.has(name))) return file;
+  }
+  return null;
 }
 
 /**
@@ -958,6 +990,33 @@ export function pythonReopenScope(
   }
   const moduleLeaves = [...new Set([...affected].map((m) => m.slice(m.lastIndexOf('.') + 1)))];
   return { targetFiles, sourceDirs: [...sourceDirs], moduleLeaves };
+}
+
+/**
+ * What an edit of these Python files can move through
+ * {@link pythonModuleAboveScript}: such a module binds only while it defines
+ * the names its importers take, so an edit links or unlinks them though no file
+ * appeared or vanished. Only a module in a folder that is neither a package nor
+ * a root, with Python folders below it, can be one, so any other edit re-opens
+ * nothing.
+ */
+export function pythonScriptModuleScope(
+  context: ResolutionContext,
+  editedFiles: string[]
+): { targetFiles: string[]; sourceDirs: string[]; moduleLeaves: string[] } {
+  const index = pythonModuleIndex(context);
+  const targetFiles: string[] = [];
+  const moduleLeaves: string[] = [];
+  for (const raw of editedFiles) {
+    const file = raw.replace(/\\/g, '/');
+    const dir = parentDir(file);
+    if (!PYTHON_MODULE_FILE.test(file) || !dir || index.packageDirs.has(dir) ||
+        index.projectRoots.has(dir) || index.localRoots.has(dir)) continue;
+    if (![...index.dirs].some((d) => d.startsWith(`${dir}/`))) continue;
+    targetFiles.push(file);
+    moduleLeaves.push(file.slice(dir.length + 1, -'.py'.length));
+  }
+  return { targetFiles, sourceDirs: [], moduleLeaves };
 }
 
 /**

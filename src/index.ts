@@ -1654,6 +1654,16 @@ export class CodeGraph {
               this.resolver.clearCaches();
               for (const f of this.orchestrator.resurrectPythonPackageImporters(this.resolver.getPythonPackageImporters(editedInits))) reopened.add(f);
             }
+            // An edit can give a module above a script the names its importers
+            // take from it, or take them away.
+            const scriptModules = this.resolver.getPythonScriptModuleScope(
+              (result.changedFilePaths ?? []).filter((f) => pythonFilesBefore.has(f) && after.has(f))
+            );
+            if (scriptModules.targetFiles.length > 0) {
+              this.resolver.clearCaches();
+              for (const f of this.orchestrator.resurrectResolutionEdgesTouching('python', scriptModules)) reopened.add(f);
+            }
+
             // Resolve the narrow set now, the way the changed files' own
             // references were resolved above, rather than leaving a handful of
             // refs to the orphan sweep and its whole-graph synthesis pass.
