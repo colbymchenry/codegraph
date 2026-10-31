@@ -242,6 +242,7 @@ describe('recovering an interrupted bulk load off the event loop (#1887)', () =>
       (async () => {
         const { default: CodeGraph, initGrammars } = require(${JSON.stringify(path.join(DIST, 'index.js'))});
         await initGrammars(); // grammar loading is not what this measures
+        require(${JSON.stringify(path.join(DIST, 'engine.js'))}); // nor is loading the engine, under load past this timeout
         require(${JSON.stringify(watchdog)}).installMainThreadWatchdog();
         const cg = await CodeGraph.open(${JSON.stringify(root)});
         cg.close();

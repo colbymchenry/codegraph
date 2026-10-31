@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { defineConfig } from 'vitest/config';
 import { WASM_RUNTIME_FLAGS } from './src/extraction/wasm-runtime-flags';
@@ -74,6 +75,14 @@ export default defineConfig({
         test: {
           name: 'engine',
           include: ['__tests__/**/*.test.ts'],
+          // A lazy `require` of a `.ts` file can't run under vitest's module
+          // transform: see src/lazy-engine.ts.
+          alias: [
+            {
+              find: /^\.\/lazy-engine$/,
+              replacement: fileURLToPath(new URL('./__tests__/lazy-engine-eager.ts', import.meta.url)),
+            },
+          ],
           exclude: ['**/node_modules/**', '**/dist/**', '__tests__/ui-package.test.ts'],
         },
       },

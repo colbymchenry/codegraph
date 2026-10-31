@@ -37,7 +37,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { isSourceFile, buildScopeIgnore, type ScopeIgnore } from '../extraction';
 import { loadExtensionOverrides, PROJECT_CONFIG_FILENAME } from '../project-config';
-import { logDebug, logWarn } from '../errors';
+import { LockUnavailableError, logDebug, logWarn } from '../errors';
 import { escapesRoot, normalizePath } from '../utils';
 import { isCodeGraphDataDir } from '../directory';
 import { watchDisabledReason } from './watch-policy';
@@ -244,19 +244,7 @@ export interface WatchOptions {
   inertForTests?: boolean;
 }
 
-/**
- * Thrown by a `syncFn` to signal that the underlying sync couldn't acquire
- * the cross-process write lock (#449). The watcher treats this as "no
- * progress" — preserves `pendingFiles`, skips `onSyncComplete`, and the
- * `finally` block reschedules. Quiet (debug-only) because a long-running
- * external indexer can hit this every debounce cycle.
- */
-export class LockUnavailableError extends Error {
-  constructor(message = 'CodeGraph file lock unavailable; another process is writing') {
-    super(message);
-    this.name = 'LockUnavailableError';
-  }
-}
+export { LockUnavailableError };
 
 /**
  * Per-file pending entry — tracks a source file the watcher saw an event for
