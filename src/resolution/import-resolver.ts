@@ -356,6 +356,18 @@ function hasEsmDefaultExport(filePath: string, idx: FileExportIndex, context: Re
   return !!source && source.includes('default') && ESM_DEFAULT_EXPORT_RE.test(source);
 }
 
+/**
+ * Whether `node` is what its own file says it default-exports: what an `export
+ * default` statement declares or names, a single-file component, or the name
+ * `module.exports` is set to. Anything else a default import lands on is the
+ * guess at the module's first export ({@link esmDefaultExport}).
+ */
+export function isStatedDefaultExport(node: Node, context: ResolutionContext): boolean {
+  if (!JS_FAMILY_FILE.test(node.filePath)) return node.kind === 'component';
+  const stated = statedDefaultExport(node.filePath, getFileExportIndex(node.filePath, context), context);
+  return typeof stated === 'object' ? stated.id === node.id : commonJsDefaultExport(node.filePath, context)?.name === node.name;
+}
+
 /** What this file exports as `name`: an exported declaration, else a local export clause's binding. */
 function exportedByName(filePath: string, idx: FileExportIndex, name: string, context: ResolutionContext): Node | undefined {
   const direct = idx.byName.get(name);

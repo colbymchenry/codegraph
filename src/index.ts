@@ -57,6 +57,7 @@ import {
   ResolutionResult,
 } from './resolution';
 import { hasSynthesisPattern, isJsxChildCandidate } from './resolution/callback-synthesizer';
+import { aliasMayName } from './resolution/const-alias-synthesizer';
 import { createImportReader, reopenNameMatchedImports, reopenReferencesThroughAddedFiles, reopenReferencesThroughBarrels, reopenReferencesThroughChangedDefaults, reopenReferencesThroughDeclaredPackages, reopenReferencesThroughRetargetedModules } from './resolution/module-importers';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import type { CallSiteRow } from './graph';
@@ -1207,10 +1208,13 @@ export class CodeGraph {
         // to the `Team` this sync adds. The gate above reads each changed file
         // on its own, and a component with no markup of its own (`return null`,
         // a wrapper) matches none of its patterns. Removing one needs no check:
-        // a component a tag rendered had synthesized edges into its file.
+        // a component a tag rendered had synthesized edges into its file. A
+        // function a const in an unchanged file names is the same: `const late
+        // = fns.join` links to the `join` this sync adds.
         if (!refreshSynthesis && result.definitionDelta && result.changedFilePaths) {
           const delta = new Set(result.definitionDelta);
-          if (this.queries.getNodesByFiles(result.changedFilePaths).some((n) => delta.has(n.name) && isJsxChildCandidate(n))) {
+          const defined = this.queries.getNodesByFiles(result.changedFilePaths).filter((n) => delta.has(n.name));
+          if (defined.some(isJsxChildCandidate) || aliasMayName(this.queries, defined)) {
             refreshSynthesis = true;
             this.queries.setMetadata('synthesis_pending', '1');
           }

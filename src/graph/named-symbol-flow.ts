@@ -500,8 +500,11 @@ function walkCalls(
       if (!FLOW_EDGE_KINDS.has(c.edge.kind)) continue;
       const isNamed = named.has(c.node.id);
       // A route node is a connector, not a symbol the reader would have named:
-      // crossing one costs no bridge budget.
-      const streak = isNamed ? 0 : c.node.kind === 'route' ? at.streak : at.streak + 1;
+      // crossing one costs no bridge budget. Nor does the hop from a const to the
+      // function it holds: to a reader, `extname` and the `extname` it hands on
+      // are one symbol, and the const has already spent the budget.
+      const free = c.node.kind === 'route' || (c.edge.metadata as { synthesizedBy?: unknown } | undefined)?.synthesizedBy === 'const-alias';
+      const streak = isNamed ? 0 : free ? at.streak : at.streak + 1;
       if (streak > maxBridge) continue;
       // A route never passes a node twice: going round a cycle counts its named
       // symbols again and would out-rank the flow it repeats.

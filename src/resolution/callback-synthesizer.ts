@@ -32,6 +32,7 @@ import { goframeRouteEdges } from './goframe-synthesizer';
 import { goFuncFieldEdges } from './go-func-field-synthesizer';
 import { expoRouterReturnEdges } from './expo-router-synthesizer';
 import { nextLinkEdges, nextProxyEdges } from './next-router-synthesizer';
+import { constAliasEdges, hasConstAliasShape } from './const-alias-synthesizer';
 import { nextRouteForFile } from './frameworks/nextjs';
 import { NEXT_PROXY_FILE } from './frameworks/next-proxy';
 import { reactRouterLinkEdges } from './react-router-synthesizer';
@@ -5194,6 +5195,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   if (/\b(?:render|build|setState|defineStore|createStore|createApi|Store|href|sendEvent|sendEventWithName)\b|<\/|\/>/.test(content)) return true;
   // A wrapper renders the component it wraps (jsxEdges), in a file with no markup of its own too.
   if (WRAPPER_CALL_RE.test(content)) return true;
+  if (hasConstAliasShape(filePath, content)) return true;
   if (/\.(?:forEach|append|add|push|insert|fire|dispatchEvent|addListener|Use|GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Any|Handle)\s*\(/.test(content)) return true;
   if (/[\w$]\s*\[\s*[A-Za-z_$]/.test(content) || /\b(?:dispatch|commit)\s*\(/.test(content)) return true;
   const patterns = [THUNK_DECL_RE, CELERY_TASK_DECORATOR_RE, CELERY_DISPATCH_RE,
@@ -5270,6 +5272,8 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   },
   { name: 'ginEdges', gate: (has) => has('go'), run: (q, c, y) => ginMiddlewareChainEdges(q, c, y) },
   { name: 'thunkEdges', gate: (has) => has(...JS_FAMILY), run: (q, c, y) => reduxThunkEdges(q, c, y) },
+  // `export const extname = isWin ? win32.extname : posix.extname` onto each function it can hold.
+  { name: 'constAliasEdges', gate: (has) => has(...JS_FAMILY), run: (q, c, y) => constAliasEdges(q, c, y) },
   { name: 'registryEdges', gate: ALWAYS, run: (_q, c, y) => objectRegistryEdges(c, y) },
   { name: 'rtkEdges', gate: (has) => has(...JS_FAMILY), run: (q, c, y) => rtkQueryEdges(q, c, y) },
   { name: 'piniaEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => piniaStoreEdges(c, y) },

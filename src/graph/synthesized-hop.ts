@@ -83,6 +83,8 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
       return hop(`GoFrame route ${m.route ? String(m.route) : ''}`);
     case 'next-proxy':
       return hop(m.matcher ? `Next proxy, matcher ${quoted(m.matcher, '')}` : 'Next proxy, on every request');
+    case 'const-alias':
+      return hop(`const alias of ${quoted(m.via, 'a function')}`);
     case 'go-func-field':
       // Go: a call through a struct field holding a function, `d.refreshf(ctx)`;
       // `via` is the field it was copied from, which the wiring site writes.

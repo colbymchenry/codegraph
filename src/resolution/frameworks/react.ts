@@ -830,7 +830,7 @@ function loadedPage(value: Loaded | null): { spec: string; member: string } | nu
 }
 
 /** A declarator's own source text: `B = lazy(…)` in `const A = lazy(…), B = lazy(…)`. */
-function declarationText(node: Node, context: ResolutionContext): string {
+export function declarationText(node: Node, context: ResolutionContext): string {
   const lines = (context.getFileLines?.(node.filePath) ?? context.readFile(node.filePath)?.split(/\r?\n/) ?? [])
     .slice(node.startLine - 1, node.endLine);
   if (lines.length === 0) return '';
@@ -1761,7 +1761,7 @@ function declare(body: string, at: number, scope: Map<string, Loaded | null>): n
 }
 
 /** Where a declarator's initializer starts, past its `: Type` and `=`; -1 when it has none. */
-function initializerAt(body: string, at: number): number {
+export function initializerAt(body: string, at: number): number {
   for (let i = at; i < body.length; i++) {
     const ch = body[i]!;
     if (ch === '"' || ch === "'" || ch === '`') {
