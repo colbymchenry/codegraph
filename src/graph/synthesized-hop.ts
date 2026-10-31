@@ -75,6 +75,9 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
       // Go: the implementing struct gets the method from a type it embeds.
       if (typeof m.promotedInto === 'string') return hop(`interface → method promoted into ${m.promotedInto}`);
       return hop('interface → impl');
+    case 'python-override':
+      // Python: a call bound to the base declaration runs the subclass override.
+      return hop('base → override');
     case 'closure-collection':
       return hop(`runs ${quoted(m.field, 'a collection')} handlers`);
     case 'fn-pointer-dispatch':
