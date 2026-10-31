@@ -415,6 +415,8 @@ export function normalizePath(filePath: string): string {
   return filePath.replace(/\\/g, '/');
 }
 
+const REGEXP_SYNTAX = /[.*+?^${}()|[\]\\]/;
+
 /**
  * Escape `text` to match itself literally inside a regular expression.
  * Symbol names are not always plain words: C++'s `operator++` and
@@ -423,7 +425,8 @@ export function normalizePath(filePath: string): string {
  * is read as pattern syntax and may not compile at all.
  */
 export function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Most text here is an identifier, with nothing to escape.
+  return REGEXP_SYNTAX.test(text) ? text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : text;
 }
 
 /**
