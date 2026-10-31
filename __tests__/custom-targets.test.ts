@@ -888,3 +888,87 @@ describe('custom target specs: add and remove', () => {
     expect(removeCustomTargetSpec('never')).toEqual({ removed: false });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Parity: a spec for each JSON and TOML builtin target writes what the
+// builtin writes. Where a builtin has a quirk a spec cannot express, the test
+// names it.
+// ---------------------------------------------------------------------------
+
+import { buildCustomTarget, type CustomTargetSpec } from '../src/installer/targets/custom';
+
+describe('a spec built target writes what the builtin target writes', () => {
+  const dirs = useTmpDirs('parity');
+
+  const PARITY: Array<{ spec: CustomTargetSpec; only?: 'global' }> = [
+    { spec: { id: 'droid', family: 'mcp-json', configDir: '~/.factory', configFileName: 'mcp.json', localConfigDir: '.factory' } },
+    { spec: { id: 'kimi', family: 'mcp-json', configDir: '~/.kimi-code', homeEnvVar: 'KIMI_CODE_HOME', configFileName: 'mcp.json', localConfigDir: '.kimi-code', omitTypeField: true } },
+    { spec: { id: 'windsurf', family: 'mcp-json', configDir: '~/.codeium/windsurf', configFileName: 'mcp_config.json', omitTypeField: true, instructionsFile: null }, only: 'global' },
+    { spec: { id: 'bob', family: 'mcp-json', configDir: '~/.bob/settings', configFileName: 'mcp.json', localConfigDir: '.bob', omitTypeField: true, instructionsFile: null } },
+    { spec: { id: 'qoder', family: 'mcp-json', configDir: '~/.qoder', homeEnvVar: 'QODER_CONFIG_DIR', localConfigDir: '.qoder', localConfigFileName: 'settings.local.json', omitTypeField: true, instructionsFile: null } },
+    { spec: { id: 'qwen', family: 'mcp-json', configDir: '~/.qwen', homeEnvVar: 'QWEN_HOME', localConfigDir: '.qwen', instructionsFile: 'QWEN.md', omitTypeField: true } },
+    { spec: { id: 'grok', family: 'toml', configDir: '~/.grok', homeEnvVar: 'GROK_HOME', localConfigDir: '.grok', instructionsFile: 'rules/codegraph.md', instructionsLocal: 'config' } },
+    { spec: { id: 'codex', family: 'toml', configDir: '~/.codex', homeEnvVar: 'CODEX_HOME', localConfigDir: '.codex' } },
+  ];
+
+  function snapshot(paths: string[]): Record<string, string | null> {
+    return Object.fromEntries(paths.map((p) => [p, fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : null]));
+  }
+
+  function wipe(paths: string[]): void {
+    for (const p of paths) fs.rmSync(p, { force: true });
+  }
+
+  for (const { spec, only } of PARITY) {
+    for (const loc of (only ? ['global'] : ['global', 'local']) as Array<'global' | 'local'>) {
+      it(`${spec.id} (${loc}): same files, same bytes, same detection, same snippet`, () => {
+        const builtin = getTarget(spec.id)!;
+        const mine = buildCustomTarget(spec);
+        expect(mine.supportsLocation('local')).toBe(builtin.supportsLocation('local'));
+        expect(mine.describePaths(loc)).toEqual(builtin.describePaths(loc));
+        const paths = builtin.describePaths(loc);
+
+        const theirs = builtin.install(loc, { autoAllow: false });
+        const theirFiles = snapshot(paths);
+        const theirDetect = builtin.detect(loc);
+        const theirUninstall = builtin.uninstall(loc).files;
+        wipe(paths);
+
+        const ours = mine.install(loc, { autoAllow: false });
+        expect(ours.files).toEqual(theirs.files);
+        expect(snapshot(paths)).toEqual(theirFiles);
+        expect(mine.detect(loc)).toEqual(theirDetect);
+        expect(mine.printConfig(loc)).toBe(builtin.printConfig(loc));
+        expect(mine.uninstall(loc).files).toEqual(theirUninstall);
+        expect(snapshot(paths)).toEqual(Object.fromEntries(paths.map((p) => [p, null])));
+      });
+    }
+  }
+
+  it('pi: the same files, except that only the builtin adds exposure: direct to the entry', () => {
+    const spec: CustomTargetSpec = { id: 'pi', family: 'mcp-json', configDir: '~/.pi/agent', homeEnvVar: 'PI_CODING_AGENT_DIR', configFileName: 'mcp.json', localConfigDir: '.pi', omitTypeField: true };
+    const builtin = getTarget('pi')!;
+    const mine = buildCustomTarget(spec);
+    for (const loc of ['global', 'local'] as const) {
+      expect(mine.describePaths(loc)).toEqual(builtin.describePaths(loc));
+      const [file] = builtin.describePaths(loc);
+      builtin.install(loc, { autoAllow: false });
+      const theirs = readJson(file!);
+      wipe(builtin.describePaths(loc));
+      mine.install(loc, { autoAllow: false });
+      expect({ ...readJson(file!), mcpServers: { codegraph: { ...readJson(file!).mcpServers.codegraph, exposure: 'direct' } } }).toEqual(theirs);
+      wipe(builtin.describePaths(loc));
+    }
+  });
+
+  it('qwen: the same files, except that only the builtin writes the auto allow rule', () => {
+    const spec: CustomTargetSpec = { id: 'qwen', family: 'mcp-json', configDir: '~/.qwen', homeEnvVar: 'QWEN_HOME', localConfigDir: '.qwen', instructionsFile: 'QWEN.md', omitTypeField: true };
+    const builtin = getTarget('qwen')!;
+    const file = path.join(dirs.home(), '.qwen', 'settings.json');
+    builtin.install('global', { autoAllow: true });
+    const theirs = readJson(file);
+    wipe(builtin.describePaths('global'));
+    buildCustomTarget(spec).install('global', { autoAllow: true });
+    expect({ ...readJson(file), permissions: { allow: ['mcp__codegraph'] } }).toEqual(theirs);
+  });
+});
