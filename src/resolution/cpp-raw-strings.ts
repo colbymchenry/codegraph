@@ -114,6 +114,7 @@ export function cppNonCodeLines(file: string, context: ResolutionContext): Map<n
  */
 export function cppLiteralsBlanked(text: string, line: number, rawLines: Map<number, Ranges>): string {
   const raw = rawLines.get(line);
+  if (!raw && !text.includes('"') && !text.includes('\'')) return text;
   const out = text.split('');
   if (raw) for (const [start, end] of raw) for (let k = start; k < end && k < out.length; k++) out[k] = ' ';
   if (!text.includes('"') && !text.includes('\'')) return out.join('');

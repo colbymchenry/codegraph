@@ -291,8 +291,10 @@ function localAliasedType(name: string, caller: Node | null | undefined, ref: Un
   if (!caller || (caller.kind !== 'function' && caller.kind !== 'method') || caller.filePath !== ref.filePath) return undefined;
   const lines = linesOf(ref.filePath, context);
   if (!lines) return undefined;
+  const aliasLines = localAliasLines(caller, lines, context);
+  if (aliasLines.length === 0) return undefined;
   const declares = new RegExp(String.raw`\b(?:using\s+${escapeRegExp(name)}\s*=|typedef\b[^;]*\b${escapeRegExp(name)}\s*[;,])`);
-  for (const i of localAliasLines(caller, lines, context)) {
+  for (const i of aliasLines) {
     if (i > ref.line - 1) continue;
     const line = lines[i]!;
     if (line.includes(name) && declares.test(line)) return aliasedTypeIn(line, name);
