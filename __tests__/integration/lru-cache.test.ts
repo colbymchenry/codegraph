@@ -93,4 +93,56 @@ describe('LRUCache', () => {
     expect(cache.has('key9900')).toBe(true);
     expect(cache.has('key0')).toBe(false);
   });
+
+  it('keeps entries, order and evictions the way a re-inserted Map does', () => {
+    // The reference: recency as Map insertion order, a hit re-inserting its key.
+    const reference = new Map<number, number>();
+    const max = 16;
+    const cache = new LRUCache<number, number>(max);
+    let seed = 7;
+    const next = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return (seed >>> 12) % n;
+    };
+    for (let i = 0; i < 50_000; i++) {
+      const key = next(40);
+      const op = next(10);
+      if (op < 6) {
+        const hit = reference.get(key);
+        if (hit !== undefined) {
+          reference.delete(key);
+          reference.set(key, hit);
+        }
+        expect(cache.get(key)).toBe(hit);
+      } else if (op < 9) {
+        if (reference.has(key)) reference.delete(key);
+        else if (reference.size >= max) reference.delete(reference.keys().next().value!);
+        reference.set(key, i);
+        cache.set(key, i);
+      } else {
+        expect(cache.has(key)).toBe(reference.has(key));
+      }
+      expect(cache.size).toBe(reference.size);
+    }
+    // The order itself: fill it with new keys and see which of the old ones go, oldest first.
+    expect(cache.size).toBe(max);
+    const order = [...reference.keys()];
+    order.forEach((key, i) => {
+      expect(cache.has(key)).toBe(true);
+      cache.set(1000 + i, 0);
+      expect(cache.has(key)).toBe(false);
+    });
+  });
+
+  it('works again after clear()', () => {
+    const cache = new LRUCache<string, number>(2);
+    cache.set('a', 1);
+    cache.clear();
+    cache.set('b', 2);
+    cache.set('c', 3);
+    cache.set('d', 4);
+    expect(cache.has('b')).toBe(false);
+    expect(cache.get('c')).toBe(3);
+    expect(cache.get('d')).toBe(4);
+  });
 });
