@@ -416,6 +416,7 @@ function resolveImportPathUncached(
   language: Language,
   context: ResolutionContext
 ): string | null {
+
   // COBOL COPY/EXEC SQL INCLUDE names a copybook member, not a path — the
   // compiler searches a library, so we match against indexed file basenames.
   // Must run before isExternalImport: a bare member name would otherwise be
@@ -2632,6 +2633,32 @@ function pickClosestJvmCandidate(candidates: Node[], fromPath: string): Node {
   return best;
 }
 
+/** The Kotlin Multiplatform source set a path belongs to — `lib/src/androidMain/kotlin/a/Util.kt` is `androidMain` — or null. */
+function kmpSourceSet(filePath: string): string | null {
+  return /(?:^|\/)src\/([^/]+)\//.exec(filePath.replace(/\\/g, '/'))?.[1] ?? null;
+}
+
+/**
+ * Which of an imported declaration's same-FQN classes the caller reaches when
+ * Kotlin Multiplatform's `expect` and `actual`s share the name: the `actual`,
+ * for a caller whose compilation ever holds one — Java code runs against JVM
+ * bytecode the `expect` never produces, and a Kotlin file outside commonMain
+ * compiles with its platform's `actual` (#3033). timber's Java sample calling
+ * `Timber.plant(...)` reaches the `androidMain` actual, not the commonMain
+ * `expect`. The caller's own source set decides among the actuals when there
+ * are several (an androidMain caller takes the androidMain one); a commonMain
+ * caller compiles against the `expect` alone, and keeps the proximity pick.
+ */
+function jvmExpectActualPick(declarations: Node[], ref: UnresolvedRef): Node {
+  const actuals = declarations.filter((n) => Array.isArray(n.decorators) && n.decorators.includes('actual'));
+  if (actuals.length === 0 || actuals.length === declarations.length) return pickClosestJvmCandidate(declarations, ref.filePath);
+  const callerSet = kmpSourceSet(ref.filePath);
+  const callerSeesActuals = ref.language === 'java' || (callerSet !== null && callerSet !== 'commonMain');
+  if (!callerSeesActuals) return pickClosestJvmCandidate(declarations, ref.filePath);
+  const sameSet = callerSet === null ? [] : actuals.filter((n) => kmpSourceSet(n.filePath) === callerSet);
+  return pickClosestJvmCandidate(sameSet.length > 0 ? sameSet : actuals, ref.filePath);
+}
+
 /**
  * PHP scoped calls are encoded as "Alias.method" by both extractors. A use
  * mapping names a namespace, not a filesystem path, so resolve the receiver
@@ -3919,7 +3946,7 @@ function resolveJavaImportedReference(
     const callOfFunction = matchesBare && ref.referenceKind === 'calls' &&
       named.some((n) => n.kind === 'function' || n.kind === 'method');
     if (declarations.length > 0 && !callOfFunction) {
-      const owner = declarations.length === 1 ? declarations[0]! : pickClosestJvmCandidate(declarations, ref.filePath);
+      const owner = declarations.length === 1 ? declarations[0]! : jvmExpectActualPick(declarations, ref);
       const target = jvmImportedMember(owner, memberPath, ref, context);
       // Of a member's overloads, the one the call's argument count fits:
       // `ItemStack.Hash.of(stack, registries)`, not `of(stack)`.
