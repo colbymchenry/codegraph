@@ -81,6 +81,15 @@ export function shouldEngageAdaptively(projectedMs: number, remainingRefs: numbe
   return remainingRefs >= ADAPTIVE_ENGAGE_MIN_REFS && projectedMs >= barMs;
 }
 
+/**
+ * What a resolver worker's heap may hold of new objects. Resolving keeps many
+ * of them alive for a while, so V8 grows this space as far as it may: 192 MB a
+ * worker on Node 24, where it was the larger part of a big repo's peak memory,
+ * and 48 MB on Node 22. At 48 MB the peak is about a quarter lower and CPU time
+ * doesn't move.
+ */
+const WORKER_YOUNG_GENERATION_MB = 48;
+
 export class ResolverPool {
   private workers: PoolWorker[] = [];
   private nextId = 0;
@@ -171,7 +180,7 @@ export class ResolverPool {
 
   private constructor(workerScript: string, dbPath: string, projectRoot: string, size: number) {
     for (let i = 0; i < size; i++) {
-      const worker = new Worker(workerScript);
+      const worker = new Worker(workerScript, { resourceLimits: { maxYoungGenerationSizeMb: WORKER_YOUNG_GENERATION_MB } });
       const started = workerStarted(worker);
       let readyResolve!: () => void;
       let readyReject!: (e: Error) => void;
