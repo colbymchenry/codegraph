@@ -1249,8 +1249,16 @@ function resolveRelativeImport(
   const relativePath = path.relative(projectRoot, basePath).replace(/\\/g, '/');
 
   // Try each extension. `require('..')` up to the project root is its `index.js`.
+  let mainTried = false;
   for (const ext of extensions) {
     if (relativePath === '' && !ext.startsWith('/')) continue;
+    // A directory's `package.json` `main` comes before its index files, as
+    // Node loads a directory (#2964).
+    if (ext.startsWith('/') && !mainTried) {
+      mainTried = true;
+      const main = relativeDirectoryMain(relativePath, language, context);
+      if (main) return main;
+    }
     const candidatePath = relativePath === '' ? ext.slice(1) : relativePath + ext;
     if (context.fileExists(candidatePath)) {
       return candidatePath;
@@ -1263,6 +1271,26 @@ function resolveRelativeImport(
   }
 
   return findSourceForEmittedSpecifier(relativePath, language, context);
+}
+
+/**
+ * The indexed file a directory's `package.json` names as `main`: fastify's
+ * tests `require('..')` for the root's `"main": "fastify.js"`. Null when the
+ * directory has no manifest, no `main`, or one outside the project.
+ */
+function relativeDirectoryMain(dir: string, language: Language, context: ResolutionContext): string | null {
+  const manifest = context.readFile(dir === '' ? 'package.json' : `${dir}/package.json`);
+  if (!manifest) return null;
+  let main: unknown;
+  try {
+    main = (JSON.parse(manifest) as { main?: unknown } | null)?.main;
+  } catch {
+    return null;
+  }
+  if (typeof main !== 'string' || !main.trim()) return null;
+  const entry = path.posix.normalize(path.posix.join(dir, main.trim()));
+  if (entry.startsWith('..') || entry === '.') return null;
+  return indexedTarget(entry, language, context);
 }
 
 /**
