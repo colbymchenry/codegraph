@@ -39,7 +39,12 @@ import {
   IndexVersionWarningState,
 } from './index-version-warning';
 import { getTelemetry, ClientInfo } from '../telemetry';
-import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
+import {
+  installMainThreadWatchdog,
+  WatchdogHandle,
+  watchdogKillRecordPath,
+  watchdogKillRefusal,
+} from './liveness-watchdog';
 import type { MCPEngine } from './engine';
 import { WORKER_START_SETTLE_MS } from '../worker-teardown';
 
@@ -267,7 +272,11 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   // The proxy is long-lived and can serve fallback tool calls in-process. Match
   // direct/daemon mode by killing this launcher if its main thread wedges, so an
   // MCP host retry cannot accumulate abandoned `serve --mcp` wrapper processes.
-  const livenessWatchdog: WatchdogHandle | null = installMainThreadWatchdog();
+  // Its kills join the project's record: the fallback engine is the same code
+  // the daemon runs, so a kill here is the same loop (#3137).
+  const livenessWatchdog: WatchdogHandle | null = installMainThreadWatchdog({
+    killRecordPath: watchdogKillRecordPath(deps.root),
+  });
   let daemonStatus: 'connecting' | 'ready' | 'failed' = 'connecting';
   let daemonSocket: net.Socket | null = null;
   let clientInitId: unknown = undefined;   // suppress the daemon's reply to the forwarded initialize
@@ -394,6 +403,14 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       const args = toolCallArguments(params);
       if (!args) {
         writeClient({ jsonrpc: '2.0', id, error: { code: ErrorCodes.InvalidParams, message: TOOL_ARGUMENTS_NOT_OBJECT } });
+        return;
+      }
+      // #3137: the daemon is gone and the watchdog has killed this project's
+      // worker repeatedly. Building the same work in-process is the loop that
+      // exhausted system commit, so refuse with the reason instead.
+      const breaker = watchdogKillRefusal(deps.root);
+      if (breaker) {
+        writeClient({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: breaker }] } });
         return;
       }
       try {

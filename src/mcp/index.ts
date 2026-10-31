@@ -69,7 +69,12 @@ import { getTelemetry } from '../telemetry';
 import { checkForUpdateInBackground } from '../upgrade/update-check';
 import { EARLY_PPID } from './early-ppid';
 import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from './ppid-watchdog';
-import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
+import {
+  installMainThreadWatchdog,
+  WatchdogHandle,
+  watchdogKillRecordPath,
+  watchdogKillRefusal,
+} from './liveness-watchdog';
 import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
@@ -639,7 +644,11 @@ export class MCPServer {
     this.mode = 'direct';
     this.installSignalHandlers();
     this.installPpidWatchdog();
-    this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(resolveDaemonRoot(this.projectPath)));
+    const watchdogRoot = resolveDaemonRoot(this.projectPath);
+    this.livenessWatchdog = installMainThreadWatchdog({
+      ...watchdogProgressPaths(watchdogRoot),
+      ...(watchdogRoot ? { killRecordPath: watchdogKillRecordPath(watchdogRoot) } : {}),
+    });
   }
 
   /**
@@ -664,6 +673,14 @@ export class MCPServer {
       process.exit(0);
     }
     const root = resolveDaemonRoot(this.projectPath) ?? this.projectPath ?? process.cwd();
+    // #3137: a client restarts us after a watchdog kill, so a fresh daemon would
+    // re-run the work that just wedged. Refuse before taking any lock while the
+    // kill record says that keeps happening.
+    const breaker = watchdogKillRefusal(root);
+    if (breaker) {
+      process.stderr.write(`[CodeGraph daemon] ${breaker}\n`);
+      process.exit(0);
+    }
     // Read once and dropped, so nothing this daemon spawns inherits it.
     const handoverPid = Number(process.env[DAEMON_HANDOVER_ENV]);
     const handoverFrom = Number.isInteger(handoverPid) && handoverPid > 0 ? handoverPid : null;
@@ -679,7 +696,10 @@ export class MCPServer {
         // The detached daemon has no PPID watchdog or stdin lifeline, so a
         // wedged main thread would pin a core forever (#850). The liveness
         // watchdog is its only recovery path.
-        this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(root));
+        this.livenessWatchdog = installMainThreadWatchdog({
+          ...watchdogProgressPaths(root),
+          killRecordPath: watchdogKillRecordPath(root),
+        });
         return; // the net.Server keeps the process alive
       }
 
@@ -751,11 +771,24 @@ export class MCPServer {
     // normal repo pays nothing extra (it connects on the very first probe).
     const candidates = getDaemonSocketCandidates(root);
     const connectAnyCandidate = (deadline?: number) => connectAnyDaemonCandidate(candidates, deadline);
+    let breakerLogged = false;
     const getDaemonSocket = async () => {
       // Fast path: a daemon may already be listening (on either candidate).
       const probe = await connectAnyCandidate();
       if (probe === 'version-mismatch') return null; // definitive — serve in-process, don't poll for 6s
       if (probe && probe !== 'older-version') return probe;
+      // #3137: nothing answered, and the watchdog has killed this project's
+      // worker repeatedly — spawning another would repeat the same work. Checked
+      // after the probe so a healthy daemon is still used. The proxy's fallback
+      // refuses too, and hands the client the same reason.
+      const breaker = watchdogKillRefusal(root);
+      if (breaker) {
+        if (!breakerLogged) {
+          breakerLogged = true;
+          process.stderr.write(`[CodeGraph MCP] ${breaker}\n`);
+        }
+        return null;
+      }
       // A daemon of an older release answered — or none did, while the project
       // lock may still name one on a socket we don't probe (on Windows, daemons
       // before #2278 named their pipe after the root as typed). Either way it

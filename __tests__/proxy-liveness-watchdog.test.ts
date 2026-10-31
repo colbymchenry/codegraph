@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { spawn } from 'child_process';
+import * as fs from 'fs';
 import * as path from 'path';
 
 const MODULE = path.resolve(__dirname, '../dist/mcp/proxy.js');
@@ -20,6 +21,9 @@ function alive(pid: number): boolean {
 // Exercise the real local-handshake entry point and its real watchdog child,
 // with only the daemon/engine dependencies replaced to inject bounded faults.
 async function exercise(mode: 'connecting-wedge' | 'fallback-wedge' | 'slow-fallback'): Promise<void> {
+  // A temp root: the proxy's watchdog records its kills under the project root
+  // (#3137), so a wedge here must not write into an indexed checkout.
+  const root = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cg-proxy-wd-'));
   const child = spawn(process.execPath, ['-e', `
     const { runLocalHandshakeProxy } = require(${JSON.stringify(MODULE)});
     const mode = ${JSON.stringify(mode)};
@@ -29,7 +33,7 @@ async function exercise(mode: 'connecting-wedge' | 'fallback-wedge' | 'slow-fall
       while (true) {}
     }
     runLocalHandshakeProxy({
-      root: process.cwd(),
+      root: ${JSON.stringify(root)},
       getDaemonSocket: async () => {
         if (mode === 'connecting-wedge') {
           await delay(300);
@@ -101,6 +105,7 @@ async function exercise(mode: 'connecting-wedge' | 'fallback-wedge' | 'slow-fall
       finally { if (alive(pid)) process.kill(pid, 'SIGKILL'); }
     }
     child.stdin.destroy();
+    try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* Windows may hold it briefly */ }
   }
 }
 
