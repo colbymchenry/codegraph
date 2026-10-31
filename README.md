@@ -419,6 +419,7 @@ codegraph install --target=auto --location=local     # detected agents, project-
 codegraph install --target=copilot-vscode,copilot-cli,copilot-jetbrains --yes  # GitHub Copilot everywhere
 codegraph install --print-config codex               # print snippet, no file writes
 codegraph install --print-config copilot-vscode      # same, for Copilot in VS Code
+codegraph install --target zcode --yes               # an agent you registered with codegraph targets add
 ```
 
 | Flag | Values | Default |
@@ -539,6 +540,9 @@ The exact text is `src/mcp/server-instructions.ts` — the single source of trut
 codegraph                         # Run interactive installer
 codegraph install                 # Run installer (explicit)
 codegraph uninstall               # Remove CodeGraph from your agents AND the CLI (--keep-cli for configs only)
+codegraph targets add <spec>      # Register an agent of your own from a JSON spec, a file or inline (see Supported Agents)
+codegraph targets list            # The agents you registered, and the files each one writes
+codegraph targets remove <id>     # Forget one (run codegraph uninstall --target <id> first)
 codegraph init [path]             # Initialize a project + build its graph (one step; --local-only keeps .codegraph/ out of git)
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
 codegraph index [path]            # Full index (--force to re-index, --quiet for less output)
@@ -833,14 +837,63 @@ agents learn the `codegraph explore` command:
 - **Qoder CLI** (`qoder`) — `$QODER_CONFIG_DIR/settings.json` (default `~/.qoder`), or `.qoder/settings.local.json`; in the Qoder IDE, add the server under Settings > MCP
 - **Pi** (`pi`) — `mcp.json` in Pi's agent directory (default `~/.pi/agent`), or `.pi/mcp.json`, which Pi reads once you trust the project; `exposure: "direct"` keeps `codegraph_explore` on the model's tool list
 
-**Any other agent** whose config has one of those shapes can be added without waiting for a release. Describe it once, then install it like the agents above:
+### Adding an agent yourself
 
-```bash
-codegraph targets add '{"id":"zcode","family":"mcp-json","configDir":"~/.zcode/cli","configFileName":"config.json","localConfigDir":".zcode","serversKey":"mcp.servers","instructionsFile":null}'
-codegraph install --target zcode
+An agent that is not in the list can still be set up by `codegraph install`, with no CodeGraph release in between, as long as it keeps its MCP servers in one of three shapes:
+
+| Family | Config shape | For example |
+|---|---|---|
+| `mcp-json` | a JSON file with a map of servers, under `mcpServers`, VS Code's `servers`, ZCode's `mcp.servers` or Zed's `context_servers` | ZCode, Zed, Devin, Claude Desktop |
+| `toml` | a `config.toml` with an `[mcp_servers.codegraph]` table, as Codex CLI and Grok Build read | an agent shaped like Codex |
+| `opencode` | an opencode fork that renamed the app on disk | CoDev Code |
+
+Describe the agent once in a spec, register it, then install it like any other:
+
+```jsonc
+// zcode.json: ZCode keeps its servers under mcp.servers
+{
+  "id": "zcode",
+  "displayName": "ZCode",
+  "family": "mcp-json",
+  "configDir": "~/.zcode/cli",
+  "configFileName": "config.json",
+  "localConfigDir": ".zcode",
+  "serversKey": "mcp.servers",
+  "instructionsFile": null
+}
 ```
 
-Three shapes are supported: `mcp-json` for a JSON file with a map of servers (the shape Claude Code, Cursor, VS Code, Zed, Devin and ZCode read), `toml` for a Codex style `config.toml`, and `opencode` for an opencode fork. `codegraph targets list` shows what is registered and the files each one writes; `codegraph targets remove <id>` forgets one. The spec names where to write, never what, and every value is checked. See [the design note](docs/design/custom-installer-targets.md) for the keys.
+```bash
+codegraph targets add zcode.json      # a file, or the JSON inline: codegraph targets add '{"id":"zcode", ...}'
+codegraph install --target zcode      # auto detection and the agent picker see it from now on
+codegraph targets list                # what is registered, and the files each one writes
+codegraph targets remove zcode        # forget it; run codegraph uninstall --target zcode first
+```
+
+Two more shapes:
+
+```jsonc
+// Claude Desktop: one config dir for each platform, and the binary's full path as the
+// command, because an app launched from the Dock on macOS does not see nvm's PATH
+{
+  "id": "claude-desktop",
+  "displayName": "Claude Desktop",
+  "family": "mcp-json",
+  "configDir": { "darwin": "~/Library/Application Support/Claude", "win32": "${APPDATA}/Claude" },
+  "configFileName": "claude_desktop_config.json",
+  "absoluteCommand": true,
+  "omitTypeField": true,
+  "instructionsFile": null,
+  "notes": ["Quit and reopen Claude Desktop to load CodeGraph."]
+}
+```
+
+```jsonc
+// CoDev Code: an opencode fork, so only the name on disk differs
+{ "id": "codev", "displayName": "CoDev Code", "family": "opencode", "appName": "codev", "schemaUrl": "https://opencode.ai/config.json" }
+```
+
+The keys: `configDir` is absolute, `~`, or starts with one `${ENV}` token, or is a `{darwin, win32, linux}` map; `homeEnvVar` names a variable that overrides it, the way `GROK_HOME` does for Grok Build; `configFileName` and `localConfigDir` place the files; `serversKey` is the path to the servers map; `instructionsFile` is where the CodeGraph block goes, or `null` for none; `omitTypeField` drops the `type` key for an agent that refuses it; `absoluteCommand` writes the binary's full path on macOS; `notes` are shown after each install. A spec names where to write, never what. Every value is checked, and a spec that would write a file one of the agents above owns is refused. The full key table is in [docs/design/custom-installer-targets.md](docs/design/custom-installer-targets.md).
 
 ## Supported Languages
 
