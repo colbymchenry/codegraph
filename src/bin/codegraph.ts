@@ -3137,7 +3137,7 @@ program
     // locations unless --location narrows it.
     if (opts.refresh) {
       const { refreshTargets } = await import('../installer');
-      const { ALL_TARGETS } = await import('../installer/targets/registry');
+      const { getAllTargets } = await import('../installer/targets/registry');
       if (opts.location && opts.location !== 'global' && opts.location !== 'local') {
         error(`--location must be "global" or "local" (got "${opts.location}").`);
         process.exit(1);
@@ -3148,7 +3148,7 @@ program
       let changed = 0;
       let failed = 0;
       for (const loc of locs) {
-        for (const report of refreshTargets(ALL_TARGETS, loc)) {
+        for (const report of refreshTargets(getAllTargets(), loc)) {
           if (report.status === 'failed') {
             failed += 1;
             error(`${report.displayName}: could not refresh — ${report.error}`);

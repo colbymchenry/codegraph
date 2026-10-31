@@ -555,3 +555,336 @@ describe('spec paths', () => {
     expect(resolveSpecDir('~/agent', 'linux', env)).toEqual({ dir: path.join(os.homedir(), 'agent') });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Specs: checked on `targets add` and on load, then merged into the registry.
+// ---------------------------------------------------------------------------
+
+import {
+  addCustomTargetSpec,
+  loadCustomTargets,
+  removeCustomTargetSpec,
+  resetCustomTargetsCache,
+  targetsFilePath,
+  validateCustomTargetSpec,
+  MAX_CUSTOM_TARGETS,
+} from '../src/installer/targets/custom';
+import {
+  ALL_TARGETS,
+  detectAll,
+  getAllTargets,
+  getTarget,
+  listTargetIds,
+  resolveTargetFlag,
+  telemetryTargetId,
+} from '../src/installer/targets/registry';
+import { refreshTargets, uninstallTargets } from '../src/installer';
+
+const ZCODE_SPEC = {
+  id: 'zcode',
+  displayName: 'ZCode',
+  family: 'mcp-json',
+  docsUrl: 'https://zcode.z.ai',
+  configDir: '~/.zcode/cli',
+  configFileName: 'config.json',
+  localConfigDir: '.zcode',
+  serversKey: 'mcp.servers',
+  instructionsFile: null,
+};
+const CODEV_SPEC = { id: 'codev', displayName: 'CoDev Code', family: 'opencode', appName: 'codev', schemaUrl: 'https://opencode.ai/config.json' };
+const TOML_SPEC = {
+  id: 'mytoml',
+  displayName: 'My TOML Agent',
+  family: 'toml',
+  configDir: '~/.mytoml',
+  homeEnvVar: 'MYTOML_HOME',
+  localConfigDir: '.mytoml',
+  instructionsFile: 'rules/codegraph.md',
+  instructionsLocal: 'config',
+};
+const DESKTOP_SPEC = {
+  id: 'desk',
+  displayName: 'Desk App',
+  family: 'mcp-json',
+  configDir: { darwin: '~/Library/Application Support/Desk', linux: '~/.config/desk', win32: '${APPDATA}/Desk' },
+  configFileName: 'desk_config.json',
+  absoluteCommand: true,
+  omitTypeField: true,
+  instructionsFile: null,
+  notes: ['Quit and reopen Desk App to load CodeGraph.'],
+};
+
+const errorsOf = (spec: unknown) => validateCustomTargetSpec(spec, ALL_TARGETS);
+
+describe('custom target specs: validation', () => {
+  useTmpDirs('validate');
+
+  it('accepts the reference specs', () => {
+    for (const spec of [ZCODE_SPEC, CODEV_SPEC, TOML_SPEC, DESKTOP_SPEC]) {
+      expect(errorsOf(spec), spec.id).toEqual([]);
+    }
+  });
+
+  it('rejects an id that is malformed, reserved, or a builtin', () => {
+    for (const [id, reason] of [
+      ['Bad Id', /must be 1 to 32 lowercase/],
+      ['-x', /must be 1 to 32 lowercase/],
+      ['a'.repeat(33), /must be 1 to 32 lowercase/],
+      ['all', /is reserved/],
+      ['custom', /is reserved/],
+      ['qwen', /is a builtin target/],
+      [undefined, /must be 1 to 32 lowercase/],
+    ] as const) {
+      expect(errorsOf({ ...ZCODE_SPEC, id }).join('\n'), String(id)).toMatch(reason);
+    }
+  });
+
+  it('rejects an unknown family, and keys another family reads', () => {
+    expect(errorsOf({ ...ZCODE_SPEC, family: 'yaml' }).join('\n')).toMatch(/"family" must be one of opencode, toml, mcp-json/);
+    expect(errorsOf({ ...TOML_SPEC, omitTypeField: true }).join('\n')).toMatch(/"omitTypeField" is not a key the toml family reads/);
+    expect(errorsOf({ ...CODEV_SPEC, configDir: '~/.codev' }).join('\n')).toMatch(/"configDir" is not a key the opencode family reads/);
+    expect(errorsOf({ ...ZCODE_SPEC, extra: 1 }).join('\n')).toMatch(/"extra" is not a key/);
+  });
+
+  it('rejects a config dir that is missing, relative, under another user\'s home, or climbing out', () => {
+    expect(errorsOf({ ...ZCODE_SPEC, configDir: undefined }).join('\n')).toMatch(/"configDir" is required/);
+    for (const dir of ['agent', './agent', '~x/agent', '$HOME/agent', '${APPDATA}Agent']) {
+      expect(errorsOf({ ...ZCODE_SPEC, configDir: dir }).join('\n'), dir).toMatch(/"configDir" must be absolute, start with ~\/ or start with one \$\{ENV\} token/);
+    }
+    expect(errorsOf({ ...ZCODE_SPEC, configDir: '~/agent/../other' }).join('\n')).toMatch(/must not contain "\.\."/);
+    expect(errorsOf({ ...ZCODE_SPEC, configDir: ['~/agent'] }).join('\n')).toMatch(/must be a path or a/);
+  });
+
+  it('a platform map covers this machine and names only known platforms', () => {
+    expect(errorsOf({ ...ZCODE_SPEC, configDir: { [OTHER_PLATFORM]: '~/agent' } }).join('\n')).toMatch(/no entry for this platform/);
+    expect(errorsOf({ ...ZCODE_SPEC, configDir: { [process.platform]: '~/agent', freebsd: '/x' } }).join('\n')).toMatch(/unknown platform\(s\) freebsd/);
+    expect(errorsOf({ ...ZCODE_SPEC, configDir: { [process.platform]: '~/agent', win32: 'Agent' } }).join('\n')).toMatch(/"configDir\.win32" must be absolute/);
+    expect(errorsOf({ ...ZCODE_SPEC, configDir: { [process.platform]: '~/agent', win32: 'C:\\Users\\me\\Agent' } })).toEqual([]);
+  });
+
+  it('checks every other value', () => {
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ ...ZCODE_SPEC, homeEnvVar: 'not a name' }, /"homeEnvVar" must be an environment variable name/],
+      [{ ...ZCODE_SPEC, docsUrl: 'zcode.z.ai' }, /"docsUrl" must be an http or https URL/],
+      [{ ...ZCODE_SPEC, docsUrl: 'file:///etc/passwd' }, /"docsUrl" must be an http or https URL/],
+      [{ ...CODEV_SPEC, schemaUrl: 'javascript:alert(1)' }, /"schemaUrl" must be an http or https URL/],
+      [{ ...CODEV_SPEC, appName: '../codev' }, /"appName" must be one path segment/],
+      [{ ...CODEV_SPEC, appName: undefined }, /"appName" must be one path segment/],
+      [{ ...ZCODE_SPEC, displayName: '' }, /"displayName" must be one line/],
+      [{ ...ZCODE_SPEC, displayName: 'a\u001b[31mred' }, /"displayName" must be one line/],
+      [{ ...ZCODE_SPEC, notes: ['a', 'b', 'c', 'd', 'e', 'f'] }, /"notes" must be up to 5 lines/],
+      [{ ...ZCODE_SPEC, notes: ['x'.repeat(201)] }, /"notes" must be up to 5 lines/],
+      [{ ...ZCODE_SPEC, notes: ['two\nlines'] }, /"notes" must be up to 5 lines/],
+      [{ ...ZCODE_SPEC, notes: 'one' }, /"notes" must be up to 5 lines/],
+      [{ ...ZCODE_SPEC, serversKey: '$schema' }, /"serversKey" must be 1 to 3 identifiers/],
+      [{ ...ZCODE_SPEC, serversKey: 'a.b.c.d' }, /"serversKey" must be 1 to 3 identifiers/],
+      [{ ...ZCODE_SPEC, serversKey: 'mcp..servers' }, /"serversKey" must be 1 to 3 identifiers/],
+      [{ ...ZCODE_SPEC, serversKey: '' }, /"serversKey" must be 1 to 3 identifiers/],
+      [{ ...ZCODE_SPEC, configFileName: 'config.toml' }, /"configFileName" must be a file name ending in \.json or \.jsonc/],
+      [{ ...ZCODE_SPEC, configFileName: 'dir/config.json' }, /"configFileName" must be a file name/],
+      [{ ...TOML_SPEC, configFileName: 'config.json' }, /"configFileName" must be a file name ending in \.toml/],
+      [{ ...ZCODE_SPEC, localConfigFileName: '..' }, /"localConfigFileName" must be a file name/],
+      [{ ...ZCODE_SPEC, localConfigDir: '/abs' }, /"localConfigDir" must be a relative path/],
+      [{ ...ZCODE_SPEC, localConfigDir: '../up' }, /"localConfigDir" must be a relative path/],
+      [{ ...ZCODE_SPEC, localConfigDir: '' }, /"localConfigDir" must be a relative path/],
+      [{ ...ZCODE_SPEC, instructionsFile: '/etc/AGENTS.md' }, /"instructionsFile" must be null or a relative path/],
+      [{ ...ZCODE_SPEC, instructionsFile: '../AGENTS.md' }, /"instructionsFile" must be null or a relative path/],
+      [{ ...ZCODE_SPEC, instructionsLocal: 'root' }, /"instructionsLocal" must be "project" or "config"/],
+      [{ ...ZCODE_SPEC, omitTypeField: 'yes' }, /"omitTypeField" must be true or false/],
+      [{ ...ZCODE_SPEC, absoluteCommand: 1 }, /"absoluteCommand" must be true or false/],
+    ];
+    for (const [spec, reason] of cases) {
+      expect(errorsOf(spec).join('\n'), JSON.stringify(spec)).toMatch(reason);
+    }
+    expect(errorsOf(null)).toEqual(['spec must be a JSON object']);
+    expect(errorsOf([ZCODE_SPEC])).toEqual(['spec must be a JSON object']);
+  });
+
+  it('refuses a spec that would write a file a builtin target owns', () => {
+    const qwenFile = { id: 'myqwen', family: 'mcp-json', configDir: '~/.qwen', instructionsFile: null };
+    expect(errorsOf(qwenFile).join('\n')).toMatch(/would write .*settings\.json, which the Qwen Code target owns/);
+    const codexToml = { id: 'mycodex', family: 'toml', configDir: '~/.codex', instructionsFile: null };
+    expect(errorsOf(codexToml).join('\n')).toMatch(/config\.toml, which the Codex CLI target owns/);
+    const localClash = { id: 'myclaude', family: 'mcp-json', configDir: '~/.myclaude', localConfigDir: '.', configFileName: '.mcp.json', instructionsFile: null };
+    expect(errorsOf(localClash).join('\n')).toMatch(/\.mcp\.json, which the Claude Code target owns/);
+  });
+});
+
+describe('custom target specs: loading and the registry', () => {
+  const dirs = useTmpDirs('load');
+  const file = () => path.join(dirs.home(), '.codegraph', 'targets.json');
+  const write = (content: unknown) => {
+    fs.mkdirSync(path.dirname(file()), { recursive: true });
+    fs.writeFileSync(file(), typeof content === 'string' ? content : JSON.stringify(content, null, 2));
+    resetCustomTargetsCache();
+  };
+  const quiet = () => vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+  beforeEach(() => resetCustomTargetsCache());
+
+  it('the file lives under ~/.codegraph, or where CODEGRAPH_TARGETS_FILE points', () => {
+    expect(targetsFilePath()).toBe(file());
+    vi.stubEnv('CODEGRAPH_TARGETS_FILE', path.join(dirs.home(), 'elsewhere.json'));
+    expect(targetsFilePath()).toBe(path.join(dirs.home(), 'elsewhere.json'));
+  });
+
+  it('no file: no custom targets, and the registry is the builtin list', () => {
+    expect(loadCustomTargets(ALL_TARGETS)).toEqual({ targets: [], specs: [], warnings: [] });
+    expect(getAllTargets().map((t) => t.id)).toEqual(ALL_TARGETS.map((t) => t.id));
+    expect(getTarget('zcode')).toBeUndefined();
+  });
+
+  it('a file that cannot be read is a warning, printed once, never a throw', () => {
+    write('{ "targets": [ half');
+    const warn = quiet();
+    try {
+      expect(loadCustomTargets(ALL_TARGETS).warnings).toEqual([expect.stringMatching(/^Ignoring .*targets\.json: not valid JSON/)]);
+      expect(getAllTargets().length).toBe(ALL_TARGETS.length);
+      loadCustomTargets(ALL_TARGETS);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+    write({ targets: { not: 'a list' } });
+    const again = quiet();
+    try {
+      expect(loadCustomTargets(ALL_TARGETS).warnings).toEqual([expect.stringMatching(/"targets" must be an array/)]);
+    } finally {
+      again.mockRestore();
+    }
+  });
+
+  it('a spec that fails a check is skipped with its first problem, and the valid ones are kept', () => {
+    write({ targets: [{ ...ZCODE_SPEC, id: 'Bad' }, CODEV_SPEC, 'not an object'] });
+    const warn = quiet();
+    try {
+      const loaded = loadCustomTargets(ALL_TARGETS);
+      expect(loaded.specs.map((s) => s.id)).toEqual(['codev']);
+      expect(loaded.warnings).toEqual([
+        expect.stringMatching(/^Skipping custom target "Bad": "id" must be/),
+        expect.stringMatching(/^Skipping custom target "<no id>": spec must be a JSON object/),
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('the first of two specs with one id wins', () => {
+    write({ targets: [ZCODE_SPEC, { ...ZCODE_SPEC, displayName: 'Second' }] });
+    const warn = quiet();
+    try {
+      const loaded = loadCustomTargets(ALL_TARGETS);
+      expect(loaded.targets.map((t) => t.displayName)).toEqual(['ZCode']);
+      expect(loaded.warnings).toEqual([expect.stringMatching(/Skipping a second custom target "zcode"/)]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('at most 50 specs are loaded', () => {
+    const many = Array.from({ length: MAX_CUSTOM_TARGETS + 1 }, (_, i) => ({ ...ZCODE_SPEC, id: `agent${i}`, configDir: `~/.agent${i}` }));
+    write({ targets: many });
+    const warn = quiet();
+    try {
+      const loaded = loadCustomTargets(ALL_TARGETS);
+      expect(loaded.specs.length).toBe(MAX_CUSTOM_TARGETS);
+      expect(loaded.warnings).toEqual([expect.stringMatching(/at most 50 custom targets are loaded/)]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a changed file is read again without a reset', () => {
+    write({ targets: [ZCODE_SPEC] });
+    expect(getTarget('zcode')?.displayName).toBe('ZCode');
+    fs.writeFileSync(file(), JSON.stringify({ targets: [{ ...ZCODE_SPEC, displayName: 'ZCode 2' }] }));
+    const stat = fs.statSync(file());
+    fs.utimesSync(file(), stat.atime, new Date(stat.mtimeMs + 2000));
+    expect(getTarget('zcode')?.displayName).toBe('ZCode 2');
+  });
+
+  it('a loaded target is in every registry lookup, after the builtin ones', () => {
+    write({ targets: [ZCODE_SPEC, TOML_SPEC] });
+    expect(listTargetIds().slice(-2)).toEqual(['zcode', 'mytoml']);
+    expect(resolveTargetFlag('all', 'global').map((t) => t.id)).toEqual([...ALL_TARGETS.map((t) => t.id), 'zcode', 'mytoml']);
+    expect(resolveTargetFlag('zcode,codex', 'global').map((t) => t.id)).toEqual(['zcode', 'codex']);
+    expect(detectAll('global').map(({ target }) => target.id)).toContain('mytoml');
+    expect(() => resolveTargetFlag('nope', 'global')).toThrow(/Unknown --target id\(s\): nope\. Known: .*zcode, mytoml, plus/);
+  });
+
+  it('auto picks a custom target whose config dir exists', () => {
+    write({ targets: [ZCODE_SPEC] });
+    fs.mkdirSync(path.join(dirs.home(), '.zcode', 'cli'), { recursive: true });
+    expect(resolveTargetFlag('auto', 'global').map((t) => t.id)).toEqual(['zcode']);
+  });
+
+  it('telemetry records the family, never the name', () => {
+    write({ targets: [ZCODE_SPEC, CODEV_SPEC, TOML_SPEC] });
+    expect(telemetryTargetId('zcode')).toBe('custom-mcp-json');
+    expect(telemetryTargetId('codev')).toBe('custom-opencode');
+    expect(telemetryTargetId('mytoml')).toBe('custom-toml');
+    expect(telemetryTargetId('codex')).toBe('codex');
+  });
+
+  it('refresh and uninstall sweeps include a custom target', () => {
+    write({ targets: [ZCODE_SPEC] });
+    const zcode = getTarget('zcode')!;
+    expect(refreshTargets(getAllTargets(), 'global').find((r) => r.id === 'zcode')!.status).toBe('not-configured');
+
+    zcode.install('global', { autoAllow: false });
+    expect(refreshTargets(getAllTargets(), 'global').find((r) => r.id === 'zcode')!.status).toBe('unchanged');
+
+    const report = uninstallTargets(getAllTargets(), 'global').find((r) => r.id === 'zcode')!;
+    expect(report.status).toBe('removed');
+    expect(report.removedPaths).toEqual([path.join(dirs.home(), '.zcode', 'cli', 'config.json')]);
+  });
+});
+
+describe('custom target specs: add and remove', () => {
+  const dirs = useTmpDirs('persist');
+  const file = () => path.join(dirs.home(), '.codegraph', 'targets.json');
+
+  beforeEach(() => resetCustomTargetsCache());
+
+  it('add writes the spec, the loader sees it, and add again replaces it', () => {
+    expect(addCustomTargetSpec(ZCODE_SPEC, ALL_TARGETS)).toEqual({ replaced: false });
+    expect(JSON.parse(fs.readFileSync(file(), 'utf-8'))).toEqual({ targets: [ZCODE_SPEC] });
+    expect(getTarget('zcode')?.displayName).toBe('ZCode');
+
+    expect(addCustomTargetSpec({ ...ZCODE_SPEC, displayName: 'ZCode 2' }, ALL_TARGETS)).toEqual({ replaced: true });
+    expect(JSON.parse(fs.readFileSync(file(), 'utf-8')).targets).toHaveLength(1);
+    expect(getTarget('zcode')?.displayName).toBe('ZCode 2');
+  });
+
+  it('add keeps other keys in the file, and comments are read', () => {
+    fs.mkdirSync(path.dirname(file()), { recursive: true });
+    fs.writeFileSync(file(), '{\n  // mine\n  "note": "keep",\n  "targets": [],\n}\n');
+    addCustomTargetSpec(CODEV_SPEC, ALL_TARGETS);
+    expect(JSON.parse(fs.readFileSync(file(), 'utf-8'))).toEqual({ note: 'keep', targets: [CODEV_SPEC] });
+  });
+
+  it('add refuses an invalid spec with every problem listed, and writes nothing', () => {
+    expect(() => addCustomTargetSpec({ ...ZCODE_SPEC, id: 'Bad', serversKey: '$x' }, ALL_TARGETS))
+      .toThrow(/Invalid custom target spec:\n  - "id" must be[^\n]*\n  - "serversKey" must be/);
+    expect(fs.existsSync(file())).toBe(false);
+  });
+
+  it('add and remove refuse to touch a file they cannot read', () => {
+    fs.mkdirSync(path.dirname(file()), { recursive: true });
+    fs.writeFileSync(file(), '{ half');
+    expect(() => addCustomTargetSpec(ZCODE_SPEC, ALL_TARGETS)).toThrow(/Cannot update .*targets\.json, fix or remove it first/);
+    expect(() => removeCustomTargetSpec('zcode')).toThrow(/Cannot update/);
+    expect(fs.readFileSync(file(), 'utf-8')).toBe('{ half');
+  });
+
+  it('remove takes out only the named id, and says when there was none', () => {
+    addCustomTargetSpec(ZCODE_SPEC, ALL_TARGETS);
+    addCustomTargetSpec(CODEV_SPEC, ALL_TARGETS);
+    expect(removeCustomTargetSpec('zcode')).toEqual({ removed: true });
+    expect(JSON.parse(fs.readFileSync(file(), 'utf-8'))).toEqual({ targets: [CODEV_SPEC] });
+    expect(getTarget('zcode')).toBeUndefined();
+    expect(getTarget('codev')).toBeDefined();
+    expect(removeCustomTargetSpec('zcode')).toEqual({ removed: false });
+    expect(removeCustomTargetSpec('never')).toEqual({ removed: false });
+  });
+});
