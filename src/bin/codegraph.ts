@@ -3137,7 +3137,7 @@ program
     // locations unless --location narrows it.
     if (opts.refresh) {
       const { refreshTargets } = await import('../installer');
-      const { ALL_TARGETS } = await import('../installer/targets/registry');
+      const { getAllTargets } = await import('../installer/targets/registry');
       if (opts.location && opts.location !== 'global' && opts.location !== 'local') {
         error(`--location must be "global" or "local" (got "${opts.location}").`);
         process.exit(1);
@@ -3148,7 +3148,7 @@ program
       let changed = 0;
       let failed = 0;
       for (const loc of locs) {
-        for (const report of refreshTargets(ALL_TARGETS, loc)) {
+        for (const report of refreshTargets(getAllTargets(), loc)) {
           if (report.status === 'failed') {
             failed += 1;
             error(`${report.displayName}: could not refresh — ${report.error}`);
@@ -3245,6 +3245,87 @@ program
         keepCli: opts.keepCli,
         cliFilename: __filename,
       });
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph targets add|list|remove
+ *
+ * User defined installer targets: a spec names a family, one of the config
+ * shapes the installer already writes, and the agent's paths. Specs are kept
+ * in ~/.codegraph/targets.json and make `codegraph install --target <id>`
+ * work for an agent without a builtin target. See
+ * docs/design/custom-installer-targets.md.
+ */
+const targetsCommand = program
+  .command('targets')
+  .description('Manage user defined agent targets for `codegraph install` (add, list, remove)');
+
+targetsCommand
+  .command('add <spec>')
+  .description('Register a target from a JSON spec: a file path, or inline JSON starting with "{"')
+  .action(async (specArg: string) => {
+    const { addCustomTargetSpec, targetsFilePath } = await import('../installer/targets/custom');
+    const { ALL_TARGETS } = await import('../installer/targets/registry');
+    let raw = specArg;
+    if (!specArg.trimStart().startsWith('{')) {
+      if (!fs.existsSync(specArg)) {
+        error(`Spec file not found: ${specArg}`);
+        process.exit(1);
+      }
+      raw = fs.readFileSync(specArg, 'utf-8');
+    }
+    let spec: unknown;
+    try {
+      spec = JSON.parse(raw);
+    } catch (err) {
+      error(`The spec is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+    try {
+      const { replaced } = addCustomTargetSpec(spec, ALL_TARGETS);
+      const id = (spec as { id: string }).id;
+      success(`${replaced ? 'Updated' : 'Added'} target "${id}" in ${targetsFilePath()}`);
+      info(`Wire it up with: codegraph install --target ${id}`);
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+targetsCommand
+  .command('list')
+  .description('List the registered targets and the files each one writes')
+  .action(async () => {
+    const { loadCustomTargets, supportedLocations, targetsFilePath } = await import('../installer/targets/custom');
+    const { ALL_TARGETS } = await import('../installer/targets/registry');
+    const { specs, targets } = loadCustomTargets(ALL_TARGETS);
+    if (specs.length === 0) {
+      info(`No user defined targets are registered (${targetsFilePath()}).`);
+      info('Add one with: codegraph targets add <spec.json>');
+      return;
+    }
+    specs.forEach((spec, i) => {
+      const target = targets[i]!;
+      console.log(`${spec.id}: ${target.displayName} (${spec.family} family)`);
+      for (const loc of supportedLocations(target)) {
+        for (const p of target.describePaths(loc)) console.log(`  ${loc}: ${p}`);
+      }
+    });
+  });
+
+targetsCommand
+  .command('remove <id>')
+  .description('Forget a registered target. Run `codegraph uninstall --target <id>` first to remove what it wrote.')
+  .action(async (id: string) => {
+    const { removeCustomTargetSpec, targetsFilePath } = await import('../installer/targets/custom');
+    try {
+      const { removed } = removeCustomTargetSpec(id);
+      if (removed) success(`Removed target "${id}" from ${targetsFilePath()}`);
+      else info(`No target "${id}" is registered. Nothing to remove.`);
     } catch (err) {
       error(err instanceof Error ? err.message : String(err));
       process.exit(1);

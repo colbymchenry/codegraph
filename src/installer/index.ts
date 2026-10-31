@@ -19,10 +19,11 @@ import { execSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import {
-  ALL_TARGETS,
   detectAll,
+  getAllTargets,
   getTarget,
   resolveTargetFlag,
+  telemetryTargetId,
 } from './targets/registry';
 import type { AgentTarget, Location, TargetId, WriteResult } from './targets/types';
 // Import the lightweight submodules directly (not the ../sync barrel, which
@@ -265,7 +266,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   // from the file actions above). Target IDs and the location enum only.
   if (installedIds.length > 0) {
     getTelemetry().recordLifecycle('install', {
-      targets: installedIds,
+      targets: installedIds.map(telemetryTargetId),
       scope: location,
       kind: sawCreated ? 'fresh' : sawUpdated ? 'upgrade' : 'reinstall',
     });
@@ -503,7 +504,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   if (opts.target !== undefined) {
     targets = resolveTargetFlag(opts.target, location);
   } else {
-    targets = [...ALL_TARGETS];
+    targets = getAllTargets();
   }
   if (targets.length === 0) {
     clack.outro('No agent targets selected — nothing to do.');
@@ -589,7 +590,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   // Telemetry churn signal (agent IDs only) — flush now, since after an
   // uninstall there is usually no "next run" to deliver it.
   if (removed.length > 0) {
-    getTelemetry().recordLifecycle('uninstall', { targets: removed.map((r) => r.id) });
+    getTelemetry().recordLifecycle('uninstall', { targets: removed.map((r) => telemetryTargetId(r.id)) });
     await getTelemetry().flushNow();
   }
 
@@ -645,7 +646,7 @@ async function resolveTargets(
 
   const choice = await clack.multiselect<string>({
     message: 'Which agents should CodeGraph configure?',
-    options: ALL_TARGETS.map((t) => {
+    options: getAllTargets().map((t) => {
       const det = detected.find(({ target }) => target.id === t.id)!.detection;
       const flag = det.installed ? '(detected)' : '(not found)';
       const globalOnly = !t.supportsLocation('local') ? ' — global only' : '';

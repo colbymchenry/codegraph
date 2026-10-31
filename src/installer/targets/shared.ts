@@ -11,6 +11,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { execSync } from 'child_process';
 import {
   CODEGRAPH_INSTRUCTIONS_BLOCK,
   CODEGRAPH_SECTION_START,
@@ -37,6 +38,53 @@ export function getMcpServerConfig(): { type: string; command: string; args: str
 export function getStdioServerConfig(): { command: string; args: string[] } {
   const { command, args } = getMcpServerConfig();
   return { command, args };
+}
+
+/**
+ * Resolve the on-disk path of the `codegraph` binary so a Mac GUI app
+ * launched from Dock/Finder (with a stripped PATH) can find it. Falls
+ * back to the bare `codegraph` name when:
+ *
+ *  - we're not on macOS (Linux GUI apps inherit user PATH; Windows
+ *    uses env PATH directly), OR
+ *  - the lookup fails for any reason (preserving install in restricted
+ *    environments where `which`/`command -v` aren't available).
+ *
+ * Resolution prefers `command -v` (built-in, no PATH manipulation),
+ * with `which` as a fallback. Both are read via the user's interactive
+ * shell PATH at install time — that's the right PATH for finding
+ * nvm-managed tools like ours.
+ *
+ * Moved here from the Antigravity target, which still uses it, so a
+ * target for any other app launched from the Dock can write the same
+ * command.
+ */
+export function resolveCodegraphCommand(): string {
+  if (process.platform !== 'darwin') return 'codegraph';
+  try {
+    const resolved = execSync('command -v codegraph || which codegraph', {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      shell: '/bin/bash',
+      windowsHide: true,
+    }).trim();
+    if (resolved && fs.existsSync(resolved)) {
+      // fnm resolves `codegraph` inside an ephemeral per-shell symlink dir
+      // (~/.local/state/fnm_multishells/<pid>/bin) that fnm removes when the
+      // installing shell exits, leaving a dangling command in the GUI app's
+      // MCP config. Canonicalize the containing directory so the path outlives
+      // the shell, while preserving the `codegraph` binary name (agents that
+      // validate the command by basename still match).
+      try {
+        return path.join(fs.realpathSync(path.dirname(resolved)), path.basename(resolved));
+      } catch {
+        return resolved;
+      }
+    }
+  } catch {
+    /* fall through to bare name */
+  }
+  return 'codegraph';
 }
 
 /**
