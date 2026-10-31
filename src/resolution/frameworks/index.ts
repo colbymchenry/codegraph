@@ -6,6 +6,7 @@
 
 import { FrameworkResolver, ResolutionContext } from '../types';
 import type { Language } from '../../types';
+import { codeigniterResolver } from './codeigniter';
 import { drupalResolver } from './drupal';
 import { laravelResolver } from './laravel';
 import { expressResolver } from './express';
@@ -44,6 +45,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   // PHP
   laravelResolver,
   drupalResolver,
+  codeigniterResolver,
   // JavaScript/TypeScript
   expressResolver,
   nestjsResolver,
@@ -176,6 +178,7 @@ export function registerFrameworkResolver(resolver: FrameworkResolver): void {
 }
 
 // Re-export framework resolvers
+export { codeigniterResolver } from './codeigniter';
 export { drupalResolver } from './drupal';
 export { laravelResolver, FACADE_MAPPINGS } from './laravel';
 export { expressResolver } from './express';

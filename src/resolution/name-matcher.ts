@@ -410,10 +410,81 @@ function pythonRefClass(name: string, ref: UnresolvedRef, context: ResolutionCon
   return classes.length === 1 ? classes[0]! : null;
 }
 
+/**
+ * Whether every import binding a Python name in `filePath` is of a module
+ * Python's search doesn't find in the project: `class Color(Enum)` after `from
+ * enum import Enum` is not the project's own `Enum`. That search can miss a
+ * project module only on a path the program sets up itself (`sys.path`), so a
+ * `target` in a file the import path names stays, as does one in `filePath`,
+ * which may rebind the name (`class Enum(Enum)`). A relative import is the
+ * project's. `import a.b` binds `a`.
+ */
+export function isPythonNameFromOutside(name: string, filePath: string, target: Node | null | undefined, context: ResolutionContext): boolean {
+  if (target?.filePath === filePath) return false;
+  const bindings = context.getImportMappings(filePath, 'python')
+    .filter((imp) => imp.localName === name || (imp.isNamespace && imp.source.split('.')[0] === name));
+  return bindings.length > 0 && bindings.every((imp) =>
+    !imp.source.startsWith('.') &&
+    context.resolveModuleFile?.(imp.source, filePath, 'python') === null &&
+    !(target && isInPythonModulePath(target.filePath, imp.source)));
+}
+
+/** Whether `file` is the module `dotted` or inside it, under any root: `lib/x/helpers/base.py` for `helpers.base`. */
+function isInPythonModulePath(file: string, dotted: string): boolean {
+  const tail = `/${dotted.replace(/\./g, '/')}`;
+  const at = `/${file}`;
+  return at.includes(`${tail}/`) || at.endsWith(`${tail}.py`) || at.endsWith(`${tail}.pyi`);
+}
+
+/**
+ * A Python class's base list as written, up to its closing parenthesis, which
+ * may be lines below the `class` line: black and ruff wrap a long list one base
+ * per line. Comments in it are left out. Undefined for a class without one.
+ * A PEP 695 type parameter list between the name and the bases, `class
+ * Repo[T: (int, str)](Base[T]):`, is skipped whole, wrapped or not, so a
+ * constraint tuple in it is not taken for the base list.
+ */
+function pythonBaseList(cls: Node, context: ResolutionContext): string | undefined {
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  const head = /^\s*class\s+\w+/.exec(lines[cls.startLine - 1] ?? '');
+  if (!head) return undefined;
+  let list = '';
+  let depth = 0;
+  let params = 0;
+  for (let i = cls.startLine - 1; i < Math.max(cls.endLine, cls.startLine); i++) {
+    const text = (i === cls.startLine - 1 ? lines[i]!.slice(head[0].length) : lines[i] ?? '').replace(/#.*$/, '');
+    for (const ch of text) {
+      if (depth === 0) {
+        if (ch === '[') params++;
+        else if (ch === ']') params--;
+        else if (params === 0 && ch === '(') depth = 1;
+        // Anything else after the name and its parameters, such as `:`, means no base list.
+        else if (params === 0 && !/\s/.test(ch)) return undefined;
+        continue;
+      }
+      if (ch === '(') depth++;
+      else if (ch === ')' && --depth === 0) return list;
+      list += ch;
+    }
+    if (depth > 0) list += ' ';
+  }
+  return undefined;
+}
+
+/**
+ * Whether the base `sup` of Python class `cls` comes from outside the project,
+ * so that `decl`, the project class of that name, isn't it. A dotted base is
+ * bound through its first word: `enum.Enum` through `import enum`.
+ */
+function isPythonBaseFromOutside(cls: Node, sup: string, decl: Node, context: ResolutionContext): boolean {
+  const written = new RegExp(`(?<![\\w.])([\\w.]*\\.)?${escapeRegExp(sup)}\\b`).exec(pythonBaseList(cls, context) ?? '');
+  return isPythonNameFromOutside(written?.[1]?.split('.')[0] ?? sup, cls.filePath, decl, context);
+}
+
 function pythonBases(cls: Node, ref: UnresolvedRef, context: ResolutionContext): Node[] {
-  const line = context.getFileLines?.(cls.filePath)?.[cls.startLine - 1]
-    ?? context.readFile(cls.filePath)?.split('\n')[cls.startLine - 1] ?? '';
-  const bases = line.match(/^\s*class\s+\w+\s*\(([^)]*)\)/)?.[1];
+  let bases = pythonBaseList(cls, context);
+  // A parameterized base, `Base[str]` or `Pair[str, Dict[str, int]]`, names its class before the brackets.
+  while (bases && /\[[^[\]]*\]/.test(bases)) bases = bases.replace(/\[[^[\]]*\]/g, '');
   return (bases?.split(',') ?? []).flatMap(name => {
     const base = pythonRefClass(name.trim(), { ...ref, filePath: cls.filePath }, context);
     return base ? [base] : [];
@@ -13486,6 +13557,8 @@ function matchEnclosingScopeMember(
 /**
  * Try to resolve a reference by exact name match
  */
+const RAZOR_VIEW = /\.(?:cshtml|razor)$/i;
+
 export function matchByExactName(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -13737,6 +13810,10 @@ export function matchByExactName(
   if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
+    // A view's `<script>` calls a global, and the page's script tags decide which
+    // file answers. nopCommerce's admin and public bundles both define
+    // `setLocation`, and a storefront view has no path nearer to either.
+    if (JS_FAMILY.has(ref.language) && RAZOR_VIEW.test(ref.filePath) && pool.some((c) => c.id !== bestMatch.id && computePathProximity(ref.filePath, c.filePath) === proximity)) return null;
     // Every candidate is a copy of one symbol and this is the caller's own
     // copy: the name itself is not ambiguous, only which copy — so rank it
     // above a proximity guess, but below a unique name or the file's own
@@ -21515,8 +21592,10 @@ function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[]
     // BaseManager.from_queryset(QuerySet))` — subclasses that class: the
     // qualifier is the supertype, not the method called on it.
     // A parameterized base, `Base[User]`, is `Base`: its type arguments are no supertypes.
+    // The list is read whole, as `pythonBases` reads it: black and ruff wrap a
+    // long one past the three lines `head` holds.
     case 'python': {
-      let bases = /\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1];
+      let bases = pythonBaseList(cls, context);
       while (bases && /\[[^[\]]*\]/.test(bases)) bases = bases.replace(/\[[^[\]]*\]/g, '');
       return names(bases?.replace(/\w+\s*=\s*[\w.]+/g, '').replace(/([A-Za-z_][\w.]*)\.\w+\s*\(/g, '$1 ('));
     }
@@ -21573,6 +21652,7 @@ function findInheritedClassMethod(classes: Node[], name: string, context: Resolu
       for (const sup of declaredSupertypes(cls, context)) {
         for (const decl of context.getNodesByName(sup)) {
           if (decl.language !== cls.language || !isMethodOwnerKind(decl) || seen.has(decl.id)) continue;
+          if (cls.language === 'python' && isPythonBaseFromOutside(cls, sup, decl, context)) continue;
           seen.add(decl.id);
           const method = rubyMethodsOfKindFirst(context.getNodesInFile(decl.filePath).filter((n) => n.kind === 'method' && n.name === name &&
             n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === decl.name), kind)[0];

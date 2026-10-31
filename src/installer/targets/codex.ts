@@ -40,17 +40,11 @@ import {
   WriteResult,
 } from './types';
 import {
-  atomicWriteFileSync,
   getMcpServerConfig,
-  removeFileUnlessLinked,
-  removeMarkedSection,
+  removeInstructionsEntry,
   upsertInstructionsEntry,
 } from './shared';
-import {
-  CODEGRAPH_SECTION_END,
-  CODEGRAPH_SECTION_START,
-} from '../instructions-template';
-import { buildTomlTable, removeTomlTable, tomlDefinesTable, tomlLineBreak, upsertTomlTable } from './toml';
+import { buildTomlTable, deleteTomlTable, tomlDefinesTable, writeTomlTable } from './toml';
 
 const TOML_HEADER = 'mcp_servers.codegraph';
 
@@ -119,7 +113,7 @@ class CodexTarget implements AgentTarget {
     const files: WriteResult['files'] = [];
     const notes: string[] = [];
 
-    const mcp = writeMcpEntry(loc);
+    const mcp = writeTomlTable(tomlConfigPath(loc), TOML_HEADER, buildCodegraphBlock());
     files.push(mcp.file);
     if (mcp.note) notes.push(mcp.note);
 
@@ -136,29 +130,11 @@ class CodexTarget implements AgentTarget {
     const files: WriteResult['files'] = [];
     const notes: string[] = [];
 
-    const tomlPath = tomlConfigPath(loc);
-    if (fs.existsSync(tomlPath)) {
-      const content = fs.readFileSync(tomlPath, 'utf-8');
-      const result = removeTomlTable(content, TOML_HEADER);
-      if (result.action === 'removed') {
-        if (result.content.trim() === '') {
-          removeFileUnlessLinked(tomlPath, '');
-        } else {
-          atomicWriteFileSync(tomlPath, result.content.trimEnd() + tomlLineBreak(content));
-        }
-        files.push({ path: tomlPath, action: 'removed' });
-      } else {
-        files.push({ path: tomlPath, action: 'not-found' });
-        if (result.action === 'conflict') {
-          const { conflict } = result;
-          notes.push(`${tomlPath} sets ${TOML_HEADER} inside ${conflict.key} (${conflict.form}, line ${conflict.line}), which CodeGraph can't edit safely. Remove it from there yourself.`);
-        }
-      }
-    } else {
-      files.push({ path: tomlPath, action: 'not-found' });
-    }
+    const mcp = deleteTomlTable(tomlConfigPath(loc), TOML_HEADER);
+    files.push(mcp.file);
+    if (mcp.note) notes.push(mcp.note);
 
-    files.push(removeInstructionsEntry(loc));
+    files.push(removeInstructionsEntry(instructionsPath(loc)));
 
     return notes.length > 0 ? { files, notes } : { files };
   }
@@ -179,54 +155,6 @@ function buildCodegraphBlock(): string {
     command: mcp.command,
     args: mcp.args,
   });
-}
-
-function writeMcpEntry(loc: Location): { file: WriteResult['files'][number]; note?: string } {
-  const file = tomlConfigPath(loc);
-  const dir = path.dirname(file);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-  const block = buildCodegraphBlock();
-  // Single read — `existing === ''` derives both "is the file empty
-  // or absent" and "what was its content," avoiding a TOCTOU window
-  // between two `fs.existsSync` calls.
-  const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
-  const created = existing.length === 0;
-  const result = upsertTomlTable(existing, TOML_HEADER, block);
-
-  if (result.action === 'conflict') {
-    // Never append a second definition: a table defined twice makes the
-    // whole file invalid TOML, and Codex then loads none of it (#2562).
-    const { conflict } = result;
-    if (conflict.kind === 'defined') {
-      // The user's own entry, in a form CodeGraph doesn't rewrite: it
-      // already configures Codex, so it is left exactly as written.
-      return {
-        file: { path: file, action: 'unchanged' },
-        note: `Left the ${TOML_HEADER} entry in ${file} as you wrote it (${conflict.form}, line ${conflict.line}): CodeGraph only rewrites a [${TOML_HEADER}] table.`,
-      };
-    }
-    throw new Error(
-      `${file} sets ${conflict.key} as ${conflict.form} (line ${conflict.line}), so a [${TOML_HEADER}] table can't be added without breaking the file. ` +
-      `Nothing was changed: add CodeGraph's server to ${conflict.key} yourself, or rewrite it as [${conflict.key}.<name>] tables, then run this again.`,
-    );
-  }
-  if (result.action === 'unchanged') {
-    return { file: { path: file, action: 'unchanged' } };
-  }
-  atomicWriteFileSync(file, result.content);
-  return { file: { path: file, action: created ? 'created' : 'updated' } };
-}
-
-/**
- * Strip the marker-delimited CodeGraph block from this location's
- * AGENTS.md if a prior install wrote one. Used by both install
- * (self-heal on upgrade) and uninstall — see issue #529.
- */
-function removeInstructionsEntry(loc: Location): WriteResult['files'][number] {
-  const file = instructionsPath(loc);
-  const action = removeMarkedSection(file, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
-  return { path: file, action };
 }
 
 export const codexTarget: AgentTarget = new CodexTarget();

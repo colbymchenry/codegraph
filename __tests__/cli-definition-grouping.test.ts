@@ -235,6 +235,33 @@ describe('CLI definition boundaries and limits', () => {
     }
   });
 
+  it('says so when impact stops at its safety limit, and only then', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-impact-limit-'));
+    try {
+      const callers = Array.from({ length: 10_050 }, (_, i) => `export function caller${i}() { hub(); }`);
+      fs.writeFileSync(path.join(root, 'hub.ts'), ['export function hub() {}', ...callers].join('\n'));
+      (await CodeGraph.init(root, { index: true })).close();
+      const impact = (...args: string[]) => spawnSync(process.execPath, [BIN, 'impact', '-p', root, ...args, '--', 'hub'], {
+        encoding: 'utf-8',
+        env: { ...process.env, CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_WASM_RELAUNCHED: '1', NO_COLOR: '1' },
+        maxBuffer: 64 * 1024 * 1024,
+        timeout: 60_000,
+      });
+
+      const out = JSON.parse(impact('--json').stdout);
+      expect(out.nodeCount).toBe(10_000);
+      expect(out.truncated).toBe(true);
+      expect(out.definitions[0].truncated).toBe(true);
+      const text = impact();
+      expect(text.status, text.stderr).toBe(0);
+      expect(text.stdout + text.stderr).toMatch(/truncated at the safety limit/i);
+
+      expect(json('impact').truncated).toBeUndefined();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
   it('applies impact depth within each definition and reports its own graph counts', () => {
     for (const depth of [1, 2]) {
       const out = json('impact', 'handle', ['--depth', String(depth)]);

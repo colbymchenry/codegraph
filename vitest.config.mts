@@ -1,11 +1,10 @@
+import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { defineConfig } from 'vitest/config';
 import { WASM_RUNTIME_FLAGS } from './src/extraction/wasm-runtime-flags';
 
 /**
- * The SHARED base. `vitest.workspace.mts` extends it twice — once for the
- * engine's node-environment suites and once for the viewer package's jsdom
- * one — so the environment, the plugins and the module-resolution conditions
- * a browser test needs cannot leak into the other 200-odd suites.
+ * One process, two Vitest projects. The engine stays in Node; the UI package
+ * test alone gets Svelte compilation, jsdom and browser resolution conditions.
  */
 export default defineConfig({
   test: {
@@ -18,6 +17,15 @@ export default defineConfig({
     // A throwaway home dir (and git global config) per test file, so nothing
     // the suite runs can write to the developer's real one (#2275).
     setupFiles: ['./__tests__/setup-home-sandbox.ts'],
+    /**
+     * Since Vitest 3 a synchronous test or hook fails when it outlasts its
+     * timeout. Under Vitest 2 the timer could not fire until the body had
+     * returned, so a body blocked in `spawnSync` never timed out at all. Hundreds
+     * of tests here block on the built CLI, and on a loaded machine the 5 s and
+     * 10 s defaults would turn them into flakes.
+     */
+    testTimeout: 30_000,
+    hookTimeout: 60_000,
     /**
      * Several MCP integration tests (mcp-daemon, mcp-initialize, mcp-ppid-watchdog,
      * mcp-roots) spawn `dist/bin/codegraph.js serve --mcp` with `process.execPath`
@@ -49,16 +57,47 @@ export default defineConfig({
      * parses have warmed a grammar function up, its background tier-up job
      * exhausts a compiler Zone and aborts the worker — `Fatal process out of
      * memory: Zone`, surfaced by vitest only as "Worker exited unexpectedly"
-     * with the rest of the file's tests silently unrun (#1779; the product-side
-     * story is in wasm-runtime-flags.ts, #293/#298). On Node 24 with a
-     * 660-test extraction suite this reproduced on every run at the same test.
-     * V8 flags are process-global, so the parse worker threads a test spawns
-     * are covered too.
+     * with the rest of the file's tests silently unrun (#1779, #1883; the
+     * product-side story is in wasm-runtime-flags.ts, #293/#298). V8 flags are
+     * process-global, so the parse worker threads a test spawns are covered
+     * too. Vitest 4 reads `test.execArgv`; the 2.x `poolOptions.forks.execArgv`
+     * is silently ignored here. The engine project inherits it via `extends`.
      */
-    poolOptions: { forks: { execArgv: [...WASM_RUNTIME_FLAGS] } },
+    execArgv: [...WASM_RUNTIME_FLAGS],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
     },
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: 'engine',
+          include: ['__tests__/**/*.test.ts'],
+          exclude: ['**/node_modules/**', '**/dist/**', '__tests__/ui-package.test.ts'],
+        },
+      },
+      {
+        // Browser package resolution must not leak into the engine project:
+        // web-tree-sitter and other dual packages would resolve differently.
+        // And no `extends`: a project that extends takes the base's `include`
+        // too, so every engine suite would run a second time inside jsdom.
+        extends: false,
+        plugins: [svelte({ configFile: 'ui/svelte.config.js' })],
+        resolve: { conditions: ['browser'] },
+        test: {
+          name: 'ui',
+          globals: true,
+          include: ['__tests__/ui-package.test.ts'],
+          environment: 'jsdom',
+          server: {
+            deps: {
+              // @xyflow/svelte ships source .svelte files that Node cannot load.
+              inline: [/@xyflow\/svelte/],
+            },
+          },
+        },
+      },
+    ],
   },
 });

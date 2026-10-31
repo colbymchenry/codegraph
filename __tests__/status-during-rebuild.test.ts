@@ -237,4 +237,19 @@ describe('codegraph status on an index an older release built (#2913)', () => {
       after.close();
     }
   });
+
+  it('names only the full rebuild when an older engine built it', () => {
+    const conn = DatabaseConnection.open(dbPath);
+    try {
+      conn.getDb().exec("UPDATE project_metadata SET value = '1' WHERE key = 'indexed_with_extraction_version'");
+    } finally {
+      conn.close();
+    }
+
+    // sync leaves unchanged files as the older engine read them.
+    const out = runStatus(dir, false);
+    expect(out).toContain('re-index to pick up');
+    expect(out).toContain('Run "codegraph index" for a full rebuild');
+    expect(out).not.toContain('codegraph sync');
+  });
 });

@@ -50,6 +50,7 @@ are explicitly lower priority here.
 | P2 | Blazor `.razor` | `@typeof(MainLayout)`, `@inherits LayoutBase` | `references` | the type |
 | P3 | Razor `.cshtml` | `<partial name="_X"/>`, `<vc:basket>`, `Component.InvokeAsync("X")` | `references` | the partial view / `XViewComponent` |
 | P3 | Razor `.cshtml` | `asp-page="./Register"`, `asp-controller`/`asp-action` | `references` | the page / controller action |
+| Done | Razor `.cshtml`/`.razor` | inline `<script>` JS/TS (Razor inside it blanked first, `razor-script.ts`) | `calls`, `imports` | the function or module the script names, with `javascript`/`typescript` as the reference's language, so the family gate lets it reach a `.js` symbol; the view stays one node. nopCommerce's web layer: +251 edges, all to the helper the call names; a global two bundles define stays unlinked |
 | P4 (defer) | Thymeleaf `.html` | `th:replace="~{frag :: x}"` | `references` | template fragment (template→template only) |
 | P4 (defer) | Django `.html` | `{% extends %}` / `{% include %}` / `{% url 'n' %}` | `references` | template / named route |
 

@@ -4,7 +4,7 @@
  * home, Claude profile, daemon registry or git identity.
  */
 import { describe, it, expect, inject } from 'vitest';
-import type { GlobalSetupContext } from 'vitest/node';
+import type { TestProject } from 'vitest/node';
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -77,7 +77,7 @@ describe('test home sandbox', () => {
     let registry = '';
     const teardown = setupHomeSandboxRun({
       provide(_key: string, value: string) { registry = value; },
-    } as unknown as GlobalSetupContext);
+    } as unknown as TestProject);
     const homes = ['skipped', 'held'].map((label) => {
       const home = fs.mkdtempSync(path.join(os.tmpdir(), `codegraph-test-home-${label}-`));
       fs.writeFileSync(path.join(home, '.gitconfig'), '');

@@ -540,12 +540,20 @@ impl<'t> Walker<'t> {
         let Some(row) = self.create_node("class", &name, node, extra) else { return };
 
         // Inheritance: `class Flask(Scaffold, Mixin):` — argument_list children.
+        // A parameterized base, `class Leaf(Base[str])`, is a `subscript`
+        // whose value names the class.
         let extends_kind = edge_kind_index("extends").unwrap();
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
             if child.kind() == "argument_list" {
                 for j in 0..child.named_child_count() {
-                    let Some(arg) = child.named_child(j) else { continue };
+                    let Some(base) = child.named_child(j) else { continue };
+                    let arg = if base.kind() == "subscript" {
+                        let Some(value) = base.child_by_field_name("value") else { continue };
+                        value
+                    } else {
+                        base
+                    };
                     if matches!(arg.kind(), "identifier" | "attribute") {
                         let name = self.text(arg).to_string();
                         self.push_ref_at(row, &name, extends_kind, arg);

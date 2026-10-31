@@ -1,6 +1,6 @@
 /**
  * The marker-fenced agent-instructions block the installer writes into each
- * agent's instructions file (CLAUDE.md / AGENTS.md / GEMINI.md).
+ * agent's instructions file (CLAUDE.md / AGENTS.md / GEMINI.md / QWEN.md).
  *
  * History: pre-#529 the installer wrote a full usage playbook here, which
  * duplicated the MCP `initialize` instructions for the main agent — so it

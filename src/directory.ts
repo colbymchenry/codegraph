@@ -4,6 +4,7 @@
  * Manages the .codegraph/ directory structure for CodeGraph data.
  */
 
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -953,6 +954,62 @@ function ensureGitignore(gitignorePath: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The local-only `.codegraph/.gitignore` (#910): the wildcard alone, which
+ * ignores this file too, so nothing of CodeGraph's shows in `git status` and
+ * nothing asks to be committed. It carries no header, so `ensureGitignore`
+ * treats it as the user's own and leaves it alone from then on.
+ */
+const LOCAL_ONLY_GITIGNORE_CONTENT = '*\n';
+
+/** What `makeGitignoreLocalOnly` did. */
+export type LocalOnlyGitignoreResult =
+  /** The file is local-only now. */
+  | 'written'
+  /** It already was. */
+  | 'unchanged'
+  /** It holds rules CodeGraph didn't write, so it was left alone. */
+  | 'customized'
+  /** It is committed, so rewriting it would show up as a change. Left alone. */
+  | 'tracked';
+
+/** Whether git tracks `file`. False outside a repository, or without git. */
+function isTrackedByGit(file: string): boolean {
+  try {
+    execFileSync('git', ['ls-files', '--error-unmatch', '--', path.basename(file)], {
+      cwd: path.dirname(file),
+      stdio: 'ignore',
+      windowsHide: true,
+      timeout: 10_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Make `.codegraph/.gitignore` local-only, for `codegraph init --local-only`.
+ * Only a file CodeGraph generated is replaced: anything else, or one a project
+ * has committed to share the rule, stays as it is and the caller says why.
+ */
+export function makeGitignoreLocalOnly(projectRoot: string): LocalOnlyGitignoreResult {
+  const gitignorePath = path.join(getCodeGraphDir(projectRoot), '.gitignore');
+  let existing: string | null;
+  try {
+    existing = fs.readFileSync(gitignorePath, 'utf-8').replace(/\r\n/g, '\n');
+  } catch {
+    existing = null;
+  }
+  if (existing === LOCAL_ONLY_GITIGNORE_CONTENT) return 'unchanged';
+  if (existing !== null) {
+    if (existing !== GITIGNORE_CONTENT && !isStaleDefaultGitignore(existing)) return 'customized';
+    if (isTrackedByGit(gitignorePath)) return 'tracked';
+  }
+  fs.writeFileSync(gitignorePath, LOCAL_ONLY_GITIGNORE_CONTENT, 'utf-8');
+  return 'written';
 }
 
 /**

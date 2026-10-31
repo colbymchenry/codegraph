@@ -24,7 +24,7 @@ import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targ
 import { uninstallTargets, refreshTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable, tomlDefinesTable } from '../src/installer/targets/toml';
 import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
-import { replaceOrAppendMarkedSection, removeMarkedSection } from '../src/installer/targets/shared';
+import { configDirFromEnv, replaceOrAppendMarkedSection, removeMarkedSection } from '../src/installer/targets/shared';
 import {
   CODEGRAPH_INSTRUCTIONS_BLOCK,
   CODEGRAPH_SECTION_END,
@@ -75,7 +75,11 @@ describe('standalone installer Windows shell guidance (#1294)', () => {
 // `$HOME` (POSIX) / `$USERPROFILE` (Windows) env vars that
 // `os.homedir()` reads first. Same trick the rest of the suite uses
 // when it needs a mock home.
+const AGENT_HOME_OVERRIDES = ['QWEN_HOME', 'DSH_HOME', 'GROK_HOME', 'KIMI_CODE_HOME', 'QODER_CONFIG_DIR', 'PI_CODING_AGENT_DIR'];
+
 function setHome(dir: string): { restore: () => void } {
+  const overrides = AGENT_HOME_OVERRIDES.map((name) => [name, process.env[name]] as const);
+  for (const [name] of overrides) delete process.env[name];
   const prev = {
     HOME: process.env.HOME,
     USERPROFILE: process.env.USERPROFILE,
@@ -104,6 +108,9 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.COPILOT_HOME === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = prev.COPILOT_HOME;
       if (prev.CODEX_HOME === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev.CODEX_HOME;
       if (prev.CLAUDE_CONFIG_DIR === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev.CLAUDE_CONFIG_DIR;
+      for (const [name, value] of overrides) {
+        if (value === undefined) delete process.env[name]; else process.env[name] = value;
+      }
     },
   };
 }
@@ -1380,6 +1387,9 @@ describe('Installer targets — registry', () => {
     expect(getTarget('copilot-vscode')?.id).toBe('copilot-vscode');
     expect(getTarget('copilot-cli')?.id).toBe('copilot-cli');
     expect(getTarget('copilot-jetbrains')?.id).toBe('copilot-jetbrains');
+    for (const id of ['bob', 'droid', 'windsurf', 'qwen', 'dsh', 'grok', 'kimi', 'qoder', 'pi']) {
+      expect(getTarget(id)?.id).toBe(id);
+    }
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
@@ -2341,6 +2351,12 @@ describe('Installer — install --refresh keeps each agent\'s instructions file 
     ['codex', (home) => path.join(home, '.codex', 'AGENTS.md')],
     ['gemini', (home) => path.join(home, '.gemini', 'GEMINI.md')],
     ['opencode', (home) => path.join(home, '.config', 'opencode', 'AGENTS.md')],
+    ['droid', (home) => path.join(home, '.factory', 'AGENTS.md')],
+    ['qwen', (home) => path.join(home, '.qwen', 'QWEN.md')],
+    ['dsh', (home) => path.join(home, '.dsh', 'AGENTS.md')],
+    ['grok', (home) => path.join(home, '.grok', 'rules', 'codegraph.md')],
+    ['kimi', (home) => path.join(home, '.kimi-code', 'AGENTS.md')],
+    ['pi', (home) => path.join(home, '.pi', 'agent', 'AGENTS.md')],
   ];
   const USER = `${CODEGRAPH_SECTION_START}\n## CodeGraph\n\n# My notes\n\nAlways run the tests first.\n\n`;
 
@@ -2572,22 +2588,30 @@ describe.skipIf(!FILE_SYMLINKS)(`Installer — a symbolic link is written throug
     const agentsMd = sharedFile('AGENTS.md');
     const codexToml = sharedFile('codex.toml');
     const copilot = sharedFile('copilot.json');
+    const droid = sharedFile('droid.json');
+    const grokToml = sharedFile('grok.toml');
+    const dshPatch = sharedFile('cordis.patch.yml');
     link(path.join(tmpHome, '.codex', 'AGENTS.md'), agentsMd);
     link(path.join(tmpHome, '.codex', 'config.toml'), codexToml);
     link(path.join(tmpHome, '.copilot', 'mcp-config.json'), copilot);
-    getTarget('codex')!.install('global', { autoAllow: false });
-    getTarget('copilot-cli')!.install('global', { autoAllow: false });
+    link(path.join(tmpHome, '.factory', 'mcp.json'), droid);
+    link(path.join(tmpHome, '.grok', 'config.toml'), grokToml);
+    link(path.join(tmpHome, '.dsh', 'cordis.patch.yml'), dshPatch);
+    const ids = ['codex', 'copilot-cli', 'droid', 'grok', 'dsh'] as const;
+    for (const id of ids) getTarget(id)!.install('global', { autoAllow: false });
     expect(fs.readFileSync(agentsMd, 'utf-8')).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
 
-    getTarget('codex')!.uninstall('global');
-    getTarget('copilot-cli')!.uninstall('global');
+    for (const id of ids) getTarget(id)!.uninstall('global');
 
-    for (const p of ['.codex/AGENTS.md', '.codex/config.toml', '.copilot/mcp-config.json']) {
+    for (const p of ['.codex/AGENTS.md', '.codex/config.toml', '.copilot/mcp-config.json', '.factory/mcp.json', '.grok/config.toml', '.dsh/cordis.patch.yml']) {
       expect(isLink(path.join(tmpHome, p)), p).toBe(true);
     }
     expect(fs.readFileSync(agentsMd, 'utf-8')).toBe('');
     expect(fs.readFileSync(codexToml, 'utf-8')).toBe('');
+    expect(fs.readFileSync(grokToml, 'utf-8')).toBe('');
     expect(JSON.parse(fs.readFileSync(copilot, 'utf-8'))).toEqual({});
+    expect(JSON.parse(fs.readFileSync(droid, 'utf-8'))).toEqual({});
+    expect(fs.readFileSync(dshPatch, 'utf-8')).toBe('[]\n');
   });
 
   it('a link that can\'t be written fails only its own agent in a refresh: the others are still refreshed', () => {
@@ -3857,6 +3881,815 @@ describe('Installer targets — Codex CODEX_HOME override (#1627)', () => {
     expect(fs.existsSync(path.join(process.cwd(), '.codex', 'config.toml'))).toBe(true);
     // The project layer lives beside the project, never under the user profile.
     expect(fs.existsSync(path.join(custom, 'config.toml'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The agents that keep `mcpServers.codegraph` in a JSON file: each one's
+// documented paths and entry, and what the shared editor promises all of them.
+// ---------------------------------------------------------------------------
+
+interface JsonTargetCase {
+  id: string;
+  /** Path of the MCP config under the home (global) or the project (local), and the entry written there. */
+  global: string[];
+  local: string[] | null;
+  entry: Record<string, unknown>;
+  /** Instructions file under the home; null when the target writes none. */
+  globalInstructions: string[] | null;
+  /** Instructions file under the project. */
+  localInstructions: string[] | null;
+}
+
+const STDIO_ENTRY = { command: 'codegraph', args: ['serve', '--mcp'] };
+
+const JSON_TARGETS: JsonTargetCase[] = [
+  { id: 'bob', global: ['.bob', 'settings', 'mcp.json'], local: ['.bob', 'mcp.json'], entry: STDIO_ENTRY, globalInstructions: null, localInstructions: null },
+  { id: 'droid', global: ['.factory', 'mcp.json'], local: ['.factory', 'mcp.json'], entry: { type: 'stdio', ...STDIO_ENTRY }, globalInstructions: ['.factory', 'AGENTS.md'], localInstructions: ['AGENTS.md'] },
+  { id: 'windsurf', global: ['.codeium', 'windsurf', 'mcp_config.json'], local: null, entry: STDIO_ENTRY, globalInstructions: null, localInstructions: null },
+  { id: 'qwen', global: ['.qwen', 'settings.json'], local: ['.qwen', 'settings.json'], entry: STDIO_ENTRY, globalInstructions: ['.qwen', 'QWEN.md'], localInstructions: ['QWEN.md'] },
+  { id: 'kimi', global: ['.kimi-code', 'mcp.json'], local: ['.kimi-code', 'mcp.json'], entry: STDIO_ENTRY, globalInstructions: ['.kimi-code', 'AGENTS.md'], localInstructions: ['AGENTS.md'] },
+  { id: 'qoder', global: ['.qoder', 'settings.json'], local: ['.qoder', 'settings.local.json'], entry: STDIO_ENTRY, globalInstructions: null, localInstructions: null },
+  { id: 'pi', global: ['.pi', 'agent', 'mcp.json'], local: ['.pi', 'mcp.json'], entry: { ...STDIO_ENTRY, exposure: 'direct' }, globalInstructions: ['.pi', 'agent', 'AGENTS.md'], localInstructions: ['AGENTS.md'] },
+];
+
+/** Runs each test with a throwaway home and working directory. */
+function useTmpDirs(label: string): { home: () => string; cwd: () => string } {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir(`${label}-home`);
+    tmpCwd = mkTmpDir(`${label}-cwd`);
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  return { home: () => tmpHome, cwd: () => tmpCwd };
+}
+
+describe('Installer targets — agents with a JSON mcpServers file', () => {
+  const dirs = useTmpDirs('jsoncfg');
+
+  for (const c of JSON_TARGETS) {
+    const locations = (['global', 'local'] as const).filter((l) => c[l] !== null);
+
+    for (const location of locations) {
+      const file = () => path.join(location === 'global' ? dirs.home() : dirs.cwd(), ...c[location]!);
+      const instructions = location === 'global' ? c.globalInstructions : c.localInstructions;
+      const instructionsFile = () => path.join(location === 'global' ? dirs.home() : dirs.cwd(), ...instructions!);
+
+      describe(`${c.id} (${location})`, () => {
+        it('writes the documented entry to the documented file, and nothing else for the MCP config', () => {
+          const result = getTarget(c.id)!.install(location, { autoAllow: false });
+
+          expect(JSON.parse(fs.readFileSync(file(), 'utf-8'))).toEqual({ mcpServers: { codegraph: c.entry } });
+          expect(result.files.find((f) => f.path === file())?.action).toBe('created');
+        });
+
+        it(instructions ? 'writes the instructions block where the agent reads it' : 'writes no instructions file', () => {
+          const result = getTarget(c.id)!.install(location, { autoAllow: false });
+
+          if (instructions) {
+            expect(fs.readFileSync(instructionsFile(), 'utf-8')).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+            expect(result.files.map((f) => f.path)).toEqual([file(), instructionsFile()]);
+          } else {
+            expect(result.files.map((f) => f.path)).toEqual([file()]);
+          }
+        });
+
+        it('an entry the user changed stays as it is through a re-install and a refresh', () => {
+          const pinned = { ...c.entry, command: '/opt/bin/codegraph', args: ['serve', '--mcp', '--path', '/work'], cwd: '/work', disabled: true, alwaysAllow: ['codegraph_explore'], exposure: 'deferred' };
+          const content = `${JSON.stringify({ mcpServers: { codegraph: pinned } }, null, 2)}\n`;
+          fs.mkdirSync(path.dirname(file()), { recursive: true });
+          fs.writeFileSync(file(), content);
+
+          const target = getTarget(c.id)!;
+          expect(target.detect(location).alreadyConfigured).toBe(true);
+          const again = target.install(location, { autoAllow: false });
+
+          expect(again.files.find((f) => f.path === file())?.action).toBe('unchanged');
+          expect(fs.readFileSync(file(), 'utf-8')).toBe(content);
+          if (location === 'global') {
+            expect(refreshTargets([target], 'global')[0]!.status).not.toBe('failed');
+            expect(fs.readFileSync(file(), 'utf-8')).toBe(content);
+          }
+        });
+
+        it('an entry missing a key gets only that key', () => {
+          fs.mkdirSync(path.dirname(file()), { recursive: true });
+          fs.writeFileSync(file(), JSON.stringify({ mcpServers: { codegraph: { disabled: true } } }));
+
+          getTarget(c.id)!.install(location, { autoAllow: false });
+
+          expect(JSON.parse(fs.readFileSync(file(), 'utf-8')).mcpServers.codegraph).toEqual({ ...c.entry, disabled: true });
+        });
+
+        it('the rest of the file is not reformatted, and uninstall gives its values back', () => {
+          const content = '{\n    "theme": "dark",\n    "mcpServers": {\n        "other": { "command": "x" }\n    },\n    "tail": [1, 2]\n}\n';
+          fs.mkdirSync(path.dirname(file()), { recursive: true });
+          fs.writeFileSync(file(), content);
+          const target = getTarget(c.id)!;
+
+          target.install(location, { autoAllow: false });
+
+          const installed = fs.readFileSync(file(), 'utf-8');
+          expect(installed).toContain('{\n    "theme": "dark",\n    "mcpServers": {\n');
+          expect(installed).toContain('    "tail": [1, 2]\n}\n');
+          expect(installed).toContain('\n        "codegraph": {\n            "');
+          expect(JSON.parse(installed).mcpServers.other).toEqual({ command: 'x' });
+          expect(JSON.parse(installed).mcpServers.codegraph).toEqual(c.entry);
+
+          target.uninstall(location);
+          expect(JSON.parse(fs.readFileSync(file(), 'utf-8'))).toEqual(JSON.parse(content));
+        });
+
+        it('uninstall deletes a file left with nothing in it, and is then a no-op', () => {
+          const target = getTarget(c.id)!;
+          target.install(location, { autoAllow: false });
+
+          const result = target.uninstall(location);
+
+          expect(result.files.find((f) => f.path === file())?.action).toBe('removed');
+          expect(fs.existsSync(file())).toBe(false);
+          if (instructions) expect(fs.existsSync(instructionsFile())).toBe(false);
+          expect(target.uninstall(location).files.find((f) => f.path === file())?.action).toBe('not-found');
+        });
+
+        it('a config that does not parse is backed up before it is replaced', () => {
+          fs.mkdirSync(path.dirname(file()), { recursive: true });
+          fs.writeFileSync(file(), '{ half a config');
+          const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+          try {
+            expect(getTarget(c.id)!.detect(location).alreadyConfigured).toBe(false);
+            expect(warn).not.toHaveBeenCalled();
+            getTarget(c.id)!.install(location, { autoAllow: false });
+            expect(warn).toHaveBeenCalled();
+          } finally {
+            warn.mockRestore();
+          }
+          expect(fs.readFileSync(`${file()}.backup`, 'utf-8')).toBe('{ half a config');
+          expect(JSON.parse(fs.readFileSync(file(), 'utf-8')).mcpServers.codegraph).toEqual(c.entry);
+        });
+
+        it('uninstall leaves a config that does not parse alone', () => {
+          fs.mkdirSync(path.dirname(file()), { recursive: true });
+          fs.writeFileSync(file(), '{ half a config');
+
+          const result = getTarget(c.id)!.uninstall(location);
+
+          expect(result.files.find((f) => f.path === file())?.action).toBe('not-found');
+          expect(fs.readFileSync(file(), 'utf-8')).toBe('{ half a config');
+        });
+
+        it('an mcpServers that is not an object stops the install with nothing changed', () => {
+          const content = '{ "mcpServers": ["not", "an", "object"] }\n';
+          fs.mkdirSync(path.dirname(file()), { recursive: true });
+          fs.writeFileSync(file(), content);
+
+          expect(() => getTarget(c.id)!.install(location, { autoAllow: false })).toThrow(/mcpServers.*Nothing was changed/);
+          expect(fs.readFileSync(file(), 'utf-8')).toBe(content);
+        });
+
+        it('keeps CRLF line endings and a byte order mark', () => {
+          const content = '\uFEFF{\r\n  "theme": "dark"\r\n}\r\n';
+          fs.mkdirSync(path.dirname(file()), { recursive: true });
+          fs.writeFileSync(file(), content);
+
+          getTarget(c.id)!.install(location, { autoAllow: false });
+
+          const text = fs.readFileSync(file(), 'utf-8');
+          expect(text.startsWith('\uFEFF')).toBe(true);
+          expect(text.replace(/\r\n/g, '')).not.toContain('\n');
+          expect(JSON.parse(text.slice(1)).mcpServers.codegraph).toEqual(c.entry);
+          expect(fs.existsSync(`${file()}.backup`)).toBe(false);
+        });
+      });
+    }
+  }
+
+  it('bob: a global file under the earlier name is the one used, while mcp.json is absent', () => {
+    const settings = path.join(dirs.home(), '.bob', 'settings');
+    const earlier = path.join(settings, 'mcp_settings.json');
+    fs.mkdirSync(settings, { recursive: true });
+    fs.writeFileSync(earlier, '{\n  "mcpServers": {\n    "other": { "command": "x" }\n  }\n}\n');
+    const bob = getTarget('bob')!;
+
+    bob.install('global', { autoAllow: false });
+
+    expect(JSON.parse(fs.readFileSync(earlier, 'utf-8')).mcpServers.codegraph).toEqual(STDIO_ENTRY);
+    expect(fs.existsSync(path.join(settings, 'mcp.json'))).toBe(false);
+    expect(bob.detect('global').alreadyConfigured).toBe(true);
+
+    bob.uninstall('global');
+    expect(JSON.parse(fs.readFileSync(earlier, 'utf-8'))).toEqual({ mcpServers: { other: { command: 'x' } } });
+  });
+
+  it('bob: mcp.json wins as soon as it exists', () => {
+    const settings = path.join(dirs.home(), '.bob', 'settings');
+    fs.mkdirSync(settings, { recursive: true });
+    fs.writeFileSync(path.join(settings, 'mcp_settings.json'), '{}\n');
+    fs.writeFileSync(path.join(settings, 'mcp.json'), '{}\n');
+
+    getTarget('bob')!.install('global', { autoAllow: false });
+
+    expect(JSON.parse(fs.readFileSync(path.join(settings, 'mcp.json'), 'utf-8')).mcpServers.codegraph).toEqual(STDIO_ENTRY);
+    expect(fs.readFileSync(path.join(settings, 'mcp_settings.json'), 'utf-8')).toBe('{}\n');
+  });
+
+  it('droid: a local install says the file is meant to be committed; a global one has nothing to say', () => {
+    const droid = getTarget('droid')!;
+    expect(droid.install('global', { autoAllow: false }).notes).toBeUndefined();
+    expect(droid.install('local', { autoAllow: false }).notes?.join(' ')).toMatch(/committed/);
+  });
+
+  it('windsurf: global only, with a clear note', () => {
+    const windsurf = getTarget('windsurf')!;
+    expect(windsurf.supportsLocation('local')).toBe(false);
+    expect(windsurf.detect('local')).toEqual({ installed: false, alreadyConfigured: false });
+    expect(windsurf.describePaths('local')).toEqual([]);
+    const result = windsurf.install('local', { autoAllow: false });
+    expect(result.files).toEqual([]);
+    expect(result.notes?.join(' ')).toMatch(/no project-local/);
+    expect(windsurf.uninstall('local').files).toEqual([]);
+    expect(windsurf.printConfig('local')).toMatch(/no project-local/);
+  });
+
+  it('kimi, pi, qoder: a local install says the folder has to be trusted first', () => {
+    for (const id of ['kimi', 'pi', 'qoder']) {
+      expect(getTarget(id)!.install('local', { autoAllow: false }).notes?.join(' '), id).toMatch(/trust/i);
+      expect(getTarget(id)!.install('global', { autoAllow: false }).notes?.join(' '), id).not.toMatch(/trust/i);
+    }
+  });
+
+  it('qoder: a local install stays out of the .mcp.json Claude Code shares', () => {
+    const shared = path.join(dirs.cwd(), '.mcp.json');
+    getTarget('claude')!.install('local', { autoAllow: false });
+    const before = fs.readFileSync(shared, 'utf-8');
+    const qoder = getTarget('qoder')!;
+
+    qoder.install('local', { autoAllow: false });
+    qoder.uninstall('local');
+
+    expect(fs.readFileSync(shared, 'utf-8')).toBe(before);
+  });
+
+  it.each([
+    ['qwen', 'QWEN_HOME', ['settings.json', 'QWEN.md']],
+    ['kimi', 'KIMI_CODE_HOME', ['mcp.json', 'AGENTS.md']],
+    ['qoder', 'QODER_CONFIG_DIR', ['settings.json']],
+    ['pi', 'PI_CODING_AGENT_DIR', ['mcp.json', 'AGENTS.md']],
+    ['dsh', 'DSH_HOME', ['cordis.patch.yml', 'AGENTS.md']],
+    ['grok', 'GROK_HOME', ['config.toml', path.join('rules', 'codegraph.md')]],
+  ] as const)('%s: a global install follows %s', (id, name, files) => {
+    process.env[name] = path.join(dirs.home(), 'moved');
+    try {
+      const target = getTarget(id)!;
+      const result = target.install('global', { autoAllow: false });
+
+      const expected = files.map((f) => path.join(dirs.home(), 'moved', f));
+      expect(result.files.map((f) => f.path)).toEqual(expected);
+      for (const file of expected) expect(fs.existsSync(file), file).toBe(true);
+      expect(fs.readdirSync(dirs.home())).toEqual(['moved']);
+      expect(target.detect('global').alreadyConfigured).toBe(true);
+    } finally {
+      delete process.env[name];
+    }
+  });
+
+  it.each([
+    ['a blank value is unset', '   ', (home: string) => path.join(home, 'fallback')],
+    ['~ is the home', '~', (home: string) => home],
+    ['~/ starts in the home', '~/moved/here', (home: string) => path.join(home, 'moved', 'here')],
+  ])('configDirFromEnv: %s', (_name, value, expected) => {
+    process.env.CODEGRAPH_TEST_HOME_DIR = value;
+    try {
+      expect(configDirFromEnv('CODEGRAPH_TEST_HOME_DIR', path.join(dirs.home(), 'fallback'))).toBe(expected(dirs.home()));
+    } finally {
+      delete process.env.CODEGRAPH_TEST_HOME_DIR;
+    }
+  });
+
+  it('configDirFromEnv: a relative path starts in the working directory', () => {
+    process.env.CODEGRAPH_TEST_HOME_DIR = path.join('some', 'dir');
+    try {
+      expect(configDirFromEnv('CODEGRAPH_TEST_HOME_DIR', 'unused')).toBe(path.join(process.cwd(), 'some', 'dir'));
+    } finally {
+      delete process.env.CODEGRAPH_TEST_HOME_DIR;
+    }
+  });
+});
+
+describe('Installer targets — settings files that hold comments', () => {
+  const dirs = useTmpDirs('jsonc');
+
+  const SETTINGS = [
+    '{',
+    '  // my setup',
+    '  "general": { "language": "zh" }, // keep Chinese replies',
+    '  /* providers below */',
+    '  "model": { "name": "qwen3-max" },',
+    '}',
+    '',
+  ].join('\n');
+
+  for (const [id, relative] of [['qwen', ['.qwen', 'settings.json']], ['qoder', ['.qoder', 'settings.json']]] as const) {
+    it(`${id}: comments survive install, re-install and uninstall, and detect sees through them`, () => {
+      const file = path.join(dirs.home(), ...relative);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, SETTINGS);
+      const target = getTarget(id)!;
+      expect(target.detect('global').alreadyConfigured).toBe(false);
+
+      target.install('global', { autoAllow: false });
+
+      const installed = fs.readFileSync(file, 'utf-8');
+      for (const kept of ['// my setup', '// keep Chinese replies', '/* providers below */', '"qwen3-max"']) {
+        expect(installed).toContain(kept);
+      }
+      expect(parseJsonc(installed).mcpServers.codegraph).toEqual(STDIO_ENTRY);
+      expect(target.detect('global').alreadyConfigured).toBe(true);
+      expect(fs.existsSync(`${file}.backup`)).toBe(false);
+
+      for (const f of target.install('global', { autoAllow: false }).files) expect(f.action, f.path).toBe('unchanged');
+      expect(fs.readFileSync(file, 'utf-8')).toBe(installed);
+
+      target.uninstall('global');
+      const after = fs.readFileSync(file, 'utf-8');
+      expect(after).toContain('// my setup');
+      expect(parseJsonc(after)).toEqual(parseJsonc(SETTINGS));
+    });
+  }
+});
+
+describe('Installer targets — Qwen Code auto-allow', () => {
+  const dirs = useTmpDirs('qwen');
+  const settings = () => path.join(dirs.home(), '.qwen', 'settings.json');
+  const read = () => parseJsonc(fs.readFileSync(settings(), 'utf-8'));
+  const seed = (content: string) => {
+    fs.mkdirSync(path.dirname(settings()), { recursive: true });
+    fs.writeFileSync(settings(), content);
+  };
+
+  it('autoAllow adds the rule for the whole server, in the one write of the settings file', () => {
+    const result = getTarget('qwen')!.install('global', { autoAllow: true });
+
+    expect(read().permissions).toEqual({ allow: ['mcp__codegraph'] });
+    expect(result.files.filter((f) => f.path === settings())).toEqual([{ path: settings(), action: 'created' }]);
+  });
+
+  it('without autoAllow no permissions are written', () => {
+    getTarget('qwen')!.install('global', { autoAllow: false });
+    expect(read().permissions).toBeUndefined();
+  });
+
+  it('the rule joins the rules already there, with comments kept, and only once', () => {
+    seed('{\n  "permissions": {\n    // team rules\n    "allow": ["Bash(git *)"],\n    "deny": ["Read(.env)"]\n  }\n}\n');
+    const qwen = getTarget('qwen')!;
+
+    qwen.install('global', { autoAllow: true });
+    const installed = fs.readFileSync(settings(), 'utf-8');
+    expect(read().permissions).toEqual({ allow: ['Bash(git *)', 'mcp__codegraph'], deny: ['Read(.env)'] });
+    expect(installed).toContain('// team rules');
+
+    for (const f of qwen.install('global', { autoAllow: true }).files) expect(f.action, f.path).toBe('unchanged');
+    expect(fs.readFileSync(settings(), 'utf-8')).toBe(installed);
+  });
+
+  it('a permissions.allow that is not a list is left alone', () => {
+    seed('{ "permissions": { "allow": "Bash" } }\n');
+    getTarget('qwen')!.install('global', { autoAllow: true });
+    expect(read().permissions).toEqual({ allow: 'Bash' });
+  });
+
+  it('a refresh never adds the rule back', () => {
+    const qwen = getTarget('qwen')!;
+    qwen.install('global', { autoAllow: true });
+    const trimmed = read();
+    trimmed.permissions.allow = [];
+    fs.writeFileSync(settings(), `${JSON.stringify(trimmed, null, 2)}\n`);
+
+    refreshTargets([qwen], 'global');
+
+    expect(read().permissions.allow).toEqual([]);
+  });
+
+  it('uninstall takes out only the rule and the server', () => {
+    seed(`${JSON.stringify({
+      model: { name: 'qwen3-max' },
+      mcpServers: { idea: { command: 'java' } },
+      permissions: { allow: ['mcp__idea', 'Read'], deny: ['Read(.env)'] },
+    }, null, 2)}\n`);
+    const qwen = getTarget('qwen')!;
+
+    qwen.install('global', { autoAllow: true });
+    qwen.uninstall('global');
+
+    expect(read()).toEqual({
+      model: { name: 'qwen3-max' },
+      mcpServers: { idea: { command: 'java' } },
+      permissions: { allow: ['mcp__idea', 'Read'], deny: ['Read(.env)'] },
+    });
+  });
+
+  it('uninstall removes a rule left without its server, and the wrappers that held only it', () => {
+    seed(`${JSON.stringify({ theme: 'dark', permissions: { allow: ['mcp__codegraph'] } }, null, 2)}\n`);
+
+    const result = getTarget('qwen')!.uninstall('global');
+
+    expect(result.files[0]).toEqual({ path: settings(), action: 'removed' });
+    expect(read()).toEqual({ theme: 'dark' });
+  });
+});
+
+describe('Installer targets — Grok Build', () => {
+  const dirs = useTmpDirs('grok');
+  const tomlPath = () => path.join(dirs.home(), '.grok', 'config.toml');
+  const rulesPath = () => path.join(dirs.home(), '.grok', 'rules', 'codegraph.md');
+  const seed = (content: string) => {
+    fs.mkdirSync(path.dirname(tomlPath()), { recursive: true });
+    fs.writeFileSync(tomlPath(), content);
+  };
+  const TABLE = '[mcp_servers.codegraph]\ncommand = "codegraph"\nargs = ["serve", "--mcp"]\n';
+
+  it('a global install writes the table and the rules file', () => {
+    const grok = getTarget('grok')!;
+    const result = grok.install('global', { autoAllow: true });
+
+    expect(fs.readFileSync(tomlPath(), 'utf-8')).toBe(TABLE);
+    expect(fs.readFileSync(rulesPath(), 'utf-8')).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+    expect(result.files.map((f) => f.path)).toEqual([tomlPath(), rulesPath()]);
+    expect(result.notes?.join(' ')).toMatch(/\/mcps/);
+    expect(result.notes?.join(' ')).not.toMatch(/trusted/);
+
+    for (const f of grok.install('global', { autoAllow: true }).files) expect(f.action, f.path).toBe('unchanged');
+  });
+
+  it('a local install writes under ./.grok, says it needs trust, and leaves the global entry', () => {
+    const grok = getTarget('grok')!;
+    grok.install('global', { autoAllow: false });
+
+    const result = grok.install('local', { autoAllow: false });
+
+    expect(fs.readFileSync(path.join(dirs.cwd(), '.grok', 'config.toml'), 'utf-8')).toBe(TABLE);
+    expect(fs.existsSync(path.join(dirs.cwd(), '.grok', 'rules', 'codegraph.md'))).toBe(true);
+    expect(result.notes?.join(' ')).toMatch(/trusted/);
+
+    grok.uninstall('local');
+    expect(grok.detect('local').alreadyConfigured).toBe(false);
+    expect(grok.detect('global').alreadyConfigured).toBe(true);
+  });
+
+  it('siblings survive, and uninstall gives the file back', () => {
+    const content = '[models]\ndefault = "grok-4"\n\n[mcp_servers.other]\ncommand = "other"\n';
+    seed(content);
+    const grok = getTarget('grok')!;
+
+    grok.install('global', { autoAllow: false });
+    expect(fs.readFileSync(tomlPath(), 'utf-8')).toBe(`${content}\n${TABLE}`);
+
+    grok.uninstall('global');
+    expect(fs.readFileSync(tomlPath(), 'utf-8')).toBe(content);
+  });
+
+  it('uninstall deletes a file holding only our table', () => {
+    const grok = getTarget('grok')!;
+    grok.install('global', { autoAllow: false });
+
+    grok.uninstall('global');
+
+    expect(fs.existsSync(tomlPath())).toBe(false);
+    expect(fs.existsSync(rulesPath())).toBe(false);
+  });
+
+  it('a table the user changed stays as it is through a re-install and a refresh', () => {
+    const content = '[mcp_servers.codegraph]\ncommand = "/opt/bin/codegraph"\nargs = ["serve", "--mcp"]\nenabled = false\nstartup_timeout_sec = 60\n';
+    seed(content);
+    const grok = getTarget('grok')!;
+
+    expect(grok.install('global', { autoAllow: false }).files[0]).toEqual({ path: tomlPath(), action: 'unchanged' });
+    refreshTargets([grok], 'global');
+
+    expect(fs.readFileSync(tomlPath(), 'utf-8')).toBe(content);
+  });
+
+  it('a table written with an indent or quoted keys is found, and never defined twice', () => {
+    const content = '  [ "mcp_servers" . codegraph ]\n  command = "codegraph"\n  args = ["serve", "--mcp"]\n';
+    seed(content);
+    const grok = getTarget('grok')!;
+
+    expect(grok.detect('global').alreadyConfigured).toBe(true);
+    grok.install('global', { autoAllow: false });
+
+    expect(fs.readFileSync(tomlPath(), 'utf-8')).toBe(content);
+  });
+
+  it('dotted keys or an inline table are left as written, with a note', () => {
+    for (const content of [
+      'mcp_servers.codegraph.command = "codegraph"\n',
+      '[mcp_servers]\ncodegraph = { command = "codegraph", args = ["serve", "--mcp"] }\n',
+    ]) {
+      seed(content);
+      const grok = getTarget('grok')!;
+
+      const result = grok.install('global', { autoAllow: false });
+
+      expect(result.files[0]).toEqual({ path: tomlPath(), action: 'unchanged' });
+      expect(result.notes?.join(' ')).toMatch(/Left the mcp_servers\.codegraph entry/);
+      expect(fs.readFileSync(tomlPath(), 'utf-8')).toBe(content);
+    }
+  });
+
+  it('an inline mcp_servers stops the install with nothing changed', () => {
+    const content = 'mcp_servers = { other = { command = "x" } }\n';
+    seed(content);
+
+    expect(() => getTarget('grok')!.install('global', { autoAllow: false })).toThrow(/Nothing was changed/);
+    expect(fs.readFileSync(tomlPath(), 'utf-8')).toBe(content);
+  });
+
+  it('uninstall reports an entry inside an inline mcp_servers instead of touching it', () => {
+    const content = 'mcp_servers = { codegraph = { command = "codegraph" } }\n';
+    seed(content);
+    const grok = getTarget('grok')!;
+
+    const result = grok.uninstall('global');
+
+    expect(result.files[0]).toEqual({ path: tomlPath(), action: 'not-found' });
+    expect(result.notes?.join(' ')).toMatch(/Remove it from there yourself/);
+    expect(fs.readFileSync(tomlPath(), 'utf-8')).toBe(content);
+  });
+
+  it('the rules file keeps what the user wrote around the block', () => {
+    fs.mkdirSync(path.dirname(rulesPath()), { recursive: true });
+    fs.writeFileSync(rulesPath(), `# My notes\n\nBe terse.\n\n${LEGACY_BLOCK}\n`);
+    const grok = getTarget('grok')!;
+
+    grok.install('global', { autoAllow: false });
+    expect(fs.readFileSync(rulesPath(), 'utf-8')).toBe(`# My notes\n\nBe terse.\n\n${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+
+    grok.uninstall('global');
+    expect(fs.readFileSync(rulesPath(), 'utf-8')).toBe('# My notes\n\nBe terse.\n');
+  });
+});
+
+describe('Installer targets — DeepSeek Harness', () => {
+  const dirs = useTmpDirs('dsh');
+  const dsh = () => getTarget('dsh')!;
+  const patchPath = () => path.join(dirs.home(), '.dsh', 'cordis.patch.yml');
+  const agentsPath = () => path.join(dirs.home(), '.dsh', 'AGENTS.md');
+  const seed = (content: string, file = patchPath()) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content);
+  };
+  const read = (file = patchPath()) => fs.readFileSync(file, 'utf-8');
+  const ENTRY = [
+    '- insert:',
+    '    - id: mcp-codegraph',
+    "      name: '@deepseek-ai/dsh-mcp-client'",
+    '      config:',
+    '        serverName: codegraph',
+    '        transport: stdio',
+    '        command: codegraph',
+    '        args:',
+    '          - serve',
+    '          - --mcp',
+    '',
+  ].join('\n');
+  const USER_ROW = [
+    '    - id: mcp-github',
+    "      name: '@deepseek-ai/dsh-mcp-client'",
+    '      config:',
+    '        serverName: github',
+    '        transport: stdio',
+    '        command: npx',
+    "        args: ['-y', '@modelcontextprotocol/server-github']",
+    '',
+  ].join('\n');
+  const profilePatch = (name: string) => path.join(dirs.home(), '.dsh', 'profiles', name, 'cordis.patch.yml');
+
+  it('a fresh install writes the patch and the AGENTS.md block; uninstall removes both', () => {
+    const result = dsh().install('global', { autoAllow: true });
+
+    expect(read()).toBe(ENTRY);
+    expect(read(agentsPath())).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+    expect(result.files.map((f) => f.path)).toEqual([patchPath(), agentsPath()]);
+    expect(dsh().detect('global').alreadyConfigured).toBe(true);
+    for (const f of dsh().install('global', { autoAllow: true }).files) expect(f.action, f.path).toBe('unchanged');
+
+    dsh().uninstall('global');
+    expect(fs.existsSync(patchPath())).toBe(false);
+    expect(fs.existsSync(agentsPath())).toBe(false);
+  });
+
+  it('the documented empty list is replaced, and comes back on uninstall', () => {
+    const content = '# my patches\n[]\n# the end\n';
+    seed(content);
+
+    dsh().install('global', { autoAllow: false });
+    expect(read()).toBe(`# my patches\n${ENTRY}# the end\n`);
+
+    dsh().uninstall('global');
+    expect(read()).toBe('# my patches\n# the end\n[]\n');
+  });
+
+  it('a comments-only file, which stops dsh from starting, is repaired, and uninstall keeps it valid', () => {
+    seed('# nothing here yet\n');
+
+    dsh().install('global', { autoAllow: false });
+    expect(read()).toBe(`# nothing here yet\n${ENTRY}`);
+
+    dsh().uninstall('global');
+    expect(read()).toBe('# nothing here yet\n[]\n');
+  });
+
+  it('an empty file gets the patch, and goes away with it', () => {
+    seed('');
+    dsh().install('global', { autoAllow: false });
+    expect(read()).toBe(ENTRY);
+    dsh().uninstall('global');
+    expect(fs.existsSync(patchPath())).toBe(false);
+  });
+
+  it('the patch goes after the user\'s own, and uninstall gives the file back byte for byte', () => {
+    const content = `# overrides\n- id: tool-bash\n  disabled: true\n\n- insert:\n${USER_ROW}`;
+    seed(content);
+
+    dsh().install('global', { autoAllow: false });
+    expect(read()).toBe(`${content}\n${ENTRY}`);
+
+    dsh().uninstall('global');
+    expect(read()).toBe(content);
+  });
+
+  it('a row the user wrote stays as it is through a re-install and a refresh: a pinned cwd is not reset', () => {
+    const row = [
+      '- insert:',
+      '    - id: my-codegraph',
+      '      name: "@deepseek-ai/dsh-mcp-client"',
+      '      config:',
+      '        serverName: "codegraph"',
+      '        transport: stdio',
+      '        command: /opt/bin/codegraph',
+      '        args: [serve, --mcp, --path, /work]',
+      '        cwd: /work',
+      '',
+    ].join('\n');
+    seed(row);
+
+    expect(dsh().detect('global').alreadyConfigured).toBe(true);
+    expect(dsh().install('global', { autoAllow: false }).files[0]).toEqual({ path: patchPath(), action: 'unchanged' });
+    refreshTargets([dsh()], 'global');
+
+    expect(read()).toBe(row);
+  });
+
+  it('a row merged into the user\'s insert list is found, and uninstall takes out only that row', () => {
+    const ours = [
+      '    - id: mcp-codegraph',
+      "      name: '@deepseek-ai/dsh-mcp-client'",
+      '      config:',
+      '        serverName: codegraph',
+      '        transport: stdio',
+      '        command: codegraph',
+      '        args: [serve, --mcp]',
+      '',
+    ].join('\n');
+    seed(`- insert:\n${USER_ROW}${ours}${USER_ROW.replace(/github/g, 'gitlab')}`);
+
+    dsh().install('global', { autoAllow: false });
+    expect(read().match(/serverName: codegraph/g)).toHaveLength(1);
+
+    dsh().uninstall('global');
+    expect(read()).toBe(`- insert:\n${USER_ROW}${USER_ROW.replace(/github/g, 'gitlab')}`);
+  });
+
+  it('a row written on one line is a row like any other', () => {
+    const flow = "    - { id: mcp-codegraph, name: '@deepseek-ai/dsh-mcp-client', config: { serverName: codegraph, transport: stdio, command: codegraph, args: [serve, --mcp] } }\n";
+    seed(`- insert:\n${USER_ROW}${flow}`);
+
+    expect(dsh().detect('global').alreadyConfigured).toBe(true);
+    dsh().install('global', { autoAllow: false });
+    expect(read()).toBe(`- insert:\n${USER_ROW}${flow}`);
+
+    dsh().uninstall('global');
+    expect(read()).toBe(`- insert:\n${USER_ROW}`);
+  });
+
+  it('a comment that mentions the server is not an entry', () => {
+    const content = "# serverName: codegraph\n- id: tool-bash\n  disabled: true\n";
+    seed(content);
+
+    expect(dsh().detect('global').alreadyConfigured).toBe(false);
+    dsh().install('global', { autoAllow: false });
+    expect(read()).toBe(`${content}\n${ENTRY}`);
+  });
+
+  it('a file that is not a block list stops the install with nothing changed', () => {
+    for (const content of ['[{ id: tool-bash, disabled: true }]\n', 'not: a list\n', '  - id: indented\n    disabled: true\n']) {
+      seed(content);
+      expect(() => dsh().install('global', { autoAllow: false }), content).toThrow(/Nothing was changed/);
+      expect(read()).toBe(content);
+    }
+  });
+
+  it('an entry in a form it can\'t edit is left alone, and uninstall says so', () => {
+    const content = "[{ insert: [{ id: mcp-codegraph, name: '@deepseek-ai/dsh-mcp-client', config: { serverName: codegraph } }] }]\n";
+    seed(content);
+
+    expect(dsh().detect('global').alreadyConfigured).toBe(true);
+    expect(dsh().install('global', { autoAllow: false }).files[0]).toEqual({ path: patchPath(), action: 'unchanged' });
+
+    const result = dsh().uninstall('global');
+    expect(result.files[0]).toEqual({ path: patchPath(), action: 'not-found' });
+    expect(result.notes?.join(' ')).toMatch(/Remove it from there yourself/);
+    expect(read()).toBe(content);
+  });
+
+  it('a row nested in a group is not mistaken for the group, and the group stays', () => {
+    const content = [
+      '- insert:',
+      '    - id: my-group',
+      '      name: group',
+      '      config:',
+      '        - id: mcp-codegraph',
+      "          name: '@deepseek-ai/dsh-mcp-client'",
+      '          config: { serverName: codegraph }',
+      '',
+    ].join('\n');
+    seed(content);
+
+    const result = dsh().uninstall('global');
+
+    expect(result.notes?.join(' ')).toMatch(/Remove it from there yourself/);
+    expect(read()).toBe(content);
+  });
+
+  it('an insert item with keys of its own stays when its only row is ours', () => {
+    const content = `${ENTRY}  note: mine\n`;
+    seed(content);
+
+    const result = dsh().uninstall('global');
+
+    expect(result.notes?.join(' ')).toMatch(/Remove it from there yourself/);
+    expect(read()).toBe(content);
+  });
+
+  it('a profile\'s own entry counts: nothing is added beside it, and uninstall removes it, keeping the file', () => {
+    const profile = profilePatch('web');
+    seed(`# my profile\n${ENTRY}`, profile);
+
+    expect(dsh().detect('global').alreadyConfigured).toBe(true);
+    const result = dsh().install('global', { autoAllow: false });
+    expect(result.files[0]).toEqual({ path: patchPath(), action: 'unchanged' });
+    expect(result.notes?.join(' ')).toMatch(/Left the CodeGraph entry in .*web/);
+    expect(fs.existsSync(patchPath())).toBe(false);
+
+    const removed = dsh().uninstall('global');
+    expect(removed.files.map((f) => f.path)).toContain(profile);
+    expect(read(profile)).toBe('# my profile\n[]\n');
+    expect(dsh().detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('a profile that was only emptied by uninstall keeps a valid file', () => {
+    const profile = profilePatch('web');
+    seed(ENTRY, profile);
+
+    dsh().uninstall('global');
+
+    expect(read(profile)).toBe('[]\n');
+  });
+
+  it('CRLF is kept', () => {
+    const content = '# mine\r\n- id: tool-bash\r\n  disabled: true\r\n';
+    seed(content);
+
+    dsh().install('global', { autoAllow: false });
+    expect(read()).toBe(`${content}\r\n${ENTRY.replace(/\n/g, '\r\n')}`);
+
+    dsh().uninstall('global');
+    expect(read()).toBe(content);
+  });
+
+  it('global only', () => {
+    expect(dsh().supportsLocation('local')).toBe(false);
+    expect(dsh().install('local', { autoAllow: false }).files).toEqual([]);
+    expect(dsh().uninstall('local').files).toEqual([]);
+    expect(dsh().describePaths('local')).toEqual([]);
+  });
+
+  it('printConfig prints the patch to paste', () => {
+    expect(dsh().printConfig('global')).toBe(`# Add to ${patchPath()}\n\n${ENTRY}`);
   });
 });
 

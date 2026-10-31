@@ -7,6 +7,7 @@
 import { Node, Edge, Context, Subgraph, EdgeKind } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from './traversal';
+import { findFileCycles } from './file-cycles';
 
 /**
  * Graph query manager for complex queries
@@ -219,48 +220,12 @@ export class GraphQueryManager {
   }
 
   /**
-   * Find circular dependencies in the graph
+   * Find circular imports between files
    *
-   * @returns Array of cycles, each cycle is an array of node IDs
+   * @returns Groups of files that all reach each other through imports, smallest first
    */
   findCircularDependencies(): string[][] {
-    const files = this.queries.getAllFiles();
-    const cycles: string[][] = [];
-    const visited = new Set<string>();
-    const recursionStack = new Set<string>();
-
-    const dfs = (filePath: string, path: string[]): void => {
-      if (recursionStack.has(filePath)) {
-        // Found a cycle
-        const cycleStart = path.indexOf(filePath);
-        if (cycleStart !== -1) {
-          cycles.push(path.slice(cycleStart));
-        }
-        return;
-      }
-
-      if (visited.has(filePath)) {
-        return;
-      }
-
-      visited.add(filePath);
-      recursionStack.add(filePath);
-
-      const dependencies = this.getFileDependencies(filePath);
-      for (const dep of dependencies) {
-        dfs(dep, [...path, filePath]);
-      }
-
-      recursionStack.delete(filePath);
-    };
-
-    for (const file of files) {
-      if (!visited.has(file.path)) {
-        dfs(file.path, []);
-      }
-    }
-
-    return cycles;
+    return findFileCycles(this.queries.getFileImportPairs());
   }
 
   /**

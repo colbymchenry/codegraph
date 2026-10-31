@@ -8,7 +8,7 @@ Thanks for helping out. Small, focused changes are the easiest to review and lan
 
 ## Build from source
 
-You need Git, npm, and Node.js 22.5 or later, below 25. Running from source uses Node's built-in `node:sqlite`; the published installers bundle their own Node, so this only matters here.
+You need Git, npm, and Node.js 22.12 or later, below 25. `npm ci` stops on anything older, because the build and test tools need it and running from source uses Node's built-in `node:sqlite`; the published installers bundle their own Node, so this only matters here.
 
 ```bash
 # Fork the repository on GitHub, then:

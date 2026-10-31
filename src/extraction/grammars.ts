@@ -487,6 +487,11 @@ function expandGrammarLanguages(languages: Language[]): Language[] {
   if (languages.some((l) => l === 'cfml')) {
     languages = [...languages, 'cfscript', 'cfquery'];
   }
+  // A view's `@code` blocks are C#, its `<script>` blocks JavaScript or
+  // TypeScript. A sync that re-reads only a view loads what the view needs.
+  if (languages.includes('razor')) {
+    languages = [...languages, 'csharp', 'typescript', 'javascript'];
+  }
   return languages;
 }
 
@@ -843,6 +848,15 @@ export function isGrammarLoaded(language: Language): boolean {
  */
 export function isFileLevelOnlyLanguage(language: Language): boolean {
   return language === 'yaml' || language === 'twig' || language === 'properties';
+}
+
+/**
+ * Whether files of this language are expected to yield symbols, so that a
+ * language with none is news. Not so for the file-level languages, nor for
+ * `xml`, where only MyBatis mappers yield anything.
+ */
+export function yieldsSymbols(language: Language): boolean {
+  return !isFileLevelOnlyLanguage(language) && language !== 'xml' && language !== 'unknown';
 }
 
 /**
