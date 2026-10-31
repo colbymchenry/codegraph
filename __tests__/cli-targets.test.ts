@@ -12,6 +12,7 @@ import * as path from 'path';
 import * as os from 'os';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
+const PREUNINSTALL = path.resolve(__dirname, '../dist/bin/uninstall.js');
 
 interface RunResult {
   status: number;
@@ -35,9 +36,9 @@ describe('codegraph targets', () => {
   const targetsFile = () => path.join(home, 'targets.json');
 
   /** Run the CLI with stdin closed, so a prompt would fail instead of hang. */
-  function run(args: string[]): RunResult {
+  function run(args: string[], script = BIN): RunResult {
     try {
-      const stdout = execFileSync(process.execPath, [BIN, ...args], {
+      const stdout = execFileSync(process.execPath, [script, ...args], {
         cwd,
         encoding: 'utf-8',
         env: {
@@ -144,6 +145,17 @@ describe('codegraph targets', () => {
 
     const removed = run(['uninstall', '--yes', '--target', 'zcode', '--keep-cli']);
     expect(removed.status, removed.out).toBe(0);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it('the npm preuninstall cleanup takes out a registered target\'s global entry', () => {
+    expect(run(['targets', 'add', JSON.stringify(SPEC)]).status).toBe(0);
+    const file = path.join(home, '.zcode', 'cli', 'config.json');
+    expect(run(['install', '--yes', '--target', 'zcode']).status).toBe(0);
+    expect(fs.existsSync(file)).toBe(true);
+
+    const cleaned = run([], PREUNINSTALL);
+    expect(cleaned.status, cleaned.out).toBe(0);
     expect(fs.existsSync(file)).toBe(false);
   });
 
