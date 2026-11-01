@@ -71,17 +71,20 @@ const MAX_HUNK_LINES = 24;
 const MAX_FILE_LINES = 200;
 
 /**
- * Room for `git diff --unified=0` on a large diff. spawnSync's default is
- * 1 MiB, and an overflow makes `runGit` return null.
+ * Room for `git diff --unified=0` on a large diff, or `git show` of a large
+ * file. spawnSync's default is 1 MiB, and an overflow makes `runGit` return
+ * null.
  */
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
 /**
  * Run git in `root` and return its stdout, or null when git fails (not a
  * repository, an unknown ref, a missing path). `core.quotePath=false` keeps
- * non-ASCII names unescaped, so they match the index's paths.
+ * non-ASCII names unescaped, so they match the index's paths. `codegraph
+ * orphans` also reads the merge base and pre-image files through it; callers
+ * refuse a ref beginning with `-` before it gets here.
  */
-function runGit(root: string, args: string[]): string | null {
+export function runGit(root: string, args: string[]): string | null {
   const res = spawnSync('git', ['-c', 'core.quotePath=false', ...args], {
     cwd: root,
     encoding: 'utf8',
