@@ -25,7 +25,7 @@ import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, ma
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
-import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
+import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances, swiftExtensionOnlyNames, swiftUnresolvedTypeMemberEdges, resolveSwiftQualifiedSupertype } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
 import {
@@ -374,6 +374,14 @@ export class ReferenceResolver {
   private supertypeNodeMemo = new Map<string, { gen: number; nodes: Node[] }>();
   // getSuperclassNodes' memo (`extends` edges alone), the same way.
   private superclassNodeMemo = new Map<string, { gen: number; nodes: Node[] }>();
+  // getUnresolvedSupertypeNames' answers for every node, from one query on
+  // first use; dropped in clearCaches. Not generation-tagged like the memos
+  // above: the rows it reads are `extends`/`implements` references, which
+  // resolve and persist before any reference that asks (they are
+  // prerequisites), so they do not change while it is held. A per-node read
+  // was a full scan of unresolved_refs each time: the batched loop drops
+  // idx_unresolved_from_node (DatabaseConnection.BULK_REF_INDEX_NAMES).
+  private unresolvedSupertypeNames: Map<string, string[]> | null = null;
 
   /** Invalidate the getSupertypes memo — call when resolved edges may have advanced. */
   private advanceSupertypeGeneration(): void {
@@ -680,6 +688,7 @@ export class ReferenceResolver {
     this.supertypeMemo.clear();
     this.supertypeNodeMemo.clear();
     this.superclassNodeMemo.clear();
+    this.unresolvedSupertypeNames = null;
     this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
@@ -1097,6 +1106,27 @@ export class ReferenceResolver {
         }
         this.superclassNodeMemo.set(id, { gen: this.supertypeGen, nodes });
         return nodes;
+      },
+
+      getUnresolvedSupertypeNames: (id: string) => {
+        if (!this.unresolvedSupertypeNames) {
+          // One read keyed by the names the project only extends (the only
+          // names the Swift walk maps to anything), inverted to the
+          // referencing node; each node's names in name order.
+          const byId = new Map<string, string[]>();
+          const sources = this.queries.getUnresolvedReferenceSourcesNamed(
+            swiftExtensionOnlyNames(this.context), ['extends', 'implements']);
+          for (const [name, fromIds] of sources) {
+            for (const fromId of fromIds) {
+              const names = byId.get(fromId);
+              if (names) names.push(name);
+              else byId.set(fromId, [name]);
+            }
+          }
+          for (const names of byId.values()) names.sort();
+          this.unresolvedSupertypeNames = byId;
+        }
+        return this.unresolvedSupertypeNames.get(id) ?? [];
       },
 
       getImportMappings: (filePath: string, language) => {
@@ -1748,6 +1778,15 @@ export class ReferenceResolver {
     const rustBound = matchRustUseBoundName(ref, this.context);
     if (rustBound !== undefined) return this.gateLanguage(rustBound, ref);
 
+    // A qualified Swift inheritance entry (`class QC: Kit.Runner`) carries its
+    // dotted path; no declaration is named `Kit.Runner`, so the pre-filter
+    // below would drop it. It is the type that path names or nothing, as with
+    // CFML's component paths above: no fallthrough on a miss, since a name
+    // match on the last segment can only guess past the qualifier.
+    if (ref.language === 'swift' && isInheritanceRef(ref) && ref.referenceName.includes('.')) {
+      return this.gateLanguage(resolveSwiftQualifiedSupertype(ref, this.context), ref);
+    }
+
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
     // necessary because re-export rename chains (`import { login }
@@ -2247,10 +2286,16 @@ export class ReferenceResolver {
     // invariant in status form: after a COMPLETED pass nothing it processed
     // is still 'pending', so any pending row at rest belongs to an
     // interrupted run and the sweep can key off the pending count.
+    // A Swift `Type.member()` failure whose member is external still gets a
+    // `references` edge to the project type (swiftUnresolvedTypeMemberEdges);
+    // its row is parked failed all the same.
     if (result.unresolved.length > 0) {
-      const { byRowId, legacyKeys } = ReferenceResolver.partitionFailedCleanup(this.nonDeferredFailures(result.unresolved));
+      const failures = this.nonDeferredFailures(result.unresolved);
+      const { byRowId, legacyKeys } = ReferenceResolver.partitionFailedCleanup(failures);
       this.queries.markReferencesFailedByRowIds(byRowId);
       this.queries.markReferencesFailed(legacyKeys);
+      const typeMemberEdges = swiftUnresolvedTypeMemberEdges(failures, this.context);
+      if (typeMemberEdges.length > 0) this.queries.insertEdges(typeMemberEdges);
     }
 
     return result;
@@ -2261,8 +2306,10 @@ export class ReferenceResolver {
    * ref list — used by sync's failed-ref retry pass (#1240). Same persistence
    * semantics: resolved refs become edges and their rows are deleted;
    * still-unresolvable refs are (re-)marked failed (a no-op for rows already
-   * in that status). Yields per-ref because sync can run on the daemon's
-   * liveness-watchdog thread (#850/#1091) and a retry set is unbounded when
+   * in that status), and a Swift `Type.member()` failure whose member is
+   * external also gets a `references` edge to the project type
+   * (swiftUnresolvedTypeMemberEdges). Yields per-ref because sync can run on
+   * the daemon's liveness-watchdog thread (#850/#1091) and a retry set is unbounded when
    * a large edit lands many popular symbol names at once.
    */
   async resolveAndPersistListYielding(refs: UnresolvedReference[]): Promise<ResolutionResult> {
@@ -2296,13 +2343,21 @@ export class ReferenceResolver {
       await maybeYield();
     }
 
-    const failedCleanup = ReferenceResolver.partitionFailedCleanup(this.nonDeferredFailures(result.unresolved));
+    const failures = this.nonDeferredFailures(result.unresolved);
+    const failedCleanup = ReferenceResolver.partitionFailedCleanup(failures);
     for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {
       this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK));
       await maybeYield();
     }
     for (let i = 0; i < failedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
       this.queries.markReferencesFailed(failedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
+      await maybeYield();
+    }
+    // A Swift `Type.member()` failure whose member is external: a `references`
+    // edge to the project type, alongside its failed row.
+    const typeMemberEdges = swiftUnresolvedTypeMemberEdges(failures, this.context);
+    for (let i = 0; i < typeMemberEdges.length; i += PERSIST_CHUNK) {
+      this.queries.insertEdges(typeMemberEdges.slice(i, i + PERSIST_CHUNK));
       await maybeYield();
     }
 
@@ -2986,7 +3041,10 @@ export class ReferenceResolver {
       // Park unresolvable refs from this batch as status='failed' so they
       // leave the pending set (the batch reader and non-progress guard below
       // only see pending rows) but stay retryable when a later sync adds a
-      // symbol that could satisfy them (#1240).
+      // symbol that could satisfy them (#1240). A Swift `Type.member()`
+      // failure whose member is external also gets a `references` edge to the
+      // project type (swiftUnresolvedTypeMemberEdges); its row is parked all
+      // the same.
       tLp = Date.now();
       const failures = this.nonDeferredFailures(result.unresolved);
       const deferredCount = result.unresolved.length - failures.length;
@@ -2997,6 +3055,11 @@ export class ReferenceResolver {
       }
       for (let i = 0; i < failedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
         removedThisBatch += this.queries.markReferencesFailed(failedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
+      }
+      const typeMemberEdges = swiftUnresolvedTypeMemberEdges(failures, this.context);
+      for (let i = 0; i < typeMemberEdges.length; i += PERSIST_CHUNK) {
+        this.queries.insertEdges(typeMemberEdges.slice(i, i + PERSIST_CHUNK));
         await maybeYield();
       }
       lp('marks', tLp);

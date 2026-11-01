@@ -171,21 +171,46 @@ export interface ResolutionContext {
   /**
    * Direct supertypes of the type named `typeName` (same language): the classes
    * it extends and the interfaces / protocols / traits it implements/conforms to,
-   * by simple name. Backed by the resolved `implements`/`extends` edges, so it is
-   * EMPTY during the first resolution pass (edges aren't built yet) and populated
-   * afterward — the conformance pass uses it to resolve a chained method defined
-   * on a supertype the receiver type conforms to (e.g. a protocol-extension
-   * method). Optional so external/test contexts compile without it.
+   * by simple name. Backed by the resolved `implements`/`extends` edges, plus,
+   * for Swift, the conformances a declaration names to types the project only
+   * extends (swiftExtendedConformances, read from the source). Every
+   * resolution path (one set, a list, the batched loop) resolves and persists
+   * the prerequisite references (ReferenceResolver.isPrerequisite: `imports`,
+   * `extends` and `implements`, together) before the dependent kinds, so a
+   * dependent reference such as a `calls` one sees these edges complete; a
+   * prerequisite reference, while the prerequisites resolve, may see some of
+   * them still missing. The conformance pass uses it to
+   * resolve a chained method defined on a supertype the receiver type conforms
+   * to (e.g. a protocol-extension method). Optional so external/test contexts
+   * compile without it.
    */
   getSupertypes?(typeName: string, language: Language): string[];
   /**
    * The nodes one type declaration extends or implements, through its own
    * resolved `implements`/`extends` edges: where getSupertypes unions those of
    * every type sharing a simple name, this is the supertypes of the node
-   * `id`. Empty during the first resolution pass, as getSupertypes is.
-   * Optional so external/test contexts compile without it.
+   * `id`. Complete for a dependent (non-prerequisite) reference and possibly
+   * partial for a prerequisite one (`imports`, `extends`, `implements`), as
+   * getSupertypes' edges are. Optional so external/test contexts compile
+   * without it.
    */
   getSupertypeNodes?(id: string): Node[];
+  /**
+   * The names the node `id` extends or implements that resolved to no node
+   * and that the project's Swift nodes only extend (swiftExtensionOnlyNames):
+   * its `extends`/`implements` references to those names still in the
+   * unresolved table, in name order. A Swift conformance to a type the project
+   * only extends (`struct HV: View` with `extension View {}` and no
+   * declaration of `View`) leaves no edge, because an extension is not the
+   * type, so getSupertypeNodes cannot see it; this name is the only record of
+   * it, and the Swift supertype walk maps it to the project's extensions of
+   * that name so their members still reach the conformer. A failed reference
+   * to any other name gives that walk nothing, so it is not read. Read for
+   * every node at once on first use and held until the resolver's caches are
+   * cleared: the references it reads are prerequisites, settled before any
+   * reference that asks. Optional so external/test contexts compile without it.
+   */
+  getUnresolvedSupertypeNames?(id: string): string[];
   /**
    * The classes one class declaration extends, through its own resolved
    * `extends` edges alone: the parent a `super.m()` call reaches, never an
