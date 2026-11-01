@@ -298,7 +298,8 @@ function moduleConfigEntry(abs: string, previous: string | undefined, projectRoo
   try {
     stat = fs.statSync(abs, { throwIfNoEntry: false });
   } catch { /* a file that can't be looked at is not there */ }
-  if (!stat) return 'absent';
+  // (A FIFO under one of these names would park the read.)
+  if (!stat?.isFile()) return 'absent';
   const stamp = `${stat.mtimeMs}:${stat.size}`;
   return previous?.endsWith(`@${stamp}`) ? previous : `${moduleConfigDigest(abs, projectRoot)}@${stamp}`;
 }
@@ -3369,7 +3370,8 @@ export class ReferenceResolver {
       ...this.context,
       readFile: (filePath: string) => {
         try {
-          return fs.readFileSync(path.join(this.projectRoot, filePath), 'utf-8');
+          const abs = path.join(this.projectRoot, filePath);
+          return fs.statSync(abs).isFile() ? fs.readFileSync(abs, 'utf-8') : null;
         } catch {
           return null;
         }

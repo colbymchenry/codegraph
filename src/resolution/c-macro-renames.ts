@@ -7,23 +7,26 @@
  * A macro with no parameters gets no node, so only the source says what one
  * does. Headers are read once per resolver, in one pass over their `define`s,
  * into an index by macro name: a name no header renames costs one lookup,
- * however many files write it. A vendor's register maps can run to hundreds of
- * megabytes, so the pass stops at a budget, past which a name is left as written.
- * A source file is read when a name in it is asked about. A rename counts
- * where the translation unit from the asking file has certainly defined
- * it by that line (isCppMacroDefinedAt): a macro under a flag no file sets, or
- * written further down, renames nothing. Two renames of one name that disagree
- * (`#ifdef` arms) say nothing either.
+ * however many files write it. So are the source files something includes
+ * (`#include "impl.c"`), which reach their includers as a header does. A
+ * vendor's register maps can run to hundreds of megabytes, so the pass stops at
+ * a budget, past which a name is left as written. Any other source file reaches
+ * itself alone, so it is read when a name in it is asked about, for its own
+ * answers: the index is fixed once built, and no answer depends on which files
+ * have asked. A rename counts where the translation unit from the asking file
+ * has certainly defined it by that line (isCppMacroDefinedAt): a macro under a
+ * flag no file sets, or written further down, renames nothing. Two renames of
+ * one name that disagree (`#ifdef` arms) say nothing either.
  */
 import type { ResolutionContext, UnresolvedRef } from './types';
-import { cppIncluders } from './cpp-includers';
+import { cppIncludedSources, cppIncluders } from './cpp-includers';
 import { directiveLines, isCppMacroDefinedAt } from './cpp-macro-visibility';
 
 interface Memo {
-  /** Macro name → the files with a `#define` of it to one name. */
+  /** Macro name → the headers and included source files with a `#define` of it to one name. */
   byName: Map<string, string[]>;
-  /** The source files read so far. */
-  sources: Set<string>;
+  /** A source file asked about → the names it renames itself. */
+  own: Map<string, ReadonlySet<string>>;
   /** `file\0name` → what the name is renamed to there (null: nothing). */
   answers: Map<string, string | null>;
 }
@@ -35,7 +38,7 @@ export function clearCMacroRenames(context: ResolutionContext): void {
 }
 
 const HEADER_FILE = /\.(?:h|hh|hpp|hxx)$/i;
-/** Characters of headers one resolver reads for renames: redis has 2 MB, rocksdb 9 MB, betaflight 109 MB. */
+/** Characters of the index one resolver reads for renames: redis has 2 MB of headers, rocksdb 9 MB, betaflight 109 MB. */
 const HEADER_SCAN_BUDGET = 16_000_000;
 /** `#define sds hisds`, with a comment after it or none. */
 const RENAME_LINE = /^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+([A-Za-z_]\w*)[ \t]*(?:\/[/*].*)?\r?$/;
@@ -60,16 +63,37 @@ function memoFor(context: ResolutionContext): Memo {
   if (memo) return memo;
   const byName = new Map<string, string[]>();
   let budget = HEADER_SCAN_BUDGET;
-  for (const file of context.getAllFiles()) {
-    if (budget <= 0) break;
-    if (!HEADER_FILE.test(file)) continue;
+  const read = (file: string): void => {
     const source = context.readFile(file);
-    if (!source) continue;
+    if (!source) return;
     index(file, source, byName);
     budget -= source.length;
+  };
+  for (const file of context.getAllFiles()) {
+    if (budget <= 0) break;
+    if (HEADER_FILE.test(file)) read(file);
   }
-  MEMO.set(context, (memo = { byName, sources: new Set(), answers: new Map() }));
+  for (const file of cppIncludedSources(context)) {
+    if (budget <= 0) break;
+    if (!HEADER_FILE.test(file)) read(file);
+  }
+  MEMO.set(context, (memo = { byName, own: new Map(), answers: new Map() }));
   return memo;
+}
+
+const NO_NAMES: ReadonlySet<string> = new Set();
+const NO_FILES: readonly string[] = [];
+
+/** What the source file `file` renames itself. */
+function ownRenames(file: string, memo: Memo, context: ResolutionContext): ReadonlySet<string> {
+  let own = memo.own.get(file);
+  if (!own) {
+    const names = new Map<string, string[]>();
+    index(file, context.readFile(file) ?? '', names);
+    own = names.size > 0 ? new Set(names.keys()) : NO_NAMES;
+    memo.own.set(file, own);
+  }
+  return own;
 }
 
 /** The one name `name` is renamed to at `line` of `file`, by the file or by what it includes. */
@@ -81,17 +105,14 @@ export function cMacroRename(
   context: ResolutionContext
 ): string | null {
   const memo = memoFor(context);
-  if (!HEADER_FILE.test(file) && !memo.sources.has(file)) {
-    memo.sources.add(file);
-    index(file, context.readFile(file) ?? '', memo.byName);
-  }
-  const files = memo.byName.get(name);
-  if (!files) return null;
+  const indexed = memo.byName.get(name) ?? NO_FILES;
+  const own = !HEADER_FILE.test(file) && ownRenames(file, memo, context).has(name);
+  if (!own && indexed.length === 0) return null;
   const key = `${file}\0${name}`;
   let renamed = memo.answers.get(key);
   if (renamed === undefined) {
     const renames = new Set<string>();
-    for (const candidate of files) {
+    for (const candidate of own && !indexed.includes(file) ? [file, ...indexed] : indexed) {
       if (candidate !== file && !cppIncluders(candidate, context).has(file)) continue;
       for (const directive of directiveLines(context.readFile(candidate) ?? '')) {
         const m = RENAME_LINE.exec(directive);
