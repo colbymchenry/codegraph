@@ -65,11 +65,15 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
     env: Record<string, string>,
     body: string,
     hardTimeoutMs: number,
-    progressPaths?: string[]
+    progressPaths?: string[],
+    killRecordPath?: string
   ): Promise<{ code: number | null; signal: NodeJS.Signals | 'TIMEOUT' | null }> {
+    const options: { progressPaths?: string[]; killRecordPath?: string } = {};
+    if (progressPaths) options.progressPaths = progressPaths;
+    if (killRecordPath) options.killRecordPath = killRecordPath;
     const src = `
       const { installMainThreadWatchdog } = require(${JSON.stringify(MODULE)});
-      installMainThreadWatchdog(${progressPaths ? JSON.stringify({ progressPaths }) : ''});
+      installMainThreadWatchdog(${JSON.stringify(options)});
       ${body}
     `;
     const child = spawn(process.execPath, ['-e', src], {
@@ -211,6 +215,41 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
     ]);
     expectKilled(r);
   }, 20000);
+
+  // --- kill record (#3137): a kill must outlive the killed process, so a fresh
+  // one can see it and refuse to repeat the work that wedged. ---
+
+  it('records the kill so a fresh process can see it (#3137)', async () => {
+    const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cg-wdk-'));
+    progressDirs.push(dir);
+    const record = path.join(dir, 'watchdog-kills.jsonl');
+    const r = await runChild(
+      { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '500' },
+      'setTimeout(() => { while (true) {} }, 150);',
+      8000,
+      undefined,
+      record
+    );
+    expectKilled(r);
+    const lines = fs.readFileSync(record, 'utf8').trim().split('\n');
+    expect(lines).toHaveLength(1);
+    expect(Number(lines[0])).toBeGreaterThan(Date.now() - 60_000);
+  }, 12000);
+
+  it('does not record anything when the process exits on its own', async () => {
+    const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cg-wdk-'));
+    progressDirs.push(dir);
+    const record = path.join(dir, 'watchdog-kills.jsonl');
+    const r = await runChild(
+      { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '500' },
+      'setTimeout(() => process.exit(0), 700);',
+      8000,
+      undefined,
+      record
+    );
+    expect(r).toEqual({ code: 0, signal: null });
+    expect(fs.existsSync(record)).toBe(false);
+  }, 12000);
 
   it('does NOT kill a wedged process when CODEGRAPH_NO_WATCHDOG=1', async () => {
     const { code, signal } = await runChild(

@@ -28,6 +28,19 @@
  * the parent exits normally the pipe closes and the child exits too (no
  * orphan).
  *
+ * **A kill outlives the killed process (#3137).** The restart is driven by the
+ * MCP client's next connection, not by this process, so a break in the loop has
+ * to be visible to a FRESH one. When armed with a project (`killRecordPath`),
+ * the child appends the kill's timestamp to `.codegraph/watchdog-kills.jsonl`
+ * before it `SIGKILL`s. The automatic restart path reads that record
+ * ({@link watchdogKillRefusal}): after
+ * {@link WATCHDOG_KILL_TRIP_LIMIT} kills inside
+ * {@link WATCHDOG_KILL_TRIP_WINDOW_MS} it starts no new daemon and no in-process
+ * fallback, and answers tool calls with the reason instead of repeating work
+ * that just wedged the process. The kill conditions are unchanged — a real
+ * wedge still dies — and the record ages out on its own, so the pause lifts as
+ * soon as the streak leaves the window.
+ *
  * **Won't fire on real work.** Heavy parsing runs in the parse worker
  * (off-thread) and the daemon's indexing shells out to a child process, so the
  * daemon's main thread mostly does fast, bounded work; the exception, a sync
@@ -65,10 +78,22 @@
  */
 import * as fs from 'fs';
 import * as os from 'os';
+import * as path from 'path';
 import { spawn, ChildProcess } from 'child_process';
+import { getCodeGraphDir } from '../directory';
 
 /** Default: 60s — ~300× shorter than the 5h #850 wedge, far longer than any real main-thread block. */
 export const DEFAULT_WATCHDOG_TIMEOUT_MS = 60_000;
+
+/**
+ * Kills inside {@link WATCHDOG_KILL_TRIP_WINDOW_MS} that stop the automatic
+ * restart path (#3137). Low enough to break a crash loop after three restarts,
+ * high enough that unrelated one-off wedges in a busy day never trip it.
+ */
+export const WATCHDOG_KILL_TRIP_LIMIT = 3;
+
+/** Sliding window the kill record is counted over; also the pause's length. */
+export const WATCHDOG_KILL_TRIP_WINDOW_MS = 10 * 60_000;
 
 /**
  * Hard cap on disk-progress deferral: after this many timeouts' worth of
@@ -109,6 +134,49 @@ export function deriveCheckIntervalMs(timeoutMs: number): number {
   return Math.min(2000, Math.max(50, Math.round(timeoutMs / 5)));
 }
 
+/** `<project>/.codegraph/watchdog-kills.jsonl` — one kill timestamp per line. */
+export function watchdogKillRecordPath(root: string): string {
+  return path.join(getCodeGraphDir(root), 'watchdog-kills.jsonl');
+}
+
+/**
+ * Kills recorded inside {@link WATCHDOG_KILL_TRIP_WINDOW_MS}. Read-only and
+ * never throws: a missing, unreadable or malformed record is "no kills".
+ */
+export function recentWatchdogKills(recordPath: string, now: number = Date.now()): number {
+  let raw: string;
+  try { raw = fs.readFileSync(recordPath, 'utf8'); } catch { return 0; }
+  const cutoff = now - WATCHDOG_KILL_TRIP_WINDOW_MS;
+  let kills = 0;
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const at = Number(trimmed);
+    if (Number.isFinite(at) && at >= cutoff && at <= now) kills++;
+  }
+  return kills;
+}
+
+/**
+ * The client-facing refusal when this project's worker was killed by the
+ * watchdog repeatedly, or `null` while automatic restarts may proceed (#3137).
+ * The caller refuses to spawn a daemon or build the in-process fallback and
+ * hands this text to the client, so the same work is not re-run.
+ */
+export function watchdogKillRefusal(root: string, now: number = Date.now()): string | null {
+  const recordPath = watchdogKillRecordPath(root);
+  const kills = recentWatchdogKills(recordPath, now);
+  if (kills < WATCHDOG_KILL_TRIP_LIMIT) return null;
+  const minutes = Math.round(WATCHDOG_KILL_TRIP_WINDOW_MS / 60_000);
+  const logPath = path.join(path.dirname(recordPath), 'daemon.log');
+  return (
+    `CodeGraph is paused for this project: the liveness watchdog killed its MCP worker ${kills} ` +
+    `times in the last ${minutes} minutes, so starting another would repeat the same work. Check ` +
+    `${logPath} and the project's index, then retry in at most ${minutes} minutes — the pause lifts ` +
+    `on its own. To reset it now, delete ${recordPath}.`
+  );
+}
+
 /** Arming/teardown diagnostics, gated on the existing MCP debug switch. */
 function debug(msg: string): void {
   if (process.env.CODEGRAPH_MCP_DEBUG) {
@@ -133,9 +201,13 @@ const fs = require('fs');
 const parentPid = Number(process.argv[1]);
 const timeoutMs = Number(process.argv[2]);
 const capMs = Number(process.argv[3]);
-const progressPaths = process.argv.slice(4);
+const recordPath = process.argv[4];
+const progressPaths = process.argv.slice(5);
 const secs = Math.round(timeoutMs / 1000);
 function kill(extra) {
+  // #3137: the restarted process is not our child, so the kill must outlive us.
+  // Append before killing: a fresh process reads this to refuse the same work.
+  if (recordPath) { try { fs.appendFileSync(recordPath, Date.now() + '\\n'); } catch (e) {} }
   // Timestamped so daemon.log kills can be correlated with anything (#1431) —
   // computed here at kill time; this child process is never the wedged one.
   try { fs.writeSync(2, Buffer.from('[' + new Date().toISOString() + '] [CodeGraph] Main thread unresponsive for ~' + secs + 's' + (extra || '') + ' — killing the wedged process so a fresh one can start (#850). Disable with CODEGRAPH_NO_WATCHDOG=1.\\n')); } catch (e) {}
@@ -192,6 +264,13 @@ export interface WatchdogOptions {
    * {@link addWatchdogProgressPaths}; with neither, a silent timeout kills.
    */
   progressPaths?: string[];
+  /**
+   * When set, each kill appends its timestamp here first so a FRESH process can
+   * see it and refuse to repeat the same work (#3137). The automatic restart
+   * path reads it through {@link watchdogKillRefusal}. Without it the child
+   * behaves exactly as before.
+   */
+  killRecordPath?: string;
 }
 
 /**
@@ -251,7 +330,13 @@ interface WatchdogChild {
 }
 
 /** Spawn a watchdog child for `paths`, or null when it can't be spawned. */
-function spawnWatchdogChild(timeoutMs: number, checkMs: number, capMs: number, paths: readonly string[]): WatchdogChild | null {
+function spawnWatchdogChild(
+  timeoutMs: number,
+  checkMs: number,
+  capMs: number,
+  paths: readonly string[],
+  killRecordPath?: string
+): WatchdogChild | null {
   let child: ChildProcess;
   try {
     // No execArgv inheritance (unlike Worker), so the child carries none of our
@@ -259,7 +344,7 @@ function spawnWatchdogChild(timeoutMs: number, checkMs: number, capMs: number, p
     // fd 2 so the kill notice lands wherever the parent logs (daemon.log).
     child = spawn(
       process.execPath,
-      ['-e', CHILD_SOURCE, String(process.pid), String(timeoutMs), String(capMs), ...paths],
+      ['-e', CHILD_SOURCE, String(process.pid), String(timeoutMs), String(capMs), killRecordPath ?? '', ...paths],
       {
         stdio: ['pipe', 'ignore', 'inherit'],
         windowsHide: true,
@@ -318,7 +403,7 @@ export function installMainThreadWatchdog(options: WatchdogOptions = {}): Watchd
   const armedPaths = options.progressPaths ?? [];
   const watchedPaths = (): string[] => [...new Set([...armedPaths, ...addedProgressPaths.keys()])];
 
-  let current = spawnWatchdogChild(timeoutMs, checkMs, capMs, watchedPaths());
+  let current = spawnWatchdogChild(timeoutMs, checkMs, capMs, watchedPaths(), options.killRecordPath);
   if (!current) return null;
 
   // Heartbeat: a byte per tick. When the main thread wedges, these stop and the
@@ -340,7 +425,7 @@ export function installMainThreadWatchdog(options: WatchdogOptions = {}): Watchd
     if (!current) return;
     const paths = watchedPaths();
     if (paths.length === current.paths.length && paths.every((p) => current!.paths.includes(p))) return;
-    const next = spawnWatchdogChild(timeoutMs, checkMs, capMs, paths);
+    const next = spawnWatchdogChild(timeoutMs, checkMs, capMs, paths, options.killRecordPath);
     if (!next) return;
     const previous = current;
     current = next;
