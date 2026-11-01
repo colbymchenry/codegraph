@@ -44,6 +44,8 @@ type Cache = {
   byBasename: Map<string, string[]> | null;
   /** Per root file: macro name → define/undef events in root-file line order. */
   roots: Map<string, Timeline>;
+  /** Per root file and macro: the timeline of that macro alone (isCppMacroDefinedAt). */
+  watched: Map<string, Timeline>;
 };
 
 const memo = new WeakMap<ResolutionContext, Cache>();
@@ -95,10 +97,32 @@ export function isVisibleCppMacro(ref: UnresolvedRef, context: ResolutionContext
   return before.length > 0 && before[before.length - 1]!.defined === true;
 }
 
+/**
+ * Is `name` certainly defined as a macro at `line` of `file`, read as a
+ * translation unit? A `#define` under a flag no file sets is not: redis's
+ * `#define RedisModuleString robj` holds in the core, which sets
+ * REDISMODULE_CORE, and not in a module that includes the same header.
+ */
+export function isCppMacroDefinedAt(
+  name: string,
+  file: string,
+  line: number,
+  language: UnresolvedRef['language'],
+  context: ResolutionContext
+): boolean {
+  const cache = cacheFor(context);
+  const key = `${language}\0${file}\0${name}`;
+  let timeline = cache.watched.get(key);
+  if (!timeline) cache.watched.set(key, (timeline = walkTranslationUnit(file, language, context, cache, name)));
+  if (line >= timeline.cutoff) return false;
+  const before = (timeline.events.get(name) ?? []).filter((e) => e.line <= line);
+  return before.length > 0 && before[before.length - 1]!.defined === true;
+}
+
 function cacheFor(context: ResolutionContext): Cache {
   let cache = memo.get(context);
   if (!cache) {
-    cache = { summaries: new Map(), includes: new Map(), byBasename: null, roots: new Map() };
+    cache = { summaries: new Map(), includes: new Map(), byBasename: null, roots: new Map(), watched: new Map() };
     memo.set(context, cache);
   }
   return cache;
@@ -261,7 +285,9 @@ function walkTranslationUnit(
   rootFile: string,
   language: UnresolvedRef['language'],
   context: ResolutionContext,
-  cache: Cache
+  cache: Cache,
+  // Follow this macro alone, and whether it is defined, not whether it is function-like.
+  watched?: string
 ): Timeline {
   const timeline = new Map<string, Event[]>();
   const definitions = new Map<string, { defined: Truth; value: Truth; macro: Truth }>();
@@ -362,9 +388,9 @@ function walkTranslationUnit(
         macroNames.add(ev.name);
         version++;
       }
-      if (macroNames.has(ev.name)) {
+      if (watched === undefined ? macroNames.has(ev.name) : ev.name === watched) {
         const events = timeline.get(ev.name) ?? [];
-        events.push({ line, defined: now });
+        events.push({ line, defined: watched === undefined ? now : next.defined });
         timeline.set(ev.name, events);
       }
     }

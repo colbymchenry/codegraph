@@ -63,6 +63,7 @@ import {
   stripCppTemplateArguments,
   type CppNamedType,
 } from './cpp-type-aliases';
+import { cMacroRename } from './c-macro-renames';
 import { cppIncluders } from './cpp-includers';
 import { cppMacroNamespaceFrames, cppNamespaceAliases } from './cpp-namespaces';
 import { stripCommentsForRegex } from './strip-comments';
@@ -172,7 +173,10 @@ export function matchCppDeclaredType(ref: UnresolvedRef, context: ResolutionCont
     parameters: cppTemplateParameters(holder, context),
     declared: true,
   };
-  const found = cppClassWritten(ref.referenceName, site, ref, context);
+  // A macro the file sees can rename the type (`#define sds hisds`), and a type
+  // the new name doesn't reach is left as written.
+  const renamed = cMacroRename(ref.referenceName, site.file, ref.line, ref.language, context);
+  const found = (renamed && cppClassWritten(renamed, site, ref, context)) || cppClassWritten(ref.referenceName, site, ref, context);
   const node = found === undefined ? definedByIncluder(ref.referenceName, site, context) : found?.node;
   if (!node || node.id === holder.id) return null;
   return found?.exact
