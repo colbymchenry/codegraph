@@ -66,6 +66,14 @@ export interface WorkspacePackages {
    * npm package for everyone else. The root manifest's are in `byName`.
    */
   scopedByName?: Map<string, Map<string, string>>;
+  /**
+   * Folders below the root whose package.json declares `workspaces` of its
+   * own: a monorepo inside the repository, with an install of its own. Its
+   * files see neither the root's packages nor the root's globals: react's
+   * `compiler/` runs on an npm `react` and on `@types/jest`, not on
+   * `packages/react` and `scripts/jest`.
+   */
+  nestedRoots?: string[];
 }
 
 /**
@@ -81,6 +89,8 @@ export interface PackageEntries {
    * `null` (not exported) holds no target.
    */
   exports?: Map<string, string[]>;
+  /** What the same keys' `browser` condition names, for those that have one. */
+  browser?: Map<string, string[]>;
   /**
    * The package root's `source`, `module`, `main`, `types` and `typings`
    * fields, read after `exports` (as TypeScript's older `node` resolution
@@ -97,6 +107,8 @@ export interface WorkspaceImportTargets {
    * its `main`-style fields.
    */
   declared: string[];
+  /** The entries the package declares for a browser (a `browser` condition), best first. */
+  browser: string[];
   /** The package's directory plus the import's subpath (`packages/ui/widgets`), extension-less. */
   directory: string;
   /** The package's directory. */
@@ -136,7 +148,7 @@ export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | 
   // (`import { CartRepository } from "data"`). Same monorepo problem as npm
   // workspaces, different manifest. An npm package does the same with
   // `"acme-shared": "file:../common"` and no root `workspaces` (#2456).
-  const { ohpm, npm } = collectPathDeps(projectRoot);
+  const { ohpm, npm, workspaceRoots } = collectPathDeps(projectRoot);
   const entryByName = new Map<string, string>();
   for (const [name, dir] of ohpm) {
     if (byName.has(name)) continue;
@@ -149,7 +161,12 @@ export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | 
   }
   npm.delete('');
 
-  if (byName.size === 0 && npm.size === 0) return null;
+  // A member of the root's own workspace is installed with it, whatever its
+  // manifest declares: package managers don't nest workspaces.
+  const members = new Set(byName.values());
+  const nestedRoots = workspaceRoots.filter((dir) => !members.has(dir));
+
+  if (byName.size === 0 && npm.size === 0 && nestedRoots.length === 0) return null;
 
   // What each npm-style package's manifest declares for its importers.
   const entriesByDir = new Map<string, PackageEntries>();
@@ -166,6 +183,7 @@ export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | 
     entryByName: entryByName.size > 0 ? entryByName : undefined,
     entriesByDir: entriesByDir.size > 0 ? entriesByDir : undefined,
     scopedByName: npm.size > 0 ? npm : undefined,
+    nestedRoots: nestedRoots.length > 0 ? nestedRoots : undefined,
   };
 }
 
@@ -189,6 +207,13 @@ function exportTargets(value: unknown): string[] {
   return [0, 1, 2].flatMap((t) => conditions.filter(([key]) => tier(key) === t).flatMap(([, v]) => exportTargets(v)));
 }
 
+/** What an `exports` value's `browser` condition names, at any depth of its conditions. */
+function browserTargets(value: unknown): string[] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  const conditions = value as Record<string, unknown>;
+  return 'browser' in conditions ? exportTargets(conditions.browser) : Object.values(conditions).flatMap(browserTargets);
+}
+
 /** The package.json fields an importer of the package root reaches without `exports`, best first. */
 const MAIN_FIELDS = ['source', 'module', 'main', 'types', 'typings'];
 
@@ -206,14 +231,18 @@ function readPackageEntries(projectRoot: string, dirRel: string): PackageEntries
   const exp = pkg.exports;
   if (exp !== undefined && exp !== null) {
     const exports = new Map<string, string[]>();
+    const browser = new Map<string, string[]>();
     const subpaths = typeof exp === 'object' && !Array.isArray(exp) && Object.keys(exp).some((key) => key.startsWith('.'));
     const entries: Array<[string, unknown]> = subpaths
       ? Object.entries(exp as Record<string, unknown>).filter(([key]) => key.startsWith('.'))
       : [['.', exp]];
     for (const [key, value] of entries) {
       exports.set(key, [...new Set(exportTargets(value).map(inPackage).filter((t): t is string => t !== null))]);
+      const forBrowser = browserTargets(value).map(inPackage).filter((t): t is string => t !== null);
+      if (forBrowser.length > 0) browser.set(key, forBrowser);
     }
     out.exports = exports;
+    if (browser.size > 0) out.browser = browser;
   }
   const main = MAIN_FIELDS
     .map((field) => pkg![field])
@@ -288,10 +317,11 @@ const OHPM_SKIP_DIRS = new Set([
   'build', 'dist', 'out', 'oh-package-lock.json5',
 ]);
 
-function collectPathDeps(projectRoot: string): { ohpm: Map<string, string>; npm: Map<string, Map<string, string>> } {
+function collectPathDeps(projectRoot: string): { ohpm: Map<string, string>; npm: Map<string, Map<string, string>>; workspaceRoots: string[] } {
   const ohpm = new Map<string, string>();
   const ambiguous = new Set<string>();
   const npm = new Map<string, Map<string, string>>();
+  const workspaceRoots: string[] = [];
 
   const queue: Array<{ rel: string; depth: number }> = [{ rel: '', depth: 0 }];
   let visited = 0;
@@ -315,6 +345,7 @@ function collectPathDeps(projectRoot: string): { ohpm: Map<string, string>; npm:
         continue;
       }
       if (e.name === NPM_MANIFEST) {
+        if (rel !== '' && readWorkspaceGlobs(abs).length > 0) workspaceRoots.push(rel);
         const deps = new Map<string, string>();
         for (const [name, target] of readNpmPathDeps(path.join(abs, e.name))) {
           const targetAbs = path.resolve(abs, target);
@@ -344,7 +375,7 @@ function collectPathDeps(projectRoot: string): { ohpm: Map<string, string>; npm:
     }
   }
 
-  return { ohpm, npm };
+  return { ohpm, npm, workspaceRoots };
 }
 
 function isDirectory(abs: string): boolean {
@@ -436,8 +467,9 @@ export function workspaceImportTargets(
   const subpath = importPath.slice(hit.name.length); // '' or '/widgets'
   const directory = (hit.dir + subpath).replace(/\/{2,}/g, '/');
   const ohpm = subpath ? undefined : ws.entryByName?.get(hit.name);
-  const declared = ohpm ? [ohpm] : declaredEntries(ws.entriesByDir?.get(hit.dir), subpath);
-  return { declared, directory, packageDir: hit.dir };
+  const entries = ws.entriesByDir?.get(hit.dir);
+  const declared = ohpm ? [ohpm] : declaredEntries(entries, subpath);
+  return { declared, browser: entries?.browser ? exportedTargets(entries.browser, '.' + subpath) : [], directory, packageDir: hit.dir };
 }
 
 /**
@@ -450,7 +482,26 @@ function matchPackage(importPath: string, ws: WorkspacePackages, fromFile?: stri
   const scoped = scopedPackage(importPath, ws, fromFile);
   if (scoped) return scoped;
   const name = longestName(importPath, ws.byName.keys());
-  return name === null ? null : { name, dir: ws.byName.get(name)! };
+  if (name === null) return null;
+  const dir = ws.byName.get(name)!;
+  return fromFile !== undefined && leavesWorkspaceRoot(fromFile, dir, ws) ? null : { name, dir };
+}
+
+/** The nested root (see WorkspacePackages.nestedRoots) `file` is under, the deepest; `''` for the project's own. */
+function workspaceRootOf(file: string, roots: string[]): string {
+  let root = '';
+  for (const dir of roots) {
+    if (dir.length > root.length && file.startsWith(dir + '/')) root = dir;
+  }
+  return root;
+}
+
+/** Whether `target`, a project path, lies outside the nested root `file` is under, if it is under one. */
+export function leavesWorkspaceRoot(file: string, target: string, ws: WorkspacePackages | null | undefined): boolean {
+  const roots = ws?.nestedRoots;
+  if (!roots) return false;
+  const root = workspaceRootOf(file.replace(/\\/g, '/'), roots);
+  return root !== '' && !target.replace(/\\/g, '/').startsWith(root + '/');
 }
 
 /** The path dependency the nearest declaring manifest above `fromFile` maps `importPath` to. */
@@ -518,7 +569,8 @@ export function workspaceFingerprint(ws: WorkspacePackages | null): string {
     byName: sorted(ws.byName),
     entryByName: sorted(ws.entryByName),
     scoped: sorted(ws.scopedByName).map(([dir, names]) => [dir, sorted(names)]),
-    entries: sorted(ws.entriesByDir).map(([dir, e]) => [dir, sorted(e.exports), e.main ?? []]),
+    entries: sorted(ws.entriesByDir).map(([dir, e]) => [dir, sorted(e.exports), sorted(e.browser), e.main ?? []]),
+    nested: ws.nestedRoots ?? [],
   });
   return createHash('sha256').update(canonical).digest('hex');
 }

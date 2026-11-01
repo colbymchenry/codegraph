@@ -12,7 +12,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport 
 import { applyAliases, aliasAndBaseUrlCandidates } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport, workspaceImportTargets, type WorkspaceImportTargets } from './workspace-packages';
-import { stripCommentsForRegex, templateLiteralTextAt } from './strip-comments';
+import { blankStringContents, stripCommentsForRegex, templateLiteralTextAt } from './strip-comments';
 import { makeLineAt } from './synth-utils';
 import { dartDirectiveFile } from './dart-libraries';
 import { ambientModuleDeclares, declaringFileAnswers, findAmbientModuleExport, findAmbientModuleFile, inBlock, isDeclarationFile, isInModuleBlock, namespaceBlocks, type NamespaceBlock } from './ambient-modules';
@@ -1470,6 +1470,10 @@ function resolveAliasedImport(
   const workspaces = context.getWorkspacePackages?.();
   const targets = workspaces ? workspaceImportTargets(importPath, workspaces, fromFile) : null;
   if (targets) {
+    const forBrowser = targets.browser.length > 0 && fromFile !== undefined && isBrowserCode(fromFile, context)
+      ? declaredWorkspaceEntry({ ...targets, declared: targets.browser }, language, context)
+      : null;
+    if (forBrowser) return forBrowser;
     const declared = declaredWorkspaceEntry(targets, language, context);
     if (declared) return declared;
     const direct = tryWithExt(targets.directory);
@@ -1550,6 +1554,20 @@ function declaredWorkspaceEntry(targets: WorkspaceImportTargets, language: Langu
     if (hit) return hit;
   }
   return null;
+}
+
+/** A read of the page a browser gives a script: `document.title`, `window.location`. */
+const BROWSER_GLOBAL_READ = /(?<![\w$.])(?:document|window)\s*[.[]/;
+
+/**
+ * Whether a file reads the browser's page, so that the `browser` condition of
+ * an import is the one it runs with: react's `fixtures/flight/src/index.js`,
+ * which a bundler builds for the page, takes `react-server-dom-webpack/client`
+ * as `client.browser.js`, not the `node` variant a server's file gets.
+ */
+function isBrowserCode(file: string, context: ResolutionContext): boolean {
+  const source = context.readFile(file);
+  return !!source && BROWSER_GLOBAL_READ.test(blankStringContents(stripCommentsForRegex(source, 'typescript')));
 }
 
 /** `target`, build output the index lacks, as the indexed source it is built from (see builtSourcesOf); null when there is none. */
