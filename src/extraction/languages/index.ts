@@ -10,6 +10,7 @@ import type { LanguageExtractor } from '../tree-sitter-types';
 
 import { typescriptExtractor } from './typescript';
 import { javascriptExtractor } from './javascript';
+import { bashExtractor } from './bash';
 import { pythonExtractor } from './python';
 import { goExtractor } from './go';
 import { rustExtractor } from './rust';
@@ -42,6 +43,7 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   tsx: typescriptExtractor,
   javascript: javascriptExtractor,
   jsx: javascriptExtractor,
+  bash: bashExtractor,
   python: pythonExtractor,
   go: goExtractor,
   rust: rustExtractor,
