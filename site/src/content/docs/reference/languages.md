@@ -26,7 +26,7 @@ Language support is automatic from the file extension — there's nothing to con
 | Svelte | `.svelte` | Full support (script extraction, Svelte 5 runes, SvelteKit routes) |
 | Vue | `.vue` | Full support (script + script-setup, Nuxt page/API/middleware routes) |
 | Astro | `.astro` | Full support (frontmatter + script extraction, template component/call references, `src/pages/` routes) |
-| Liquid | `.liquid` | Full support |
+| Liquid | `.liquid` | Partial support (Shopify snippets, sections, section groups, JSON templates and `{% schema %}`; `assign`/`capture` variables; Jekyll-style includes are not resolved) |
 | Pascal / Delphi | `.pas`, `.dpr`, `.dpk`, `.lpr` | Full support (classes, records, interfaces, enums, DFM/FMX forms) |
 | Lua | `.lua` | Full support (functions, methods, locals, `require` imports, call edges) |
 | R | `.R`, `.r` | Full support (functions, S4/R5/R6 classes with methods, `library`/`require` imports, `source()` file references, call edges) |
