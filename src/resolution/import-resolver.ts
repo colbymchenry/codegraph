@@ -2732,10 +2732,9 @@ export function resolveJvmImport(
   // FQN across source sets (commonMain / androidMain / appleMain). Taking the
   // first candidate let a single platform `actual` absorb every common-side
   // import, so the `expect` (the canonical API a commonMain file imports)
-  // looked unused. Prefer the candidate CLOSEST to the importing file by
-  // directory proximity — a commonMain import resolves to the commonMain
-  // declaration — with the `expect` side as a tiebreak.
-  const best = candidates.length === 1 ? candidates[0]! : pickClosestJvmCandidate(candidates, ref.filePath);
+  // looked unused. A commonMain import resolves to the commonMain declaration,
+  // a platform's to its `actual` (pickJvmDeclaration).
+  const best = candidates.length === 1 ? candidates[0]! : pickJvmDeclaration(candidates, ref);
   return {
     original: ref,
     targetNodeId: best.id,
@@ -2793,6 +2792,51 @@ function pickClosestJvmCandidate(candidates: Node[], fromPath: string): Node {
     }
   }
   return best;
+}
+
+/** The source set a file is in: `androidMain` of `lib/src/androidMain/kotlin/a/Util.kt`; null outside any `src/<set>/`. */
+function kmpSourceSet(filePath: string): string | null {
+  return /(?:^|\/)src\/([^/]+)\//.exec(filePath)?.[1] ?? null;
+}
+
+/** What a source set builds for: `android` of `androidMain` and `androidUnitTest`, `common` of `commonTest`. */
+function kmpBuildTarget(set: string): string {
+  return set.replace(/(?:Main|(?:Unit|Instrumented|Device|Host)?Test)$/, '');
+}
+
+/** Kotlin Multiplatform targets that build for the JVM. */
+const KMP_JVM_TARGET = /^(?:android|jvm|desktop)/;
+
+/**
+ * Which of a declaration's same-named Kotlin Multiplatform declarations a JVM
+ * reference reaches. A file compiled for common code sees the `expect`, so
+ * commonMain and commonTest keep the nearest declaration, the `expect` on a
+ * tie. Anything built for a platform sees the `actual`: Kotlin of that target's
+ * source sets its own (an androidUnitTest the androidMain one) or that of a
+ * target it builds on (`iosArm64Main` from `iosMain`), and with neither the
+ * `expect`, as an intermediate source set does. Java, and a Kotlin module with
+ * no source sets of its own, run against JVM bytecode, where no `expect` exists:
+ * timber's Java sample calling `Timber.plant(…)` is the `androidMain` `actual`,
+ * never an `iosMain` one. Of the JVM's targets the one its path names, else not
+ * Android's: okhttp's samples are `jvmMain`'s, its `android-test` `androidMain`'s.
+ */
+function pickJvmDeclaration(declarations: Node[], ref: UnresolvedRef): Node {
+  const actuals = declarations.filter((n) => n.decorators?.includes('actual'));
+  if (actuals.length === 0 || actuals.length === declarations.length) return pickClosestJvmCandidate(declarations, ref.filePath);
+  const set = kmpSourceSet(ref.filePath);
+  const target = set === null ? null : kmpBuildTarget(set);
+  const targetOf = (n: Node): string => kmpBuildTarget(kmpSourceSet(n.filePath) ?? '');
+  if (target?.startsWith('common') || (target === null && ref.language !== 'java')) return pickClosestJvmCandidate(declarations, ref.filePath);
+  const own = actuals.filter((n) => targetOf(n) === target);
+  if (own.length > 0) return pickClosestJvmCandidate(own, ref.filePath);
+  if (ref.language === 'java' || target === 'main' || target === 'test') {
+    const jvm = actuals.filter((n) => KMP_JVM_TARGET.test(targetOf(n)));
+    const android = /android/i.test(ref.filePath);
+    const named = jvm.filter((n) => targetOf(n).startsWith('android') === android);
+    return pickClosestJvmCandidate(named.length > 0 ? named : jvm.length > 0 ? jvm : actuals, ref.filePath);
+  }
+  const above = actuals.filter((n) => targetOf(n) !== '' && target!.startsWith(targetOf(n)));
+  return pickClosestJvmCandidate(above.length > 0 ? above : declarations, ref.filePath);
 }
 
 /**
@@ -4138,7 +4182,7 @@ function resolveJavaImportedReference(
     const callOfFunction = matchesBare && ref.referenceKind === 'calls' &&
       named.some((n) => n.kind === 'function' || n.kind === 'method');
     if (declarations.length > 0 && !callOfFunction) {
-      const owner = declarations.length === 1 ? declarations[0]! : pickClosestJvmCandidate(declarations, ref.filePath);
+      const owner = declarations.length === 1 ? declarations[0]! : pickJvmDeclaration(declarations, ref);
       const target = jvmImportedMember(owner, memberPath, ref, context);
       // Of a member's overloads, the one the call's argument count fits:
       // `ItemStack.Hash.of(stack, registries)`, not `of(stack)`.
