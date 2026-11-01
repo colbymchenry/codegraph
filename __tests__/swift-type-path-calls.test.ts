@@ -117,7 +117,8 @@ describe('Swift: a call through a type path', () => {
       expect(reached('six')).toEqual(['API::PackageController::Model:8']);
       // A module qualifier.
       expect(reached('seven')).toEqual(['Zed::GetRoute::query:9']);
-      // No such type, and no such member: nothing, not some other type's `query`.
+      // No such type (eight) or no such member (nine): no call, not some other type's `query`.
+      // (nine still gets a `references` edge to GetRoute; see swift-external-member-ref.test.ts.)
       expect(reached('eight')).toEqual([]);
       expect(reached('nine')).toEqual([]);
       // A case with associated values.
