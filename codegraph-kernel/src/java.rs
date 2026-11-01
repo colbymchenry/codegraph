@@ -1335,6 +1335,26 @@ impl<'t> Walker<'t> {
 
     // --- value references ------------------------------------------------------------
 
+    /// isForeignJavaField: `InferenceString.PARSER` reads that class's constant,
+    /// not the `PARSER` of the file reading it.
+    fn is_foreign_field(&self, n: Node<'t>, target_row: u32) -> bool {
+        let Some(access) = n.parent() else { return false };
+        if access.kind() != "field_access" {
+            return false;
+        }
+        let Some(object) = access.child_by_field_name("object") else { return false };
+        if access.child_by_field_name("field").map(|f| f.start_byte()) != Some(n.start_byte()) {
+            return false;
+        }
+        let written = self.text(object);
+        let qualifier = written.rsplit('.').next().unwrap_or("").trim();
+        if qualifier == "this" {
+            return false;
+        }
+        let qualified = &self.nodes_meta[target_row as usize].qualified_name;
+        qualified.rsplit("::").nth(1) != Some(qualifier)
+    }
+
     fn flush_value_refs(&mut self, root: Node<'t>) {
         let scopes = std::mem::take(&mut self.value_scopes);
         let mut targets = std::mem::take(&mut self.fs_values);
@@ -1400,6 +1420,7 @@ impl<'t> Walker<'t> {
                         if target_id != self.node_ids[scope.row as usize]
                             && ref_name != scope.name
                             && !seen.contains(&target_id)
+                            && !self.is_foreign_field(n, target_row)
                         {
                             seen.insert(target_id);
                             let meta = self.arena.put(r#"{"valueRef":true}"#);

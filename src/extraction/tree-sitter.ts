@@ -1492,7 +1492,7 @@ export class TreeSitterExtractor {
           // Skip self and same-name targets: a symbol referencing a file-scope
           // sibling of its own name (the two halves of a conditional `try: X=…;
           // except: X=…`) is never a meaningful value read.
-          if (targetId && targetId !== scope.id && refName !== scope.name && !seen.has(targetId)) {
+          if (targetId && targetId !== scope.id && refName !== scope.name && !seen.has(targetId) && !this.isForeignJavaField(n, targetId)) {
             seen.add(targetId);
             this.edges.push({
               source: scope.id,
@@ -1508,6 +1508,23 @@ export class TreeSitterExtractor {
         }
       }
     }
+  }
+
+  /**
+   * Whether a Java field read is another type's: `InferenceString.PARSER` reads
+   * that class's constant, not the `PARSER` of the file reading it. This file's
+   * own is read bare, through `this`, or through the class that declares it.
+   */
+  private isForeignJavaField(n: SyntaxNode, targetId: string): boolean {
+    if (this.language !== 'java' || n.parent?.type !== 'field_access') return false;
+    const access = n.parent;
+    const object = getChildByField(access, 'object');
+    if (!object || getChildByField(access, 'field')?.startIndex !== n.startIndex) return false;
+    const written = getNodeText(object, this.source);
+    const qualifier = written.slice(written.lastIndexOf('.') + 1).trim();
+    if (qualifier === 'this') return false;
+    const segments = this.nodes.find((d) => d.id === targetId)?.qualifiedName.split('::') ?? [];
+    return segments[segments.length - 2] !== qualifier;
   }
 
   /**
