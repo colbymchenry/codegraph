@@ -1633,6 +1633,7 @@ interface PropertySchema {
   description: string;
   enum?: string[];
   default?: unknown;
+  maxLength?: number;
 }
 
 /**
@@ -1693,6 +1694,24 @@ const READ_ONLY_ANNOTATIONS: ToolAnnotations = {
  * All tools support cross-project queries via the optional `projectPath` parameter.
  */
 export const tools: ToolDefinition[] = [
+  {
+    name: 'codegraph_grep',
+    description: 'Search indexed file contents with a regex or literal string, group hits by enclosing symbol and rank by incoming graph edges. Questionable name-matched calls are marked; strict excludes them from ranking. Zero-hit guidance distinguishes indexed code from unindexed files. Requires ripgrep.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', maxLength: 4096, description: 'Regex valid in JavaScript and ripgrep, or a literal string with fixed: true. At most 4,096 characters.' },
+        in: { type: 'string', description: 'Repo-relative path prefix to search under, e.g. src/db.' },
+        ignore_case: { type: 'boolean', description: 'Case-insensitive match.' },
+        fixed: { type: 'boolean', description: 'Treat the pattern as a literal string, not a regex.' },
+        strict: { type: 'boolean', description: 'Exclude questionable incoming calls from counts and ranking.' },
+        json: { type: 'boolean', description: 'Return the structured result as JSON instead of text.' },
+        projectPath: projectPathProperty,
+      },
+      required: ['pattern'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
   {
     name: 'codegraph_suspects',
     description: 'Audit name-only and low-confidence call edges, ranked by standard-library collisions (Rust and Swift), missing imports, ambiguous definitions and confidence. Returns targets and sample callers; these are review candidates, not proven errors.',
@@ -2060,7 +2079,7 @@ export function getStaticTools(): ToolDefinition[] {
  * from explore.
  *
  * The other defined tools (`node`, `search`, `callers`, plus callees/impact/files/
- * status, suspects and blast) remain fully functional — handlers stay, the library API and CLI are
+ * status, suspects, grep and blast) remain fully functional — handlers stay, the library API and CLI are
  * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
 const DEFAULT_MCP_TOOLS = new Set(['explore']);
@@ -3141,8 +3160,7 @@ export class ToolHandler {
         if (projectPath !== pathCheck) args = { ...args, projectPath };
         await this.awaitProjectGate(projectPath);
       }
-      // The `path` and `pattern` properties used by codegraph_files are
-      // also path-shaped — apply the same cap.
+      // Cap file paths/globs and grep patterns before tool-specific dispatch.
       if (args.path !== undefined) {
         const check = this.validateOptionalPath(args.path, 'path');
         if (typeof check === 'object' && check !== undefined) return check;
@@ -3371,6 +3389,7 @@ export class ToolHandler {
    */
   private async dispatchTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
     switch (toolName) {
+      case 'codegraph_grep': return await this.handleGrep(args);
       case 'codegraph_suspects': return await this.handleSuspects(args);
       case 'codegraph_blast': return await this.handleBlast(args);
       case 'codegraph_search': return await this.handleSearch(args);
@@ -3381,6 +3400,32 @@ export class ToolHandler {
       case 'codegraph_node': return await this.handleNode(args);
       case 'codegraph_files': return await this.handleFiles(args);
       default: return this.errorResult(`Unknown tool: ${toolName}`);
+    }
+  }
+
+  /** Group indexed content hits using the same read-only derivation as the CLI. */
+  private async handleGrep(args: Record<string, unknown>): Promise<ToolResult> {
+    if (typeof args.pattern !== 'string') return this.textResult('pattern must be a string.');
+    if (args.in != null && typeof args.in !== 'string') return this.textResult('in must be a repo-relative path prefix.');
+    for (const key of ['fixed', 'ignore_case', 'strict', 'json']) {
+      if (args[key] != null && typeof args[key] !== 'boolean') return this.textResult(`${key} must be a boolean.`);
+    }
+    const root = this.getCodeGraph(args.projectPath as string | undefined).getProjectRoot();
+    const { grepIndex, GrepPatternError, GrepScopeError, GrepIndexError } = await import('../search/grep');
+    const { formatGrepResult, zeroHitNote } = await import('../search/grep-format');
+    try {
+      const result = await grepIndex(root, args.pattern, {
+        in: args.in as string | undefined,
+        fixed: args.fixed === true,
+        ignoreCase: args.ignore_case === true,
+        strict: args.strict === true,
+      });
+      return this.textResult(args.json === true ? JSON.stringify(result, null, 2) : result.totalHits === 0 ? zeroHitNote(result) : formatGrepResult(result));
+    } catch (err) {
+      if (err instanceof GrepPatternError || err instanceof GrepScopeError || (err instanceof GrepIndexError && err.reason === 'not-indexed')) {
+        return this.textResult(err.message);
+      }
+      throw err;
     }
   }
 
