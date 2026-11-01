@@ -322,25 +322,41 @@ nothing: the Go struct-embedding branch (5496) runs for Go only (it was inert
 here anyway — rust `field_declaration` always carries a `field_identifier`
 name), so rustlang.rs has no `field_declaration` arm.
 
-### impl Trait for Type — extractRustImplItem (5690)
+### impl Trait for Type — extractRustImplItem / extract_rust_impl_item
 
-- hasFor = any child (ALL children) with `type === 'for' && !isNamed` — plain
-  `impl Type { }` → return (no edge; getReceiverType handles member attachment).
-- typeIdents = DIRECT namedChildren of type `type_identifier` | `generic_type`
-  | `scoped_type_identifier`; need ≥2 else return (v0.24.2 has `trait:` and
-  `type:` FIELDS, but the code deliberately uses positional filtering —
-  PRESERVE the positional logic).
-- traitNode = FIRST, typeNode = LAST. traitName: scoped_type_identifier →
-  `source.substring(startIndex,endIndex)` (full `fmt::Display`); else
-  getNodeText. typeName: generic_type → inner type_identifier text (`Container`)
-  else text.
-- targetId = `findNodeByName(typeName)` (5740): FIRST node in `this.nodes`
-  with that name and kind ∈ {struct, enum, class} — **NOT trait**, and
-  source-order dependent (the type must be defined EARLIER in the same file;
-  cross-file impls emit nothing). If found: push
-  {fromNodeId: **the TYPE's node id** (a back-reference), referenceName:
-  traitName (full path text), referenceKind:'implements', line/col of the
-  trait node}.
+- Called for every `impl_item`, both at module scope and inside function
+  bodies (TS: the main visit and the function-body walk; kernel: the same two
+  sites).
+- Reads the grammar's `trait` and `type` FIELDS (#1588). No `trait` field →
+  inherent `impl Type { }` → return, nothing emitted (getReceiverType handles
+  member attachment).
+- traitName = full text of the `trait` node (getNodeText / `self.text`), so a
+  scoped path (`std::fmt::Display`) and generic args (`From<u32>`) keep their
+  spelling.
+- typeName = `rustImplTypeName(typeField)` (TS, `languages/rust.ts`) /
+  `impl_type_name` (kernel): `type_identifier` / `identifier` → text;
+  `generic_type` and `reference_type` → recurse into their `type` field;
+  `scoped_type_identifier` / `scoped_identifier` → recurse into `name` (last
+  segment). Any other shape (tuple, `dyn`, pointer, primitive…) → undefined →
+  return.
+- isPath: unwrap `generic_type` / `reference_type` via their `type` field; the
+  type is a path when what remains is `scoped_type_identifier` or
+  `scoped_identifier` (`crate::X`, `self::X`, `super::X`, `m::X`, `&m::X<T>`).
+- Target lookup (TS: `findTypeInScope`; kernel: inline over `nodes_meta`):
+  candidates are nodes already extracted from THIS file (so declared earlier)
+  with that name and kind ∈ {struct, union, enum, class} — **never trait**;
+  cross-file impls emit nothing.
+  - Bare name: search the impl's enclosing scope first (nodeStack head / stack
+    top: the fn or method whose body, or the const/static whose initializer,
+    is being walked; or the file), then each scope outward to the file.
+    Within one scope the earliest-declared candidate wins. A fn-local type is
+    visible only to impls in that fn or nested deeper. An inline `mod` mints
+    no node, so its types belong to the file's scope.
+  - Path: search the file scope only (nodeStack[0] / `stack[..1]`) — a path
+    always names a module item, never a fn-local one.
+- If found: push {fromNodeId: **the TYPE's node id** (a back-reference),
+  referenceName: traitName, referenceKind: 'implements', line/col of the
+  trait node}. Not found → nothing.
 
 ### Type-annotation references (5752-6112)
 
