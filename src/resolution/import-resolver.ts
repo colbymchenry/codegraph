@@ -4440,13 +4440,21 @@ function resolveStaticMember(
 ): Node | undefined {
   if (!STATIC_MEMBER_CONTAINERS.has(container.kind)) return undefined;
   // First segment after the receiver: `Foo.bar.baz` → `bar`.
-  const member = ref.referenceName.slice(localName.length + 1).split('.')[0];
+  const [member, ...rest] = ref.referenceName.slice(localName.length + 1).split('.');
   if (!member) return undefined;
 
   const candidates = context
     .getNodesByQualifiedName(`${container.qualifiedName}::${member}`)
     .filter((n) => n.filePath === container.filePath);
   if (candidates.length === 0) return undefined;
+
+  // A Python reference keeps its whole chain, and it reads the chain's last
+  // link: `Foo.bar.fset()` is no call of `bar`, nor `Foo.Inner.objects.create()`
+  // a new `Inner`, but `Foo.Inner.run()` is `Inner`'s `run`.
+  if (ref.language === 'python' && rest.length > 0) {
+    const next = candidates.find((n) => STATIC_MEMBER_CONTAINERS.has(n.kind));
+    return next && resolveStaticMember(next, { ...ref, referenceName: `${member}.${rest.join('.')}` }, member, context);
+  }
 
   // When the reference is a call, prefer a callable member if several nodes
   // share the qualifiedName (e.g. a static property and a method).
