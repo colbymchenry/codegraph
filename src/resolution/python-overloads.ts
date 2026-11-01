@@ -24,12 +24,15 @@ export function clearPythonOverloadMemos(context: ResolutionContext): void {
 }
 
 /**
- * Whether the decorators above a `def` hold `overload`, spelled bare or through
- * a module (`typing.overload`, `t.overload`). Decorators are not kept on Python
+ * Whether the decorators above a `def` hold `overload`, spelled bare, through a
+ * module (`typing.overload`, `t.overload`) or under the name the file imported it
+ * as (`from typing import overload as ov`). Decorators are not kept on Python
  * nodes, so they're read from the source, upward from the `def`.
  */
 function isOverloadStub(n: Node, context: ResolutionContext): boolean {
   const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  const names = new Set(['overload']);
+  for (const m of context.getImportMappings(n.filePath, 'python')) if (m.exportedName === 'overload') names.add(m.localName);
   let open = 0;
   for (let i = n.startLine - 2; i >= 0 && i >= n.startLine - 1 - DECORATOR_LOOKBACK; i--) {
     const text = lines[i]?.trim() ?? '';
@@ -38,7 +41,7 @@ function isOverloadStub(n: Node, context: ResolutionContext): boolean {
     open += (text.match(/\)/g)?.length ?? 0) - (text.match(/\(/g)?.length ?? 0);
     if (open > 0) continue;
     if (!text.startsWith('@')) return false;
-    if (/^@(?:\w+\.)*overload\b/.test(text)) return true;
+    if (names.has(/^@(?:\w+\.)*(\w+)/.exec(text)?.[1] ?? '')) return true;
   }
   return false;
 }

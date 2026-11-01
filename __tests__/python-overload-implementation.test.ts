@@ -103,6 +103,32 @@ describe('a call to a Python name declared with typing.overload', () => {
     }
   });
 
+  it('reads the decorator under the name the file imported it as', async () => {
+    await index({
+      'aliased.py': [
+        'from typing import overload as ov',
+        '',
+        '@ov',
+        'def pick(a: int) -> int: ...',              // 4
+        '',
+        '@ov',
+        'def pick(a: str) -> str: ...',              // 7
+        '',
+        'def pick(a):',                              // 9
+        '    return a',
+        '',
+      ].join('\n'),
+      'use.py': [
+        'from aliased import pick',
+        '',
+        'def caller():',
+        '    return pick(1)',
+        '',
+      ].join('\n'),
+    });
+    expect(calleeLines('caller', 'pick')).toEqual([9]);
+  });
+
   it('takes the implementation below the stub it reached, when a file has two sets', async () => {
     await index({
       'twice.py': [
