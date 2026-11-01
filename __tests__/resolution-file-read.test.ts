@@ -50,11 +50,11 @@ describe('resolution file reads', () => {
   it('rejects an oversized package archive before decoding and caches the rejection', () => {
     const relative = sparseArchive();
     const read = vi.spyOn(fs, 'readFileSync');
-    const stat = vi.spyOn(fs, 'statSync');
+    const open = vi.spyOn(fs, 'openSync');
     expect(context.readFile(relative)).toBeNull();
     expect(context.readFile(relative)).toBeNull();
     expect(read).not.toHaveBeenCalled();
-    expect(stat).toHaveBeenCalledTimes(1);
+    expect(open).toHaveBeenCalledTimes(1);
     fs.writeFileSync(path.join(root, relative), 'export const repaired = true;');
     resolver.clearCaches();
     expect(context.readFile(relative)).toBe('export const repaired = true;');
@@ -74,13 +74,13 @@ describe('resolution file reads', () => {
   it('rejects directories before reading and caches missing files', () => {
     fs.mkdirSync(path.join(root, 'directory'));
     const read = vi.spyOn(fs, 'readFileSync');
-    const stat = vi.spyOn(fs, 'statSync');
+    const open = vi.spyOn(fs, 'openSync');
     for (const name of ['directory', 'missing.ts']) {
       expect(context.readFile(name)).toBeNull();
       expect(context.readFile(name)).toBeNull();
     }
     expect(read).not.toHaveBeenCalled();
-    expect(stat).toHaveBeenCalledTimes(2);
+    expect(open).toHaveBeenCalledTimes(2);
   });
 
   it('skips excluded HAR imports during indexing while preserving source workspace imports', async () => {
@@ -95,10 +95,10 @@ describe('resolution file reads', () => {
       "import { RNAbility } from 'archive';\nimport { Repository } from 'data';\n" +
       'export class MainAbility extends RNAbility {}\nexport class Local extends Repository {}\n');
     const read = vi.spyOn(fs, 'readFileSync');
-    const stat = vi.spyOn(fs, 'statSync');
+    const open = vi.spyOn(fs, 'openSync');
     await cg.indexAll();
     const archive = path.join(root, relative);
-    expect(stat.mock.calls.some(([file]) => String(file) === archive)).toBe(true);
+    expect(open.mock.calls.some(([file]) => String(file) === archive)).toBe(true);
     expect(read.mock.calls.some(([file]) => String(file) === archive)).toBe(false);
     const repository = cg.getNodesByKind('class').find(n => n.name === 'Repository');
     const local = cg.getNodesByKind('class').find(n => n.name === 'Local');

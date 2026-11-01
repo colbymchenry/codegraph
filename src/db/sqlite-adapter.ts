@@ -25,6 +25,13 @@ export interface SqliteStatement {
    * `all()`-ing every symbol on a dense project spiked the heap into an OOM.
    */
   iterate(...params: any[]): IterableIterator<any>;
+  /**
+   * From now on, hand each row over as an array of its values rather than an
+   * object keyed by column, which is about a third cheaper to read. Returns the
+   * column names, in array order, or undefined on a runtime that can't, whose
+   * rows stay objects (Node before 22.16).
+   */
+  rowsAsArrays(): string[] | undefined;
 }
 
 export interface TransactionOptions {
@@ -135,6 +142,11 @@ class NodeSqliteAdapter implements SqliteDatabase {
       },
       iterate(...params: any[]) {
         return stmt.iterate(...params);
+      },
+      rowsAsArrays() {
+        if (typeof stmt.setReturnArrays !== 'function' || typeof stmt.columns !== 'function') return undefined;
+        stmt.setReturnArrays(true);
+        return stmt.columns().map((column: { name: string }) => column.name);
       },
     };
   }

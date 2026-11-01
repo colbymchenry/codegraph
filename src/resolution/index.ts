@@ -755,14 +755,21 @@ export class ReferenceResolver {
       // Import resolvers may follow package metadata to an archive (`file:*.har`,
       // for example). Reject anything extraction would not accept before UTF-8
       // decoding can multiply a large binary blob into gigabytes of V8 heap.
-      const stats = fs.statSync(fullPath);
-      if (!stats.isFile() || stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
-        this.fileCache.set(filePath, null);
-        return null;
+      // (On the open file: looking the path up twice is a quarter of the read.
+      // O_NONBLOCK keeps a FIFO with no writer from parking the open itself.)
+      const fd = fs.openSync(fullPath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
+      try {
+        const stats = fs.fstatSync(fd);
+        if (!stats.isFile() || stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+          this.fileCache.set(filePath, null);
+          return null;
+        }
+        const content = fs.readFileSync(fd, 'utf-8');
+        this.fileCache.set(filePath, content);
+        return content;
+      } finally {
+        fs.closeSync(fd);
       }
-      const content = fs.readFileSync(fullPath, 'utf-8');
-      this.fileCache.set(filePath, content);
-      return content;
     } catch (error) {
       logDebug('Failed to read file for resolution', { filePath, error: String(error) });
       this.fileCache.set(filePath, null);
