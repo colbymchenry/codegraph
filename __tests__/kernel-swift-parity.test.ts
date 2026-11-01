@@ -13,7 +13,7 @@
  * `defer`, optional-chaining receivers, #750 re-encode, literal-set
  * membership quirks, implicit members), positional return types with the
  * nested-generic failure, present-false isAsync, `open`→internal visibility,
- * multi-case enum first-only minting, `/** *​/` docs ignored-and-chain-
+ * multi-case enum entries minting every case, `/** *​/` docs ignored-and-chain-
  * breaking, value-ref targets incl. the declared-then-assigned
  * assignment-prune case the swift-nio sweep caught, SWIFT_SPEC fn-refs with
  * the label-forward skip and #selector shapes) and its CRLF variant (derived
