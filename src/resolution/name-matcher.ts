@@ -2524,7 +2524,7 @@ const LUA_NAME_ALIAS = /^([A-Za-z_]\w*)((?:\s*\.\s*[A-Za-z_]\w*)*)\s*$/;
 function luaAliasTarget(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
   const decl = luaLocalDecl(ref.referenceName, ref.filePath, ref.line, context);
   if (!decl) return undefined;
-  const target = luaAliasOf(decl, context, 0);
+  const target = luaAliasOf(decl, context);
   if (target === undefined) return undefined;
   if (target === null) return null;
   return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
@@ -2568,16 +2568,16 @@ interface LuaSite { file: string; line: number; name: string; node: Node }
  * global), null for the standard library or an outside module, `undefined`
  * for an initializer that is not an alias.
  */
-function luaAliasOf(decl: Node, context: ResolutionContext, depth: number): Node | null | undefined {
+function luaAliasOf(decl: Node, context: ResolutionContext): Node | null | undefined {
   const rhs = decl.signature!.replace(/^\s*=\s*/, '').trim();
-  return luaAliasExpr(rhs, { file: decl.filePath, line: decl.startLine, name: decl.name, node: decl }, context, depth);
+  return luaAliasExpr(rhs, { file: decl.filePath, line: decl.startLine, name: decl.name, node: decl }, context);
 }
 
 const luaMembers = (chain: string): string[] => chain.split('.').map((s) => s.trim()).filter(Boolean);
 
-function luaAliasExpr(rhs: string, site: LuaSite, context: ResolutionContext, depth: number): Node | null | undefined {
+function luaAliasExpr(rhs: string, site: LuaSite, context: ResolutionContext): Node | null | undefined {
   const req = LUA_REQUIRE_ALIAS.exec(rhs);
-  if (req) return luaModuleMember(req[2]!, luaMembers(req[3]!), site.node, context, depth);
+  if (req) return luaModuleMember(req[2]!, luaMembers(req[3]!), site.node, context);
   const named = LUA_NAME_ALIAS.exec(rhs);
   if (!named) return undefined;
   const root = named[1]!;
@@ -2585,7 +2585,7 @@ function luaAliasExpr(rhs: string, site: LuaSite, context: ResolutionContext, de
   const rootDecl = root === site.name ? null : luaLocalDecl(root, site.file, site.line - 1, context);
   if (rootDecl) {
     const module = LUA_REQUIRE_ALIAS.exec(rootDecl.signature!.replace(/^\s*=\s*/, '').trim());
-    if (module && path.length > 0) return luaModuleMember(module[2]!, [...luaMembers(module[3]!), ...path], rootDecl, context, depth);
+    if (module && path.length > 0) return luaModuleMember(module[2]!, [...luaMembers(module[3]!), ...path], rootDecl, context);
     return undefined;
   }
   if (path.length === 0) return LUA_GLOBAL_FUNCTIONS.has(root) ? null : undefined;
@@ -2611,8 +2611,13 @@ function luaAliasExpr(rhs: string, site: LuaSite, context: ResolutionContext, de
 /** Per-context memo: `file\0a.b` → what that module member is. */
 const LUA_MEMBERS = new WeakMap<ResolutionContext, Map<string, Node | null | undefined>>();
 
-/** `member` of the module `require(name)` returns, from `decl`'s file: its function of that name. */
-function luaModuleMember(name: string, path: string[], decl: Node, context: ResolutionContext, depth: number): Node | null | undefined {
+/**
+ * `member` of the module `require(name)` returns, from `decl`'s file: its
+ * function of that name. A member a module re-exports from another is followed
+ * to its end: each module leads to one place, so a chain has one answer wherever
+ * it's entered, and the memo below keeps a cycle from going round.
+ */
+function luaModuleMember(name: string, path: string[], decl: Node, context: ResolutionContext): Node | null | undefined {
   const file = luaModuleFile(name, decl, context);
   if (!file) return null;
   // `require "kong.conf_loader"` called directly: the module's returned value.
@@ -2622,12 +2627,12 @@ function luaModuleMember(name: string, path: string[], decl: Node, context: Reso
   const key = `${file}\0${path.join('.')}`;
   if (memo.has(key)) return memo.get(key);
   memo.set(key, null); // a cycle of re-exports names nothing
-  const found = luaMemberIn(file, path, context, depth);
+  const found = luaMemberIn(file, path, context);
   memo.set(key, found);
   return found;
 }
 
-function luaMemberIn(file: string, path: string[], context: ResolutionContext, depth: number): Node | null | undefined {
+function luaMemberIn(file: string, path: string[], context: ResolutionContext): Node | null | undefined {
   const member = path[path.length - 1]!;
   const nodes = context.getNodesInFile(file);
   const inFile = nodes.filter((n) => n.name === member);
@@ -2637,7 +2642,6 @@ function luaMemberIn(file: string, path: string[], context: ResolutionContext, d
     return fns.find((n) => owner !== null && n.qualifiedName.endsWith(`${owner}::${member}`)) ??
       fns.find((n) => n.kind === 'method') ?? fns[0]!;
   }
-  if (depth >= 3) return null;
   // The module exports something under this name: `return { check = check_phase }`,
   // `_M.check = check_phase`, `kong_exec = cmd.kong_exec,` (spec helpers' table).
   const source = (context.readFile(file) ?? '')
@@ -2652,13 +2656,13 @@ function luaMemberIn(file: string, path: string[], context: ResolutionContext, d
       if (fn) return fn;
     }
     const at = nodes.find((n) => n.kind === 'file') ?? nodes[0];
-    const next = at ? luaAliasExpr(rhs, { file, line, name: member, node: at }, context, depth + 1) : undefined;
+    const next = at ? luaAliasExpr(rhs, { file, line, name: member, node: at }, context) : undefined;
     if (next !== undefined) return next;
   }
   // The module re-exports an alias of its own (`local splitn = require(…).splitn`).
   const alias = inFile.find((n) => n.kind === 'variable' && n.signature && isLuaLocal(n, context));
   if (alias) {
-    const next = luaAliasOf(alias, context, depth + 1);
+    const next = luaAliasOf(alias, context);
     if (next !== undefined) return next;
   }
   const global = inFile.find((n) => n.kind === 'variable' && !isLuaLocal(n, context));
@@ -30495,24 +30499,28 @@ const TS_ALIASED_TYPES = new WeakMap<ResolutionContext, Map<string, Node | null>
  * The class or interface a type alias `file` declares stands for: react's
  * `export type BackendBridge = Bridge<BackendEvents, FrontendEvents>`, through
  * an alias of an alias, each name read the way the alias's own file reads it.
+ * An alias names one thing, so every alias on a chain has the chain's answer,
+ * however long it is, and one that comes back to itself has none.
  */
-function tsAliasedType(name: string, file: string, at: UnresolvedRef, context: ResolutionContext, depth = 0): Node | null {
+function tsAliasedType(name: string, file: string, at: UnresolvedRef, context: ResolutionContext, seen = new Set<string>()): Node | null {
   let memo = TS_ALIASED_TYPES.get(context);
   if (!memo) TS_ALIASED_TYPES.set(context, (memo = new Map()));
   const key = file + '\0' + name;
   const hit = memo.get(key);
   if (hit !== undefined) return hit;
+  if (seen.has(key)) return null;
+  seen.add(key);
   let found: Node | null = null;
   const alias = (context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file).filter((n) => n.name === name))
     .find((n) => n.kind === 'type_alias');
-  const written = alias && depth < 4 ? tsAliasValueName(alias, context) : null;
+  const written = alias ? tsAliasValueName(alias, context) : null;
   // `type Box<T> = T | null` holds whatever its argument is.
   if (alias && written && !tsClassTypeParameter(alias, written, context)) {
     const named = tsNamedType(written, alias, at, context);
     if (named && named !== 'outside') found = named;
     else if (!named) {
       const there = { ...at, filePath: alias.filePath, language: alias.language };
-      found = tsAliasedType(written.split('.').pop()!, tsImportedTypeFile(written, there, context) ?? alias.filePath, at, context, depth + 1);
+      found = tsAliasedType(written.split('.').pop()!, tsImportedTypeFile(written, there, context) ?? alias.filePath, at, context, seen);
     }
   }
   memo.set(key, found);
