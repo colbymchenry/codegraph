@@ -28,6 +28,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { escapeRegExp } from '../utils';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
+import { cppTemplateArgumentEdges } from './cpp-template-instantiations';
 import { goframeRouteEdges } from './goframe-synthesizer';
 import { goFuncFieldEdges } from './go-func-field-synthesizer';
 import { expoRouterReturnEdges } from './expo-router-synthesizer';
@@ -5313,7 +5314,7 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   // A Next proxy and the routes its matcher covers are joined by path and config, not by any line of code.
   if (NEXT_PROXY_FILE.test(filePath) || nextRouteForFile(filePath) !== null) return true;
   if (/\.(?:c|h|cc|cpp|cxx|hpp|hh|hxx|cppm|ipp|inl|tcc|def|inc|tbl)$/i.test(filePath) &&
-    /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
+    /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[|</.test(content)) return true;
   if (/\b(?:class|interface|protocol|trait|impl|extends|implements|expect|actual)\b/.test(content)) return true;
   // Every Go file: besides the declarations the interface passes read, a call
   // through a func field, or a function put in one, can sit in any of them.
@@ -5420,6 +5421,9 @@ export const SYNTH_PASSES: SynthPassDef[] = [
     gate: (has) => has('c', 'cpp'),
     run: (q, c, y, sub) => cFnPointerDispatchEdges(q, c, y, sub),
   },
+  // `Txn::Put(…)` in `template <typename Txn> class Mixin` onto each class the project writes as `Txn`.
+  // After the other C++ passes: a pair one of them bridges keeps its edge.
+  { name: 'cppTemplateEdges', gate: (has) => has('cpp'), run: (q, c, y) => cppTemplateArgumentEdges(q, c, y) },
   { name: 'goframeEdges', gate: (has) => has('go'), run: (_q, c, y) => goframeRouteEdges(c, y) },
   // `d.refreshf(ctx)` onto the functions put in that func field (`RefreshF: d.refresh`).
   // After the Go framework passes: a pair one of them bridges keeps its more specific edge.

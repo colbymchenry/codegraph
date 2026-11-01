@@ -805,6 +805,16 @@ export class ReferenceResolver {
     }
   }
 
+  /** The text a walk over the indexed files reads: see ResolutionContext.scanFile. */
+  private scanFile(filePath: string): string | null {
+    if (this.fileCache.has(filePath)) return this.fileCache.get(filePath) ?? null;
+    try {
+      return fs.readFileSync(path.join(this.projectRoot, filePath), 'latin1');
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Create the resolution context
    */
@@ -992,6 +1002,7 @@ export class ReferenceResolver {
       readFile: (filePath: string) => this.readFileCached(filePath),
 
       fileContains: (filePath: string, needle: string) => this.fileContains(filePath, needle),
+      scanFile: (filePath: string) => this.scanFile(filePath),
 
       getFileLines: (filePath: string) => {
         const cached = this.fileLinesCache.get(filePath);

@@ -17369,7 +17369,7 @@ const CPP_CALLERS_MEMBERS = new WeakMap<ResolutionContext, Map<string, CppWritte
  * `TEST_F(Fixture, Name)` or `TEST_P` body is a method of a class derived
  * from `Fixture`. Null when none of them declares it.
  */
-function cppCallersMember(name: string, caller: Node, ref: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
+export function cppCallersMember(name: string, caller: Node, ref: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
   let memo = CPP_CALLERS_MEMBERS.get(context);
   if (!memo) CPP_CALLERS_MEMBERS.set(context, (memo = new Map()));
   const key = `${caller.id}\u0000${name}`;
@@ -18503,7 +18503,7 @@ function cppBasesKnown(cls: Node, context: ResolutionContext, depth = 0, seen = 
  * `inner(…).name(…)` keeps the first: the arguments at its position are the
  * inner call's.)
  */
-function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: ResolutionContext, depth = 0, seen = new Set<string>()): Node | null {
+export function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: ResolutionContext, depth = 0, seen = new Set<string>()): Node | null {
   const want = `${cls.qualifiedName}::${name}`;
   const named = context.getMethodMatches?.(cls.name, name, ref.language) ??
     context.getNodesByName(name).filter((n) => n.kind === 'method' && sameLanguageFamily(n.language, ref.language));
@@ -19251,7 +19251,7 @@ export function cppSpecializationArguments(n: Node, context: ResolutionContext):
  * calls — `unsigned short` for fmt's `num_bits<unsigned short>()` — or null
  * when it writes none, leaving them to be deduced.
  */
-function cppCallTemplateArguments(ref: UnresolvedRef, context: ResolutionContext): string[] | null {
+export function cppCallTemplateArguments(ref: UnresolvedRef, context: ResolutionContext): string[] | null {
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
   const text = lines.slice(ref.line - 1, ref.line + 3).join('\n');
   return cppTemplateArgumentsAfter(text, ref.referenceName.split(/::|\.|->/).pop()!, Math.max(0, ref.column));
@@ -19327,7 +19327,7 @@ type CppArgumentType =
  * `TryLock(column_family[i], keys[i], …)` on a `std::vector<Slice>`. Null
  * otherwise. (String literals are cppOverloadFit's.)
  */
-function cppArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionContext): CppArgumentType | null {
+export function cppArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionContext): CppArgumentType | null {
   const text = arg.trim();
   if (/^(?:u8|u|U|L)?'(?:[^'\\]|\\.)+'$/.test(text)) return { kind: 'char' };
   if (text === 'true' || text === 'false') return { kind: 'bool' };
@@ -19644,7 +19644,7 @@ function isCppDependentBase(decl: Node, base: Node, context: ResolutionContext):
  * declaration in an earlier block the call is outside of counts too: the
  * name strategies decide, as before.
  */
-function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+export function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (caller.filePath !== ref.filePath || CPP_CLASS_KINDS.has(caller.kind)) return false;
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
   if (!lines) return false;
@@ -32833,7 +32833,7 @@ function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext)
 }
 
 /** Split `a, f(b, c), d<e, f>` at its top-level commas. */
-function splitCppTopLevel(text: string): string[] {
+export function splitCppTopLevel(text: string): string[] {
   const out: string[] = [];
   let depth = 0;
   // Where each template argument list open around the current character closes.
@@ -32950,7 +32950,7 @@ function cppWithoutComments(text: string): string {
   return out;
 }
 
-function cppCallArguments(ref: UnresolvedRef, name: string, context: ResolutionContext): string[] | null {
+export function cppCallArguments(ref: UnresolvedRef, name: string, context: ResolutionContext): string[] | null {
   const list = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), name, context);
   return list === null ? null : splitCppTopLevel(cppWithoutComments(list));
 }
@@ -32968,7 +32968,7 @@ const CPP_OVERLOAD_PARAMETERS = new WeakMap<ResolutionContext, Map<string, strin
  * declares the method with the same parameter types and no default, or
  * not at all. A method a macro defines writes its list in its expansion.
  */
-function cppOverloadParameters(n: Node, name: string, context: ResolutionContext): string | null {
+export function cppOverloadParameters(n: Node, name: string, context: ResolutionContext): string | null {
   let memo = CPP_OVERLOAD_PARAMETERS.get(context);
   if (!memo) CPP_OVERLOAD_PARAMETERS.set(context, (memo = new Map()));
   const key = `${n.id}\u0000${name}`;

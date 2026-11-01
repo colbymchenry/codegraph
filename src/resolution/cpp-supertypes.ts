@@ -107,7 +107,7 @@ export function isCppDeclaredTypeRef(ref: UnresolvedRef, context: ResolutionCont
 function seenFrom(site: CppNameSite, context: ResolutionContext, unit?: string): (n: Node) => boolean {
   const visible = visibleFrom(site.file, unit);
   return (n) => {
-    if (!visible(n)) return false;
+    if (!visible(n) || site.sees?.(n) === false) return false;
     const fn = cppFunctionAround(n, context);
     return !fn || (fn.filePath === site.file && site.line >= fn.startLine && site.line <= fn.endLine);
   };
@@ -230,6 +230,8 @@ export interface CppNameSite {
    * before the enclosing namespaces'.
    */
   classScope?: string;
+  /** Which declarations the file writing the name can see, when that is narrower than a header's being anyone's. */
+  sees?: (n: Node) => boolean;
 }
 
 /** The class a C or C++ type name names. */
