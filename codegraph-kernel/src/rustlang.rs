@@ -107,12 +107,16 @@ struct Cand {
     row: usize,
 }
 
-/// Per-node metadata for the receiver-method owner lookup and
-/// findNodeByName (mirrors the TS scans over `this.nodes` — FIRST match
-/// wins, earlier-in-file only).
+/// Per-node metadata for the receiver-method owner lookup and the impl
+/// target lookup (mirror the TS scans over `this.nodes` — earlier-in-file
+/// only; the owner lookup takes the FIRST match). `parent` is the row of the
+/// scope on the stack top when the node was created (its `contains` source;
+/// `NONE` for the file node). TS keeps the same value in `typeParentIds`, but
+/// only for struct/union/enum/class nodes, the only kinds the impl lookup reads.
 struct NodeMeta {
     kind: &'static str,
     name: String,
+    parent: u32,
 }
 
 pub struct Walker<'t> {
@@ -190,7 +194,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         return_type: NONE_STR,
         extra_json: NONE_STR,
     });
-    w.nodes_meta.push(NodeMeta { kind: "file", name: base_name.to_string() });
+    w.nodes_meta.push(NodeMeta { kind: "file", name: base_name.to_string(), parent: NONE });
     w.node_ids.push(ids::file_node_id(file_path));
     w.stack.push(Scope { row: 0, kind: "file", name: base_name.to_string() });
 
@@ -313,10 +317,10 @@ impl<'t> Walker<'t> {
             return_type: ret_ref,
             extra_json: NONE_STR,
         });
-        self.nodes_meta.push(NodeMeta { kind, name: name.to_string() });
+        let parent_row = self.top_row();
+        self.nodes_meta.push(NodeMeta { kind, name: name.to_string(), parent: parent_row });
         self.node_ids.push(id);
 
-        let parent_row = self.top_row();
         self.tables.push_edge(&EdgeRow {
             source_idx: parent_row,
             target_idx: row,
@@ -1169,24 +1173,51 @@ impl<'t> Walker<'t> {
 
     /// extractRustImplItem — `impl Trait for Type` back-reference from the
     /// grammar's `trait` / `type` fields (#1588; an inherent impl has no
-    /// `trait` field and emits nothing). Target = FIRST earlier node of kind
-    /// struct/union/enum/class (never trait) named by impl_type_name; ref FROM
-    /// the type's node, named by the trait's full text (scoped path / generic
-    /// args kept), at the trait node's position.
+    /// `trait` field and emits nothing). Target = the type named by
+    /// impl_type_name, found lexically as TS's findTypeInScope: among earlier
+    /// nodes of kind struct/union/enum/class (never trait), the scopes on the
+    /// stack are searched from the top (the fn, or the const/static whose
+    /// initializer, is being walked; or the file) outward, earliest-declared
+    /// first within a scope, so a fn-local type is
+    /// visible only to impls in that fn or nested deeper. When the impl
+    /// writes the type as a path (`crate::X`, `self::X`, `super::X`, `m::X`,
+    /// also under `generic_type` / `reference_type`, unwrapped as
+    /// impl_type_name does), only the file's scope (the stack bottom) is
+    /// searched: a path always names a module item, never one declared in a
+    /// fn body. Ref FROM the type's node, named by the trait's full text
+    /// (scoped path / generic args kept), at the trait node's position.
     fn extract_rust_impl_item(&mut self, node: Node<'t>) {
         let Some(trait_node) = node.child_by_field_name("trait") else {
             return;
         };
         let trait_name = self.text(trait_node).to_string();
-        let Some(type_name) = self.impl_type_name(node.child_by_field_name("type")) else {
+        let type_field = node.child_by_field_name("type");
+        let Some(type_name) = self.impl_type_name(type_field) else {
             return;
         };
 
-        let target_row = self
-            .nodes_meta
-            .iter()
-            .position(|m| m.name == type_name && matches!(m.kind, "struct" | "union" | "enum" | "class"))
-            .map(|i| i as u32);
+        // Whether the implementing type is written as a path: unwrap
+        // generic_type / reference_type and look at what names the type.
+        let mut named = type_field;
+        while let Some(n) = named.filter(|n| matches!(n.kind(), "generic_type" | "reference_type")) {
+            named = n.child_by_field_name("type");
+        }
+        let is_path = matches!(
+            named.map(|n| n.kind()),
+            Some("scoped_type_identifier" | "scoped_identifier")
+        );
+        let scopes = if is_path { &self.stack[..1] } else { &self.stack[..] };
+
+        let target_row = scopes.iter().rev().find_map(|scope| {
+            self.nodes_meta
+                .iter()
+                .position(|m| {
+                    m.parent == scope.row
+                        && m.name == type_name
+                        && matches!(m.kind, "struct" | "union" | "enum" | "class")
+                })
+                .map(|i| i as u32)
+        });
         if let Some(target_row) = target_row {
             self.push_ref_at(target_row, &trait_name, edge_kind_index("implements").unwrap(), trait_node);
         }
@@ -1244,6 +1275,11 @@ impl<'t> Walker<'t> {
         // Rocket route macros: handler paths live in a raw token tree.
         if kind == "macro_invocation" {
             self.extract_rust_route_macro(node);
+        }
+        // `impl Trait for Type` in a body: the implements back-reference, as at
+        // module scope; the walk below still descends for the impl's methods.
+        if kind == "impl_item" {
+            self.extract_rust_impl_item(node);
         }
 
         if kind == "call_expression" {
