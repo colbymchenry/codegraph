@@ -141,7 +141,7 @@ function getArrayValue(section: string, key: string): string | null {
   return null;
 }
 
-function parseWorkspaceMembers(cargoToml: string): string[] {
+export function parseWorkspaceMembers(cargoToml: string): string[] {
   const workspaceSection = getSection(cargoToml, 'workspace');
   if (!workspaceSection) return [];
   const membersValue = getArrayValue(workspaceSection, 'members');
@@ -244,6 +244,11 @@ function expandMembers(members: string[], context: ResolutionContext): string[] 
   return expanded;
 }
 
+/** The workspace's crates (readCargoWorkspaceCrateMap), as the resolver keeps them. */
+export function getCargoWorkspaceCrateMap(context: ResolutionContext): Map<string, string> {
+  return context.getCargoCrates?.() ?? readCargoWorkspaceCrateMap(context);
+}
+
 /**
  * Build a map from crate-name aliases to workspace member directory paths.
  * Example: "mytool-core" and "mytool_core" -> "crates/mytool-core"
@@ -251,7 +256,7 @@ function expandMembers(members: string[], context: ResolutionContext): string[] 
  * Supports glob members (e.g. `members = ["crates/*"]`) via picomatch
  * when the context exposes `listDirectories`.
  */
-export function getCargoWorkspaceCrateMap(context: ResolutionContext): Map<string, string> {
+export function readCargoWorkspaceCrateMap(context: ResolutionContext): Map<string, string> {
   const result = new Map<string, string>();
   const rootCargoToml = context.readFile('Cargo.toml');
   if (!rootCargoToml) return result;

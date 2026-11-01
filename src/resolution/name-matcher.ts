@@ -26,7 +26,7 @@ import { isTestFile, isTestPath } from '../search/query-utils';
 import { ambientModuleDeclarations, declaringFileAnswers, inBlock, isDeclarationFile, isMergedAmbientDeclaration, scanGlobalScope, type GlobalScopeScan } from './ambient-modules';
 import { leavesWorkspaceRoot } from './workspace-packages';
 import { isMinifiedContent } from '../extraction/generated-detection';
-import { getCargoWorkspaceCrateMap, parsePackageName, parseTargetPaths } from './frameworks/cargo-workspace';
+import { getCargoWorkspaceCrateMap, parsePackageName, parseTargetPaths, parseWorkspaceMembers } from './frameworks/cargo-workspace';
 import { blankRustCode, readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -9569,6 +9569,15 @@ function rustManifestDependencies(text: string): RustManifestDependency[] {
     if (dep) read(entry(kind!, dep[1]!), dep[2] ? `${dep[2]} = ${dep[3]}` : dep[3]!);
   }
   return [...deps.values()];
+}
+
+/**
+ * What resolution reads from a Cargo manifest: the workspace's members, the
+ * package's name, its targets' paths and what it depends on by name and path.
+ * A version bump is none of that.
+ */
+export function cargoManifestFields(text: string): string {
+  return JSON.stringify([parseWorkspaceMembers(text), parsePackageName(text), parseTargetPaths(text), rustManifestDependencies(text)]);
 }
 
 /** The crates the project's manifests depend on, by the name code writes them (`futures_util`), less the project's own. */
@@ -22537,6 +22546,14 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PY_FILE_DEFS.delete(context);
   PY_SCOPE_BINDINGS.delete(context);
   PY_LOCAL_CLASS_MEMO.delete(context);
+  SFC_SCRIPT_RANGES.delete(context);
+  RECEIVER_ONLY_NAMES.delete(context);
+  OBJC_MEMBER_TABLES.delete(context);
+  OBJC_CLASS_FILES.delete(context);
+  CPP_SPECIALIZATION_OWNER_ARGUMENTS.delete(context);
+  CPP_SPECIALIZATION_ARGUMENTS.delete(context);
+  GO_BUILD_CONSTRAINTS.delete(context);
+  GO_BUILD_TWINS.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {

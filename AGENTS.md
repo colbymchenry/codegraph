@@ -179,6 +179,7 @@ Tests live in `__tests__/` and mirror the module they cover. Notable ones beyond
 - `installer-targets.test.ts` — parameterized contract suite across every registered target (`ALL_TARGETS`); see the installer notes above.
 - `evaluation/` — `runner.ts` + `test-cases.ts` exercise codegraph against synthetic projects and score the results; run via `npm run eval` (builds first). Not part of `npm test`.
 - `sqlite-backend.test.ts` / `node-sqlite-backend.test.ts` — pin that `node:sqlite` is the sole backend: `getBackend()` reports `node-sqlite` and the DB comes up in WAL.
+- `name-matcher-memo-clears.test.ts` — every module-level memo in `name-matcher.ts` is dropped by `clearNameMatcherMemos` or named in its short allow-list. A resolver outlives a sync, so a memo that isn't dropped goes stale in a long-lived server alone, where no single-index test sees it (`sync-memo-lifetime.test.ts` edits and syncs on one object). A project-level read too large to repeat (a Cargo workspace, a compile database) stays out of the clear functions and joins the module-config snapshot instead.
 - `pr19-improvements.test.ts`, `frameworks-integration.test.ts` — regression coverage for specific past PRs/incidents; don't rename these, the names anchor to git history.
 
 Tests create temp dirs with `fs.mkdtempSync` and clean up in `afterEach`. They write real files and exercise real SQLite — there is no DB mocking.

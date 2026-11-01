@@ -290,6 +290,12 @@ export interface ResolutionContext {
    */
   getCppIncludeDirs?(): string[];
   /**
+   * The crates of the project's Cargo workspace, each spelling of a name →
+   * its member's directory. Optional so minimal contexts compile; they read
+   * the manifests themselves (see getCargoWorkspaceCrateMap).
+   */
+  getCargoCrates?(): Map<string, string>;
+  /**
    * The import node of every C / C++ `#include`, narrowed to the path it
    * spells and where it is written: what ./cpp-includers builds the include
    * graph from. Optional so minimal contexts compile; it falls back to

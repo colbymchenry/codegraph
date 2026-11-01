@@ -25,11 +25,11 @@ const TRANID_NAME_RE = /TRAN/i;
 const VALUE_LITERAL_RE = /\bVALUE\s+['"]([A-Za-z0-9$#@]{1,4})['"]/i;
 
 /**
- * transaction id → owning program module, built once per resolution context.
- * A WeakMap so a per-ref scan of every data node can't go quadratic on
- * copybook-heavy repos.
+ * transaction id → owning program module, built once per node list (whose
+ * identity changes when the resolver's caches do). A WeakMap so a per-ref scan
+ * of every data node can't go quadratic on copybook-heavy repos.
  */
-const transidIndexes = new WeakMap<ResolutionContext, Map<string, string>>();
+const transidIndexes = new WeakMap<ResolutionContext, { source: readonly Node[]; index: Map<string, string> }>();
 
 function buildIndex(context: ResolutionContext): Map<string, string> {
   const index = new Map<string, string>();
@@ -73,13 +73,14 @@ export const cicsResolver: FrameworkResolver = {
     if (!ref.referenceName.startsWith(TRANSID_REF_PREFIX)) return null;
     const tx = ref.referenceName.slice(TRANSID_REF_PREFIX.length).toUpperCase();
 
-    let index = transidIndexes.get(context);
-    if (!index) {
-      index = buildIndex(context);
-      transidIndexes.set(context, index);
+    const source = context.getNodesByKind('variable');
+    let entry = transidIndexes.get(context);
+    if (!entry || entry.source !== source) {
+      entry = { source, index: buildIndex(context) };
+      transidIndexes.set(context, entry);
     }
 
-    const targetNodeId = index.get(tx);
+    const targetNodeId = entry.index.get(tx);
     if (!targetNodeId) return null;
     return {
       original: ref,

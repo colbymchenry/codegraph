@@ -662,7 +662,8 @@ function angularMounts(context: ResolutionContext, routes: readonly Node[]): Ang
   return mounts;
 }
 
-const workspaceRoots = new WeakMap<ResolutionContext, Map<string, string | null>>();
+/** Per context, renewed with the route list. */
+const workspaceRoots = new WeakMap<ResolutionContext, { source: readonly Node[]; memo: Map<string, string | null> }>();
 
 /**
  * The app a routes file belongs to. An Angular workspace — the directory an
@@ -673,8 +674,10 @@ const workspaceRoots = new WeakMap<ResolutionContext, Map<string, string | null>
  * workspace, the conventional app root.
  */
 function angularAppRoot(filePath: string, context: ResolutionContext): string {
-  let memo = workspaceRoots.get(context);
-  if (!memo) workspaceRoots.set(context, (memo = new Map()));
+  const source = context.getNodesByKind('route');
+  let entry = workspaceRoots.get(context);
+  if (!entry || entry.source !== source) workspaceRoots.set(context, (entry = { source, memo: new Map() }));
+  const memo = entry.memo;
   const slash = filePath.lastIndexOf('/');
   const dir = slash < 0 ? '' : filePath.slice(0, slash);
   let found = memo.get(dir);

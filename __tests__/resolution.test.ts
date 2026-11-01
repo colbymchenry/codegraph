@@ -12,7 +12,7 @@ import { CodeGraph } from '../src';
 import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
 import { matchReference, resolveMethodOnType, matchByQualifiedName, matchByExactName, preferCallSiteFile, matchMethodCall } from '../src/resolution/name-matcher';
-import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
+import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirsFromCompileDB, loadCppIncludeDirsHeuristic, isPhpIncludePathRef } from '../src/resolution/import-resolver';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
 import { QueryBuilder } from '../src/db/queries';
@@ -3872,9 +3872,7 @@ int run() {
   });
 
   describe('C/C++ Import Resolution', () => {
-    afterEach(() => {
-      clearCppIncludeDirCache();
-    });
+    const loadCppIncludeDirs = (root: string): string[] => loadCppIncludeDirsFromCompileDB(root) ?? loadCppIncludeDirsHeuristic(root);
 
     it('should resolve C include to header in same directory', () => {
       const context: ResolutionContext = {
@@ -4107,7 +4105,6 @@ int run() {
         fs.mkdirSync(path.join(tempProject, 'include'), { recursive: true });
         fs.mkdirSync(path.join(tempProject, 'src', 'lib'), { recursive: true });
 
-        clearCppIncludeDirCache();
         const dirs = loadCppIncludeDirs(tempProject);
 
         // Should find include and src/lib (relative to project root)
@@ -4131,7 +4128,6 @@ int run() {
         // Create a directory without headers — should not be included
         fs.mkdirSync(path.join(tempProject, 'docs'), { recursive: true });
 
-        clearCppIncludeDirCache();
         const dirs = loadCppIncludeDirs(tempProject);
 
         expect(dirs).toContain('include');
@@ -4161,7 +4157,6 @@ int run() {
         fs.writeFileSync(path.join(tempProject, 'iosmod', 'View.h'), '');
         fs.writeFileSync(path.join(tempProject, 'iosmod', 'View.m'), '');
 
-        clearCppIncludeDirCache();
         const dirs = loadCppIncludeDirs(tempProject);
 
         // Both included — Obj-C dirs are intentionally allowed.
@@ -4190,7 +4185,6 @@ int run() {
           `#include "utils.h"\n#include <vector>\nint main(){ return add(1,2); }\n`
         );
 
-        clearCppIncludeDirCache();
         cg = await CodeGraph.init(tempProject, { index: true });
 
         // Sanity: file nodes exist for the header and the cpp.

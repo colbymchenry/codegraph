@@ -1712,69 +1712,33 @@ function namesOwnConfigModule(importPath: string, fromFile: string, language: La
 }
 
 /**
- * C/C++ include directory cache (keyed by project root).
- * Loaded once per resolver instance, shared across calls.
+ * The Clang compilation databases a project can have, relative to its root,
+ * the first one found being the one read.
  */
-const cppIncludeDirCache = new Map<string, string[]>();
+export const CPP_COMPILE_DB_FILES = [
+  'compile_commands.json',
+  'build/compile_commands.json',
+  'cmake-build-debug/compile_commands.json',
+  'cmake-build-release/compile_commands.json',
+  'out/compile_commands.json',
+] as const;
 
 /**
- * Clear the C/C++ include directory cache (call between indexing runs)
- */
-export function clearCppIncludeDirCache(): void {
-  cppIncludeDirCache.clear();
-}
-
-/**
- * Discover C/C++ include search directories for a project.
- *
- * Strategy:
- * 1. Look for compile_commands.json (Clang compilation database) in the
- *    project root and common build subdirectories. Parse -I and -isystem
- *    flags from compiler commands.
- * 2. If no compilation database is found, probe for common convention
- *    directories (include/, src/, lib/, api/) and top-level directories
- *    containing .h/.hpp files.
- *
- * Returns paths relative to projectRoot.
- */
-export function loadCppIncludeDirs(projectRoot: string): string[] {
-  const cached = cppIncludeDirCache.get(projectRoot);
-  if (cached !== undefined) return cached;
-
-  const dirs = loadCppIncludeDirsFromCompileDB(projectRoot)
-    || loadCppIncludeDirsHeuristic(projectRoot);
-
-  cppIncludeDirCache.set(projectRoot, dirs);
-  return dirs;
-}
-
-/**
- * Try to load include directories from compile_commands.json.
+ * The C/C++ include search directories a project's compile_commands.json
+ * names, by its -I and -isystem flags, relative to projectRoot.
  * Returns null if no compilation database is found (so the heuristic
  * fallback can run). Returns an array (possibly empty) otherwise.
  */
-function loadCppIncludeDirsFromCompileDB(projectRoot: string): string[] | null {
-  const candidates = [
-    path.join(projectRoot, 'compile_commands.json'),
-    path.join(projectRoot, 'build', 'compile_commands.json'),
-    path.join(projectRoot, 'cmake-build-debug', 'compile_commands.json'),
-    path.join(projectRoot, 'cmake-build-release', 'compile_commands.json'),
-    path.join(projectRoot, 'out', 'compile_commands.json'),
-  ];
-
-  let dbPath: string | undefined;
-  for (const c of candidates) {
-    try {
-      if (fs.existsSync(c)) {
-        dbPath = c;
-        break;
-      }
-    } catch {
-      // ignore
-    }
+export function loadCppIncludeDirsFromCompileDB(projectRoot: string): string[] | null {
+  for (const file of CPP_COMPILE_DB_FILES) {
+    const dbPath = path.join(projectRoot, file);
+    if (fs.existsSync(dbPath)) return readCompileDbIncludeDirs(dbPath, projectRoot);
   }
-  if (!dbPath) return null;
+  return null;
+}
 
+/** The include directories the compilation database at `dbPath` names; null when it can't be read. */
+export function readCompileDbIncludeDirs(dbPath: string, projectRoot: string): string[] | null {
   try {
     const content = fs.readFileSync(dbPath, 'utf-8');
     const entries = JSON.parse(content) as Array<{
@@ -1862,7 +1826,7 @@ function shlexSplit(cmd: string): string[] {
  * Heuristic include directory discovery when no compile_commands.json exists.
  * Checks common convention directories and scans top-level dirs for headers.
  */
-function loadCppIncludeDirsHeuristic(projectRoot: string): string[] {
+export function loadCppIncludeDirsHeuristic(projectRoot: string): string[] {
   const dirs: string[] = [];
   const conventionDirs = ['include', 'src', 'lib', 'api', 'inc'];
 
@@ -2535,17 +2499,6 @@ function extractCppImports(content: string): ImportMapping[] {
   }
 
   return mappings;
-}
-
-// Cache import mappings per file to avoid re-reading and re-parsing
-const importMappingCache = new Map<string, ImportMapping[]>();
-
-/**
- * Clear the import mapping cache (call between indexing runs)
- */
-export function clearImportMappingCache(): void {
-  importMappingCache.clear();
-  cppIncludeDirCache.clear();
 }
 
 /**

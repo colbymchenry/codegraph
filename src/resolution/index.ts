@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
+import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -45,9 +45,10 @@ import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { clearRubyConstantPathMemos, matchRubyConstantPathRef } from './ruby-constant-paths';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, CPP_COMPILE_DB_FILES, loadCppIncludeDirsFromCompileDB, loadCppIncludeDirsHeuristic, readCompileDbIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
 import { ResolverPool, minRefsForPool, poolStartSettled, resolveWorkersWorthStarting, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
+import { readCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } from './frameworks';
 import { clearDeclaredDependencies } from './frameworks/package-deps';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -252,9 +253,14 @@ const CPP_BUILT_INS = new Set([
 ]);
 
 /** The module-config files at the project root a resolver reads, present or not (#2977). */
-const MODULE_CONFIG_ROOT_FILES = ['tsconfig.json', 'jsconfig.json', 'tsconfig.base.json', 'go.mod'] as const;
+const MODULE_CONFIG_ROOT_FILES = ['tsconfig.json', 'jsconfig.json', 'tsconfig.base.json', 'go.mod', 'Cargo.toml', ...CPP_COMPILE_DB_FILES] as const;
 
-/** Project-relative config path → digest of what resolution reads from it (see `moduleConfigDigest`), 'absent' for one not there. */
+/**
+ * Project-relative config path → `<digest>@<stamp>`: a digest of what
+ * resolution reads from it (see `moduleConfigDigest`) and the stamp of the file
+ * it was read from (see `moduleConfigEntry`), 'absent' for one not there. An
+ * older engine wrote the digest alone.
+ */
 export type ModuleConfigSnapshot = Record<string, string>;
 
 /** A stored snapshot's files (see `getModuleConfigSnapshot`); an index without one, or one an older engine wrote, has none. */
@@ -269,37 +275,80 @@ export function parseModuleConfigSnapshot(stored: string | null): ModuleConfigSn
   }
 }
 
-/** Digest each of `files` (absolute) as the project sees it now, keyed by its project-relative path. */
-function moduleConfigSnapshot(projectRoot: string, files: Iterable<string>): ModuleConfigSnapshot {
+/** Each of `files` (absolute) as the project sees it now, keyed by its project-relative path. */
+function moduleConfigSnapshot(projectRoot: string, files: Iterable<string>, previous: ModuleConfigSnapshot): ModuleConfigSnapshot {
   const snapshot: ModuleConfigSnapshot = {};
   for (const abs of files) {
     const rel = path.relative(projectRoot, abs).replace(/\\/g, '/');
     // A config outside the project (an `extends` into node_modules or a parent
     // folder) is read where it is; the key stays relative so the index moves.
-    snapshot[rel] = moduleConfigDigest(abs);
+    snapshot[rel] = moduleConfigEntry(abs, previous[rel], projectRoot);
   }
   return snapshot;
 }
 
 /**
- * A digest of what resolution reads from one config file, 'absent' for one not
- * there: a go.mod's module path, a tsconfig / jsconfig's `extends`, `baseUrl`
- * and `paths`. Not of its bytes: a dependency bump or a `strict` flag moves no
- * import, and would re-open every one.
+ * One file's snapshot entry. Every sync looks at these files, so one whose
+ * modified time and size haven't moved keeps the digest it has and isn't read:
+ * a compile database runs to megabytes, and a Cargo workspace to a manifest per
+ * crate.
  */
-function moduleConfigDigest(abs: string): string {
-  if (!fs.existsSync(abs)) return 'absent';
-  const read = path.basename(abs) === 'go.mod'
-    ? loadGoModule(path.dirname(abs))?.modulePath ?? ''
+function moduleConfigEntry(abs: string, previous: string | undefined, projectRoot: string): string {
+  let stat: fs.Stats | undefined;
+  try {
+    stat = fs.statSync(abs, { throwIfNoEntry: false });
+  } catch { /* a file that can't be looked at is not there */ }
+  if (!stat) return 'absent';
+  const stamp = `${stat.mtimeMs}:${stat.size}`;
+  return previous?.endsWith(`@${stamp}`) ? previous : `${moduleConfigDigest(abs, projectRoot)}@${stamp}`;
+}
+
+/**
+ * A digest of what resolution reads from one config file: a go.mod's module
+ * path, a tsconfig / jsconfig's `extends`, `baseUrl` and `paths`, what a Cargo
+ * manifest declares (see `cargoManifestFields`), the include directories a
+ * compile database names. Not of its bytes: a dependency bump, a `strict` flag
+ * or a build that writes its database again moves no import, and would re-open
+ * every one.
+ */
+function moduleConfigDigest(abs: string, projectRoot: string): string {
+  const file = path.basename(abs);
+  const read = file === 'go.mod' ? loadGoModule(path.dirname(abs))?.modulePath ?? ''
+    : file === 'Cargo.toml' ? cargoManifestDigestText(abs)
+    : file === 'compile_commands.json' ? (readCompileDbIncludeDirs(abs, projectRoot) ?? []).join('\n')
     : aliasConfigFields(abs) ?? '';
   return createHash('sha256').update(read).digest('hex').slice(0, 16);
 }
 
-/** The languages whose imports a changed config file governs: the ES-module family for a tsconfig / jsconfig, Go for a go.mod. */
+function cargoManifestDigestText(abs: string): string {
+  try {
+    return cargoManifestFields(fs.readFileSync(abs, 'utf-8'));
+  } catch {
+    return '';
+  }
+}
+
+/** The files of `now` whose digest differs from `was`'s; a stamp alone moved nothing. */
+export function changedModuleConfigs(was: ModuleConfigSnapshot, now: ModuleConfigSnapshot): string[] {
+  const digest = (entry: string): string => entry.split('@')[0]!;
+  // A snapshot from before manifests and compile databases counted says nothing about them.
+  const buildFilesKnown = 'Cargo.toml' in was;
+  return Object.keys(now).filter((rel) =>
+    (buildFilesKnown || !/(?:^|\/)(?:Cargo\.toml|compile_commands\.json)$/.test(rel)) &&
+    digest(was[rel] ?? 'absent') !== digest(now[rel]!));
+}
+
+/**
+ * The languages whose imports a changed config file governs: the ES-module
+ * family for a tsconfig / jsconfig, Go for a go.mod, Rust for a Cargo manifest,
+ * C and C++ for a compile database.
+ */
 export function moduleConfigLanguages(changed: readonly string[]): Set<Language> {
   const languages = new Set<Language>();
   for (const rel of changed) {
     if (/(?:^|\/)go\.mod$/.test(rel)) languages.add('go');
+    else if (/(?:^|\/)Cargo\.toml$/.test(rel)) languages.add('rust');
+    else if (/(?:^|\/)compile_commands\.json$/.test(rel)) for (const language of ['c', 'cpp'] as const) languages.add(language);
     else for (const language of ESM_IMPORT_LANGUAGES) languages.add(language);
   }
   return languages;
@@ -404,6 +453,15 @@ export class ReferenceResolver {
   private projectAliases: AliasMap | null | undefined = undefined;
   // Per directory: the aliases of the nearest non-root tsconfig declaring `paths` or `baseUrl`.
   private dirAliases = new Map<string, AliasMap | null>();
+  // The Cargo workspace's crates and the include directories a compile
+  // database names (null: the project has none). Same lazy convention: read
+  // once, whatever the size of the workspace or the database, and dropped by
+  // resetModuleConfig when the module-config snapshot says they moved.
+  private cargoCrates: Map<string, string> | undefined = undefined;
+  private compileDbIncludeDirs: string[] | null | undefined = undefined;
+  // The include directories of a project with no compile database, found by
+  // listing its top folders: read again when files come or go (getModuleConfigSnapshot).
+  private layoutIncludeDirs: string[] | undefined = undefined;
   // Per project-relative directory ('' = the root): the module of the nearest
   // go.mod at or above it, up to the project root. Same lazy/immutable
   // convention as dirAliases.
@@ -456,6 +514,9 @@ export class ReferenceResolver {
     // A full index resolves by the package.json files on disk now, as the
     // fingerprint it stamps says, even in a process that read them earlier.
     this.workspacePackages = undefined;
+    this.cargoCrates = undefined;
+    this.compileDbIncludeDirs = undefined;
+    this.layoutIncludeDirs = undefined;
     // Detection reads through the caches (file contents, existence probes,
     // declared dependencies): clear them first, or a process that read the
     // manifests earlier detects by what they said then (#2519).
@@ -1188,8 +1249,11 @@ export class ReferenceResolver {
       },
 
       getCppIncludeDirs: () => {
-        return loadCppIncludeDirs(this.projectRoot);
+        if (this.compileDbIncludeDirs === undefined) this.compileDbIncludeDirs = loadCppIncludeDirsFromCompileDB(this.projectRoot);
+        return this.compileDbIncludeDirs ?? (this.layoutIncludeDirs ??= loadCppIncludeDirsHeuristic(this.projectRoot));
       },
+
+      getCargoCrates: () => this.readCargoCrates(),
 
       getCppIncludeNodes: () => this.queries.getCppIncludeNodes(),
     };
@@ -3226,28 +3290,51 @@ export class ReferenceResolver {
    * (`extends` chains included), every go.mod, and the root's candidates
    * whether present or not, so one that appears is seen too. `previous` is the
    * snapshot the index was stamped with; its files are read again, so a config
-   * this process never loaded still counts.
+   * this process never loaded still counts. `treeMoved` says files came or went
+   * since this resolver last looked: a crate under a `crates/*` member names no
+   * file the snapshot holds, and a new top folder of headers can be an include
+   * directory, so what is read from the tree's layout is read again. A
+   * snapshot from before manifests counted has its members to learn too.
    */
-  getModuleConfigSnapshot(previous: string | null): ModuleConfigSnapshot {
+  getModuleConfigSnapshot(previous: string | null, treeMoved = false): ModuleConfigSnapshot {
+    const was = parseModuleConfigSnapshot(previous);
+    if (treeMoved || !('Cargo.toml' in was)) {
+      this.cargoCrates = undefined;
+      this.layoutIncludeDirs = undefined;
+      this.readCargoCrates();
+    }
     const files = new Set<string>(this.moduleConfigFiles);
     for (const name of MODULE_CONFIG_ROOT_FILES) files.add(path.join(this.projectRoot, name));
-    for (const rel of Object.keys(parseModuleConfigSnapshot(previous))) files.add(path.join(this.projectRoot, rel));
-    return moduleConfigSnapshot(this.projectRoot, files);
+    for (const rel of Object.keys(was)) files.add(path.join(this.projectRoot, rel));
+    return moduleConfigSnapshot(this.projectRoot, files, was);
+  }
+
+  /** The Cargo workspace's crates, read from disk the first time; every member's manifest joins the snapshot. */
+  private readCargoCrates(): Map<string, string> {
+    if (!this.cargoCrates) {
+      this.cargoCrates = readCargoWorkspaceCrateMap(this.diskContext());
+      for (const dir of this.cargoCrates.values()) this.moduleConfigFiles.add(path.join(this.projectRoot, dir, 'Cargo.toml'));
+    }
+    return this.cargoCrates;
   }
 
   /**
-   * Forget the tsconfig / jsconfig alias maps and the go.mod modules this
-   * resolver read, and every memo resolved through them, so the next reference
-   * reads the files as they are now (#2977). The caller re-opens the imports
-   * the old maps resolved.
+   * Forget the tsconfig / jsconfig alias maps, the go.mod modules, the Cargo
+   * crates and the compile database's directories this resolver read, and
+   * every memo resolved through them, so the next reference reads the files as
+   * they are now (#2977). The caller re-opens the imports the old maps resolved.
    */
   resetModuleConfig(): void {
     this.projectAliases = undefined;
     this.dirAliases.clear();
     this.goModuleByDir.clear();
     this.goPackageDirs.clear();
+    this.cargoCrates = undefined;
+    this.compileDbIncludeDirs = undefined;
     this.moduleConfigFiles.clear();
     this.clearCaches();
+    // Its manifests stay in the snapshot, whatever this sync resolves.
+    this.readCargoCrates();
   }
 
   /** The fingerprint of the workspace map this resolver resolves by (see `workspaceFingerprint`). */

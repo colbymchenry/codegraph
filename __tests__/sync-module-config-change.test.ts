@@ -1,7 +1,8 @@
 /**
  * A sync follows a change to the files import resolution is configured by
  * (#2977): `tsconfig.json` / `jsconfig.json` `paths` and `baseUrl`, their
- * `extends` chain, and a `go.mod` module path. The resolver read them once and
+ * `extends` chain, a `go.mod` module path, Cargo manifests and a
+ * `compile_commands.json`. The resolver read them once and
  * kept the maps for its lifetime, and the watcher follows source files only,
  * so an edit kept resolving imports by the old mapping — in the same process,
  * and in later ones too, since a sync re-resolves only the changed files.
@@ -96,6 +97,42 @@ const GO_BEFORE: Files = {
   'main.go': 'package main\n\nimport "example.com/app/util"\n\nfunc run() int { return util.Foo() }\n',
 };
 
+const cargoMember = (name: string): Files => ({
+  [`${name}/Cargo.toml`]: `[package]\nname = "${name}"\nversion = "0.1.0"\n`,
+  [`${name}/src/lib.rs`]: 'pub fn run() {}\npub struct Thing;\n',
+});
+
+const CARGO_BEFORE: Files = {
+  'Cargo.toml': '[workspace]\nmembers = ["a"]\n',
+  'a/Cargo.toml': '[package]\nname = "a"\nversion = "0.1.0"\n\n[dependencies]\nb = { path = "../b" }\n',
+  'a/src/lib.rs': 'use b::Thing;\npub fn go() { b::run(); let _t = Thing; }\n',
+  ...cargoMember('b'),
+};
+
+const compileDb = (root: string, dir: string): string =>
+  JSON.stringify([{ directory: root, file: 'src/a.c', command: `cc -I${dir} -c src/a.c` }]);
+
+const C_BEFORE: Files = {
+  'third/foo.h': 'int third_fn(void);\n',
+  'other/foo.h': 'int other_fn(void);\n',
+  'src/a.c': '#include "foo.h"\nint use(void) { return 1; }\n',
+};
+
+/** What the first `#include` of `file` names. */
+function includeTarget(graph: CodeGraph, file: string): string[] {
+  return graph.getNodesInFile(file).filter((n) => n.kind === 'file')
+    .flatMap((n) => graph.getOutgoingEdges(n.id))
+    .filter((e) => e.kind === 'imports')
+    .map((e) => graph.getNode(e.target)!.filePath);
+}
+
+/** What a full index of C_BEFORE holds under a compile database naming `dir`, which names the folder it's in. */
+async function fullIndexWithDb(dir: string): Promise<string[]> {
+  const root = tempRoot();
+  write(root, { ...C_BEFORE, 'compile_commands.json': compileDb(root, dir) });
+  return stateOf(root, await index(root));
+}
+
 /** Index `before`, write `after` over it, sync; return the graph and what a full index of the final tree holds. */
 async function syncEdit(before: Files, after: Files): Promise<{ root: string; graph: CodeGraph; full: string[] }> {
   const root = tempRoot();
@@ -145,6 +182,54 @@ describe('a sync follows a module-config change (#2977)', () => {
     expect(stateOf(root, graph)).toEqual(full);
   }, 120_000);
 
+  it('a Cargo workspace gains a member, the importer untouched', async () => {
+    const { root, graph, full } = await syncEdit(CARGO_BEFORE, { 'Cargo.toml': '[workspace]\nmembers = ["a", "b"]\n' });
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
+  it('a crate appears under a `crates/*` member, which no manifest the index knows says', async () => {
+    const before: Files = {
+      'Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n',
+      'crates/a/Cargo.toml': '[package]\nname = "a"\nversion = "0.1.0"\n',
+      'crates/a/src/lib.rs': 'use b::Thing;\npub fn go() { b::run(); let _t = Thing; }\n',
+    };
+    const { root, graph, full } = await syncEdit(before, {
+      'crates/b/Cargo.toml': '[package]\nname = "b"\nversion = "0.1.0"\n',
+      'crates/b/src/lib.rs': 'pub fn run() {}\npub struct Thing;\n',
+    });
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
+  it('a member crate is renamed in its manifest, with the imports written for it', async () => {
+    const { root, graph, full } = await syncEdit({ ...CARGO_BEFORE, 'Cargo.toml': '[workspace]\nmembers = ["a", "b"]\n' }, {
+      'b/Cargo.toml': '[package]\nname = "c"\nversion = "0.1.0"\n',
+      'a/Cargo.toml': '[package]\nname = "a"\nversion = "0.1.0"\n\n[dependencies]\nc = { path = "../b" }\n',
+      'a/src/lib.rs': 'use c::Thing;\npub fn go() { c::run(); let _t = Thing; }\n',
+    });
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
+  it('a compile database appears, the source untouched', async () => {
+    const root = tempRoot();
+    write(root, C_BEFORE);
+    const graph = await index(root);
+    write(root, { 'compile_commands.json': compileDb(root, 'third') });
+    await graph.sync();
+    expect(includeTarget(graph, 'src/a.c')).toEqual(['third/foo.h']);
+    expect(stateOf(root, graph)).toEqual(await fullIndexWithDb('third'));
+  }, 120_000);
+
+  it('a compile database names another include directory, the source untouched', async () => {
+    const root = tempRoot();
+    write(root, { ...C_BEFORE, 'compile_commands.json': compileDb(root, 'third') });
+    const graph = await index(root);
+    expect(includeTarget(graph, 'src/a.c')).toEqual(['third/foo.h']);
+    write(root, { 'compile_commands.json': compileDb(root, 'other') });
+    await graph.sync();
+    expect(includeTarget(graph, 'src/a.c')).toEqual(['other/foo.h']);
+    expect(stateOf(root, graph)).toEqual(await fullIndexWithDb('other'));
+  }, 120_000);
+
   it('a later process sees the change too', async () => {
     const root = tempRoot();
     write(root, TS_BEFORE);
@@ -170,6 +255,72 @@ describe('a sync follows a module-config change (#2977)', () => {
     const result = await graph.sync();
     expect(result.filesModified).toBe(1);
     expect(stateOf(root, graph)).toEqual(before);
+  }, 120_000);
+
+  it('a manifest or compile database edit that moves no import re-opens nothing', async () => {
+    const reopen = vi.spyOn(ExtractionOrchestrator.prototype, 'resurrectResolutionEdgesForLanguage');
+    try {
+      const root = tempRoot();
+      write(root, { ...C_BEFORE, ...CARGO_BEFORE, 'compile_commands.json': compileDb(root, 'third') });
+      const graph = await index(root);
+      const before = stateOf(root, graph);
+      reopen.mockClear();
+      // A version bump, and a build that wrote its database again with more of the same.
+      write(root, {
+        'a/Cargo.toml': '[package]\nname = "a"\nversion = "0.2.0"\n\n[dependencies]\nb = { path = "../b" }\n',
+        'compile_commands.json': JSON.stringify([
+          { directory: root, file: 'src/a.c', command: 'cc -Ithird -c src/a.c' },
+          { directory: root, file: 'src/b.c', command: 'cc -Ithird -c src/b.c' },
+        ]),
+      });
+      await graph.sync();
+      expect(reopen).not.toHaveBeenCalled();
+      expect(stateOf(root, graph)).toEqual(before);
+    } finally {
+      reopen.mockRestore();
+    }
+  }, 120_000);
+
+  it('a compile database whose stamp has not moved is not read again', async () => {
+    const root = tempRoot();
+    write(root, { ...C_BEFORE, 'compile_commands.json': compileDb(root, 'third') });
+    const file = path.join(root, 'compile_commands.json');
+    const when = new Date(1_700_000_000_000);
+    fs.utimesSync(file, when, when);
+    const graph = await index(root);
+    // Unreadable as JSON, and the same size and time: reading it would drop the directory.
+    fs.writeFileSync(file, 'x'.repeat(fs.statSync(file).size));
+    fs.utimesSync(file, when, when);
+    const reopen = vi.spyOn(ExtractionOrchestrator.prototype, 'resurrectResolutionEdgesForLanguage');
+    try {
+      await graph.sync();
+      expect(reopen).not.toHaveBeenCalled();
+    } finally {
+      reopen.mockRestore();
+    }
+  }, 120_000);
+
+  it('an index from before manifests counted re-opens nothing on its first sync', async () => {
+    const root = tempRoot();
+    write(root, CARGO_BEFORE);
+    const graph = await index(root);
+    const db = DatabaseConnection.open(getDatabasePath(root));
+    try {
+      const stored = db.getDb().prepare("SELECT value FROM project_metadata WHERE key = 'module_config_snapshot'").get() as { value: string };
+      const old = Object.fromEntries(Object.entries(JSON.parse(stored.value) as Record<string, string>)
+        .filter(([rel]) => !/Cargo\.toml$|compile_commands\.json$/.test(rel))
+        .map(([rel, entry]) => [rel, entry.split('@')[0]!]));
+      db.getDb().prepare("UPDATE project_metadata SET value = ? WHERE key = 'module_config_snapshot'").run(JSON.stringify(old));
+    } finally {
+      db.close();
+    }
+    const reopen = vi.spyOn(ExtractionOrchestrator.prototype, 'resurrectResolutionEdgesForLanguage');
+    try {
+      await graph.sync();
+      expect(reopen).not.toHaveBeenCalled();
+    } finally {
+      reopen.mockRestore();
+    }
   }, 120_000);
 
   it('a config edit that moves no mapping re-opens nothing: a tsconfig flag, a go.mod requirement', async () => {
