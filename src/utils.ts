@@ -461,6 +461,12 @@ type LockHolder =
   | { state: 'held'; pid?: number }
   | { state: 'stale' };
 
+/** Optional index identity, used to recognize lock records copied to another project. */
+export interface FileLockOwner {
+  stamp(): object;
+  isForeign(record: unknown): boolean;
+}
+
 /**
  * Cross-process file lock using a lock file with PID tracking.
  *
@@ -471,19 +477,17 @@ export class FileLock {
   private lockPath: string;
   private held = false;
 
-  constructor(lockPath: string) {
+  constructor(lockPath: string, private readonly owner?: FileLockOwner) {
     this.lockPath = lockPath;
   }
 
   /**
    * Acquire the lock. Throws if the lock is held by another live process.
    *
-   * A free lock costs one create. A stale one, whose PID is dead or missing,
-   * is replaced only by the process holding `<lock>.break` (itself a
-   * FileLock), after reading it again there (#2979). Before, two processes
-   * that read the same dead PID both unlinked the lock and created their own,
-   * the second one deleting the first one's live lock, and both went on to
-   * write as the only writer.
+   * A free lock costs one create. A stale one (a dead or missing PID, or an
+   * independently copied index) is replaced only by the process holding
+   * `<lock>.break` (itself a FileLock), after reading it again there (#2979).
+   * This serializes stale takers so neither deletes a successor's live lock.
    */
   acquire(): void {
     const refusal = this.tryAcquire(0);
@@ -506,7 +510,8 @@ export class FileLock {
       holder = this.readHolder();
     }
     // A long sync can hold the lock for hours. Its age says nothing about
-    // whether the writer is still alive; only a dead PID is stale.
+    // whether the writer is still alive. Only PID liveness or independent
+    // physical-index identity can establish that the record is stale.
     if (holder.state !== 'stale') return holder;
     if (depth >= MAX_LOCK_BREAK_DEPTH) return { state: 'held' };
     const breaker = new FileLock(`${this.lockPath}.break`);
@@ -542,7 +547,11 @@ export class FileLock {
    * EMPTY_LOCK_GRACE_MS). False when the lock already exists.
    */
   private create(): boolean {
-    const pid = String(process.pid);
+    // The first line stays a bare PID for readers that use parseInt. Identity
+    // is a second JSON line; locks without an owner keep the PID-only format.
+    const pid = this.owner
+      ? `${process.pid}\n${JSON.stringify(this.owner.stamp())}\n`
+      : String(process.pid);
     const tmp = `${this.lockPath}.${process.pid}.${threadId}.tmp`;
     try {
       fs.writeFileSync(tmp, pid);
@@ -566,12 +575,12 @@ export class FileLock {
   private readHolder(): LockHolder {
     let content: string;
     try {
-      content = fs.readFileSync(this.lockPath, 'utf-8').trim();
+      content = fs.readFileSync(this.lockPath, 'utf-8');
     } catch (err) {
       // Unreadable is not proof the holder is gone: leave it to `codegraph unlock`.
       return (err as NodeJS.ErrnoException).code === 'ENOENT' ? { state: 'free' } : { state: 'held' };
     }
-    if (content === '') {
+    if (content.trim() === '') {
       let age: number;
       try {
         age = Date.now() - fs.statSync(this.lockPath).mtimeMs;
@@ -583,6 +592,12 @@ export class FileLock {
     const pid = parseInt(content, 10);
     // Malformed: no process owns it.
     if (!(pid > 0)) return { state: 'stale' };
+    const newline = content.indexOf('\n');
+    if (this.owner && newline !== -1) {
+      try {
+        if (this.owner.isForeign(JSON.parse(content.slice(newline + 1)))) return { state: 'stale' };
+      } catch { /* Missing or malformed identity is decided by PID liveness. */ }
+    }
     return this.isProcessAlive(pid) ? { state: 'held', pid } : { state: 'stale' };
   }
 

@@ -60,6 +60,8 @@ import {
   swapWriterLock,
   tryAcquireWriterLock,
   assertNoRebuild,
+  isForeignLockRecord,
+  lockStamp,
   writerLockHeldMessage,
   type WriterLockInfo,
 } from './writer-lock';
@@ -257,7 +259,10 @@ export class Daemon {
     // (#2335); take it over without letting it fall free.
     if (writer.kind === 'taken' && this.handoverFrom !== null &&
         writer.existing?.pid === this.handoverFrom && writer.existing.mode === 'handover') {
-      const info: WriterLockInfo = { pid: process.pid, mode: 'daemon', startedAt: Date.now(), ready: false };
+      const info: WriterLockInfo = {
+        pid: process.pid, mode: 'daemon', startedAt: Date.now(), ready: false,
+        ...lockStamp(this.projectRoot),
+      };
       if (swapWriterLock(this.projectRoot, this.handoverFrom, info)) {
         writer = { kind: 'acquired', pidPath: writer.pidPath, info };
         process.stderr.write(`[CodeGraph daemon] Took over the writer lock from launcher pid ${this.handoverFrom}, which stopped an older daemon.\n`);
@@ -341,6 +346,9 @@ export class Daemon {
       version: CodeGraphPackageVersion,
       socketPath: this.socketPath,
       startedAt: Date.now(),
+      // The stamp `tryAcquireDaemonLock` wrote: this record replaces that one,
+      // and a record without it could not be told apart from a copied one.
+      ...lockStamp(this.projectRoot),
     };
 
     // Refresh the lock on every successful bind, not only relocation. The
@@ -361,7 +369,17 @@ export class Daemon {
 
     // Drop a discovery record so `codegraph list` / `stop --all` can find us.
     // Best-effort; a missing record only means list's liveness prune covers it.
-    registerDaemon({ root: this.projectRoot, ...lock });
+    // The entry names the root this daemon was started with. The lock stamp
+    // (a canonical `root`, `dirId`, `dbId`) belongs to the pidfile only, so the
+    // entry copies the pidfile's other fields one by one rather than spreading
+    // `lock`, whose `root` would replace this one.
+    registerDaemon({
+      root: this.projectRoot,
+      pid: lock.pid,
+      version: lock.version,
+      socketPath: lock.socketPath,
+      startedAt: lock.startedAt,
+    });
 
     process.stderr.write(
       `[CodeGraph daemon] Listening on ${this.socketPath} (pid ${process.pid}, v${CodeGraphPackageVersion}). Idle timeout ${this.idleTimeoutMs}ms.\n`
@@ -706,6 +724,13 @@ export type AcquireResult =
  * Whoever links first wins; everyone else gets EEXIST and reads a complete file.
  * There is no empty-file window at all.
  *
+ * The record carries this project's {@link lockStamp} (its root and the
+ * identity of its physical index), so a copy of this `.codegraph/` at another
+ * path can tell the source's record from its own: there the record is foreign
+ * (see {@link isForeignLockRecord}), decodes to `existing: null`, and is
+ * cleared as stale instead of making the copy's daemon defer to the source's
+ * live one. Every record that is not foreign is decided by pid liveness.
+ *
  * Filesystems without hard links (#997): ExFAT/FAT external volumes and some
  * network mounts can't `link()` at all — it throws ENOTSUP/EPERM, which would
  * otherwise kill the daemon before it ever reaches the socket bind. There we
@@ -728,6 +753,7 @@ export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
     version: CodeGraphPackageVersion,
     socketPath: getDaemonSocketPath(projectRoot),
     startedAt: Date.now(),
+    ...lockStamp(projectRoot),
   };
 
   // Temp name is pid-scoped so racing candidates never collide on it.
@@ -759,13 +785,15 @@ export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
   if (acquired) return { kind: 'acquired', pidPath, info };
 
   // Taken. Because the pidfile was link'd atomically it always holds a complete
-  // record — `existing` is null only for a genuinely corrupt leftover, never a
-  // mid-write race.
+  // record — `existing` is null only for a genuinely corrupt leftover or a
+  // foreign record (another project's, copied in with its `.codegraph/`),
+  // never a mid-write race. Either way `lockContents` keeps the exact
+  // bytes so the caller can compare-and-delete it.
   let existing: DaemonLockInfo | null = null;
   let lockContents: string | null = null;
   try {
     lockContents = fs.readFileSync(pidPath, 'utf8');
-    existing = decodeLockInfo(lockContents);
+    existing = decodeLockInfo(lockContents, projectRoot);
   } catch { /* unreadable lockfile — treat as malformed */ }
   return { kind: 'taken', existing, lockContents, pidPath };
 }
@@ -804,13 +832,18 @@ export function acquireLockViaExclusiveOpen(pidPath: string, info: DaemonLockInf
  * `expectedDeadPid` (the pid the caller believed was dead) makes the clear a
  * compare-and-delete: bail if the file now holds a different pid. By default a
  * live pid is also preserved; `allowLivePid` is reserved for callers that have
- * already disproved daemon identity with the socket hello (#1553). Returns true
- * when the stale lock is gone (or was already gone).
+ * already disproved daemon identity with the socket hello (#1553). Passing
+ * `projectRoot` (the project `pidPath` belongs to) also clears a FOREIGN record
+ * (see {@link isForeignLockRecord}; one copied in with a `.codegraph/`) even
+ * though its pid is alive: that pid is the source project's daemon, not this
+ * project's. A live record that is not foreign is kept. The `expectedLockContents` and
+ * `expectedDeadPid` compares still apply first. Returns true when the stale
+ * lock is gone (or was already gone).
  */
 export function clearStaleDaemonLock(
   pidPath: string,
   expectedDeadPid?: number,
-  opts: { allowLivePid?: boolean; expectedLockContents?: string } = {}
+  opts: { allowLivePid?: boolean; expectedLockContents?: string; projectRoot?: string } = {}
 ): boolean {
   try {
     const raw = fs.readFileSync(pidPath, 'utf8');
@@ -822,9 +855,12 @@ export function clearStaleDaemonLock(
     if (info) {
       // A different pid took over since we read it — not ours to clear.
       if (expectedDeadPid !== undefined && info.pid !== expectedDeadPid) return false;
+      // A foreign record (another project's, copied in with its `.codegraph/`)
+      // names that project's daemon; its liveness says nothing about this one.
+      const foreign = opts.projectRoot !== undefined && isForeignLockRecord(info, opts.projectRoot);
       // PID liveness is normally sufficient. The takeover caller may override
       // it only after a failed identity handshake proves PID reuse.
-      if (!opts.allowLivePid && info.pid > 0 && isProcessAlive(info.pid)) return false;
+      if (!foreign && !opts.allowLivePid && info.pid > 0 && isProcessAlive(info.pid)) return false;
     }
     fs.unlinkSync(pidPath);
     return true;
