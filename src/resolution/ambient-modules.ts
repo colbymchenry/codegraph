@@ -244,6 +244,8 @@ export interface GlobalScopeScan {
    * `abstract`, `enum`, `function`, `const`, …).
    */
   globalWords: Set<string>;
+  /** A `declare` statement at the file's top level: `declare class`, never a call `declare(…)`. */
+  declares: boolean;
   /** The file's `declare module '<name>' { … }` blocks, whose names are the declared module's. */
   moduleBlocks: readonly AmbientModuleBlock[];
   /** Names an `import X = …` declaration binds: `import AutofillIpcServer = autofill.AutofillIpcServer`. */
@@ -261,6 +263,7 @@ export function scanGlobalScope(source: string): GlobalScopeScan {
   const globalWords = new Set<string>();
   const importAliases = new Set<string>();
   let declare = 0; // 1: `declare`, 2: `declare global`
+  let declares = false;
   let inGlobal = false;
   let alias = 0; // 1: `import` (or `import type`), 2: `import X`
   let aliasName = '';
@@ -284,13 +287,14 @@ export function scanGlobalScope(source: string): GlobalScopeScan {
     }
     if (kind === Kind.Word) {
       if (script) globalWords.add(`${line}:${column}`);
+      if (declare === 1) declares = true;
       declare = text === 'declare' ? 1 : declare === 1 && text === 'global' ? 2 : 0;
       return;
     }
     if (kind === Kind.Punct && text === '{' && declare === 2) inGlobal = true;
     declare = 0;
   });
-  return { script, globalWords, moduleBlocks, importAliases };
+  return { script, globalWords, declares, moduleBlocks, importAliases };
 }
 
 /** One `namespace A.B { … }` statement, or one in the old spelling, `module A { … }`. */

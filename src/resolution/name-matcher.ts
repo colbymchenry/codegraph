@@ -2009,10 +2009,20 @@ export function tsGlobalScope(file: string, context: ResolutionContext): GlobalS
   if (scope === undefined) {
     const source = context.readFile(file);
     scope = source === null ? null : scanGlobalScope(source);
-    if (scope?.script && HAS_CJS_EXPORT.test(source!)) scope = { ...scope, script: false, globalWords: new Set() };
+    if (scope?.script && HAS_CJS_EXPORT.test(source!) && !isFlowLibrary(file, scope)) scope = { ...scope, script: false, globalWords: new Set() };
     memo.set(file, scope);
   }
   return scope;
+}
+
+/**
+ * Whether a file is a Flow library definition: a `.js` script with a top-level
+ * `declare`, which only Flow reads, like react's `flow-typed/environments` and
+ * the `[libs]` of its flowconfig. Its `declare module.exports` is no CommonJS
+ * export, and its top level is the global scope of every file Flow checks.
+ */
+function isFlowLibrary(file: string, scope: GlobalScopeScan): boolean {
+  return scope.declares && /\.[cm]?jsx?$/i.test(file);
 }
 
 /**
@@ -2031,13 +2041,16 @@ export function tsGlobalScope(file: string, context: ResolutionContext): GlobalS
  * level is global only to its own program — vscode's colorize fixtures
  * declare `type T` and copilot's eslint fixtures `interface Node` — and a
  * test's or fixture's globals are its tests' only, as its `declare module`
- * blocks are (see ambient-modules.ts).
+ * blocks are (see ambient-modules.ts). A Flow library's are for the JavaScript
+ * files Flow reads (isFlowLibrary): TypeScript's own `ReadableStream` is no
+ * `declare class` of a `flow-typed` folder beside it.
  */
 function isTsTypeInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (n.filePath === ref.filePath || !TS_JS_FILE.test(n.filePath)) return true;
   const scope = tsGlobalScope(n.filePath, context);
   if (!scope) return true;
-  if ((scope.script && !isDeclarationFile(n.filePath)) || (isTestFile(n.filePath) && !isTestFile(ref.filePath))) return false;
+  const declaration = isDeclarationFile(n.filePath) || (isFlowLibrary(n.filePath, scope) && !/\.[cm]?tsx?$/i.test(ref.filePath));
+  if ((scope.script && !declaration) || (isTestFile(n.filePath) && !isTestFile(ref.filePath))) return false;
   return scope.globalWords.has(`${n.startLine}:${n.startColumn}`);
 }
 
@@ -2059,7 +2072,7 @@ function isTsBareTypeName(ref: UnresolvedRef, context: ResolutionContext): boole
       (typeRef && isWrittenQualified(ref, context))) return false;
   const scope = tsGlobalScope(ref.filePath, context);
   const at = { startLine: ref.line, startColumn: ref.column };
-  return scope?.script === false && !scope.importAliases.has(ref.referenceName) &&
+  return !!scope && (scope.script === false || isFlowLibrary(ref.filePath, scope)) && !scope.importAliases.has(ref.referenceName) &&
     !scope.moduleBlocks.some((block) => inBlock(at, block));
 }
 
