@@ -193,6 +193,8 @@ export interface ResolutionContext {
    * external/test contexts compile without it.
    */
   getSuperclassNodes?(id: string): Node[];
+  /** {@link getSuperclassNodes} with where each `extends` is written, which is all that orders them. */
+  getSuperclassEdges?(id: string): Array<{ target: Node; line?: number; column?: number }>;
   /**
    * Look up a node by its id. Lets matchers derive the FROM-symbol's
    * enclosing-class scope (Swift implicit-self method scoping, `this.X`
