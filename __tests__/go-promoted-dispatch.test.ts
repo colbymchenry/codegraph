@@ -276,14 +276,14 @@ describe('a call through a Go interface reaches the method embedding promotes', 
   it('links the interface method to the embedded type that declares it', () => {
     const seriesSet = one('SeriesSet', 'storage/interface.go');
     const chunkSet = one('ChunkSeriesSet', 'storage/interface.go');
-    // blockSeriesSet's embedding, the first of the two.
-    const embedding = at('tsdb/querier.go', '\tblockBaseSeriesSet');
-    // Both structs satisfy both interfaces by name, and both get Next from
-    // the same base: one edge, through the first of them.
-    for (const iface of [seriesSet, chunkSet]) {
-      expect(dispatch(cg, methodOf(cg, iface, 'Next'))).toEqual([`blockBaseSeriesSet::Next <- blockSeriesSet @${embedding}`]);
-      expect(dispatch(cg, methodOf(cg, iface, 'Err'))).toEqual([`blockBaseSeriesSet::Err <- blockSeriesSet @${embedding}`]);
-      expect(dispatch(cg, methodOf(cg, iface, 'At'))).toEqual(['blockChunkSeriesSet::At', 'blockSeriesSet::At']);
+    const lines = FILES['tsdb/querier.go']!.split('\n');
+    const embedded = lines.flatMap((text, i) => (text === '\tblockBaseSeriesSet' ? [`tsdb/querier.go:${i + 1}`] : []));
+    // Each struct's `At` returns its own interface's type, and each gets Next
+    // from the same base, through its own embedding.
+    for (const [iface, type, embedding] of [[seriesSet, 'blockSeriesSet', embedded[0]], [chunkSet, 'blockChunkSeriesSet', embedded[1]]] as const) {
+      expect(dispatch(cg, methodOf(cg, iface, 'Next'))).toEqual([`blockBaseSeriesSet::Next <- ${type} @${embedding}`]);
+      expect(dispatch(cg, methodOf(cg, iface, 'Err'))).toEqual([`blockBaseSeriesSet::Err <- ${type} @${embedding}`]);
+      expect(dispatch(cg, methodOf(cg, iface, 'At'))).toEqual([`${type}::At`]);
     }
   });
 
