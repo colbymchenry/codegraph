@@ -1633,6 +1633,7 @@ interface PropertySchema {
   description: string;
   enum?: string[];
   default?: unknown;
+  maxLength?: number;
 }
 
 /**
@@ -1693,6 +1694,38 @@ const READ_ONLY_ANNOTATIONS: ToolAnnotations = {
  * All tools support cross-project queries via the optional `projectPath` parameter.
  */
 export const tools: ToolDefinition[] = [
+  {
+    name: 'codegraph_grep',
+    description: 'Search indexed file contents with a regex or literal string, group hits by enclosing symbol and rank by incoming graph edges. Questionable name-matched calls are marked; strict excludes them from ranking. Zero-hit guidance distinguishes indexed code from unindexed files. Requires ripgrep.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', maxLength: 4096, description: 'Regex valid in JavaScript and ripgrep, or a literal string with fixed: true. At most 4,096 characters.' },
+        in: { type: 'string', description: 'Repo-relative path prefix to search under, e.g. src/db.' },
+        ignore_case: { type: 'boolean', description: 'Case-insensitive match.' },
+        fixed: { type: 'boolean', description: 'Treat the pattern as a literal string, not a regex.' },
+        strict: { type: 'boolean', description: 'Exclude questionable incoming calls from counts and ranking.' },
+        json: { type: 'boolean', description: 'Return the structured result as JSON instead of text.' },
+        projectPath: projectPathProperty,
+      },
+      required: ['pattern'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'codegraph_suspects',
+    description: 'Audit name-only and low-confidence call edges, ranked by standard-library collisions (Rust and Swift), missing imports, ambiguous definitions and confidence. Returns targets and sample callers; these are review candidates, not proven errors.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectPath: projectPathProperty,
+        limit: { type: 'string', description: 'Positive integer (string or number) or "all"; default 25 targets.' },
+        maxEdgesPerTarget: { type: 'number', description: 'Non-negative sample edge count; default 5. Zero retains target counts.' },
+        format: { type: 'string', enum: ['text', 'json'], description: 'Default text; JSON returns { version: 1, suspects }.' },
+      },
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
   {
     name: 'codegraph_search',
     description: 'Quick symbol search by name. Returns locations only (no code). Use codegraph_explore instead to get the actual source / understand an area in one call.',
@@ -2014,12 +2047,12 @@ export function getStaticTools(): ToolDefinition[] {
 /**
  * The MCP tools served by DEFAULT (short names). Pared to ONLY `codegraph_explore`
  * — the single tool that reliably earns its place: one capped call returns the
- * verbatim source of the relevant symbols grouped by file. Every other tool is a
- * narrower slice of what explore already does, and presence itself steers
- * mis-picks, so they are no longer LISTED to agents.
+ * verbatim source of the relevant symbols grouped by file. Specialized tools
+ * remain opt-in so their presence does not steer general source questions away
+ * from explore.
  *
  * The other defined tools (`node`, `search`, `callers`, plus callees/impact/files/
- * status) remain fully functional — handlers stay, the library API and CLI are
+ * status, suspects and grep) remain fully functional — handlers stay, the library API and CLI are
  * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
 const DEFAULT_MCP_TOOLS = new Set(['explore']);
@@ -2334,7 +2367,7 @@ export class ToolHandler {
    */
   getTools(): ToolDefinition[] {
     const allow = this.toolAllowlist();
-    // No explicit allowlist → the default 4-tool surface (see
+    // No explicit allowlist → the explore-only surface (see
     // DEFAULT_MCP_TOOLS for the evidence). An allowlist replaces the
     // default entirely, so any defined tool can be re-enabled.
     let visible = allow
@@ -3100,8 +3133,7 @@ export class ToolHandler {
         if (projectPath !== pathCheck) args = { ...args, projectPath };
         await this.awaitProjectGate(projectPath);
       }
-      // The `path` and `pattern` properties used by codegraph_files are
-      // also path-shaped — apply the same cap.
+      // Cap file paths/globs and grep patterns before tool-specific dispatch.
       if (args.path !== undefined) {
         const check = this.validateOptionalPath(args.path, 'path');
         if (typeof check === 'object' && check !== undefined) return check;
@@ -3330,6 +3362,8 @@ export class ToolHandler {
    */
   private async dispatchTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
     switch (toolName) {
+      case 'codegraph_grep': return await this.handleGrep(args);
+      case 'codegraph_suspects': return await this.handleSuspects(args);
       case 'codegraph_search': return await this.handleSearch(args);
       case 'codegraph_callers': return await this.handleCallers(args);
       case 'codegraph_callees': return await this.handleCallees(args);
@@ -3339,6 +3373,50 @@ export class ToolHandler {
       case 'codegraph_files': return await this.handleFiles(args);
       default: return this.errorResult(`Unknown tool: ${toolName}`);
     }
+  }
+
+  /** Group indexed content hits using the same read-only derivation as the CLI. */
+  private async handleGrep(args: Record<string, unknown>): Promise<ToolResult> {
+    if (typeof args.pattern !== 'string') return this.textResult('pattern must be a string.');
+    if (args.in != null && typeof args.in !== 'string') return this.textResult('in must be a repo-relative path prefix.');
+    for (const key of ['fixed', 'ignore_case', 'strict', 'json']) {
+      if (args[key] != null && typeof args[key] !== 'boolean') return this.textResult(`${key} must be a boolean.`);
+    }
+    const root = this.getCodeGraph(args.projectPath as string | undefined).getProjectRoot();
+    const { grepIndex, GrepPatternError, GrepScopeError, GrepIndexError } = await import('../search/grep');
+    const { formatGrepResult, zeroHitNote } = await import('../search/grep-format');
+    try {
+      const result = await grepIndex(root, args.pattern, {
+        in: args.in as string | undefined,
+        fixed: args.fixed === true,
+        ignoreCase: args.ignore_case === true,
+        strict: args.strict === true,
+      });
+      return this.textResult(args.json === true ? JSON.stringify(result, null, 2) : result.totalHits === 0 ? zeroHitNote(result) : formatGrepResult(result));
+    } catch (err) {
+      if (err instanceof GrepPatternError || err instanceof GrepScopeError || (err instanceof GrepIndexError && err.reason === 'not-indexed')) {
+        return this.textResult(err.message);
+      }
+      throw err;
+    }
+  }
+
+  /** Handle codegraph_suspects: ranked audit candidates, sharing the CLI's read-only derivation. */
+  private async handleSuspects(args: Record<string, unknown>): Promise<ToolResult> {
+    const { parseSuspectCount } = await import('../graph/suspects-options');
+    let limit: number | undefined;
+    let edges: number | undefined;
+    try { limit = parseSuspectCount(args.limit ?? 25, true, 1); }
+    catch { return this.textResult('limit must be a positive integer or "all".'); }
+    try { edges = parseSuspectCount(args.maxEdgesPerTarget ?? 5, false, 0); }
+    catch { return this.textResult('maxEdgesPerTarget must be a non-negative integer.'); }
+    if (args.format != null && args.format !== 'text' && args.format !== 'json') {
+      return this.textResult('format must be text or json.');
+    }
+    const root = this.getCodeGraph(args.projectPath as string | undefined).getProjectRoot();
+    const { findSuspects, formatSuspects, suspectsToJson } = await import('../graph/suspects');
+    const list = findSuspects(root, { limit, maxEdgesPerTarget: edges });
+    return this.textResult(args.format === 'json' ? JSON.stringify(suspectsToJson(list), null, 2) : formatSuspects(list));
   }
 
   /**
