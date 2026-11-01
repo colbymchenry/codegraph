@@ -400,15 +400,21 @@ export function clearCppTypeAliasMemos(context: ResolutionContext): void {
   LOCAL_ALIAS_LINES.delete(context);
 }
 
+/**
+ * What may come between a `template <…>` head and where its declaration
+ * starts: protobuf's `template <typename T, typename... Args>` /
+ * `PROTOBUF_NDEBUG_INLINE static T* Create(…)`.
+ */
+const HEAD_SPECIFIERS = String.raw`(?:\s*(?:\[\[[^\]]*\]\]|(?:static|inline|constexpr|consteval|virtual|explicit|friend|extern)\b|[A-Z][A-Z0-9]*_[A-Z0-9_]*\b(?:\s*\([^()]*\))?))*\s*`;
+const HEAD_ENDS_DECLARATION = new RegExp(String.raw`^template\s*<([\s\S]*)>${HEAD_SPECIFIERS}$`);
+const ONLY_SPECIFIERS = new RegExp(`^${HEAD_SPECIFIERS}$`);
+
 /** Add the parameter names of the `template <…>` header that ends right where a declaration starts. */
 function collectTemplateHeader(lines: readonly string[], startLine: number, startColumn: number, names: Set<string>): void {
   // (A header can take several lines: fmt's `join` spends four on its parameters' defaults.)
   const before = [...lines.slice(Math.max(0, startLine - 9), startLine - 1), (lines[startLine - 1] ?? '').slice(0, startColumn)].join('\n');
   const at = before.lastIndexOf('template');
-  // Specifiers, attributes and macros may come between the header and where
-  // the declaration starts: protobuf's `template <typename T, typename...
-  // Args>` / `PROTOBUF_NDEBUG_INLINE static T* Create(…)`.
-  const header = at < 0 ? null : /^template\s*<([\s\S]*)>(?:\s*(?:\[\[[^\]]*\]\]|(?:static|inline|constexpr|consteval|virtual|explicit|friend|extern)\b|[A-Z][A-Z0-9]*_[A-Z0-9_]*\b(?:\s*\([^()]*\))?))*\s*$/.exec(before.slice(at));
+  const header = at < 0 ? null : HEAD_ENDS_DECLARATION.exec(before.slice(at));
   if (!header) return;
   for (const item of splitTopLevel(header[1]!)) addTemplateParameter(item, names);
 }
@@ -790,6 +796,76 @@ export function cppParentScope(qualified: string): string {
 /** The template parameters in scope where `node` is declared: its own `template <…>` header and its class templates'. */
 export function cppTemplateParameters(node: Node, context: ResolutionContext): ReadonlySet<string> {
   return templateParametersAround(node, context);
+}
+
+/** One parameter of a C++ `template <…>` head, in order: an unnamed one holds its place. */
+export interface CppTemplateParameter {
+  name: string | null;
+  /** `typename... Ts`: every argument from here on. */
+  pack: boolean;
+  /** Its default, as written: `TcParser` of `typename Parser = TcParser`. */
+  fallback: string | null;
+}
+
+/** One item of a `template <…>` head. */
+function templateParameter(item: string): CppTemplateParameter {
+  const declared = stripCppTemplateArguments(item);
+  const at = declared.indexOf('=');
+  const name = /([A-Za-z_]\w*)\s*$/.exec(at < 0 ? declared : declared.slice(0, at))?.[1];
+  // (A default can hold a `=` of its own, so it is read from the item as written.)
+  const eq = item.indexOf('=');
+  return {
+    name: name && name !== 'typename' && name !== 'class' ? name : null,
+    pack: declared.includes('...'),
+    fallback: at < 0 || eq < 0 ? null : item.slice(eq + 1).trim(),
+  };
+}
+
+/** The parameters of a `template <…>` head, from what its brackets hold. */
+export function cppTemplateParametersIn(inner: string): CppTemplateParameter[] {
+  return inner.trim() ? splitTopLevel(inner).map(templateParameter) : [];
+}
+
+/**
+ * The `template <…>` heads right before a declaration, outermost first, each
+ * with its parameters in order: one for a template, none for anything else,
+ * and two for a member template defined outside its class template
+ * (`template <class T> template <class U> void C<T>::f()`).
+ */
+export function cppTemplateHeads(node: Node, context: ResolutionContext): CppTemplateParameter[][] {
+  const lines = linesOf(node.filePath, context);
+  if (!lines) return [];
+  const before = [...lines.slice(Math.max(0, node.startLine - 13), node.startLine - 1), (lines[node.startLine - 1] ?? '').slice(0, node.startColumn)].join('\n');
+  const heads: CppTemplateParameter[][] = [];
+  const starts = [...before.matchAll(/\btemplate\s*</g)];
+  let end = before.length;
+  for (let i = starts.length - 1; i >= 0; i--) {
+    const open = starts[i]!.index! + starts[i]![0].length - 1;
+    const close = templateHeaderEnd(before, open);
+    if (close < 0 || !ONLY_SPECIFIERS.test(before.slice(close + 1, end))) break;
+    const inner = before.slice(open + 1, close);
+    heads.unshift(cppTemplateParametersIn(inner));
+    end = starts[i]!.index!;
+  }
+  return heads;
+}
+
+/**
+ * The type an alias in scope where `ref` is made declares, as written, with
+ * the alias when the index holds one: `typename TypeParam::KeyGen` for
+ * `using KeyGen = typename TypeParam::KeyGen;` in the calling function, or an
+ * alias of the calling function's class. Undefined when no such alias has
+ * that name.
+ */
+export function cppAliasWrittenAt(name: string, ref: UnresolvedRef, context: ResolutionContext): { text: string; alias?: Node } | undefined {
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  const local = localAliasedType(name, caller, ref, context);
+  if (local !== undefined) return local === null ? undefined : { text: local };
+  const found = lookupUnqualified(name, false, scopesWithin(callerScope(caller)), ref, context);
+  if (!found || typeof found !== 'object' || !('alias' in found)) return undefined;
+  const text = declarationText(found.alias, context);
+  const written = text ? aliasedTypeIn(text, found.alias.name) : null;
+  return written ? { text: written, alias: found.alias } : undefined;
 }
 
 /**

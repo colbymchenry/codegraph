@@ -4455,6 +4455,36 @@ export class QueryBuilder {
   }
 
   /**
+   * The failed C++ calls and function values with a qualifier outside `std`
+   * (`Txn::Put`, `T::T/2`), calls on a variable (`shard.Clear`), and what
+   * values are constructed as, which may go through a template parameter
+   * (cpp-template-instantiations.ts), one at a time: there can be a great
+   * many, few of which do.
+   */
+  *iterateFailedCppTypeReferences(): IterableIterator<UnresolvedReference> {
+    const rows = this.db.prepare(
+      `SELECT from_node_id, reference_name, reference_kind, line, col, file_path FROM unresolved_refs
+       WHERE status = 'failed' AND language = 'cpp' AND (reference_kind = 'instantiates'
+         OR (reference_kind IN ('calls', 'function_ref') AND reference_name GLOB '*::*' AND reference_name NOT GLOB 'std::*')
+         OR (reference_kind = 'calls' AND reference_name GLOB '*.*' AND reference_name NOT GLOB '*(*'))`
+    ).iterate() as IterableIterator<Pick<UnresolvedRefRow, 'from_node_id' | 'reference_name' | 'reference_kind' | 'line' | 'col' | 'file_path'>>;
+    for (const row of rows) {
+      yield {
+        fromNodeId: row.from_node_id,
+        referenceName: row.reference_name,
+        referenceKind: row.reference_kind as EdgeKind,
+        line: row.line,
+        column: row.col,
+        filePath: row.file_path,
+        language: 'cpp',
+      };
+    }
+    // The walk reads the whole table, which would stay in this connection's page
+    // cache through the end of synthesis, where an index peaks in memory.
+    this.db.exec('PRAGMA shrink_memory');
+  }
+
+  /**
    * Get the count of PENDING (never-attempted) references without loading
    * them into memory. Rows marked status='failed' — attempted by a completed
    * pass, no match — are excluded: they are not outstanding work, only retry
