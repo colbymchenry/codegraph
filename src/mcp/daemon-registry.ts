@@ -32,6 +32,8 @@ import {
 } from './daemon-paths';
 import {
   getWriterPidPath,
+  isForeignLockRecord,
+  lockStamp,
   readWriterLock,
   releaseWriterLock,
   swapWriterLock,
@@ -218,8 +220,11 @@ export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> 
   let lockContents: string | null = null;
   try {
     lockContents = fs.readFileSync(pidPath, 'utf8');
-    info = decodeLockInfo(lockContents);
-  } catch { /* missing/corrupt */ }
+    // Index-aware: a foreign record (another project's, copied in with its
+    // `.codegraph/`) is no daemon of this project, so it is swept like a
+    // corrupt one, never probed. A record at this root is never foreign.
+    info = decodeLockInfo(lockContents, root);
+  } catch { /* missing/corrupt/foreign */ }
   if (info && isProcessAlive(info.pid)) {
     if (canProbeDaemonIdentity(info)) {
       if (await probeDaemonIdentity(info)) return false;
@@ -291,7 +296,9 @@ export interface StopResult {
  * Stop the daemon serving `root`: SIGTERM, wait, then SIGKILL if it won't go,
  * then sweep its artifacts. `root` must be realpath'd (match how the daemon
  * keys its socket/lockfile). Resolves the pid from the authoritative lockfile,
- * falling back to the registry. Rebuild callers preserve unverified live locks
+ * falling back to the registry. A foreign lockfile (see
+ * {@link isForeignLockRecord}; one copied in with a `.codegraph/`) names no
+ * daemon of `root` and is never signalled; it is swept as stale. Rebuild callers preserve unverified live locks
  * instead of interpreting a failed probe as permission to discard the database.
  * A daemon still finishing its own shutdown is waited for, up to
  * `shutdownGraceMs` more (default {@link DAEMON_SHUTDOWN_GRACE_MS}; tests
@@ -306,7 +313,11 @@ export async function stopDaemonAt(
   let lockContents: string | null = null;
   try {
     lockContents = fs.readFileSync(getDaemonPidPath(root), 'utf8');
-    identity = decodeLockInfo(lockContents);
+    // Index-aware: a foreign record (another project's, copied in with its
+    // `.codegraph/`) names that project's daemon and must never be signalled
+    // from here; it reads as no lock, and the registry fallback below is keyed
+    // by this root.
+    identity = decodeLockInfo(lockContents, root);
     pid = identity?.pid ?? null;
   } catch {
     /* no lockfile */
@@ -364,7 +375,7 @@ export async function daemonStopFailureMessage(root: string, result: StopResult)
   const lockPath = getDaemonPidPath(root);
   let holder: number | null = null;
   try {
-    const current = decodeLockInfo(fs.readFileSync(lockPath, 'utf8'));
+    const current = decodeLockInfo(fs.readFileSync(lockPath, 'utf8'), root);
     if (current && isProcessAlive(current.pid)) holder = current.pid;
   } catch { /* no lock now */ }
   if (holder !== null && result.pid !== null && holder !== result.pid) {
@@ -472,7 +483,8 @@ async function stopVerifiedDaemon(
  * keep the new daemon from starting. When the old daemon is not stopped, the
  * slot goes back to it.
  *
- * Resolves null when the lock names no older daemon (there is none, or another
+ * Resolves null when the lock names no older daemon (there is none, the record
+ * is foreign — another project's, copied in with its `.codegraph/` — or another
  * launcher already replaced it) or the slot could not be taken (another
  * launcher holds it to replace the same daemon). Otherwise says what became of
  * the daemon: `term` or `kill` when it was stopped, and this process now holds
@@ -493,8 +505,16 @@ export async function stopOlderDaemon(
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
     return { root, pid: null, outcome: 'unverified' };
   }
+  // Decoded without the project on purpose: a null decode means an unreadable
+  // record (`unverified`), while a foreign one must resolve null, so the
+  // foreign check below is separate.
   const identity = decodeLockInfo(lockContents);
   if (!identity) return { root, pid: null, outcome: 'unverified' };
+  // A foreign record (another project's, copied in with its `.codegraph/`)
+  // names that project's daemon, not an older one of this project: there is no older
+  // daemon here to stop, and this project's daemon clears the record as stale
+  // when it starts.
+  if (isForeignLockRecord(identity, root)) return null;
   if (!isOlderRelease(identity.version, version)) return null;
   const { pid } = identity;
   if (!isProcessAlive(pid)) return { root, pid, outcome: 'not-running', version: identity.version };
@@ -526,7 +546,9 @@ export async function stopOlderDaemon(
 function takeWriterSlotFrom(root: string, pid: number): { giveBack(): void } | null {
   const previous = readWriterLock(root);
   if (previous && previous.pid !== pid && previous.pid !== process.pid && isProcessAlive(previous.pid)) return null;
-  const claim: WriterLockInfo = { pid: process.pid, mode: 'handover', startedAt: Date.now(), ready: false };
+  const claim: WriterLockInfo = {
+    pid: process.pid, mode: 'handover', startedAt: Date.now(), ready: false, ...lockStamp(root),
+  };
   const held = previous
     ? swapWriterLock(root, previous.pid, claim)
     : tryAcquireWriterLock(root, 'handover').kind === 'acquired';

@@ -54,6 +54,7 @@ import type { FileWatcher, WatchOptions, PendingFile } from './sync';
 import { LockUnavailableError } from './errors';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
+import { isForeignLockRecord, lockStamp } from './mcp/writer-lock';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
 import { loadDeprioritizePatterns } from './project-config';
@@ -220,8 +221,15 @@ export class CodeGraph {
     this.db = db;
     this.queries = queries;
     this.projectRoot = projectRoot;
+    // The lock body carries this project's lock stamp (its root and the
+    // identity of its physical index), so a codegraph.lock copied in with
+    // another project's .codegraph/ is stale here even if its pid lives, when
+    // it is foreign by isForeignLockRecord. Pid liveness decides every other
+    // lock, including one at this root after a .codegraph/ restored in place,
+    // which a live holder follows (reopenIfReplaced).
     this.fileLock = new FileLock(
-      path.join(getCodeGraphDir(projectRoot), 'codegraph.lock')
+      path.join(getCodeGraphDir(projectRoot), 'codegraph.lock'),
+      { stamp: () => lockStamp(projectRoot), isForeign: (r) => isForeignLockRecord(r, projectRoot) }
     );
     this.wireLayers();
   }

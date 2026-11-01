@@ -126,7 +126,7 @@ function makeFallbackEngine(root: string): MCPEngine {
   assertNoRebuild(root);
   let existing: ReturnType<typeof decodeLockInfo> = null;
   try {
-    existing = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'));
+    existing = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'), root);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT') {
@@ -440,7 +440,7 @@ async function outwaitCandidate(root: string, handoverFrom: number | null, pid: 
   while (Date.now() < deadline) {
     if (!heldForUs()) return false;
     let holder: number | undefined;
-    try { holder = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'))?.pid; } catch { holder = undefined; }
+    try { holder = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'), root)?.pid; } catch { holder = undefined; }
     if (holder !== pid || !isProcessAlive(pid)) return true;
     await sleep(25);
   }
@@ -713,8 +713,9 @@ export class MCPServer {
         disprovedLiveIdentity = true;
       }
 
-      // The holder is dead, the record is unreadable, or a completed socket
-      // hello disproved a live PID's identity. Revalidate the exact record and
+      // The holder is dead, the record is unreadable or foreign (another
+      // project's, copied in with its `.codegraph/`), or a completed socket hello
+      // disproved a live PID's identity. Revalidate the exact record and
       // retry the acquire only after cleanup succeeds safely.
       if (disprovedLiveIdentity) {
         // Re-probe and claim writer.pid before cleanup. A daemon that is merely
@@ -724,6 +725,7 @@ export class MCPServer {
       } else if (lock.lockContents !== null) {
         clearStaleDaemonLock(lock.pidPath, existing?.pid, {
           expectedLockContents: lock.lockContents,
+          projectRoot: root,
         });
       }
       await sleep(TAKEOVER_RETRY_DELAY_MS);
