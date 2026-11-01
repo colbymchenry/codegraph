@@ -483,19 +483,22 @@ namedChildren visited with the interface pushed: protocol_property_declaration
 → dedicated branch (§below); protocol_function_declaration /
 init_declaration / associatedtype_declaration → recursed, nothing.
 
-### Inheritance — extractInheritance (:5291), the swift case (:5619-5632)
+### Inheritance — extractInheritance, the swift inheritance_specifier case (tree-sitter.ts)
 
 Direct namedChildren scan of the declaration node; ONLY the
 `inheritance_specifier` case matches swift (one specifier per conformance,
 each `inherits_from: user_type`): userType = child.namedChildren
-`find(type==='user_type')` → typeId = ITS namedChildren
-`find(type==='type_identifier')` — the FIRST — → one **`extends`** ref
-{from class/struct/enum/interface node, name = typeId text, line/col of the
-TYPE IDENTIFIER}. QUIRKS, PRESERVE: **everything is `extends`** — protocol
-conformance, protocol inheritance, raw-value types; swift emits NO
-`implements` refs from extraction (resolution's supertype machinery handles
-both kinds); a qualified base `: Module.Base` takes the FIRST segment
-(`Module`) — the outer namespace, not the type. Where-clause constraints and
+`find(type==='user_type')` → segments = ALL of ITS namedChildren with
+`type==='type_identifier'` (none → no ref) → one **`extends`** ref
+{from class/struct/enum/interface node, name = the segments' texts joined
+with `.`, line/col of the USER TYPE}. QUIRKS, PRESERVE: **everything is
+`extends`** — protocol conformance, protocol inheritance, raw-value types;
+swift emits NO `implements` refs from extraction (resolution's supertype
+machinery handles both kinds). Not a quirk: a qualified base `: Kit.Runner`
+(flat type_identifier siblings; `A.B.C` is three, `Kit.Runner<T>` adds a
+type_arguments child, which is not a segment) is the ref `Kit.Runner` at the
+user_type's line/col (also its first segment's) — the resolver places it by
+that dotted path and reads no source text for it; `: B` stays `B`. Where-clause constraints and
 generic bounds (`type_parameter` `name:` bounds) emit nothing. None of the
 other clause cases (extends_clause/base_class_clause/delegation_specifier/…)
 match swift node types.

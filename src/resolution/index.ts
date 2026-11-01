@@ -25,7 +25,7 @@ import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, ma
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
-import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
+import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances, resolveSwiftQualifiedSupertype } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
 import {
@@ -1758,6 +1758,15 @@ export class ReferenceResolver {
     // to that local, whatever the file imports (see matchRustUseBoundName).
     const rustBound = matchRustUseBoundName(ref, this.context);
     if (rustBound !== undefined) return this.gateLanguage(rustBound, ref);
+
+    // A qualified Swift inheritance entry (`class QC: Kit.Runner`) carries its
+    // dotted path; no declaration is named `Kit.Runner`, so the pre-filter
+    // below would drop it. It is the type that path names or nothing, as with
+    // CFML's component paths above: no fallthrough on a miss, since a name
+    // match on the last segment can only guess past the qualifier.
+    if (ref.language === 'swift' && isInheritanceRef(ref) && ref.referenceName.includes('.')) {
+      return this.gateLanguage(resolveSwiftQualifiedSupertype(ref, this.context), ref);
+    }
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
