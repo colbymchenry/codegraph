@@ -6,7 +6,9 @@
  * surface area is just two file paths:
  *
  *   - `daemon.sock` — Unix domain socket / named pipe the daemon listens on.
- *   - `daemon.pid` — atomic-create lockfile holding the daemon's pid + version.
+ *   - `daemon.pid` — atomic-create lockfile holding the daemon's identity record
+ *     ({@link DaemonLockInfo}: pid, version, bound socket path, start time, and
+ *     the lock stamp naming the project and the physical index it serves).
  *
  * Both live under `.codegraph/` so the project-scoped uninstall (`codegraph
  * uninit`) sweeps them up for free.
@@ -32,6 +34,7 @@ import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { canonicalProjectRoot, getCodeGraphDir } from '../directory';
+import { isForeignLockRecord, type LockStamp } from './writer-lock';
 
 /** Soft upper bound for in-project socket paths. */
 const POSIX_SOCKET_PATH_LIMIT = 100;
@@ -101,8 +104,17 @@ export function getDaemonPidPath(projectRoot: string): string {
   return path.join(getCodeGraphDir(projectRoot), 'daemon.pid');
 }
 
-/** Structured contents of the pid lockfile. */
-export interface DaemonLockInfo {
+/**
+ * Structured contents of the pid lockfile. The stamp fields (`root`, `dirId`,
+ * `dbId`, see {@link LockStamp}) name the project and the physical index the
+ * writing daemon serves. A copied `.codegraph/` (cp -r, rsync, a cloned VM
+ * disk) carries the source's daemon.pid along, and the stamp is what lets the
+ * copy tell that record apart from one of its own: when it is foreign by
+ * {@link isForeignLockRecord}, {@link decodeLockInfo} drops it. The stamp is
+ * absent in older-format records; for every record that is not foreign, pid
+ * liveness decides.
+ */
+export interface DaemonLockInfo extends Partial<LockStamp> {
   pid: number;
   version: string;
   socketPath: string;
@@ -180,8 +192,16 @@ export function encodeLockInfo(info: DaemonLockInfo): string {
  * Parse a pidfile body. Tolerant of old-format pidfiles (plain decimal pid) so
  * a 0.10.x daemon doesn't trip over a 0.9.x lockfile if that ever happens —
  * we treat such a lockfile as "process is unknown version, refuse to share."
+ *
+ * The stamp fields (`root`, `dirId`, `dbId`) are passed through when the
+ * record carries them as strings. When `projectRoot` is given and the record
+ * is FOREIGN (see {@link isForeignLockRecord}; in practice a pidfile copied
+ * along with a `.codegraph/` from elsewhere), the record is not this project's
+ * daemon and decodes to null, exactly like a corrupt leftover: the caller sees
+ * "no daemon here" and never probes or signals the source project's daemon
+ * through it. Every other record is decoded in full and pid liveness decides.
  */
-export function decodeLockInfo(raw: string): DaemonLockInfo | null {
+export function decodeLockInfo(raw: string, projectRoot?: string): DaemonLockInfo | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
   try {
@@ -193,6 +213,12 @@ export function decodeLockInfo(raw: string): DaemonLockInfo | null {
       typeof parsed.socketPath === 'string' &&
       typeof parsed.startedAt === 'number'
     ) {
+      if (projectRoot !== undefined && isForeignLockRecord(parsed, projectRoot)) return null;
+      // A non-string stamp field is not a stamp: drop it rather than hand
+      // callers a mistyped field. Every other field passes through unchanged.
+      for (const key of ['root', 'dirId', 'dbId'] as const) {
+        if (key in parsed && typeof parsed[key] !== 'string') delete parsed[key];
+      }
       return parsed as DaemonLockInfo;
     }
   } catch {
