@@ -202,14 +202,23 @@ function identAt(code: string, at: number): string | null {
   return IDENT_AT.exec(code)?.[0] ?? null;
 }
 
-/** The offset of the `>` closing the `<` at `at`, or -1. `->` and `=>` close nothing. */
-function angleClose(code: string, at: number, limit = code.length): number {
+/**
+ * The offset of the `>` closing the `<` at `at`, or -1. `->` and `=>` close nothing.
+ * With `blocks` (the brackets' `close` map), a balanced `{ … }` inside the
+ * angle brackets, a const-generic block argument, is jumped. Otherwise a `{`
+ * ends the search.
+ */
+function angleClose(code: string, at: number, limit = code.length, blocks?: Map<number, number>): number {
   let depth = 0;
   for (let i = at; i < limit; i++) {
     const c = code[i];
     if (c === '<') depth++;
     else if (c === '>' && code[i - 1] !== '-' && code[i - 1] !== '=') {
       if (--depth === 0) return i;
+    } else if (c === '{' && blocks) {
+      const end = blocks.get(i);
+      if (end === undefined) return -1;
+      i = end;
     } else if (c === ';' || c === '{' || c === '}') return -1;
   }
   return -1;
@@ -448,6 +457,9 @@ export function readRustScopes(source: string): RustScopes {
 
   // `impl<T: Bound> … {` and `trait Name<T>: Super where … {` — an item, not
   // the `impl Trait` of a type, which follows a `:`, `(`, `,`, `<`, `&` or `->`.
+  // The body's `{` is the first one outside the header's `<…>` arguments, and
+  // the generics list reads past one inside it: a const-generic block argument
+  // (`impl Cache<{ 1 + 1 }> {`, `impl<T: Bound<{ 1 + 1 }>> …`) is jumped whole.
   const impls: RustImplBlock[] = [];
   for (const m of code.matchAll(/\b(impl|trait)\b/g)) {
     const kind = m[1] as 'impl' | 'trait';
@@ -464,16 +476,23 @@ export function readRustScopes(source: string): RustScopes {
     }
     let generics = '';
     if (code[p] === '<') {
-      const end = angleClose(code, p);
+      const end = angleClose(code, p, code.length, close);
       if (end < 0) continue;
       generics = code.slice(p + 1, end);
       p = end + 1;
     }
     let where = -1;
     let open = -1;
+    let angle = 0;
     for (let q = p; q < n; q++) {
       const c = code[q]!;
-      if (c === '{') { open = q; break; }
+      if (c === '<') angle++;
+      else if (c === '>' && angle > 0 && code[q - 1] !== '-' && code[q - 1] !== '=') angle--;
+      if (c === '{') {
+        if (angle > 0) { q = close.get(q) ?? n; continue; }
+        open = q;
+        break;
+      }
       if (c === ';' || c === '}') break;
       if (c === '(' || c === '[') { q = close.get(q) ?? n; continue; }
       if (where < 0 && c === 'w' && wordAt(code, q, 'where')) where = q + 5;
