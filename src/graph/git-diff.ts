@@ -57,6 +57,19 @@ export interface ChangedFile {
 }
 
 /**
+ * The files whose changed lines git could not read (the hunk pass failed), so
+ * their `ranges` are empty because they are unknown, not because nothing
+ * changed. Kept beside the files rather than on them: `ChangedFile` objects
+ * are printed as they are in the blast report.
+ */
+const rangesUnread = new WeakSet<ChangedFile>();
+
+/** True when git could not read the changed lines of `file`. */
+export function hasUnreadRanges(file: ChangedFile): boolean {
+  return rangesUnread.has(file);
+}
+
+/**
  * What `applyHunks` counted over every line of a hunk's body, whatever the text
  * caps kept (`MAX_HUNK_LINES`, `MAX_FILE_LINES`). Seeding reads it to set aside
  * blank separators and to recognise a removed separator, so a long hunk, or one
@@ -103,17 +116,20 @@ const MAX_HUNK_LINES = 24;
 const MAX_FILE_LINES = 200;
 
 /**
- * Room for `git diff --unified=0` on a large diff. spawnSync's default is
- * 1 MiB, and an overflow makes `runGit` return null.
+ * Room for `git diff --unified=0` on a large diff, or `git show` of a large
+ * file. spawnSync's default is 1 MiB, and an overflow makes `runGit` return
+ * null.
  */
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
 /**
  * Run git in `root` and return its stdout, or null when git fails (not a
  * repository, an unknown ref, a missing path). `core.quotePath=false` keeps
- * non-ASCII names unescaped, so they match the index's paths.
+ * non-ASCII names unescaped, so they match the index's paths. `codegraph
+ * orphans` also reads the merge base and pre-image files through it; callers
+ * refuse a ref beginning with `-` before it gets here.
  */
-function runGit(root: string, args: string[]): string | null {
+export function runGit(root: string, args: string[]): string | null {
   const res = spawnSync('git', ['-c', 'core.quotePath=false', ...args], {
     cwd: root,
     encoding: 'utf8',
@@ -146,7 +162,9 @@ export function refExists(root: string, ref: string): boolean {
 }
 
 /**
- * Changed files + post-image line ranges, or null when git fails.
+ * Changed files + post-image line ranges, or null when git fails. A hunk pass
+ * that fails alone is not null: the files come back with no ranges, each marked
+ * for `hasUnreadRanges`.
  *
  * With a `base`, the diff runs from the MERGE BASE of `base` and HEAD to the
  * WORKING TREE. The merge base, not the tip of the base branch: on a branch
@@ -235,8 +253,10 @@ function diffFiles(dir: string, range: string[]): ChangedFile[] | null {
     '--',
   ]);
   // A failed patch pass still leaves the statuses: the files are reported with
-  // no ranges rather than not at all.
+  // no ranges rather than not at all, and each is marked (`hasUnreadRanges`)
+  // so a caller that needs the lines can tell unknown from unchanged.
   if (patch !== null) applyHunks(files, patch);
+  else for (const file of files) rangesUnread.add(file);
   return files;
 }
 

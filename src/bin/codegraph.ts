@@ -23,6 +23,7 @@
  *   codegraph suspects          Audit questionable call edges
  *   codegraph grep <pattern>    Search indexed contents by enclosing symbol
  *   codegraph blast              List what depends on the lines a diff changed
+ *   codegraph orphans            List the symbols a branch added that nothing uses
  *   codegraph affected [files]   Find test files affected by changes
  *   codegraph cycles [path]      List circular imports between files
  *   codegraph ui [path]          Open the browser viewer (alias: web; not released yet — needs CODEGRAPH_UI=1)
@@ -2977,6 +2978,33 @@ program
       const projectPath = resolveProjectPath(options.path);
       const { runBlast } = await import('../graph/blast-run');
       const result = runBlast(projectPath, options);
+      if (result.ok) process.stdout.write(result.output);
+      else {
+        error(result.message);
+        process.exitCode = 1;
+      }
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    }
+  });
+
+/**
+ * The functions, methods and types added since the merge base of `--base` and
+ * HEAD that nothing uses. A missing `--base` is the shared entry point's
+ * message (exit 1), the same answer `codegraph_orphans` gives.
+ */
+program
+  .command('orphans')
+  .description('List the symbols added since the merge base of a base ref and HEAD that nothing uses')
+  .option('-p, --path <path>', 'Project path')
+  .option('-b, --base <ref>', 'Git ref whose merge base with HEAD the additions are counted from (required)')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (options: { path?: string; base?: string; json?: boolean }) => {
+    try {
+      const projectPath = resolveProjectPath(options.path);
+      const { runOrphans } = await import('../graph/orphans-run');
+      const result = await runOrphans(projectPath, { base: options.base, format: options.json ? 'json' : 'text' });
       if (result.ok) process.stdout.write(result.output);
       else {
         error(result.message);

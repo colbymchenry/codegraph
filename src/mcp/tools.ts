@@ -1754,6 +1754,26 @@ export const tools: ToolDefinition[] = [
     annotations: READ_ONLY_ANNOTATIONS,
   },
   {
+    name: 'codegraph_orphans',
+    description: 'Dead code a branch adds: the functions, methods and types added since the merge base of a base git ref ' +
+      'and HEAD that nothing uses: no incoming edge in the index, no unresolved reference by that name from the same ' +
+      'language, and (for an identifier name) no text match elsewhere in the indexed files (the report counts any the ' +
+      'search could not read). Interface/protocol/trait implementations and the requirements of used ones, tests and ' +
+      'code nested in them, program entry points (main, @main) and constructors of used types are excluded and counted. ' +
+      'Symbols whose only uses are name-only or low-confidence resolver guesses, unresolved references by name, or text ' +
+      'mentions (comments and strings included) are listed separately as "orphaned unless the guess is right", with that ' +
+      'evidence. Use it before review to find code a change added but never wired in. Requires ripgrep.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectPath: projectPathProperty,
+        base: { type: 'string', description: 'Git ref the branch is compared against, e.g. "origin/main" or a tag. Required.' },
+        format: { type: 'string', enum: ['text', 'json'], description: 'Default text.' },
+      },
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
     name: 'codegraph_search',
     description: 'Quick symbol search by name. Returns locations only (no code). Use codegraph_explore instead to get the actual source / understand an area in one call.',
     inputSchema: {
@@ -2079,7 +2099,7 @@ export function getStaticTools(): ToolDefinition[] {
  * from explore.
  *
  * The other defined tools (`node`, `search`, `callers`, plus callees/impact/files/
- * status, suspects, grep and blast) remain fully functional — handlers stay, the library API and CLI are
+ * status, suspects, grep, blast and orphans) remain fully functional — handlers stay, the library API and CLI are
  * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
 const DEFAULT_MCP_TOOLS = new Set(['explore']);
@@ -3392,6 +3412,7 @@ export class ToolHandler {
       case 'codegraph_grep': return await this.handleGrep(args);
       case 'codegraph_suspects': return await this.handleSuspects(args);
       case 'codegraph_blast': return await this.handleBlast(args);
+      case 'codegraph_orphans': return await this.handleOrphans(args);
       case 'codegraph_search': return await this.handleSearch(args);
       case 'codegraph_callers': return await this.handleCallers(args);
       case 'codegraph_callees': return await this.handleCallees(args);
@@ -3466,6 +3487,24 @@ export class ToolHandler {
     const root = this.getCodeGraph(args.projectPath as string | undefined).getProjectRoot();
     const { runBlast } = await import('../graph/blast-run');
     const result = runBlast(root, { base, depth, format, strict });
+    return this.textResult(result.ok ? result.output : result.message);
+  }
+
+  /**
+   * The symbols a branch added that nothing uses, through the CLI's entry
+   * point. A missing base, a bad argument or an unknown ref is success-shaped
+   * guidance; a ripgrep that cannot start is reported the same way, since the
+   * report cannot be made without it.
+   */
+  private async handleOrphans(args: Record<string, unknown>): Promise<ToolResult> {
+    // null is absent, as the projectPath check treats it.
+    const base = args.base === null ? undefined : args.base;
+    const format = args.format === null ? undefined : args.format;
+    if (base !== undefined && typeof base !== 'string') return this.textResult('base must be a git ref given as a string, e.g. "origin/main".');
+    if (format !== undefined && typeof format !== 'string') return this.textResult('format must be text or json.');
+    const root = this.getCodeGraph(args.projectPath as string | undefined).getProjectRoot();
+    const { runOrphans } = await import('../graph/orphans-run');
+    const result = await runOrphans(root, { base, format });
     return this.textResult(result.ok ? result.output : result.message);
   }
 

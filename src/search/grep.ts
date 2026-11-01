@@ -399,13 +399,27 @@ function defaultRipgrep(projectRoot: string): string {
   throw new GrepIndexError('ripgrep not found — install rg or set CODEGRAPH_RG to its path', 'rg-missing');
 }
 
-/**
- * Search indexed files under `opts.in` for `pattern` and group the hits by
- * innermost enclosing symbol. Hits in a file changed since it was indexed form
- * one group per file with no symbol (see `checkPaths`). The database is
- * opened read-only and closed on every path.
- */
-export async function grepIndex(projectRoot: string, pattern: string, opts: GrepOptions = {}): Promise<GrepResult> {
+/** Raw kept hits in (path rank, line) order, before symbol attribution or group ranking. */
+export interface RawSearchResult {
+  pattern: string;
+  filesSearched: number;
+  hits: RawHit[];
+  truncated: { files: number; hits: number };
+}
+
+/** The raw result and the path ranks used again when ordering symbol groups. */
+interface SearchStage {
+  raw: RawSearchResult;
+  ranks: Map<string, number>;
+}
+
+/** Shared validation and one read-only connection, closed on every path after opening. */
+async function withIndexDb<T>(
+  projectRoot: string,
+  pattern: string,
+  opts: GrepOptions,
+  run: (db: SqliteDatabase, maxHits: number) => Promise<T>,
+): Promise<T> {
   const maxHits = opts.maxHits ?? DEFAULT_MAX_HITS;
   assertMaxHits(maxHits);
   const dbPath = getDatabasePath(projectRoot);
@@ -421,55 +435,95 @@ export async function grepIndex(projectRoot: string, pattern: string, opts: Grep
 
   const conn = DatabaseConnection.open(dbPath, { readOnly: true });
   try {
-    const db = conn.getDb();
-    const prefix = opts.in ? normalizeGrepPrefix(opts.in) : '';
-    const scoped: string[] = [];
-    for (const row of db.prepare(ALL_FILES_SQL).iterate() as IterableIterator<{ path: string }>) {
-      if (pathUnderPrefix(row.path, prefix)) scoped.push(row.path);
-    }
-    if (prefix !== '' && scoped.length === 0) {
-      throw new GrepScopeError(`nothing indexed under "${prefix}/" (or any path prefix)`);
-    }
-    const files = scoped;
+    return await run(conn.getDb(), maxHits);
+  } finally {
+    conn.close();
+  }
+}
 
-    const ranks = rankPaths(files);
-    const capped = new CappedHits(ranks, maxHits);
-    const rg = opts.rgPath ?? process.env.CODEGRAPH_RG ?? defaultRipgrep(projectRoot);
-    const args = ['--json', '-a', '--no-config', '--max-depth', '0'];
-    if (opts.ignoreCase) args.push('-i');
-    if (opts.fixed) args.push('-F');
-    args.push('-e', pattern);
-    const searchable = searchablePaths(projectRoot, files);
-    const batches = searchable.paths.length > 0 ? batchPaths(searchable.paths, opts.batchBytes) : [];
-    // One active child bounds CPU/file descriptors and leaves none running
-    // after a failed batch. Exact dropped-hit counts still require every batch.
-    let unreadable = searchable.skipped;
-    for (const batch of batches) {
-      const result = await runRgBatch(rg, projectRoot, args, batch, (hit) => capped.add(hit));
-      unreadable += result.unreadable;
-    }
+/** Scope, safe paths, sequential rg batches and the hit cap; no symbol lookups. */
+async function searchStage(
+  db: SqliteDatabase,
+  projectRoot: string,
+  pattern: string,
+  opts: GrepOptions,
+  maxHits: number,
+): Promise<SearchStage> {
+  const prefix = opts.in ? normalizeGrepPrefix(opts.in) : '';
+  const scoped: string[] = [];
+  for (const row of db.prepare(ALL_FILES_SQL).iterate() as IterableIterator<{ path: string }>) {
+    if (pathUnderPrefix(row.path, prefix)) scoped.push(row.path);
+  }
+  if (prefix !== '' && scoped.length === 0) {
+    throw new GrepScopeError(`nothing indexed under "${prefix}/" (or any path prefix)`);
+  }
+  const files = scoped;
 
-    const kept = capped.kept();
+  const ranks = rankPaths(files);
+  const capped = new CappedHits(ranks, maxHits);
+  const rg = opts.rgPath ?? process.env.CODEGRAPH_RG ?? defaultRipgrep(projectRoot);
+  const args = ['--json', '-a', '--no-config', '--max-depth', '0'];
+  if (opts.ignoreCase) args.push('-i');
+  if (opts.fixed) args.push('-F');
+  args.push('-e', pattern);
+  const searchable = searchablePaths(projectRoot, files);
+  const batches = searchable.paths.length > 0 ? batchPaths(searchable.paths, opts.batchBytes) : [];
+  // One active child bounds CPU/file descriptors and leaves none running
+  // after a failed batch. Exact dropped-hit counts still require every batch.
+  let unreadable = searchable.skipped;
+  for (const batch of batches) {
+    const result = await runRgBatch(rg, projectRoot, args, batch, (hit) => capped.add(hit));
+    unreadable += result.unreadable;
+  }
+
+  const kept = capped.kept();
+  return {
+    raw: {
+      pattern,
+      filesSearched: files.length,
+      hits: kept,
+      truncated: { files: unreadable, hits: capped.total - kept.length },
+    },
+    ranks,
+  };
+}
+
+/**
+ * Search indexed text without symbol grouping. Uses grepIndex's validation,
+ * scope, safe paths and cap, opening and closing one read-only connection.
+ */
+export async function searchIndexText(projectRoot: string, pattern: string, opts: GrepOptions = {}): Promise<RawSearchResult> {
+  return withIndexDb(projectRoot, pattern, opts, async (db, maxHits) =>
+    (await searchStage(db, projectRoot, pattern, opts, maxHits)).raw);
+}
+
+/**
+ * Search indexed files under `opts.in` for `pattern` and group the hits by
+ * innermost enclosing symbol. Hits in a file changed since it was indexed form
+ * one group per file with no symbol (see `checkPaths`). Both stages share one
+ * read-only connection, closed on every path.
+ */
+export async function grepIndex(projectRoot: string, pattern: string, opts: GrepOptions = {}): Promise<GrepResult> {
+  return withIndexDb(projectRoot, pattern, opts, async (db, maxHits) => {
+    const { raw, ranks } = await searchStage(db, projectRoot, pattern, opts, maxHits);
     const strict = opts.strict === true;
-    const groups = groupHits(db, kept, strict, checkPaths(db, projectRoot, kept));
+    const groups = groupHits(db, raw.hits, strict, checkPaths(db, projectRoot, raw.hits));
     // Stable (under strict, inDegree is already the strict count): equal in-degree and equal path rank keep creation (sorted-hit) order.
     groups.sort((a, b) => b.inDegree - a.inDegree || (ranks.get(a.path) ?? 0) - (ranks.get(b.path) ?? 0));
     assignIds(groups);
 
     const result: GrepResult = {
       pattern,
-      filesSearched: files.length,
-      totalHits: kept.length,
+      filesSearched: raw.filesSearched,
+      totalHits: raw.hits.length,
       groups,
-      truncated: { files: unreadable, hits: capped.total - kept.length },
+      truncated: raw.truncated,
     };
     const saved = savedFor(db, groups);
     if (saved) result.saved = saved;
     if (strict) result.strict = true;
     return result;
-  } finally {
-    conn.close();
-  }
+  });
 }
 
 /** maxHits must be a non-negative integer: a fraction, NaN or a negative has no meaning as a hit count. */

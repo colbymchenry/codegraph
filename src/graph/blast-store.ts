@@ -59,17 +59,18 @@ const NON_SEED_KINDS = ['file', 'import', 'export', 'parameter', 'route'] as con
 /**
  * Ids per `IN (...)` list. SQLite's default bound-parameter limit is 32766 on
  * modern builds but 999 on old ones; 500 stays under both with room for the
- * `kind IN (...)` parameters that share the statement.
+ * `kind IN (...)` parameters that share the statement. Shared with the
+ * orphans store.
  */
-const MAX_IDS_PER_QUERY = 500;
+export const MAX_IDS_PER_QUERY = 500;
 
 /** `?, ?, ...` with `n` placeholders, for an `IN (...)` list. */
-function placeholders(n: number): string {
+export function placeholders(n: number): string {
   return new Array<string>(n).fill('?').join(', ');
 }
 
 /** `xs` split into consecutive slices of at most `size`. */
-function chunks<T>(xs: readonly T[], size: number): T[][] {
+export function chunks<T>(xs: readonly T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < xs.length; i += size) out.push(xs.slice(i, i + size));
   return out;
@@ -111,8 +112,13 @@ export function openBlastStore(root: string): BlastStore {
   }
 }
 
-/** The store's queries over an open connection; the store's `close` closes it. */
-function storeOver(conn: DatabaseConnection): BlastStore {
+/**
+ * The store's queries over an open connection; the store's `close` closes it.
+ * `codegraph orphans` runs these queries on the connection it also runs its
+ * own on: it never calls this store's `close`, and closes the connection once
+ * itself, so the connection has exactly one owner.
+ */
+export function storeOver(conn: DatabaseConnection): BlastStore {
   const db: SqliteDatabase = conn.getDb();
 
   const fileStmt = db.prepare(`SELECT ${NODE_COLUMNS} FROM nodes WHERE id = ? AND kind = 'file'`);
