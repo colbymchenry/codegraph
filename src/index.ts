@@ -607,6 +607,15 @@ export class CodeGraph {
   }
 
   /**
+   * Give back the memory the database connection holds only to read faster,
+   * keeping it open and keeping every answer it has worked out (see
+   * {@link DatabaseConnection.releaseMemory}).
+   */
+  releaseMemory(): void {
+    this.db.releaseMemory();
+  }
+
+  /**
    * Close the CodeGraph instance and release resources
    */
   close(): void {

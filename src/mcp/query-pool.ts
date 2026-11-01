@@ -17,6 +17,9 @@
  *     once; a poison call that keeps crashing fails gracefully (never wedges the
  *     pool). A crash budget trips a circuit breaker (`healthy` → false) so the
  *     caller falls back to in-process dispatch instead of thrashing respawns.
+ *   - idle trim: a pool that goes quiet gives its memory back. The workers a
+ *     burst added exit, and the last one to serve stays up and shrinks in
+ *     place, so the next call finds a warm worker rather than a cold start.
  *   - graceful backstop: a call that can't be served within `softTimeoutMs`
  *     resolves with SUCCESS-shaped "busy, retry" guidance — never `isError`, so
  *     a momentary overload can't teach the agent to abandon codegraph — instead
@@ -48,14 +51,21 @@ export interface PoolWorker {
 /** Default linger before a queued call is answered with busy-guidance. */
 const DEFAULT_BUSY_TIMEOUT_MS = 45_000; // < the ~60s MCP client request timeout
 
-/** Recycle a quiescent pool after a burst so worker-local graph/SQLite caches
+/** Shrink a quiescent pool after a burst so worker-local graph/SQLite caches
  * do not remain resident for the daemon's whole lifetime. Long enough that an
- * agent pausing to edit or build keeps its warm workers: the first explore on
- * a fresh one takes about 200 ms more. */
+ * agent pausing to edit or build keeps every worker it grew. */
 const DEFAULT_IDLE_SHRINK_MS = 300_000;
 
 /** How long a retired idle worker gets to exit on 'close' before it is terminated. */
 const RETIRE_TIMEOUT_MS = 5_000;
+
+/**
+ * Most a worker may still hold after its idle trim and stay. A trimmed worker
+ * holds about 80 MB, mostly heap and tree-sitter's wasm, whatever the size of
+ * the project; one above this holds something that won't come back in place,
+ * so it costs less to replace it than to keep it for the rest of the session.
+ */
+const DEFAULT_IDLE_KEEP_BYTES = 256 * 1024 * 1024;
 
 /** Hard ceiling on pool size regardless of core count / env. */
 const MAX_POOL_SIZE = 16;
@@ -95,6 +105,8 @@ interface WorkerMessage {
   ok?: boolean;
   id?: number;
   result?: ToolResult;
+  /** On 'trimmed': the heap and buffers the worker still holds. */
+  heldBytes?: number;
 }
 
 interface Job {
@@ -117,8 +129,10 @@ export interface QueryPoolOptions {
   softTimeoutMs?: number;
   /** Retries for an in-flight call whose worker crashed. Default 1. */
   maxRetries?: number;
-  /** Idle delay before recycling back to one fresh worker. Default 5 minutes; 0 disables. */
+  /** Idle delay before shrinking to one trimmed worker. Default 5 minutes; 0 disables. */
   idleShrinkMs?: number;
+  /** A worker holding more than this after its trim is replaced. Default 256 MB; 0 replaces any. */
+  idleKeepBytes?: number;
   /** How long a retired idle worker gets to exit by itself (tests shorten it). Default 5s. */
   retireTimeoutMs?: number;
   /** Worker factory (tests inject a fake). Defaults to a real `worker_threads` Worker. */
@@ -188,6 +202,7 @@ export class QueryPool {
   private readonly softTimeoutMs: number;
   private readonly maxRetries: number;
   private readonly idleShrinkMs: number;
+  private readonly idleKeepBytes: number;
   private readonly retireTimeoutMs: number;
   private readonly createWorker: () => PoolWorker;
   private readonly startSettleMs: number;
@@ -195,9 +210,12 @@ export class QueryPool {
   // Retired idle workers asked to exit: the timer that terminates one that
   // hasn't by retireTimeoutMs, and what destroy() waits on.
   private retiring = new Map<PoolWorker, { cap: NodeJS.Timeout; gone: Promise<void>; settle: () => void }>();
-  // Set by a served call and cleared by a recycle, so a clean warm worker that
-  // has answered nothing is never recycled for its own sake.
-  private servedSinceRecycle = false;
+  // Set by a served call and cleared by a shrink, so a worker that has answered
+  // nothing since is left alone rather than trimmed again for its own sake.
+  private servedSinceShrink = false;
+  // The worker that answered last, which is the one worth keeping: its caches
+  // and its compiled code are what the next call would otherwise rebuild.
+  private lastServer?: PoolWorker;
 
   constructor(opts: QueryPoolOptions) {
     this.root = opts.root;
@@ -205,6 +223,7 @@ export class QueryPool {
     this.softTimeoutMs = opts.softTimeoutMs ?? resolveBusyTimeoutMs();
     this.maxRetries = opts.maxRetries ?? 1;
     this.idleShrinkMs = Math.max(0, opts.idleShrinkMs ?? DEFAULT_IDLE_SHRINK_MS);
+    this.idleKeepBytes = opts.idleKeepBytes ?? DEFAULT_IDLE_KEEP_BYTES;
     this.retireTimeoutMs = opts.retireTimeoutMs ?? RETIRE_TIMEOUT_MS;
     this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root } }));
     this.startSettleMs = opts.startSettleMs ?? WORKER_START_SETTLE_MS;
@@ -235,9 +254,10 @@ export class QueryPool {
    * hitting that window was the recurring #662 test flake (and a real
    * first-call stall for agents). The pool exists for CONCURRENT load, which
    * by definition arrives after warm-up; the pre-pool in-process path is
-   * strictly better while nothing is warm, which also holds while an idle
-   * recycle's fresh worker starts. Stays true across crash-respawn gaps, which
-   * are covered by retry + backstop.
+   * strictly better while nothing is warm, which also holds while the
+   * replacement for a worker too heavy to keep starts. Stays true across an
+   * idle shrink, whose kept worker never stops serving, and across crash-respawn
+   * gaps, which are covered by retry + backstop.
    */
   get ready(): boolean {
     return this.everReady && !this.destroyed;
@@ -284,11 +304,20 @@ export class QueryPool {
       const job = this.inflight.get(w);
       this.inflight.delete(w);
       this.idle.push(w);
-      this.servedSinceRecycle = true;
+      this.servedSinceShrink = true;
+      this.lastServer = w;
       if (job) this.settle(job, m.result ?? busyGuidance(0));
       this.drain();
       this.armIdleShrink();
+      return;
     }
+    if (m.type === 'trimmed') this.replaceIfHeavy(w, m.heldBytes ?? 0);
+  }
+
+  /** Nothing queued or running, nothing starting, and every worker free. */
+  private get quiescent(): boolean {
+    return !this.destroyed && this.queue.length === 0 && this.inflight.size === 0 &&
+      this.pendingWorkers.size === 0 && this.idle.length === this.workers.size;
   }
 
   private clearIdleShrink(): void {
@@ -298,31 +327,50 @@ export class QueryPool {
 
   private armIdleShrink(): void {
     this.clearIdleShrink();
-    if (
-      this.idleShrinkMs === 0 || this.destroyed || !this.servedSinceRecycle ||
-      this.queue.length > 0 || this.inflight.size > 0 || this.pendingWorkers.size > 0 ||
-      this.idle.length !== this.workers.size
-    ) return;
+    if (this.idleShrinkMs === 0 || !this.servedSinceShrink || !this.quiescent) return;
     this.idleShrinkTimer = setTimeout(() => this.shrinkIdle(), this.idleShrinkMs);
     this.idleShrinkTimer.unref?.();
   }
 
   private shrinkIdle(): void {
     this.idleShrinkTimer = undefined;
-    if (
-      this.destroyed || this.queue.length > 0 || this.inflight.size > 0 ||
-      this.pendingWorkers.size > 0 || this.idle.length !== this.workers.size
-    ) return;
+    if (!this.quiescent) return;
 
-    // Drop every used isolate, including the last one: a single worker can hold
-    // hundreds of MB in graph and SQLite caches after a large query. Replace it
-    // with one clean warm worker so the next burst still avoids a cold queue.
-    const stale = [...this.workers];
+    // Keep one worker, trimmed in place, rather than ending them all and
+    // starting a clean one. A clean worker has to work out again everything a
+    // connection remembers (the dominant file, the name indexes): half a second
+    // on the next call on a mid-sized index, seconds on a large one. The trim
+    // leaves this one about 70 MB above a clean worker, on any index. Staying
+    // up also means no moment here when a call finds no worker.
+    const keep = this.lastServer && this.idle.includes(this.lastServer)
+      ? this.lastServer
+      : this.idle[this.idle.length - 1];
+    if (!keep) return;
+    for (const w of this.idle) {
+      if (w === keep) continue;
+      this.workers.delete(w);
+      this.retire(w);
+    }
+    this.idle = [keep];
+    this.servedSinceShrink = false;
+    try {
+      keep.postMessage({ type: 'trim' });
+    } catch { /* already gone: its 'exit' recovers the pool */ }
+  }
+
+  /**
+   * The last check on a kept worker: one that still holds a lot after its trim
+   * is ended like the rest, with one clean worker in its place, so that keeping
+   * a worker can't keep hold of what a large query left behind. Calls that come
+   * while the clean one starts are served in process. Back at work by now, it
+   * is left alone, and judged at the next shrink.
+   */
+  private replaceIfHeavy(w: PoolWorker, heldBytes: number): void {
+    if (heldBytes <= this.idleKeepBytes || !this.quiescent || this.workers.size !== 1) return;
     this.workers.clear();
     this.idle = [];
     this.everReady = false;
-    this.servedSinceRecycle = false;
-    for (const w of stale) this.retire(w);
+    this.retire(w);
     this.spawnOne();
   }
 

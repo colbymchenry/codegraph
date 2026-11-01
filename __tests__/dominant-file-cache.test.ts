@@ -56,6 +56,26 @@ describe('dominant file — computed once per index state (#1864)', () => {
     return cg;
   }
 
+  it('keeps the answer when the connection lets go of its memory, and reads on', async () => {
+    const cg = await setup();
+    const q = queriesOf(cg);
+    const compute = spyCompute(cg);
+    const answer = q.getDominantFile();
+    const hits = cg.searchNodes('engineStep0');
+    const db = (cg as unknown as { db: DatabaseConnection }).db.getDb();
+    const mapped = db.pragma('mmap_size', { simple: true });
+    expect(mapped).toBeGreaterThan(0);
+    const exec = vi.spyOn(db, 'exec');
+
+    cg.releaseMemory();
+
+    expect(exec.mock.calls.map(([sql]) => sql)).toEqual(expect.arrayContaining(['PRAGMA shrink_memory', 'PRAGMA mmap_size = 0']));
+    expect(q.getDominantFile()).toEqual(answer);
+    expect(compute).toHaveBeenCalledTimes(1);
+    expect(db.pragma('mmap_size', { simple: true })).toBe(mapped);
+    expect(cg.searchNodes('engineStep0')).toEqual(hits);
+  });
+
   it('reuses the answer across explores while the database is unchanged', async () => {
     const cg = await setup();
     const compute = spyCompute(cg);

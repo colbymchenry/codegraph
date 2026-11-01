@@ -41,6 +41,11 @@ interface CloseMessage {
   type: 'close';
 }
 
+/** The pool keeping this idle worker: give back what it can, and say what is left. */
+interface TrimMessage {
+  type: 'trim';
+}
+
 // Mirror the engine's lazy-require of the heavy CodeGraph + tools chain. This
 // module is only ever loaded as a Worker, so the require runs once on spawn.
 const loadCodeGraph = (): typeof import('../index').default =>
@@ -70,7 +75,7 @@ if (parentPort) {
   // against its crash budget (→ fall back to in-process) without hanging.
   port.postMessage({ type: 'ready', ok: initError === null, error: initError });
 
-  port.on('message', (msg: CallMessage | CloseMessage) => {
+  port.on('message', (msg: CallMessage | CloseMessage | TrimMessage) => {
     if (msg?.type === 'close') {
       try {
         void handler?.closeAll(); // projects opened through projectPath
@@ -81,6 +86,15 @@ if (parentPort) {
       // No GC marking in flight when the thread ends (worker-teardown.ts).
       collectBeforeExit();
       process.exit(0);
+    }
+    if (msg?.type === 'trim') {
+      try {
+        handler?.releaseIdleMemory();
+      } catch { /* a worker that can't let go still serves */ }
+      // This thread's own heap and buffers: `rss` is the whole process's.
+      const { heapUsed, external } = process.memoryUsage();
+      port.postMessage({ type: 'trimmed', heldBytes: heapUsed + external });
+      return;
     }
     if (!msg || msg.type !== 'call') return;
     void serve(msg);
