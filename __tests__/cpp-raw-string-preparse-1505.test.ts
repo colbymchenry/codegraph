@@ -101,13 +101,13 @@ value UPARAM(ref) UE_DEPRECATED(
     { name: 'line-leading', blank: blankCppAnnotationMacroCalls, head: '', macro: 'ANNOTATE', tail: '\nint helper_after() { return 1; }\n' },
     { name: 'inline', blank: blankCppInlineAnnotationMacros, head: 'using Alias ', macro: 'UE_DEPRECATED', tail: ' = int;\n' },
     { name: 'C parameterized', blank: blankCParameterizedAnnotationMacros, head: 'static void ', macro: '__section', tail: ' helper_after(void) {}\n' },
-    { name: 'C iterator', blank: blankCStatementMacroCalls, head: 'void iterate() {\n  ', macro: 'for_each_item', tail: ' {\n    visit();\n  }\n}\n' },
-  ])('balances a genuine $name macro containing a raw-string argument', ({ blank, head, macro, tail }) => {
+    { name: 'C iterator', blank: blankCStatementMacroCalls, head: 'void iterate() {\n  ', macro: 'for_each_item', tail: ' {\n    visit();\n  }\n}\n', kept: 'for_each_item;' },
+  ])('balances a genuine $name macro containing a raw-string argument', ({ blank, head, macro, tail, kept = '' }) => {
     const annotation = `${macro}(R"TAG(" ) unbalanced ( " \\
 UE_DEPRECATED(
 )TAG")`;
     expect(blank(head + annotation + tail))
-      .toBe(head + annotation.replace(/[^\r\n]/g, ' ') + tail);
+      .toBe(head + kept + annotation.slice(kept.length).replace(/[^\r\n]/g, ' ') + tail);
   });
 
   it('balances a C declaration macro with a raw-string argument', () => {

@@ -14238,7 +14238,8 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     ].join('\n');
     const out = blankCStatementMacroCalls(src);
     expect(out.length).toBe(src.length);
-    expect(out).not.toContain('list_for_each_entry');
+    expect(out).toContain('list_for_each_entry;');
+    expect(out).not.toContain('head, member');
     expect(out).toContain('use(pos);');
     // A real call statement ends with `;` — untouched.
     expect(out).toContain('use(pos);');
@@ -14445,7 +14446,7 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     ].join('\n');
     const out = blankCStatementMacroCalls(src);
     expect(out.length).toBe(src.length);
-    expect(out).not.toContain('hlist_for_each_entry_rcu');
+    expect(out).toContain('hlist_for_each_entry_rcu;');
     expect(out).not.toContain('lockdep_is_held');
     expect(out).toContain('use(p);');
     // A wrapped REAL call ends in `;` — untouched.
