@@ -16,6 +16,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { getCodeGraphDir } from '../directory';
+import { isPidLockPending, withPidLock } from './pid-lock';
 /** Signal-0 liveness (EPERM ⇒ alive). Local copy to avoid a daemon↔writer cycle. */
 function isProcessAlive(pid: number): boolean {
   try {
@@ -71,7 +72,8 @@ export function decodeWriterLockInfo(raw: string): WriterLockInfo | null {
 
 /**
  * Atomically create `writer.pid` (link-into-place, O_EXCL fallback). If held
- * by a dead PID, clear and retry once. Does not steal from a live holder.
+ * by a dead PID, clear and retry once under the PID-record mutation barrier.
+ * Does not steal from a live holder or an unfinished exclusive-create write.
  */
 export function tryAcquireWriterLock(
   projectRoot: string,
@@ -127,42 +129,51 @@ export function tryAcquireWriterLock(
     return { kind: 'taken', existing, pidPath };
   };
 
-  let result = attempt();
-  if (result.kind === 'taken' && result.existing && result.existing.pid === process.pid) {
-    // Same process already holds it (daemon acquired before engine watch).
-    return { kind: 'acquired', pidPath: result.pidPath, info: result.existing };
-  }
-  if (result.kind === 'taken') {
-    const existing = result.existing;
-    if (!existing || existing.pid <= 0 || !isProcessAlive(existing.pid)) {
-      // Stale — clear (pid-verified) and retry once.
-      try {
-        const raw = fs.readFileSync(pidPath, 'utf8');
-        const cur = decodeWriterLockInfo(raw);
-        if (!cur || cur.pid === existing?.pid) {
-          if (!cur || cur.pid <= 0 || !isProcessAlive(cur.pid)) {
-            fs.unlinkSync(pidPath);
-          }
-        }
-      } catch { /* ENOENT ok */ }
-      result = attempt();
+  const acquire = (): WriterAcquireResult => {
+    const result = attempt();
+    if (result.kind === 'acquired') return result;
+    if (result.existing?.pid === process.pid) {
+      // Same process already holds it (daemon acquired before engine watch).
+      return { kind: 'acquired', pidPath, info: result.existing };
     }
-  }
-  return result;
+    try {
+      // The barrier spans this reread, stale removal, and retry publication.
+      const raw = fs.readFileSync(pidPath, 'utf8');
+      if (isPidLockPending(pidPath, raw)) return result;
+      const current = decodeWriterLockInfo(raw);
+      if (current && current.pid > 0 && isProcessAlive(current.pid)) return result;
+      fs.unlinkSync(pidPath);
+    } catch (err) {
+      // An unreadable record is not evidence of staleness.
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return result;
+    }
+    return attempt();
+  };
+  const taken = () => ({ kind: 'taken' as const, existing: readWriterLock(projectRoot, lockName), pidPath });
+  return withPidLock(pidPath, acquire, () => {
+    const result = taken();
+    if (result.existing?.pid !== process.pid) return result;
+    // A handover can restore this process's ownership while the barrier is
+    // busy. Decide whether to wait from this snapshot taken after contention,
+    // then revalidate under the barrier before reporting same-process ownership.
+    return withPidLock(pidPath, acquire, taken, { wait: true });
+  });
 }
 
-/** Publish catch-up readiness without exposing a partially-written pidfile. */
+/** Publish readiness atomically, waiting briefly for a concurrent writer mutation. */
 export function markWriterReady(projectRoot: string): void {
   const pidPath = getWriterPidPath(projectRoot);
-  const info = readWriterLock(projectRoot);
-  if (!info || info.pid !== process.pid) return;
-  const tmp = `${pidPath}.${process.pid}.ready.tmp`;
-  try {
-    fs.writeFileSync(tmp, encode({ ...info, ready: true }), { mode: 0o600 });
-    fs.renameSync(tmp, pidPath);
-  } finally {
-    try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
-  }
+  withPidLock(pidPath, () => {
+    const info = readWriterLock(projectRoot);
+    if (!info || info.pid !== process.pid) return;
+    const tmp = `${pidPath}.${process.pid}.ready.tmp`;
+    try {
+      fs.writeFileSync(tmp, encode({ ...info, ready: true }), { mode: 0o600 });
+      fs.renameSync(tmp, pidPath);
+    } finally {
+      try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+    }
+  }, () => { throw new Error(`Timed out publishing writer readiness; inspect ${pidPath}.break for its current owner.`); }, { wait: true });
 }
 
 /** Waits between retries of a writer-record swap refused by Windows (another process has the file open). */
@@ -173,46 +184,48 @@ const SWAP_RETRY_DELAYS_MS = [25, 50, 100, 200];
  * the slot passes between two processes without ever falling free (#2335). A
  * stopped daemon's sessions serve themselves in-process the moment it goes, and
  * one that found the slot free or stale would claim it as their own writer.
- * Compare and rename are separate steps, so callers check the result: whether
- * the record was replaced. Never throws.
+ * The PID-record barrier keeps compare and rename exclusive, including Windows
+ * retries. Waits briefly for a contending mutation; returns false on timeout,
+ * changed ownership, or I/O failure; never throws.
  */
 export function swapWriterLock(projectRoot: string, fromPid: number, next: WriterLockInfo): boolean {
   const pidPath = getWriterPidPath(projectRoot);
-  const tmp = `${pidPath}.${process.pid}.swap.tmp`;
-  try {
-    if (readWriterLock(projectRoot)?.pid !== fromPid) return false;
-    fs.writeFileSync(tmp, encode(next), { mode: 0o600 });
-    for (let attempt = 0; ; attempt++) {
-      try {
-        fs.renameSync(tmp, pidPath);
-        return true;
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        const delay = SWAP_RETRY_DELAYS_MS[attempt];
-        if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(code ?? '') || delay === undefined) {
-          return false;
+  return withPidLock(pidPath, () => {
+    const tmp = `${pidPath}.${process.pid}.swap.tmp`;
+    try {
+      if (readWriterLock(projectRoot)?.pid !== fromPid) return false;
+      fs.writeFileSync(tmp, encode(next), { mode: 0o600 });
+      for (let attempt = 0; ; attempt++) {
+        try {
+          fs.renameSync(tmp, pidPath);
+          return true;
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          const delay = SWAP_RETRY_DELAYS_MS[attempt];
+          if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(code ?? '') || delay === undefined) {
+            return false;
+          }
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+          if (readWriterLock(projectRoot)?.pid !== fromPid) return false;
         }
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
-        if (readWriterLock(projectRoot)?.pid !== fromPid) return false;
       }
+    } catch {
+      return false;
+    } finally {
+      try { fs.unlinkSync(tmp); } catch { /* renamed, or never written */ }
     }
-  } catch {
-    return false;
-  } finally {
-    try { fs.unlinkSync(tmp); } catch { /* renamed, or never written */ }
-  }
+  }, () => false, { wait: true });
 }
 
-/** Release if we still own the lock (pid match). */
+/** Best-effort release after waiting briefly for the barrier, only while the PID still matches. */
 export function releaseWriterLock(projectRoot: string, lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid'): void {
   const pidPath = getWriterPidPath(projectRoot, lockName);
-  try {
-    if (!fs.existsSync(pidPath)) return;
-    const info = decodeWriterLockInfo(fs.readFileSync(pidPath, 'utf8'));
-    if (info && info.pid === process.pid) {
-      fs.unlinkSync(pidPath);
-    }
-  } catch { /* best-effort */ }
+  withPidLock(pidPath, () => {
+    try {
+      const info = decodeWriterLockInfo(fs.readFileSync(pidPath, 'utf8'));
+      if (info && info.pid === process.pid) fs.unlinkSync(pidPath);
+    } catch { /* best-effort */ }
+  }, () => {}, { wait: true });
 }
 
 /** Read current lock without acquiring. */
@@ -240,7 +253,7 @@ export function writerLockHeldMessage(
     'Only one live MCP writer may serve a project (auto-sync / index). ' +
     'Stop the other server (if it is the shared daemon, pick it in `codegraph daemon` to stop it; otherwise end the other MCP session), ' +
     'or unset CODEGRAPH_NO_DAEMON so additional clients proxy to the shared daemon. ' +
-    'If this is stale, delete ' + pidPath
+    'If this is stale, inspect ' + pidPath + ' and ' + pidPath + '.break; remove only records whose owner has exited.'
   );
 }
 
