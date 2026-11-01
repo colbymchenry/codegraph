@@ -41,7 +41,7 @@ import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-mo
 import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
-import { matchRubyConstantPathRef } from './ruby-constant-paths';
+import { clearRubyConstantPathMemos, matchRubyConstantPathRef } from './ruby-constant-paths';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -681,6 +681,7 @@ export class ReferenceResolver {
     if (this.context) {
       clearImportResolverMemos(this.context);
       clearNameMatcherMemos(this.context);
+      clearRubyConstantPathMemos(this.context);
       clearCppMacroVisibility(this.context);
       clearSwiftTypeVisibility(this.context);
       clearDartLibraryMemos(this.context);

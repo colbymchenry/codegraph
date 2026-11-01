@@ -24,6 +24,11 @@
  * So does a call on an instance variable an instance method makes
  * (`@writer.flush`), when the class's `initialize` gives the variable an
  * instance of one class, `@writer = CacheWriter.new(…)`, and nothing else.
+ *
+ * And a call on a method of the class around it, written as a bare name
+ * (`cookies.signed`), when that method, the class's own or one its ancestry
+ * declares, takes no arguments and hands back what one class makes:
+ * `@cookie_jar ||= Cookies::CookieJar.build(…)`.
  */
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
@@ -42,6 +47,8 @@ const CONSTANT_PATH_CALL = /^(::)?([A-Z]\w*(?:::[A-Z]\w*)*)\.([A-Za-z_]\w*[?!=]?
 const CONSTRUCTED_CALL = /^new (::)?([A-Z]\w*(?:::[A-Z]\w*)*)\(\)\.([A-Za-z_]\w*[?!=]?)$/;
 /** `@writer.flush`: a call on an instance variable. Group 1 is the variable's name, group 2 the method. */
 const IVAR_CALL = /^@(\w+)\.([A-Za-z_]\w*[?!=]?)$/;
+/** `cookies.signed`: a call on a bare name. Group 1 is the name, group 2 the method. */
+const BARE_NAME_CALL = /^([a-z_]\w*)\.([A-Za-z_]\w*[?!=]?)$/;
 
 /** What a Ruby constant is in the index: a class, a module, or a value (`RATES = {…}` is a `variable`). */
 const NAMESPACE_KINDS: ReadonlySet<string> = new Set(['class', 'module']);
@@ -85,6 +92,15 @@ export function matchRubyConstantPathRef(ref: UnresolvedRef, context: Resolution
       if (cls === undefined) return undefined;
       const method = cls ? methodOf(cls.qualifiedName, ivar[2]!, ref, context, 'instance') : null;
       return method ? { original: ref, targetNodeId: method.node.id, confidence: method.own ? 0.85 : 0.8, resolvedBy: 'instance-method' } : null;
+    }
+    // A call on what a method of the class around it hands back. A name the
+    // calling method binds itself, or a method that says nothing of its value,
+    // is left to the other strategies.
+    const bare = BARE_NAME_CALL.exec(ref.referenceName);
+    if (bare) {
+      const cls = accessorClass(bare[1]!, ref, context);
+      const method = cls ? methodOf(cls.qualifiedName, bare[2]!, ref, context, 'instance') : null;
+      return method ? { original: ref, targetNodeId: method.node.id, confidence: method.own ? 0.85 : 0.8, resolvedBy: 'instance-method' } : undefined;
     }
     const m = CONSTANT_PATH_CALL.exec(ref.referenceName);
     if (!m || !isNamespaced(m)) return undefined;
@@ -187,6 +203,78 @@ function ivarClassFromInitialize(name: string, owner: string, context: Resolutio
   return cls?.kind === 'class' ? cls : null;
 }
 
+const ACCESSOR_CLASSES = new WeakMap<ResolutionContext, Map<string, Node | null>>();
+
+/** Drops what was read from the files of a context whose caches are cleared. */
+export function clearRubyConstantPathMemos(context: ResolutionContext): void {
+  IVAR_CLASSES.delete(context);
+  ACCESSOR_CLASSES.delete(context);
+}
+
+/**
+ * The class of what the method `name` of the class around `ref` hands back, a
+ * call written as a bare name in an instance method: undefined unless such a
+ * method says so (accessorClassOf) and the calling method doesn't bind the
+ * name itself.
+ */
+function accessorClass(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller || caller.kind !== 'method' || caller.language !== 'ruby' || caller.isStatic === true) return undefined;
+  const owner = innermostNamespace(ref, context);
+  if (!owner || owner.kind !== 'class') return undefined;
+  let memo = ACCESSOR_CLASSES.get(context);
+  if (!memo) ACCESSOR_CLASSES.set(context, (memo = new Map()));
+  const key = `${owner.qualifiedName}\0${name}`;
+  let cls = memo.get(key);
+  if (cls === undefined) memo.set(key, (cls = accessorClassOf(name, owner.qualifiedName, ref, context)));
+  if (!cls) return undefined;
+  const lines = context.getFileLines?.(caller.filePath) ?? context.readFile(caller.filePath)?.split(/\r?\n/) ?? [];
+  return bindsName(lines.slice(caller.startLine - 1, caller.endLine).join('\n'), name) ? undefined : cls;
+}
+
+/** Whether a method's text binds `name` itself: a parameter, a block's, an assignment, a `rescue => name`. */
+function bindsName(text: string, name: string): boolean {
+  return new RegExp(String.raw`^\s*def\s[^\n]*\b${name}\b|\|[^|\n]*\b${name}\b[^|\n]*\||(?<![.@:\w])${name}\s*(?:\|\||&&|[-+*/%])?=(?![=~>])|(?<![.@:\w])${name}\s*,[^=\n]*=(?![=~>])|=>\s*${name}\b|\bfor\s+${name}\b`, 'm').test(text);
+}
+
+/**
+ * The class what the method `name` of `owner` hands back: its own or the first
+ * its ancestry declares, taking no arguments, whose last statement is
+ * `Const.new(…)` or `Const.factory(…)`, memoized (`@x ||= …`) or not, a factory
+ * being a `def self.` of that class that ends in what `new` made. Null for
+ * anything else.
+ */
+function accessorClassOf(name: string, owner: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const accessor = methodOf(owner, name, ref, context, 'instance')?.node;
+  if (!accessor || accessor.isStatic === true) return null;
+  const last = lastStatement(accessor, context);
+  if (!last || !new RegExp(String.raw`^\s*def\s+${name}\s*(?:\(\s*\))?\s*(?:#.*)?$`).test(last.head)) return null;
+  const value = last.text.replace(/^@\w+\s*\|\|=\s*/, '');
+  const at: UnresolvedRef = {
+    fromNodeId: '', referenceName: name, referenceKind: 'references',
+    line: accessor.startLine, column: 0, filePath: accessor.filePath, language: 'ruby',
+  };
+  const made = constructedValue(value, 0);
+  if (made) return constantsNamed(made.path, made.absolute, at, context).find((n) => n.kind === 'class') ?? null;
+  const factory = /^(::)?([A-Z]\w*(?:::[A-Z]\w*)*)\s*\.\s*([a-z_]\w*)\b/.exec(value);
+  if (!factory) return null;
+  const cls = constantsNamed(factory[2]!, factory[1] !== undefined, at, context).find((n) => n.kind === 'class');
+  const built = cls && context.getNodesByQualifiedName(`${cls.qualifiedName}::${factory[3]}`).find((n) => n.kind === 'method' && n.isStatic === true);
+  const end = built ? lastStatement(built, context) : null;
+  if (!end) return null;
+  const local = /^\w+$/.test(end.text) ? new RegExp(String.raw`^\s*${end.text}\s*=\s*new\b`, 'm') : null;
+  return /^new\b/.test(end.text) || local?.test(end.body) ? cls! : null;
+}
+
+/** The first line of a method, its body with comments blanked, and the body's last statement, one line long. */
+function lastStatement(method: Node, context: ResolutionContext): { head: string; body: string; text: string } | null {
+  const lines = context.getFileLines?.(method.filePath) ?? context.readFile(method.filePath)?.split(/\r?\n/);
+  if (!lines || method.endLine - method.startLine < 2) return null;
+  const body = stripCommentsForRegex(lines.slice(method.startLine, method.endLine - 1).join('\n'), 'ruby');
+  const text = body.split('\n').map((l) => l.trim()).filter(Boolean).pop();
+  return text ? { head: lines[method.startLine - 1] ?? '', body, text } : null;
+}
+
 /**
  * Each assignment to `@name` in `body` (an `initialize`, comments blanked):
  * the constant whose `.new` it assigns, and the assignment's line within
@@ -265,7 +353,7 @@ function methodOf(
   kind: RubyMethodKind = 'class',
 ): { node: Node; own: boolean } | null {
   const production = !isTestPath(ref.filePath);
-  for (const qn of rubyAncestry(owner, context)) {
+  for (const qn of rubyAncestry(owner, context, kind === 'instance')) {
     const methods = context.getNodesByQualifiedName(`${qn}::${name}`).filter((n) =>
       n.kind === 'method' && n.language === 'ruby' && !(production && isTestPath(n.filePath)));
     if (methods.length > 0) return { node: rubyMethodsOfKindFirst(ordered(methods, ref), kind)[0]!, own: qn === owner };
