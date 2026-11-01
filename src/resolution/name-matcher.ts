@@ -21328,6 +21328,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   TS_PASS_THROUGH_WRAPPERS.delete(context);
   TS_CREATE_INSTANCE_DECLARED.delete(context);
   TS_NAMED_TYPES.delete(context);
+  TS_ALIASED_TYPES.delete(context);
   TARGET_LANGUAGE.delete(context);
   PY_LINES.delete(context);
   PY_ATTR_MEMO.delete(context);
@@ -29110,15 +29111,75 @@ function tsMethodUpChain(cls: Node, name: string, at: UnresolvedRef, context: Re
 }
 
 /**
+ * The one type a TS or Flow alias's value names, as written: `Bridge` of
+ * `Bridge<A, B>`, `Bridge | null` or Flow's `?Bridge`. Null for anything else
+ * (a union of two types, an object type, a function type, `Bridge[]`).
+ */
+function tsAliasValueName(alias: Node, context: ResolutionContext): string | null {
+  const lines = (context.getFileLines?.(alias.filePath) ?? context.readFile(alias.filePath)?.split(/\r?\n/) ?? [])
+    .slice(alias.startLine - 1, alias.endLine);
+  if (lines.length === 0) return null;
+  lines[lines.length - 1] = lines[lines.length - 1]!.slice(0, alias.endColumn);
+  const text = stripCommentsForRegex(lines.join('\n').slice(alias.startColumn), 'typescript');
+  // What is outside every `<…>`, past the `=` of the declaration itself: a
+  // type parameter may have a default of its own, `type T<A = string> = …`.
+  let depth = 0;
+  let value: string | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '<') depth++;
+    else if (ch === '>' && text[i - 1] !== '=') depth--;
+    else if (depth > 0) continue;
+    else if (value !== null) value += ch;
+    else if (ch === '=' && text[i + 1] !== '>') value = '';
+    if (depth < 0) return null;
+  }
+  const parts = value?.replace(/;\s*$/, '').split('|').map((p) => p.trim()).filter((p) => p !== '' && p !== 'null' && p !== 'undefined') ?? [];
+  const name = parts.length === 1 ? parts[0]!.replace(/^\?\s*/, '') : '';
+  return /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(name) ? name : null;
+}
+
+/** Per-context memo: `<file>\0<name>` → tsAliasedType's answer. */
+const TS_ALIASED_TYPES = new WeakMap<ResolutionContext, Map<string, Node | null>>();
+
+/**
+ * The class or interface a type alias `file` declares stands for: react's
+ * `export type BackendBridge = Bridge<BackendEvents, FrontendEvents>`, through
+ * an alias of an alias, each name read the way the alias's own file reads it.
+ */
+function tsAliasedType(name: string, file: string, at: UnresolvedRef, context: ResolutionContext, depth = 0): Node | null {
+  let memo = TS_ALIASED_TYPES.get(context);
+  if (!memo) TS_ALIASED_TYPES.set(context, (memo = new Map()));
+  const key = file + '\0' + name;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  let found: Node | null = null;
+  const alias = (context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file).filter((n) => n.name === name))
+    .find((n) => n.kind === 'type_alias');
+  const written = alias && depth < 4 ? tsAliasValueName(alias, context) : null;
+  // `type Box<T> = T | null` holds whatever its argument is.
+  if (alias && written && !tsClassTypeParameter(alias, written, context)) {
+    const named = tsNamedType(written, alias, at, context);
+    if (named && named !== 'outside') found = named;
+    else if (!named) {
+      const there = { ...at, filePath: alias.filePath, language: alias.language };
+      found = tsAliasedType(written.split('.').pop()!, tsImportedTypeFile(written, there, context) ?? alias.filePath, at, context, depth + 1);
+    }
+  }
+  memo.set(key, found);
+  return found;
+}
+
+/**
  * A TS/JS member call on a value of the class or interface `typeName` that
- * `file` declares: that type's method or its nearest supertype's
- * (tsMethodUpChain); null when the whole chain is known and has none, as
- * when the method is a package's: `Emitter extends lsp.Emitter` has no
- * project `fire`, whatever other `Emitter` declares one. Undefined when
- * neither `file` nor what `at`'s file imports under the name declares the
- * type, or a supertype can't be found, for the caller's own fallback. (An
- * import may rename it: bitwarden's `MessagingService` is `export {
- * MessageSender as MessagingService }`.)
+ * `file` declares, or of a type alias of one (tsAliasedType): that type's
+ * method or its nearest supertype's (tsMethodUpChain); null when the whole
+ * chain is known and has none, as when the method is a package's: `Emitter
+ * extends lsp.Emitter` has no project `fire`, whatever other `Emitter`
+ * declares one. Undefined when neither `file` nor what `at`'s file imports
+ * under the name declares the type, or a supertype can't be found, for the
+ * caller's own fallback. (An import may rename it: bitwarden's
+ * `MessagingService` is `export { MessageSender as MessagingService }`.)
  */
 function tsKnownTypeCall(
   typeName: string,
@@ -29129,10 +29190,11 @@ function tsKnownTypeCall(
   context: ResolutionContext,
   confidence: number,
 ): ResolvedRef | null | undefined {
-  let known = tsTypeDeclaredIn(file, typeName, context);
+  let known: Node | null | undefined = tsTypeDeclaredIn(file, typeName, context);
   if (!known) {
     const named = tsNamedType(typeName, { filePath: at.filePath, language: at.language, id: '' }, at, context);
     if (named && named !== 'outside') known = named;
+    else if (!named) known = tsAliasedType(typeName, file, at, context);
   }
   if (!known) return undefined;
   const up = nmTimedT('mc-tsknown', ref, () => tsMethodUpChain(known, methodName, at, context));
