@@ -1894,6 +1894,7 @@ function lexicalScopeOf(candidate: Node, context: ResolutionContext): { start: n
     scope = { start: container.startLine, end: container.endLine };
     break;
   }
+  scope ??= literalPlaceOf(candidate, context)?.block ?? null;
   memo.set(candidate.id, scope);
   return scope;
 }
@@ -14305,20 +14306,27 @@ export function objectLiteralMemberBinding(
   return objectLiteralProperty(container, member, context)?.binding ?? null;
 }
 
+/** A holder's own text from its first column to its last: comments blanked, and in `code` string contents too. */
+function holderExtent(container: Node, context: ResolutionContext): { lines: string[]; extent: string; code: string } | null {
+  const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
+  if (!lines) return null;
+  const extentLines = lines.slice(container.startLine - 1, container.endLine);
+  if (!extentLines.length) return null;
+  extentLines[extentLines.length - 1] = extentLines[extentLines.length - 1]!.slice(0, container.endColumn);
+  extentLines[0] = extentLines[0]!.slice(container.startColumn);
+  const extent = stripCommentsForRegex(extentLines.join('\n'), 'typescript');
+  return { lines, extent, code: blankStringContents(extent) };
+}
+
 /** The last own property wins; an unknown spread/computed key invalidates earlier evidence. */
 function objectLiteralProperty(
   container: Node,
   member: string,
   context: ResolutionContext,
 ): { binding: string | null; contains: (node: Node) => boolean } | null | undefined {
-  const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
-  if (!lines) return undefined;
-  const extentLines = lines.slice(container.startLine - 1, container.endLine);
-  if (!extentLines.length) return undefined;
-  extentLines[extentLines.length - 1] = extentLines[extentLines.length - 1]!.slice(0, container.endColumn);
-  extentLines[0] = extentLines[0]!.slice(container.startColumn);
-  const extent = stripCommentsForRegex(extentLines.join('\n'), 'typescript');
-  const code = blankStringContents(extent);
+  const read = holderExtent(container, context);
+  if (!read) return undefined;
+  const { lines, extent, code } = read;
   // Start at THIS declarator, including its columns, never a sibling on the same line.
   const open = /^[^=]*=\s*(?:(?:Object\.(?:freeze|seal)\s*)?\(\s*)*\{/.exec(code);
   if (!open) return undefined;
@@ -14471,27 +14479,75 @@ function isObjectLiteralOwner(n: Node): boolean {
   return (n.kind === 'constant' || n.kind === 'variable') && JS_FAMILY.has(n.language) && /^=\s*\{/.test(n.signature ?? '');
 }
 
-const OBJECT_OWNER_OF = new WeakMap<ResolutionContext, Map<string, Node | null>>();
+/** A function qualified under an object literal's holder: the holder, and the block it is written in when that is no member's place. */
+interface LiteralPlace {
+  holder: Node;
+  block: { start: number; end: number } | null;
+}
+
+const LITERAL_PLACES = new WeakMap<ResolutionContext, Map<string, LiteralPlace | null>>();
 
 /**
- * The object literal a function node is a member of — its qualified parent,
- * an owner in its file whose extent holds it — or null for every other
- * function: a declaration, a helper nested in a function, a function inside
- * an initializer that is not an object literal (a module IIFE's own helpers).
+ * Where a function qualified under an object literal's holder is written, or
+ * null for every other function: a declaration, a helper nested in a function
+ * with a node of its own, a function inside an initializer that is not an
+ * object literal (a module IIFE's own helpers).
  */
-function objectLiteralOwnerOf(n: Node, context: ResolutionContext): Node | null {
+function literalPlaceOf(n: Node, context: ResolutionContext): LiteralPlace | null {
   if (n.kind !== 'function' || !JS_FAMILY.has(n.language)) return null;
   const cut = n.qualifiedName.lastIndexOf('::');
   if (cut <= 0) return null;
-  let memo = OBJECT_OWNER_OF.get(context);
-  if (!memo) OBJECT_OWNER_OF.set(context, (memo = new Map()));
+  let memo = LITERAL_PLACES.get(context);
+  if (!memo) LITERAL_PLACES.set(context, (memo = new Map()));
   const hit = memo.get(n.id);
   if (hit !== undefined) return hit;
   const parent = n.qualifiedName.slice(0, cut);
-  const owner = context.getNodesByQualifiedName(parent).find((o) =>
+  const holder = context.getNodesByQualifiedName(parent).find((o) =>
     o.filePath === n.filePath && o.id !== n.id && isObjectLiteralOwner(o) && rangeWithin(n, o)) ?? null;
-  memo.set(n.id, owner);
-  return owner;
+  const place = holder && { holder, block: blockBelowLiteral(n, holder, context) };
+  memo.set(n.id, place);
+  return place;
+}
+
+/**
+ * The lines of the block `n` is written in, when that lies below the literal
+ * `holder` holds, and null for a member, which sits in the literal's own
+ * braces. Only a literal's direct members have nodes under it in their own
+ * right. A function deeper down — in a method of a nested object, under a
+ * computed key, in a callback a member's value passes on — is qualified under
+ * the holder too, because nothing between them has a node, and so is one in a
+ * literal behind `satisfies` or `as const`, whose methods have none. Each is
+ * an ordinary local of the block it is written in, named bare there. The
+ * holder's own text is read, not the file's: a component's template and styles
+ * are not code.
+ */
+function blockBelowLiteral(n: Node, holder: Node, context: ResolutionContext): { start: number; end: number } | null {
+  const scan = jsFileScan(holder.filePath, context);
+  const blocks = (scan.holderBlocks ??= new Map());
+  let index = blocks.get(holder.id);
+  if (index === undefined) {
+    const code = holderExtent(holder, context)?.code;
+    index = code === undefined ? null : readJsBlocks(code);
+    blocks.set(holder.id, index);
+  }
+  if (!index) return null;
+  const firstLine = n.startLine === holder.startLine;
+  const at = jsOffset(index, n.startLine - holder.startLine + 1, n.startColumn - (firstLine ? holder.startColumn : 0));
+  const block = jsBlockAt(index, at);
+  if (!block || jsBlockAt(index, block[0]) === null) return null;
+  const { lineStarts } = index;
+  const lineOf = (offset: number): number => {
+    let line = lineStarts.length - 1;
+    while (line > 0 && lineStarts[line]! > offset) line--;
+    return holder.startLine + line;
+  };
+  return { start: lineOf(block[0]), end: lineOf(block[1]) };
+}
+
+/** The object literal a function node is a member of, or null: see literalPlaceOf and blockBelowLiteral. */
+function objectLiteralOwnerOf(n: Node, context: ResolutionContext): Node | null {
+  const place = literalPlaceOf(n, context);
+  return place && !place.block ? place.holder : null;
 }
 
 /** The node a qualified name's parent names, in `n`'s file and holding it. */
@@ -14570,6 +14626,8 @@ interface JsFileScan {
   blocks?: JsBlockIndex | null;
   bindings?: Map<string, Array<[number, number]>>;
   destructured?: Map<string, Set<string>>;
+  /** Per object-literal holder, the `{…}` blocks of its own text (see blockBelowLiteral). */
+  holderBlocks?: Map<string, JsBlockIndex | null>;
 }
 
 const JS_FILE_SCANS = new WeakMap<ResolutionContext, Map<string, JsFileScan>>();
@@ -21293,7 +21351,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   SCALA_IMPORTS.delete(context);
   ESM_EXPORT_LISTS.delete(context);
   JS_FILE_SCANS.delete(context);
-  OBJECT_OWNER_OF.delete(context);
+  LITERAL_PLACES.delete(context);
   THIS_CALLERS.delete(context);
   GLOBAL_HOLDERS.delete(context);
   CLASSIC_SCRIPTS.delete(context);
