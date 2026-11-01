@@ -122,6 +122,25 @@ describe('real workers are never terminated before they have started', () => {
     expect(startedWhenEnded).toEqual([true, true]);
   }, 30_000);
 
+  it('the resolver pool, failed while no one has asked whether it is ready, leaves no rejection unhandled', async () => {
+    vi.stubEnv('CODEGRAPH_RESOLVE_WORKERS', '2');
+    const { ResolverPool } = require('../dist/resolution/resolver-pool') as typeof import('../src/resolution/resolver-pool');
+    const unhandled: unknown[] = [];
+    const note = (reason: unknown): void => { unhandled.push(reason); };
+    process.on('unhandledRejection', note);
+    try {
+      const pool = ResolverPool.tryCreate(dbPath, root);
+      expect(pool).not.toBeNull();
+      // What a worker terminated mid-boot does to the pool, when the timing gives it that.
+      (pool as unknown as { fail(err: Error): void }).fail(new Error('resolver worker exited with code 1'));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await pool!.destroy(0);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', note);
+    }
+  }, 30_000);
+
   it('the store writer, closed while its worker boots', async () => {
     const { StoreWriter } = require('../dist/extraction/store-writer') as typeof import('../src/extraction/store-writer');
     const writer = new StoreWriter(path.resolve(__dirname, '../dist/extraction/store-worker.js'), dbPath, false);

@@ -237,6 +237,9 @@ export class ResolverPool {
         readyResolve = resolve;
         readyReject = reject;
       });
+      // A failure reaches whoever calls ready(). A pool torn down first has no one
+      // to tell: terminating a worker that hasn't said ready exits it with code 1.
+      ready.catch(() => undefined);
       this.failStarts.push(readyReject);
       const pw: PoolWorker = { worker, ready, started, busy: 0 };
       worker.on('message', (msg: { type: string; id?: number; message?: string; edges?: Edge[]; ms?: number } & Partial<ChunkResult>) => {
