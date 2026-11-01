@@ -4787,7 +4787,8 @@ function isDecoratedFixture(n: Node, context: ResolutionContext): boolean {
   return false;
 }
 
-const PY_LOCAL_BINDS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+/** Per context: a calling function and a name → the line it's bound below (pythonBoundBelow). */
+const PY_LOCAL_BINDS = new WeakMap<ResolutionContext, Map<string, number>>();
 /**
  * The file isPythonLocallyBound last read: its code lines, and per name
  * whether its module binds it. Refs arrive grouped by file, so one file per
@@ -4814,59 +4815,71 @@ function isPythonLocallyBound(name: string, ref: UnresolvedRef, context: Resolut
   return bound;
 }
 
-/** isPythonLocallyBound's answer, kept per calling function and name. */
+/**
+ * isPythonLocallyBound's answer. What is kept per calling function and name is
+ * where the binding starts, not whether a reference is past it: `view` handed on
+ * above `view = wrap(view)` is the function, and below it the local, so a kept
+ * yes or no would be the answer of whichever reference asked first.
+ */
 function pythonLocalBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const fn = context.getNodesInFile(ref.filePath)
     .filter((f) => (f.kind === 'function' || f.kind === 'method') && f.startLine <= ref.line && f.endLine >= ref.line)
     .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
   let memo = PY_LOCAL_BINDS.get(context);
   if (!memo) PY_LOCAL_BINDS.set(context, (memo = new Map()));
-  const key = `${ref.filePath}\0${fn?.id ?? ''}\0${name}\0${fn ? '' : ref.line}`;
-  const hit = memo.get(key);
-  if (hit !== undefined) return hit;
+  const key = `${ref.filePath}\0${fn?.id ?? ''}\0${name}`;
+  let below = memo.get(key);
+  if (below === undefined) memo.set(key, (below = pythonBoundBelow(name, fn, ref.filePath, context)));
+  return below < ref.line - 1;
+}
+
+/**
+ * The 0-based line below which `name` is bound in `fn`, or in the file when no
+ * function holds the reference: -1 for everywhere in it, Infinity for nowhere.
+ */
+function pythonBoundBelow(name: string, fn: Node | undefined, filePath: string, context: ResolutionContext): number {
   // An imported name is the import's (the import resolver's to follow).
-  if (pythonFromImports(ref.filePath, context).has(name)) {
-    memo.set(key, false);
-    return false;
-  }
+  if (pythonFromImports(filePath, context).has(name)) return Infinity;
   // Code only: `{% user_display user as user_display %}` in a docstring binds nothing.
   let file = PY_LOCAL_FILE.get(context);
-  if (file?.filePath !== ref.filePath) {
-    const lines = stripCommentsForRegex(context.readFile(ref.filePath) ?? '', 'python').split(/\r?\n/);
-    PY_LOCAL_FILE.set(context, (file = { filePath: ref.filePath, lines, module: new Map() }));
+  if (file?.filePath !== filePath) {
+    const lines = stripCommentsForRegex(context.readFile(filePath) ?? '', 'python').split(/\r?\n/);
+    PY_LOCAL_FILE.set(context, (file = { filePath, lines, module: new Map() }));
   }
   const lines = file.lines;
   const n = escapeRegExp(name);
   const assigns = new RegExp(`^\\s*(?:[\\w\\s,*()\\[\\]]*,\\s*)?\\(?\\*?${n}\\)?\\s*(?:,[\\w\\s,*()\\[\\]]*)?(?::[^=]+)?=(?!=)`);
   const targets = new RegExp(`\\bfor\\s+[\\w\\s,()]*\\b${n}\\b[\\w\\s,()]*\\s+in\\b|\\bas\\s+${n}\\b`);
   const params = new RegExp(`[(,]\\s*\\*{0,2}${n}\\s*(?:[:=,)]|$)`);
-  let bound = false;
+  let below = Infinity;
   if (fn) {
-    // The signature up to its `:` (it may span lines), then the body above the call.
+    // The signature up to its `:` (it may span lines), then the body.
     let i = fn.startLine - 1;
     let signature = '';
     for (; i < Math.min(lines.length, fn.startLine + 20); i++) {
       signature += lines[i] ?? '';
       if (/\)\s*(?:->[^:]*)?:\s*(?:#.*)?$/.test(lines[i] ?? '')) break;
     }
-    bound = params.test(signature.replace(/^[^(]*/, ''));
-    for (let line = i + 1; !bound && line < ref.line - 1; line++) {
+    if (params.test(signature.replace(/^[^(]*/, ''))) return -1;
+    // (A line inside a call isn't an assignment: `Fan, through="Invitation"` is
+    // arguments, however much it reads like a tuple.)
+    const starts = pythonStatementStarts(filePath, context);
+    for (let line = i + 1; line < fn.endLine; line++) {
       const text = lines[line] ?? '';
-      bound = assigns.test(text) || targets.test(text);
+      if ((starts[line] !== false && assigns.test(text)) || targets.test(text)) {
+        below = line;
+        break;
+      }
     }
   }
   // A module-level binding (`view = api_view(['GET'])(handler)`).
-  if (!bound) {
-    let module = file.module.get(n);
-    if (module === undefined) {
-      const top = new RegExp(`^(?:[\\w,\\s]*,\\s*)?${n}\\s*(?:,[\\w\\s,]*)?(?::[^=]+)?=(?!=)`);
-      module = lines.some(line => top.test(line));
-      file.module.set(n, module);
-    }
-    bound = module;
+  let module = file.module.get(n);
+  if (module === undefined) {
+    const top = new RegExp(`^(?:[\\w,\\s]*,\\s*)?${n}\\s*(?:,[\\w\\s,]*)?(?::[^=]+)?=(?!=)`);
+    module = lines.some(line => top.test(line));
+    file.module.set(n, module);
   }
-  memo.set(key, bound);
-  return bound;
+  return module ? -1 : below;
 }
 
 const PY_IMPORTS = new WeakMap<ResolutionContext, Map<string, Map<string, string>>>();
