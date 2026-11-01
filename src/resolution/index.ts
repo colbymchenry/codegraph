@@ -52,7 +52,8 @@ import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } fr
 import { clearDeclaredDependencies } from './frameworks/package-deps';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
-import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
+import { FlowChange, planParameterFlows } from './parameter-flow';
+import { MAX_SOURCE_FILE_SIZE_BYTES, readSourceText } from '../file-limits';
 import { createHash } from 'crypto';
 import { aliasConfigFields, loadProjectAliases, type AliasMap } from './path-aliases';
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
@@ -766,21 +767,9 @@ export class ReferenceResolver {
       // Import resolvers may follow package metadata to an archive (`file:*.har`,
       // for example). Reject anything extraction would not accept before UTF-8
       // decoding can multiply a large binary blob into gigabytes of V8 heap.
-      // (On the open file: looking the path up twice is a quarter of the read.
-      // O_NONBLOCK keeps a FIFO with no writer from parking the open itself.)
-      const fd = fs.openSync(fullPath, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
-      try {
-        const stats = fs.fstatSync(fd);
-        if (!stats.isFile() || stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
-          this.fileCache.set(filePath, null);
-          return null;
-        }
-        const content = fs.readFileSync(fd, 'utf-8');
-        this.fileCache.set(filePath, content);
-        return content;
-      } finally {
-        fs.closeSync(fd);
-      }
+      const content = readSourceText(fullPath);
+      this.fileCache.set(filePath, content);
+      return content;
     } catch (error) {
       logDebug('Failed to read file for resolution', { filePath, error: String(error) });
       this.fileCache.set(filePath, null);
@@ -3137,6 +3126,51 @@ export class ReferenceResolver {
       unresolved: [],
       stats: aggregateStats,
     };
+  }
+
+  /** What a sync has to tell the parameter-flow pass of the files it changes. */
+  trackParameterFlows(): FlowChange {
+    return new FlowChange(this.queries);
+  }
+
+  /**
+   * Move each call on a parameter whose class its call sites settle to that
+   * class's method, and put back through resolution a call whose flow is gone
+   * (see ./parameter-flow). The last pass on `calls` edges, once every call has
+   * an answer and the resolver pool is gone: what it holds is off the index's
+   * peak. A sync hands in what it changed, and the pass goes only as far as
+   * that reaches.
+   */
+  async resolveParameterFlows(change?: FlowChange): Promise<number> {
+    const t0 = Date.now();
+    let changed = 0;
+    try {
+      const flows = this.queries.parameterFlows;
+      for (const { retarget, drop, restore, stats, language, record } of await planParameterFlows(this.queries, this.context, change)) {
+        flows.retargetCalls(
+          retarget.flatMap((r) => (r.edgeId === undefined ? [] : [r.edgeId])),
+          retarget.flatMap((r) => (r.rowId === undefined ? [] : [r.rowId])),
+          this.createEdges(retarget.map((r) => r.resolved)),
+        );
+        flows.replaceEdgesWithFlowMarkedRefs(drop.map((d) => d.edgeId), drop.map((d) => d.reference));
+        if (retarget.length + drop.length > 0) flows.noteParameterFlows();
+        if (restore.length > 0) {
+          flows.restoreCalls(
+            restore.flatMap((r) => (r.edgeId === undefined ? [] : [r.edgeId])),
+            restore.flatMap((r) => (r.rowId === undefined ? [] : [r.rowId])),
+            restore.map((r) => r.reference),
+          );
+          const files = new Set(restore.flatMap((r) => (r.reference.filePath === undefined ? [] : [r.reference.filePath])));
+          await this.resolveAndPersistListYielding(this.queries.getUnresolvedReferencesByFiles([...files]));
+        }
+        flows.setRecord(language, record);
+        changed += retarget.length + drop.length + restore.length;
+        if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] parameter-flow: ${Date.now() - t0}ms ${JSON.stringify(stats)}`);
+      }
+    } catch (error) {
+      logDebug('Parameter flows failed', { error: String(error) });
+    }
+    return changed;
   }
 
   /** Replace synthesis only after every base-resolution pass has finished. */

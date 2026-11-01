@@ -23,6 +23,7 @@ import { parseQuery, boundedEditDistance, type ParsedQuery } from '../search/que
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
 import { isModuleKey, referenceNameTail, MEMBER_TAIL_SQL, MODULE_PARKED_SQL } from './reference-tail';
+import { ParameterFlowQueries } from './parameter-flow-queries';
 import { NAME_SUBSTRING_KINDS, buildNameSubstringIndex, searchNameSubstring, type NameSubstringIndex, type ScanOrder } from './name-substring-index';
 
 /**
@@ -464,6 +465,9 @@ export class QueryBuilder {
   // (#2620). See memoizedRead().
   private readMemos = new Map<string, { stamp: string; value: unknown }>();
 
+  // The parameter-flow pass's reads, asked once per method a flow gets to.
+  private flowQueries?: ParameterFlowQueries;
+
   // Prepared statements (lazily initialized)
   private stmts: {
     insertNode?: SqliteStatement;
@@ -601,6 +605,7 @@ export class QueryBuilder {
     this.stmts = {};
     this.batchStmts.clear();
     this.edgeKindStmts.clear();
+    this.flowQueries = undefined;
     // The change stamp is per connection, and fresh connections to two
     // different databases report the same one — the memo goes with the old
     // connection, or a worker following a rebuilt index keeps its answer (#1864).
@@ -5541,6 +5546,11 @@ export class QueryBuilder {
       sourceFilePath: row.source_file_path,
       sourceLanguage: row.source_language,
     }));
+  }
+
+  /** What the parameter-flow pass reads and writes. */
+  get parameterFlows(): ParameterFlowQueries {
+    return (this.flowQueries ??= new ParameterFlowQueries(this.db, this));
   }
 
   /**

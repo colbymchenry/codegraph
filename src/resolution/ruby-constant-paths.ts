@@ -166,7 +166,7 @@ const IVAR_CLASSES = new WeakMap<ResolutionContext, Map<string, Node | null | un
  * when the call is not in an instance method of a class, or `initialize`
  * doesn't assign the variable, or assigns it anything else.
  */
-function ivarClass(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null | undefined {
+export function ivarClass(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null | undefined {
   const caller = context.getNodeById?.(ref.fromNodeId);
   if (!caller || caller.kind !== 'method' || caller.language !== 'ruby' || caller.isStatic === true) return undefined;
   const owner = innermostNamespace(ref, context);

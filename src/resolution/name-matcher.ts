@@ -8985,7 +8985,7 @@ function rubyInstanceMethodOf(typeName: string, name: string, ref: UnresolvedRef
 const RUBY_METHOD_OWNERS = new WeakMap<ResolutionContext, Map<string, Map<string, Node[]>>>();
 
 /** The Ruby methods `name` of the class or module `owner`. A walk up a class's ancestors asks this of each one, for each method name. */
-function rubyMethodsOf(owner: string, name: string, context: ResolutionContext): Node[] {
+export function rubyMethodsOf(owner: string, name: string, context: ResolutionContext): Node[] {
   let memo = RUBY_METHOD_OWNERS.get(context);
   if (!memo) RUBY_METHOD_OWNERS.set(context, (memo = new Map()));
   let owners = memo.get(name);
@@ -9031,7 +9031,7 @@ function rubyScopeAt(ref: UnresolvedRef, context: ResolutionContext): string {
  * include, nor a `def self.` of one, which stays that module's:
  * rails' `Topic.create` is no `Reflection.create`.
  */
-function rubyClassMethodOf(qn: string, name: string, context: ResolutionContext): Node | null {
+export function rubyClassMethodOf(qn: string, name: string, context: ResolutionContext): Node | null {
   const named = (owner: string, isStatic: boolean): Node | undefined =>
     rubyMethodsOf(owner, name, context).find((n) => (n.isStatic === true) === isStatic);
   const seen = new Set<string>();
@@ -9083,7 +9083,7 @@ function rubyAncestorMethod(qn: string, name: string, context: ResolutionContext
 }
 
 /** The class or module a constant written inside `scope` names: the nearest enclosing namespace that has it, else the name itself. */
-function rubyConstantQn(name: string, scope: string, context: ResolutionContext): string {
+export function rubyConstantQn(name: string, scope: string, context: ResolutionContext): string {
   for (let prefix = scope; ; prefix = prefix.includes('::') ? prefix.slice(0, prefix.lastIndexOf('::')) : '') {
     const qn = prefix ? `${prefix}::${name}` : name;
     if (context.getNodesByQualifiedName(qn).some((n) => n.language === 'ruby' && (n.kind === 'class' || n.kind === 'module'))) return qn;

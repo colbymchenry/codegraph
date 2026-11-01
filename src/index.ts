@@ -842,6 +842,7 @@ export class CodeGraph {
           const tDeferred = Date.now();
           await this.resolver.resolveDeferredThisMemberRefs();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] deferredThisMember: ${Date.now() - tDeferred}ms`);
+          await this.resolver.resolveParameterFlows();
         }
 
         // Over an existing graph the vocabulary was kept (see the top of the
@@ -1220,8 +1221,10 @@ export class CodeGraph {
         // routes. Compared with the routes after runPostExtract below.
         const watchRoutes = this.resolver.hasNavigationRouters();
         let routesBefore = null as Node[] | null;
+        const flowChange = this.resolver.trackParameterFlows();
         const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure,
           (filePath, content) => {
+            flowChange.before(filePath);
             if (watchRoutes && routesBefore === null) routesBefore = this.queries.getNodesByKind('route');
             if (!refreshSynthesis && (this.queries.hasSynthesizedEdgesTouchingFile(filePath) ||
               this.queries.wasSynthesisInput(filePath) ||
@@ -1820,6 +1823,12 @@ export class CodeGraph {
             this.lastSynthesisAt = Date.now();
             synthesized = true;
           }
+        }
+
+        // A call in one file types a parameter in another, so an edit of the
+        // caller can move the callee's edges. Last, as in a full index.
+        if (filesChanged || result.filesRemoved > 0 || orphanCount > 0) {
+          await this.resolver.resolveParameterFlows(flowChange);
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
