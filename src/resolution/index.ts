@@ -37,6 +37,7 @@ import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCMacroRenames } from './c-macro-renames';
+import { isObjcDeclaredTypeRef, matchByExactName } from './name-matcher';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
@@ -1593,6 +1594,9 @@ export class ReferenceResolver {
     // So is the type a member of one or an alias is declared with, which only
     // a type can be: a function or macro of that name is no candidate.
     if (isCppDeclaredTypeRef(ref, this.context)) return matchCppDeclaredType(ref, this.context);
+    // In Objective-C it is the type of that name the file can see: a function
+    // or variable is no candidate, and neither is a guess by any other strategy.
+    if (isObjcDeclaredTypeRef(ref)) return matchByExactName(ref, this.context);
 
     // A Pascal name written without parentheses (#2514) links only to a
     // routine its scope reaches, or through a receiver to a method of the

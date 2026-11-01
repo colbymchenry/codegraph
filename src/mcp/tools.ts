@@ -4942,7 +4942,7 @@ export class ToolHandler {
     // names, says who holds what, not where the code goes: rocksdb's classes
     // reach everything through them, and they would pull a flow's rank and its
     // file budget away from the code on the flow.
-    const isCFamily = (node: Node | undefined): boolean => node?.language === 'c' || node?.language === 'cpp';
+    const isCFamily = (node: Node | undefined): boolean => node?.language === 'c' || node?.language === 'cpp' || node?.language === 'objc';
     const isCMemberTypeEdge = (edge: Edge): boolean =>
       edge.kind === 'references' && isTypeDeclaration(edge.source) && isCFamily(subgraph.nodes.get(edge.source));
     const connectedToEntry = new Set<string>();

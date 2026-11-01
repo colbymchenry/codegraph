@@ -3011,7 +3011,7 @@ export class TreeSitterExtractor {
    * #2327). Mirrored in the kernel (ccpp/mod.rs).
    */
   private extractCMemberTypeRefs(specifier: SyntaxNode, owner: Node): void {
-    if ((this.language !== 'c' && this.language !== 'cpp') || isUnnamedMemberType(specifier)) return;
+    if ((this.language !== 'c' && this.language !== 'cpp' && this.language !== 'objc') || isUnnamedMemberType(specifier)) return;
     this.pushCTypeRefs(cMemberTypeNames(specifier, owner.name, this.source), owner);
   }
 
@@ -4579,7 +4579,7 @@ export class TreeSitterExtractor {
 
     // A C or C++ alias references what it names, so a change to a struct
     // reaches the members declared through `typedef struct redisObject robj;`.
-    if (typeAliasNode && (this.language === 'c' || this.language === 'cpp')) {
+    if (typeAliasNode && (this.language === 'c' || this.language === 'cpp' || this.language === 'objc')) {
       this.pushCTypeRefs(cAliasTypeNames(node, name, this.source), typeAliasNode);
     }
 

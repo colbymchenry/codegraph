@@ -2711,6 +2711,30 @@ function isObjcFileLocalElsewhere(n: Node, ref: UnresolvedRef): boolean {
   return n.language === 'objc' && n.filePath !== ref.filePath && OBJC_FILE_LOCAL_KINDS.has(n.kind) && C_SOURCE_EXT.test(n.filePath);
 }
 
+/** What an Objective-C struct's member or an alias can be declared with. */
+const OBJC_DECLARED_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'protocol', 'struct', 'union', 'enum', 'type_alias']);
+
+/**
+ * Does `ref` name the type an Objective-C struct's member or an alias is
+ * declared with? Extraction writes no other `references` from either: a value
+ * read is its function's. (A node's id starts with its kind.)
+ */
+export function isObjcDeclaredTypeRef(ref: UnresolvedRef): boolean {
+  return ref.language === 'objc' && ref.referenceKind === 'references' && /^(?:struct|union|type_alias):/.test(ref.fromNodeId);
+}
+
+/**
+ * The declarations an Objective-C type name stands for: a class's own header
+ * (`NSString.h`), then any header or the file itself. A class has a node per
+ * `@implementation` and category, and the one in some other source file is the
+ * least of them: GNUstep's `NSString` has 14, in test files too.
+ */
+function objcTypeDeclarations(candidates: Node[], ref: UnresolvedRef): Node[] {
+  const visible = candidates.filter((n) => n.filePath === ref.filePath || !C_SOURCE_EXT.test(n.filePath));
+  const own = visible.filter((n) => n.filePath.endsWith(`/${ref.referenceName}.h`) || n.filePath === `${ref.referenceName}.h`);
+  return own.length > 0 ? own : visible.length > 0 ? visible : candidates;
+}
+
 /** Per context: a C/C++ type's qualified name → its declarations. */
 const CPP_TYPE_DECLS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
 /** Per context: a C/C++ file → the line and resolved file of each `#include` it writes. */
@@ -14080,6 +14104,7 @@ export function matchByExactName(
   const cMacroCall = ref.referenceKind === 'calls' && (ref.language === 'c' || ref.language === 'cpp') &&
     sameName.some((n) => n.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(n.signature ?? ''));
   const typeRef = isDotNetTypeRef(ref, context);
+  const objcDeclaredType = isObjcDeclaredTypeRef(ref);
   const rustBare = ref.language === 'rust' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const pythonShape = pythonCallShape(ref, context);
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
@@ -14116,6 +14141,7 @@ export function matchByExactName(
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
     !isObjcFileLocalElsewhere(n, ref) &&
+    !(objcDeclaredType && !OBJC_DECLARED_TYPE_KINDS.has(n.kind)) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
     !(vbReceiver && !/^(?:me|mybase|myclass)$/i.test(vbReceiver) && !isVbTypeQualifiedBy(n, vbReceiver, ref.filePath, context)) &&
     !(vbScoped && !isVbMemberInScope(n, ref, context)) &&
@@ -14222,7 +14248,8 @@ export function matchByExactName(
     : dartTypeRef && dartPrefix === null ? preferOwnDartLibrary(filtered, ref, context)
     : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context)
     : kotlinBare ? lexicalKotlinMembers(filtered, ref, context)
-    : rubyBare ? rubyMethodsOfCallerKind(filtered, ref, context) : cppSpecializationPool(filtered, ref, context);
+    : rubyBare ? rubyMethodsOfCallerKind(filtered, ref, context)
+    : objcDeclaredType ? objcTypeDeclarations(filtered, ref) : cppSpecializationPool(filtered, ref, context);
   // (Above the ceiling below nothing is picked, so no translation unit is read.)
   const candidates = ranked.length <= AMBIGUOUS_NAME_CEILING ? withinCppTranslationUnit(ranked, ref, context, true) : ranked;
 
