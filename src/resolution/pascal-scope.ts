@@ -999,11 +999,24 @@ function unitFileNamed(lower: string, fromFile: string, context: ResolutionConte
 }
 
 /** A class (or record or interface) a type name names, seen from `fromFile`. */
-function classNamed(typeName: string, fromFile: string, context: ResolutionContext, depth = 0): Node | null {
+function classNamed(typeName: string, fromFile: string, context: ResolutionContext): Node | null {
   const simple = typeName.split('.').pop()!.toLowerCase();
   const memo = memos(context).classByName;
   const key = `${fromFile}|${simple}`;
   if (memo.has(key)) return memo.get(key)!;
+  const cls = classThroughAliases(simple, fromFile, context, new Set([key]));
+  memo.set(key, cls);
+  return cls;
+}
+
+/**
+ * The class `simple` names from `fromFile`, through its type aliases: a walk,
+ * since a name can be an alias several times over (once in each branch of an
+ * `{$IFDEF}`), and the first of them that leads to a class is the answer. `seen`
+ * ends a cycle, so what a step finds can lean on where the walk came from: only
+ * classNamed's answer, for where it started, is kept.
+ */
+function classThroughAliases(simple: string, fromFile: string, context: ResolutionContext, seen: Set<string>): Node | null {
   const named = pascalNamed(simple, context);
   const visible = (kinds: ReadonlySet<string>): Node[] => {
     // In the unit's own files, then in the unit used last, which declares the
@@ -1020,20 +1033,22 @@ function classNamed(typeName: string, fromFile: string, context: ResolutionConte
     }
     return candidates.length > 0 && candidates.every((n) => n.filePath === candidates[0]!.filePath) ? candidates : [];
   };
-  let cls = declarationOf(visible(CLASS_KINDS));
-  if (!cls && depth < 4) {
-    // A type alias names the class it stands for: `TVTAncestor = TVTAncestorVcl;`,
-    // and so do a pointer type and a class reference type, whose values reach
-    // its members (`PVirtualNode = ^TVirtualNode;`, `TSynLogClass = class of
-    // TSynLog;`, #2550).
-    for (const alias of visible(ALIAS_KINDS)) {
-      const line = (fileLines(alias.filePath, context)[alias.startLine - 1] ?? '').replace(/\/\/.*$|\{[^}]*\}/g, '');
-      const target = /=\s*(?:\^|class\s+of\b)?\s*([A-Za-z_][\w.]*)\s*;/i.exec(line)?.[1];
-      if (target && (cls = classNamed(target, alias.filePath, context, depth + 1))) break;
-    }
+  const cls = declarationOf(visible(CLASS_KINDS));
+  if (cls) return cls;
+  // A type alias names the class it stands for: `TVTAncestor = TVTAncestorVcl;`,
+  // and so do a pointer type and a class reference type, whose values reach
+  // its members (`PVirtualNode = ^TVirtualNode;`, `TSynLogClass = class of
+  // TSynLog;`, #2550).
+  for (const alias of visible(ALIAS_KINDS)) {
+    const line = (fileLines(alias.filePath, context)[alias.startLine - 1] ?? '').replace(/\/\/.*$|\{[^}]*\}/g, '');
+    const target = /=\s*(?:\^|class\s+of\b)?\s*([A-Za-z_][\w.]*)\s*;/i.exec(line)?.[1]?.split('.').pop()!.toLowerCase();
+    const key = `${alias.filePath}|${target}`;
+    if (!target || seen.has(key)) continue;
+    seen.add(key);
+    const through = classThroughAliases(target, alias.filePath, context, seen);
+    if (through) return through;
   }
-  memo.set(key, cls);
-  return cls;
+  return null;
 }
 
 const ALIAS_KINDS: ReadonlySet<string> = new Set(['type_alias']);
