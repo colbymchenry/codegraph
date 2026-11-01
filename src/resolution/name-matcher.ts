@@ -21577,11 +21577,45 @@ function kotlinLocalScanLines(ref: UnresolvedRef, context: ResolutionContext, li
 }
 
 /**
+ * Library types whose member is one of their type arguments: `uiState.value` on
+ * a `StateFlow<UiState>` is a `UiState`.
+ */
+const KOTLIN_VALUE_HOLDERS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
+  StateFlow: { value: 0 }, MutableStateFlow: { value: 0 }, State: { value: 0 }, MutableState: { value: 0 },
+  LiveData: { value: 0 }, MutableLiveData: { value: 0 }, Lazy: { value: 0 },
+  Pair: { first: 0, second: 1 }, Triple: { first: 0, second: 1, third: 2 },
+};
+
+/**
+ * What `name.member` is when `name` is declared in `text` as a holder of
+ * KOTLIN_VALUE_HOLDERS: the type argument its declaration writes.
+ */
+function kotlinHeldType(text: string, name: string, member: string): string | null {
+  const m = new RegExp(`\\b${escapeRegExp(name)}\\s*:\\s*(?:[a-z_]\\w*\\.)*([A-Z]\\w*)\\s*<`).exec(text);
+  const index = m ? KOTLIN_VALUE_HOLDERS[m[1]!]?.[member] : undefined;
+  if (index === undefined) return null;
+  return kotlinTypeName(angleArguments(text.slice(m!.index))[index] ?? '');
+}
+
+/**
+ * The source a Kotlin value `name` of a chain is declared in: `owner`'s lines
+ * for a property, else the enclosing class's and the lines above the call.
+ */
+function kotlinDeclaringText(owner: Node | undefined, ref: UnresolvedRef, context: ResolutionContext): string {
+  const file = owner?.filePath ?? ref.filePath;
+  const lines = kotlinFileLines(file, context) ?? [];
+  if (owner) return lines.slice(owner.startLine - 1, owner.endLine ?? owner.startLine).join('\n');
+  const around = kotlinEnclosingClass(ref, context);
+  return lines.slice(around ? around.startLine - 1 : 0, around?.endLine ?? ref.line).join('\n');
+}
+
+/**
  * The declared type of a Kotlin receiver chain `a.b.c` / `this.a.b`: the first
  * value typed as a single receiver (`this` is the enclosing class, a type name
  * its object or companion), each next segment as a property or enum entry
  * declared in the class of the type before it, read from that class's own
- * file. KOTLIN_EXTERNAL_TYPE as soon as a segment has a
+ * file, or a holder's member as its type argument (KOTLIN_VALUE_HOLDERS).
+ * KOTLIN_EXTERNAL_TYPE as soon as a segment has a
  * type the project does not declare; null when any segment's type is unknown
  * (an inherited property, an ambiguous class name).
  */
@@ -21608,9 +21642,16 @@ function kotlinChainDeclaredType(
     if (classes.length !== 1) return null;
     owner = classes[0]!;
   }
-  for (const segment of segments.slice(1)) {
+  let holder: Node | undefined;
+  for (let i = 1; i < segments.length; i++) {
+    const segment = segments[i]!;
     if (!owner) {
       if (!type) return null;
+      if (type !== KOTLIN_EXTERNAL_TYPE && KOTLIN_VALUE_HOLDERS[type]?.[segment] !== undefined && !isProjectType(type, ref, context)) {
+        type = kotlinHeldType(kotlinDeclaringText(holder, ref, context), segments[i - 1]!, segment) ?? KOTLIN_EXTERNAL_TYPE;
+        holder = undefined;
+        continue;
+      }
       if (type === KOTLIN_EXTERNAL_TYPE || !isProjectType(type, ref, context)) return KOTLIN_EXTERNAL_TYPE;
       const t = type;
       const classes = context.getNodesByName(t.split('::').pop()!).filter(
@@ -21630,6 +21671,7 @@ function kotlinChainDeclaredType(
     }
     const own = kotlinOwnPropertyType(segment, owner, ref, context);
     type = own !== undefined ? own : kotlinInheritedPropertyType(segment, owner, ref, context);
+    holder = owner;
     owner = undefined;
   }
   return type;
