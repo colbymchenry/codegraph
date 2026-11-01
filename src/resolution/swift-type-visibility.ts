@@ -16,17 +16,20 @@
  *    subclass of it). `@State` in a view is SwiftUI's property wrapper, never
  *    `AccountsListViewModel.State` from another file. The index keeps a type
  *    reference by its last segment, so a site's qualifier (`Build.Id` vs
- *    `Package.Id`) is read back from the source line.
+ *    `Package.Id`) is read back from the source line. An inheritance entry
+ *    is the exception: its ref carries the dotted path the parse tree gives
+ *    it (`class QC: Kit.Runner` is a ref named `Kit.Runner`), used as is.
  *
  * Applied to every strategy's result at resolveOne's seam, so the framework
  * resolvers' name patterns and the name matcher obey it alike. A conformance
  * to a type the project only extends now resolves to nothing, so the
  * supertype walk reads such conformances from the declaration itself
  * (`swiftExtendedConformances`) and the extensions' members still reach the
- * conformer. Resolution only: extraction, and the kernel's, are unchanged.
+ * conformer.
  */
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
+import { isInheritanceRef } from './types';
 import { escapeRegExp } from '../utils';
 
 const TYPE_KINDS: ReadonlySet<Node['kind']> = new Set<Node['kind']>(['class', 'struct', 'enum', 'interface', 'protocol', 'type_alias']);
@@ -211,10 +214,12 @@ const QUALIFIER_BEFORE = new RegExp(String.raw`((?:${QUALIFIER_SEGMENT})+)$`);
 
 /**
  * The reference as its site writes it. The index keeps a Swift type
- * reference by its last segment — `Build.Id` is a ref named `Id` — so whether
- * the name was qualified is read back from the line: a type annotation's
- * column is the name's (`Build.|Id`), a construction's is the chain's
- * (`|API.PackageController.GetRoute.Model(`).
+ * annotation or construction by its last segment — `Build.Id` is a ref named
+ * `Id` — so whether the name was qualified is read back from the line: a type
+ * annotation's column is the name's (`Build.|Id`), a construction's is the
+ * chain's (`|API.PackageController.GetRoute.Model(`). Never called for an
+ * inheritance entry, whose ref already carries its dotted path
+ * (gateSwiftTypeTarget).
  */
 function writtenName(ref: UnresolvedRef, context: ResolutionContext): string {
   const name = ref.referenceName;
@@ -329,7 +334,22 @@ export function gateSwiftTypeTarget(result: ResolvedRef | null, ref: UnresolvedR
   const target = context.getNodeById?.(result.targetNodeId);
   if (!target || target.language !== 'swift' || !TYPE_KINDS.has(target.kind)) return result;
   const from = context.getNodeById?.(ref.fromNodeId) ?? null;
-  const written = writtenName(ref, context);
+  // An inheritance entry's ref is its dotted path from the parse tree
+  // (`Kit.Runner`), so its qualifier is taken as is, not read back from the
+  // source line.
+  const written = isInheritanceRef(ref) ? ref.referenceName : writtenName(ref, context);
+  // A supertype written with a qualifier none of whose segments names a
+  // project type (`struct Y: Swift.Error`, `class Z: Foundation.Operation`)
+  // names an external module's type: Swift never lets a project type be named
+  // through another module's qualifier. The extraction cannot tell a module
+  // from a type, and fitsPath reads such a qualifier as a module that fits a
+  // top-level project type of the same last segment, so the entry gets no
+  // target rather than a wrong one. Supertype refs only: a type annotation or
+  // a call keeps fitsPath's reading.
+  if ((ref.referenceKind === 'extends' || ref.referenceKind === 'implements') && written.includes('.')) {
+    const qualifier = written.split('.').slice(0, -1);
+    if (!qualifier.some((seg) => context.getNodesByName(seg).some((n) => n.language === 'swift' && TYPE_KINDS.has(n.kind)))) return null;
+  }
   if (!isSwiftExtension(target, context)) {
     if (!written.includes('.')) {
       if (bareScopeDepth(target, from, context) !== null) return result;
@@ -400,6 +420,22 @@ export function resolveSwiftTypePathCall(ref: UnresolvedRef, context: Resolution
   // Of one type's overloads, the first declared.
   const target = fit.reduce((a, b) => (a.filePath < b.filePath || (a.filePath === b.filePath && a.startLine <= b.startLine) ? a : b));
   return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+}
+
+/**
+ * A qualified Swift inheritance entry, `class QC: Kit.Runner`, whose ref is
+ * the dotted path the parse tree gives (`Kit.Runner`): the project's own
+ * declaration of the type on that path (declarationFor, by the last segment),
+ * or null. ResolveOne's gates still run on the result: gateSwiftTypeTarget
+ * drops it when no qualifier segment names a project type. (createEdges later
+ * writes an `extends` onto a protocol as `implements` when the source is not
+ * itself an interface or protocol.)
+ */
+export function resolveSwiftQualifiedSupertype(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const name = ref.referenceName;
+  const from = context.getNodeById?.(ref.fromNodeId) ?? null;
+  const decl = declarationFor(name.slice(name.lastIndexOf('.') + 1), name, ref, from, context);
+  return decl ? { original: ref, targetNodeId: decl.id, confidence: 0.9, resolvedBy: 'qualified-name' } : null;
 }
 
 /** Is this case declared in a `@Reducer enum`? */
