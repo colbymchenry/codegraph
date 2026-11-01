@@ -12,7 +12,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSuperty
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { isJsSuperCallSite } from './js-super-calls';
 import { JS_ARRAY_METHODS, JS_BROWSER_HOST_GLOBALS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
-import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
+import { SWIFT_TYPE_CALL, SWIFT_TYPE_PATH_CALL, resolveSwiftTypeCall, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, dartPrivateVisible, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
@@ -24924,7 +24924,10 @@ export function matchMethodCall(
   // names a class that exists in several files (`Logger.log()` / `Logger::log()`
   // with a `Logger` in both `a/` and `b/`), try the class in the call site's
   // own file first — otherwise the first-indexed class wins and a call in `b/`
-  // resolves to `a/`'s method (#1079).
+  // resolves to `a/`'s method (#1079). A Swift `Type.member()` whose receiver
+  // is a project type the caller can see is settled before this, by
+  // resolveSwiftTypeCall from matchReferenceInner. A project alias, or another
+  // file's `private` type, still comes here.
   const strat1 = nmTimedT('mc-class', ref, (): ResolvedRef | null => {
     let classCandidates = preferCallSiteFile(
       withinCppTranslationUnit(context.getNodesByName(objectOrClass!).filter(isMethodOwnerKind), ref, context),
@@ -32242,7 +32245,7 @@ export function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, co
   // `self.tableView(tableView, numberOfRowsInSection: section)` inside
   // `tableView(_:titleForHeaderInSection:)` is the other `tableView`.
   if (ref.language === 'swift') {
-    const labels = args.trim() === '' ? [] : splitCppTopLevel(args).map((a) => /^\s*([A-Za-z_]\w*)\s*:(?!:)/.exec(a)?.[1] ?? '_');
+    const labels = swiftArgumentLabels(args);
     const fitsLabels = (id: string): boolean | null => {
       const decl = context.getNodeById?.(id);
       const list = decl ? cppParenListAfter(decl.filePath, decl.startLine, 0, set!.name, context) : null;
@@ -32342,6 +32345,24 @@ function swiftOverloadForClosure(
   };
   const chosen = overloads.filter((id) => takesFunction(id) === closure);
   return chosen.length === 1 ? chosen[0]! : null;
+}
+
+/** A Swift call's argument labels from its argument list, `_` for an unlabelled argument. */
+function swiftArgumentLabels(args: string): string[] {
+  return args.trim() === '' ? [] : splitCppTopLevel(args).map((a) => /^\s*([A-Za-z_]\w*)\s*:(?!:)/.exec(a)?.[1] ?? '_');
+}
+
+/**
+ * Whether a Swift `Type.member(…)` call's argument labels fit `decl`'s
+ * parameter list (swiftLabelsFit); null when either list cannot be read: a
+ * call with no parenthesised arguments, or a member named with backticks.
+ */
+function swiftCallFitsLabels(ref: UnresolvedRef, decl: Node, context: ResolutionContext): boolean | null {
+  const member = ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1);
+  const args = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), member, context);
+  if (args === null) return null;
+  const params = cppParenListAfter(decl.filePath, decl.startLine, 0, decl.name, context);
+  return params === null ? null : swiftLabelsFit(swiftArgumentLabels(args), params);
 }
 
 /**
@@ -32560,6 +32581,15 @@ function matchReferenceInner(
   // would bind it by the member's name alone.
   if (ref.language === 'swift' && ref.referenceKind === 'calls' && SWIFT_TYPE_PATH_CALL.test(ref.referenceName)) {
     return nmTimed('swiftTypePath', ref, () => resolveSwiftTypePathCall(ref, context));
+  }
+  // So does `TestHelpers.make()` on one project type, once the project
+  // declares a type of that name (resolveSwiftTypeCall). With no such type, an
+  // alias, or another file's `private` type, it is left to the strategies below.
+  // Of the type's overloads, the call's argument labels pick (swiftCallFitsLabels).
+  if (ref.language === 'swift' && ref.referenceKind === 'calls' && SWIFT_TYPE_CALL.test(ref.referenceName)) {
+    const typed = nmTimedT('swiftTypeCall', ref, () =>
+      resolveSwiftTypeCall(ref, context, (decl) => swiftCallFitsLabels(ref, decl, context)));
+    if (typed !== undefined) return typed;
   }
 
   // A Dart call through an import prefix (`http.get(…)`) is to what the

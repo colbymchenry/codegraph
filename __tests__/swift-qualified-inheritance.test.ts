@@ -48,6 +48,12 @@ class X: Foundation.NSObject {}
 struct Y: Swift.Error {}
 class Z: Foundation.Operation {}
 `,
+  // A module-qualified conformance to a name the project only extends: the
+  // extension's members still reach the conformer through the failed ref.
+  'Sources/App/View2.swift': `extension View2 { static func y() {} }
+struct HV: SwiftUI.View2 {}
+func c3() { HV.y() }
+`,
 };
 
 const ENV_KEYS = ['CODEGRAPH_KERNEL', 'CODEGRAPH_KERNEL_LANGS'] as const;
@@ -158,6 +164,19 @@ function vectors(env: Record<(typeof ENV_KEYS)[number], string | undefined>): vo
   // the project's `class Operation` is not Z's superclass.
   it('h. gives no edge from `Foundation.Operation` to a project class Operation', () => {
     expect(supers(cg, 'Z')).toEqual([]);
+  });
+
+  // Known limit, pinned as failing in both arms: a module-qualified
+  // conformance to a type the project only extends (`struct HV:
+  // SwiftUI.View2` with a project `extension View2`) records `SwiftUI.View2`;
+  // the extension-only walk matches supertype names exactly, so the
+  // extension's members do not reach HV. Listed with the known limits in
+  // src/resolution/swift-type-visibility.ts.
+  it.fails('a module-qualified conformance to an extended-only name still reaches the extension member', () => {
+    const c3 = cg.getNodesByName('c3').filter((n) => n.language === 'swift').map((n) => n.id);
+    expect(c3).toHaveLength(1);
+    const targets = cg.getOutgoingEdgesFrom(c3, ['calls']).map((e) => cg.getNode(e.target)?.qualifiedName);
+    expect(targets, JSON.stringify(targets)).toContain('View2::y');
   });
 
   // The extraction itself carries the qualifier: the ref is the user_type's
