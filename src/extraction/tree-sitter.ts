@@ -39,10 +39,7 @@ import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
 import { commonJsRequireRefs } from './commonjs-requires';
-import {
-  getAllFrameworkResolvers,
-  getApplicableFrameworks,
-} from '../resolution/frameworks';
+import { frameworks } from './lazy-frameworks';
 
 // Re-export for backward compatibility
 export { generateNodeId } from './tree-sitter-helpers';
@@ -10048,6 +10045,7 @@ export function extractFromSource(
 
   // Framework-specific extraction (routes, middleware, etc.)
   if (frameworkNames && frameworkNames.length > 0) {
+    const { getAllFrameworkResolvers, getApplicableFrameworks } = frameworks();
     const allResolvers = getAllFrameworkResolvers();
     const applicable = getApplicableFrameworks(
       allResolvers.filter((r) => frameworkNames.includes(r.name)),

@@ -15,7 +15,7 @@ import { extractFromSource } from './tree-sitter';
 import { detectLanguage, loadGrammarsForLanguages, resetParser } from './grammars';
 import { tryKernelExtractRaw } from './kernel';
 import { commonJsRequireRefs } from './commonjs-requires';
-import { getAllFrameworkResolvers, getApplicableFrameworks } from '../resolution/frameworks';
+import { frameworks } from './lazy-frameworks';
 import { mayDefineCppMacroMethods } from './languages/cpp-macro-methods';
 import type { Language, ExtractionResult } from '../types';
 
@@ -93,8 +93,8 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
       let result: ExtractionResult | undefined;
       const frameworksNeedDecode =
         frameworkNames && frameworkNames.length > 0
-          ? getApplicableFrameworks(
-              getAllFrameworkResolvers().filter((r) => frameworkNames.includes(r.name)),
+          ? frameworks().getApplicableFrameworks(
+              frameworks().getAllFrameworkResolvers().filter((r) => frameworkNames.includes(r.name)),
               language
             ).some((fw) => !!fw.extract)
           : false;

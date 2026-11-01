@@ -20,7 +20,7 @@ import {
 } from '../types';
 import { QueryBuilder, NodeIdentity } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
-import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './parse-pool';
+import { ParseWorkerPool, parseWindowSize, resolveParsePoolSize, resolveParseTimeoutMs } from './parse-pool';
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
@@ -2570,16 +2570,19 @@ export class ExtractionOrchestrator {
       pool = new ParseWorkerPool({
         languages: neededLanguages,
         size: poolSize,
+        // CODEGRAPH_PARSE_WORKERS names the pool outright; otherwise it starts at
+        // what this many files are worth.
+        expectedParses: process.env.CODEGRAPH_PARSE_WORKERS ? undefined : files.length,
         workerScriptPath: parseWorkerPath,
         recycleInterval: WORKER_RECYCLE_INTERVAL,
         parseTimeoutMs: PARSE_TIMEOUT_MS,
         log,
         grammarBuffers,
       });
-      log(`Parse worker pool: ${poolSize} worker(s)`);
-      // Bulk index: every core will be needed — spawn the whole pool now so
-      // worker boot overlaps the first read batches instead of trickling in
-      // behind queue-pressure growth.
+      log(`Parse worker pool: up to ${poolSize} worker(s)`);
+      // Bulk index: spawn the workers this many files need now, so worker boot
+      // overlaps the first read batches instead of trickling in behind
+      // queue-pressure growth.
       pool.prewarm();
     } else {
       // In-process fallback: load grammars locally and parse on the main thread.
@@ -2629,7 +2632,7 @@ export class ExtractionOrchestrator {
     // to the single-worker path — instead of drifting with parse timing. The
     // `completed` buffer holds at most ~windowSize out-of-order results, so memory
     // stays bounded.
-    const windowSize = pool ? Math.max(4, pool.size * 2) : 1;
+    const windowSize = pool ? parseWindowSize(pool.size) : 1;
     const inFlight = new Set<Promise<void>>();
     const completed = new Map<number,
       | { ok: true; filePath: string; content: string; stats: fs.Stats; result: ExtractionResult }

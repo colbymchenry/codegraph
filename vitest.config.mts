@@ -82,6 +82,10 @@ export default defineConfig({
               find: /^\.\/lazy-engine$/,
               replacement: fileURLToPath(new URL('./__tests__/lazy-engine-eager.ts', import.meta.url)),
             },
+            {
+              find: /^\.\/lazy-frameworks$/,
+              replacement: fileURLToPath(new URL('./__tests__/lazy-frameworks-eager.ts', import.meta.url)),
+            },
           ],
           exclude: ['**/node_modules/**', '**/dist/**', '__tests__/ui-package.test.ts'],
         },

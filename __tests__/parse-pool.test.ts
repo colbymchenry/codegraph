@@ -11,13 +11,13 @@
  * parallelism safe.
  */
 import { describe, it, expect } from 'vitest';
-import { ParseWorkerPool, resolveParseBudgetMs, resolveParsePoolSize, resolveParseTimeoutMs, type ParsePoolWorker, type ParseTask } from '../src/extraction/parse-pool';
+import { ParseWorkerPool, parseWindowSize, resolveParseBudgetMs, resolveParsePoolSize, resolveParseTimeoutMs, workersWorthStarting, type ParsePoolWorker, type ParseTask } from '../src/extraction/parse-pool';
 import type { Language, ExtractionResult } from '../src/types';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 interface ParseMsg { type: 'parse'; id: number; filePath: string; content: string; language: Language }
-type Action = { result: ExtractionResult } | { crash: true } | { hang: true } | { wait: Promise<ExtractionResult> };
+type Action = { result: ExtractionResult; parseMs?: number } | { crash: true } | { hang: true } | { wait: Promise<ExtractionResult> };
 
 /**
  * Fake worker speaking the same {load-grammars → grammars-loaded} /
@@ -37,8 +37,8 @@ class FakeWorker implements ParsePoolWorker {
     else if (event === 'exit') this.exitCb = cb;
     // 'error' unused by the fakes
   }
-  private reply(id: number, result: ExtractionResult): void {
-    if (this.alive) this.msgCb?.({ type: 'parse-result', id, result });
+  private reply(id: number, result: ExtractionResult, parseMs?: number): void {
+    if (this.alive) this.msgCb?.({ type: 'parse-result', id, result, parseMs });
   }
   postMessage(msg: unknown): void {
     const m = msg as { type: string } & Partial<ParseMsg>;
@@ -55,7 +55,7 @@ class FakeWorker implements ParsePoolWorker {
     }
     if ('hang' in action) return; // never reply → timeout path
     if ('wait' in action) { void action.wait.then((r) => this.reply(m.id!, r)); return; }
-    setTimeout(() => this.reply(m.id!, action.result), 0);
+    setTimeout(() => this.reply(m.id!, action.result, action.parseMs), 0);
   }
   terminate(): Promise<number> { this.alive = false; this.onTerminate?.(); return Promise.resolve(0); }
 }
@@ -67,7 +67,7 @@ const result = (tag = 0): ExtractionResult => ({ nodes: [], edges: [], unresolve
 function makePool(
   size: number,
   behavior: (m: ParseMsg) => Action,
-  opts: Partial<{ recycleInterval: number; parseTimeoutMs: number }> = {}
+  opts: Partial<{ recycleInterval: number; parseTimeoutMs: number; expectedParses: number }> = {}
 ) {
   let spawned = 0, terminated = 0;
   const pool = new ParseWorkerPool({
@@ -75,6 +75,7 @@ function makePool(
     size,
     recycleInterval: opts.recycleInterval,
     parseTimeoutMs: opts.parseTimeoutMs,
+    expectedParses: opts.expectedParses,
     createWorker: () => { spawned++; return new FakeWorker(behavior, () => { terminated++; }); },
   });
   return { pool, counts: () => ({ spawned, terminated }) };
@@ -124,6 +125,28 @@ describe('resolveParsePoolSize', () => {
   });
 });
 
+describe('parseWindowSize', () => {
+  it('lets every worker run well ahead of a slow file at the commit cursor', () => {
+    expect(parseWindowSize(1)).toBe(8);
+    expect(parseWindowSize(8)).toBe(64);
+  });
+});
+
+describe('workersWorthStarting', () => {
+  it('takes one more worker while it saves enough of the wall clock', () => {
+    expect(workersWorthStarting(40, 8)).toBe(1);
+    expect(workersWorthStarting(350, 8)).toBe(3);
+    expect(workersWorthStarting(600, 8)).toBe(4);
+    expect(workersWorthStarting(1400, 8)).toBe(6);
+  });
+
+  it('stays within the pool, and keeps a worker when nothing is known to be left', () => {
+    expect(workersWorthStarting(60_000, 8)).toBe(8);
+    expect(workersWorthStarting(60_000, 3)).toBe(3);
+    expect(workersWorthStarting(0, 8)).toBe(1);
+  });
+});
+
 describe('ParseWorkerPool', () => {
   it('parses a file and returns the worker result', async () => {
     const { pool } = makePool(1, () => ({ result: result(42) }));
@@ -151,6 +174,47 @@ describe('ParseWorkerPool', () => {
     const { pool, counts } = makePool(8, () => ({ result: result() }));
     await pool.requestParse(task('only.ts'));
     expect(counts().spawned).toBe(1); // just the eager warm worker
+    await pool.destroy();
+  });
+
+  it('prewarms what the run is worth, not the whole pool', async () => {
+    const small = makePool(8, () => ({ result: result() }), { expectedParses: 100 }).pool;
+    small.prewarm();
+    expect(small.liveWorkers).toBe(3);
+    await small.destroy();
+
+    const tiny = makePool(8, () => ({ result: result() }), { expectedParses: 5 }).pool;
+    tiny.prewarm();
+    expect(tiny.liveWorkers).toBe(1);
+    await tiny.destroy();
+
+    const big = makePool(8, () => ({ result: result() }), { expectedParses: 5000 }).pool;
+    big.prewarm();
+    expect(big.liveWorkers).toBe(8);
+    await big.destroy();
+  });
+
+  it('prewarms the whole pool when the run gave no count', async () => {
+    const { pool } = makePool(8, () => ({ result: result() }));
+    pool.prewarm();
+    expect(pool.liveWorkers).toBe(8);
+    await pool.destroy();
+  });
+
+  it('stays small while parses are as cheap as expected', async () => {
+    const { pool } = makePool(8, () => ({ result: result(), parseMs: 2 }), { expectedParses: 100 });
+    pool.prewarm();
+    await Promise.all(Array.from({ length: 100 }, (_, i) => pool.requestParse(task(`f${i}.ts`))));
+    expect(pool.liveWorkers).toBe(3);
+    await pool.destroy();
+  });
+
+  it('grows when the run measures its parses as dearer than a typical file', async () => {
+    const { pool } = makePool(8, () => ({ result: result(), parseMs: 200 }), { expectedParses: 100 });
+    pool.prewarm();
+    expect(pool.liveWorkers).toBe(3);
+    await Promise.all(Array.from({ length: 100 }, (_, i) => pool.requestParse(task(`f${i}.ts`))));
+    expect(pool.liveWorkers).toBe(8);
     await pool.destroy();
   });
 

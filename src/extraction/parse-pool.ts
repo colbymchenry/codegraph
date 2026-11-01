@@ -59,6 +59,16 @@ const DEFAULT_PARSE_POOL_CAP = 8;
 const MAX_PARSE_POOL_SIZE = 16;
 /** Parses a worker performs before it's recycled to reclaim WASM heap. */
 const DEFAULT_RECYCLE_INTERVAL = 250;
+/** Time an average file takes to parse, in ms, until a run has measured its own. */
+const TYPICAL_PARSE_MS = 3.5;
+/** Parses to measure before trusting them. A worker's first isn't measured: it runs cold. */
+const PARSES_TO_MEASURE = 8;
+/**
+ * What a further worker has to save, in ms of the run's wall clock, to be worth
+ * starting. A start costs about 150 ms of CPU, so a run gives up at most about
+ * 40 ms for the CPU and memory of a worker it does without.
+ */
+const WORKER_WORTH_MS = 40;
 /** Base per-parse timeout; scaled up for large files by the caller's formula. */
 const DEFAULT_PARSE_TIMEOUT_MS = 10_000;
 /** Keep the default large-file budget bounded; the hard-kill window is 3× this. */
@@ -143,6 +153,31 @@ export function resolveParsePoolSize(envVal: string | undefined, cpuCount: numbe
   return Math.max(1, Math.min(cpuCount - 1, DEFAULT_PARSE_POOL_CAP));
 }
 
+/**
+ * How many workers `parseMs` of parsing is worth. W workers take parseMs / W,
+ * so one more saves about parseMs / W², and past that it only costs. A small
+ * project's few hundred ms of parsing is done sooner than most of the pool could
+ * start: 4 workers index a 150-file repo as fast as 8, with a third less CPU
+ * and memory.
+ */
+export function workersWorthStarting(parseMs: number, maxSize: number): number {
+  return Math.max(1, Math.min(maxSize, Math.ceil(Math.sqrt(parseMs / WORKER_WORTH_MS))));
+}
+
+/**
+ * How many files a worker may run ahead of the ordered commit. Once the window
+ * is out, every worker waits for the file at the commit cursor, so one slow file
+ * stops them all: at 2 a worker, rocksdb's sat idle for half their time. A file
+ * waiting its turn holds its text and its results, which a window of this size
+ * keeps to a few MB on any ordinary project.
+ */
+const PARSE_WINDOW_PER_WORKER = 8;
+
+/** How many files may be out at once: being parsed, or parsed and waiting their turn to commit. */
+export function parseWindowSize(poolSize: number): number {
+  return poolSize * PARSE_WINDOW_PER_WORKER;
+}
+
 interface ParseJob {
   id: number;
   task: ParseTask;
@@ -184,6 +219,13 @@ export interface ParseWorkerPoolOptions {
   /** Optional verbose logger (the orchestrator's `[worker] …` logger). */
   log?: (msg: string) => void;
   /**
+   * How many files this run will parse, when the caller knows. The pool then
+   * starts and grows to what that much parsing is worth (workersWorthStarting),
+   * by a typical file's cost at first and by the run's own once it has measured
+   * some; left out, it grows to `size` as work queues.
+   */
+  expectedParses?: number;
+  /**
    * Pre-read grammar WASM bytes keyed by language, forwarded to every worker's
    * `load-grammars` message so a spawn/respawn loads grammars from memory
    * instead of re-reading them from disk — on slow storage each respawn's
@@ -210,9 +252,13 @@ export class ParseWorkerPool {
   private nextId = 1;
   private totalCrashes = 0;
   private destroyed = false;
+  private parsesDone = 0;
+  private parsesMeasured = 0;
+  private parseMsMeasured = 0;
 
   private readonly languages: Language[];
   private readonly maxSize: number;
+  private readonly expectedParses?: number;
   private readonly recycleInterval: number;
   private readonly parseTimeoutMs: number;
   private readonly createWorker: () => ParsePoolWorker;
@@ -224,6 +270,7 @@ export class ParseWorkerPool {
     this.languages = opts.languages;
     this.grammarBuffers = opts.grammarBuffers;
     this.maxSize = Math.max(1, Math.min(opts.size, MAX_PARSE_POOL_SIZE));
+    this.expectedParses = opts.expectedParses;
     this.recycleInterval = opts.recycleInterval ?? DEFAULT_RECYCLE_INTERVAL;
     this.parseTimeoutMs = opts.parseTimeoutMs ?? DEFAULT_PARSE_TIMEOUT_MS;
     this.loadSettleMs = opts.loadSettleMs ?? GRAMMAR_LOAD_SETTLE_MS;
@@ -246,18 +293,27 @@ export class ParseWorkerPool {
   }
 
   /**
-   * Spawn the whole pool up front. The default demand-driven growth avoids
-   * paying worker boot for small jobs, but a bulk index KNOWS every core will
-   * be needed — on a fast repo the one-by-one ramp-up otherwise consumes most
-   * of the parse phase (each worker boot is a fresh Node isolate + grammar
-   * load, ~hundreds of ms, and growth only triggers as queue pressure builds).
+   * Spawn the pool up front, as far as the run is worth it. The default
+   * demand-driven growth avoids paying worker boot for small jobs, but a bulk
+   * index knows how much work is coming — on a fast repo the one-by-one ramp-up
+   * otherwise consumes most of the parse phase (each worker boot is a fresh Node
+   * isolate + grammar load, ~hundreds of ms, and growth only triggers as queue
+   * pressure builds).
    */
   prewarm(): void {
-    while (this.workers.size < this.maxSize) {
+    while (this.workers.size < this.wantedSize()) {
       const before = this.workers.size;
       this.spawnOne();
       if (this.workers.size === before) break; // spawn failed / breaker tripped
     }
+  }
+
+  /** The workers the parsing still to come is worth. */
+  private wantedSize(): number {
+    if (this.expectedParses === undefined) return this.maxSize;
+    const left = Math.max(0, this.expectedParses - this.parsesDone);
+    const each = this.parsesMeasured >= PARSES_TO_MEASURE ? this.parseMsMeasured / this.parsesMeasured : TYPICAL_PARSE_MS;
+    return workersWorthStarting(left * each, this.maxSize);
   }
 
   /** Pool size cap (for logging). */
@@ -321,6 +377,11 @@ export class ParseWorkerPool {
       const job = this.inflight.get(w);
       if (!job || (m.id !== undefined && m.id !== job.id)) return; // stale (post-recycle)
       this.inflight.delete(w);
+      this.parsesDone++;
+      if (typeof m.parseMs === 'number' && this.parseCounts.get(w) !== 1) {
+        this.parsesMeasured++;
+        this.parseMsMeasured += m.parseMs;
+      }
       if (job.timerExpired) {
         // The base timer fired before this result was processed. That almost
         // always means the MAIN THREAD was stalled (sync SQLite store on slow
@@ -464,7 +525,7 @@ export class ParseWorkerPool {
     // at once.
     while (
       this.queue.length > this.idle.length + this.pending.size &&
-      this.workers.size < this.maxSize &&
+      this.workers.size < this.wantedSize() &&
       this.pending.size < MAX_CONCURRENT_SPAWN &&
       !this.destroyed &&
       this.healthy
