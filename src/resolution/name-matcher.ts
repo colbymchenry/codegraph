@@ -30841,7 +30841,14 @@ export function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, co
   const argc = args.trim() === '' ? 0 : splitCppTopLevel(args).length;
   if (argc >= set.own.min && argc <= set.own.max) return result;
   const fits = set.siblings.filter((s) => s.arity !== null && argc >= s.arity.min && argc <= s.arity.max);
-  return fits.length === 1 ? { ...result, targetNodeId: fits[0]!.id } : result;
+  if (fits.length === 0) return result;
+  // Several fit when overloads differ only in parameter types: jsoup's
+  // `load(file, charsetName, baseUri, parser)` among `load(File, …, Parser)`
+  // and `load(Path, …, Parser)`. Types aren't compared, so the first declared
+  // of them, never the target the argument count rules out.
+  const line = (id: string) => context.getNodeById?.(id)?.startLine ?? Infinity;
+  const first = fits.reduce((a, b) => (line(b.id) < line(a.id) ? b : a));
+  return { ...result, targetNodeId: first.id };
 }
 
 /**

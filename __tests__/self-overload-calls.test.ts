@@ -53,6 +53,48 @@ public class Point {
   }
 }
 `,
+    'src/main/java/app/Util.java': `package app;
+
+public class Util {
+  public static String load(java.io.File f, String c, String b) { return b; }
+  public static String load(java.io.File f, String c, String b, Parser p) { return b; }
+  public static String load(java.nio.file.Path f, String c, String b, Parser p) { return b; }
+}
+`,
+    'src/main/java/app/Parser.java': `package app;
+
+public class Parser {
+}
+`,
+    'src/main/java/app/Loader.java': `package app;
+
+public class Loader {
+  String run(java.io.File file, String c, String b, Parser p) {
+    return Util.load(file, c, b, p);
+  }
+}
+`,
+    'src/Json/Reader.cs': `namespace App
+{
+    public static class Reader
+    {
+        public static string Read(string value)
+        {
+            return Read(value, null);
+        }
+
+        public static string Read(string value, string root)
+        {
+            return value + root;
+        }
+
+        public static string Read(string value, int depth)
+        {
+            return value;
+        }
+    }
+}
+`,
     'src/Json/Convert.cs': `namespace App
 {
     public static class Convert
@@ -101,6 +143,17 @@ describe('a method calling its own name', () => {
     const lines = cg.getOutgoingEdges(hash.id).filter((e) => e.kind === 'calls').map((e) => cg.getNode(e.target)!)
       .filter((t) => t.name === 'reflectionHashCode').map((t) => t.startLine);
     expect(lines).toEqual([8]);
+  });
+
+  it('Java: with several overloads the arguments fit, stays among them, not the first declared (#3040)', () => {
+    const run = cg.getNodesInFile('src/main/java/app/Loader.java').find((n) => n.name === 'run')!;
+    const lines = cg.getOutgoingEdges(run.id).filter((e) => e.kind === 'calls').map((e) => cg.getNode(e.target)!)
+      .filter((t) => t.name === 'load').map((t) => t.startLine);
+    expect(lines).toEqual([5]);
+  });
+
+  it('C#: with several overloads the arguments fit, a self-call leaves itself for the first of them', () => {
+    expect(selfNamed('src/Json/Reader.cs', 'Read')).toEqual(['5 -> 10']);
   });
 
   it('C#: reaches the overload the arguments fit', () => {
