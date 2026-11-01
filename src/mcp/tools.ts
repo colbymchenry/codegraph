@@ -1694,6 +1694,47 @@ const READ_ONLY_ANNOTATIONS: ToolAnnotations = {
  */
 export const tools: ToolDefinition[] = [
   {
+    name: 'codegraph_suspects',
+    description: 'Audit name-only and low-confidence call edges, ranked by standard-library collisions (Rust and Swift), missing imports, ambiguous definitions and confidence. Returns targets and sample callers; these are review candidates, not proven errors.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectPath: projectPathProperty,
+        limit: { type: 'string', description: 'Positive integer (string or number) or "all"; default 25 targets.' },
+        maxEdgesPerTarget: { type: 'number', description: 'Non-negative sample edge count; default 5. Zero retains target counts.' },
+        format: { type: 'string', enum: ['text', 'json'], description: 'Default text; JSON returns { version: 1, suspects }.' },
+      },
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'codegraph_blast',
+    description: 'Blast radius of a diff: which symbols and files depend on the lines changed since a base git ref ' +
+      '(through the merge base; with no base, the uncommitted changes against HEAD, or the last commit when the tree is clean), ' +
+      'walked up the call/reference graph and grouped by directory. Use it to see what a branch or working-tree change can ' +
+      'affect before reviewing or testing it. Returns each dependent with its file:line span, relation and depth, and per ' +
+      'changed area whether a test reaches it. A dependent reached only through name-matched calls is marked questionable; ' +
+      'strict: true leaves those out.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectPath: projectPathProperty,
+        base: {
+          type: 'string',
+          description: 'Git ref to compare against, e.g. "origin/main" or a tag. Omit for the uncommitted changes against HEAD, or the last commit when the tree is clean.',
+        },
+        depth: {
+          type: 'string',
+          // The schema type is a single string; the handler also takes a number.
+          description: 'Dependent hops to walk: a positive integer (string or number), or "all" for the full closure. Default 2.',
+        },
+        format: { type: 'string', enum: ['text', 'markdown', 'json'], description: 'Default text; markdown is shaped for a pull-request comment.' },
+        strict: { type: 'boolean', description: 'Leave out dependents reached only through name-matched (questionable) call edges instead of marking them. Default false.' },
+      },
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
     name: 'codegraph_search',
     description: 'Quick symbol search by name. Returns locations only (no code). Use codegraph_explore instead to get the actual source / understand an area in one call.',
     inputSchema: {
@@ -2014,12 +2055,12 @@ export function getStaticTools(): ToolDefinition[] {
 /**
  * The MCP tools served by DEFAULT (short names). Pared to ONLY `codegraph_explore`
  * — the single tool that reliably earns its place: one capped call returns the
- * verbatim source of the relevant symbols grouped by file. Every other tool is a
- * narrower slice of what explore already does, and presence itself steers
- * mis-picks, so they are no longer LISTED to agents.
+ * verbatim source of the relevant symbols grouped by file. Specialized tools
+ * remain opt-in so their presence does not steer general source questions away
+ * from explore.
  *
  * The other defined tools (`node`, `search`, `callers`, plus callees/impact/files/
- * status) remain fully functional — handlers stay, the library API and CLI are
+ * status, suspects and blast) remain fully functional — handlers stay, the library API and CLI are
  * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
 const DEFAULT_MCP_TOOLS = new Set(['explore']);
@@ -2334,7 +2375,7 @@ export class ToolHandler {
    */
   getTools(): ToolDefinition[] {
     const allow = this.toolAllowlist();
-    // No explicit allowlist → the default 4-tool surface (see
+    // No explicit allowlist → the explore-only surface (see
     // DEFAULT_MCP_TOOLS for the evidence). An allowlist replaces the
     // default entirely, so any defined tool can be re-enabled.
     let visible = allow
@@ -3330,6 +3371,8 @@ export class ToolHandler {
    */
   private async dispatchTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
     switch (toolName) {
+      case 'codegraph_suspects': return await this.handleSuspects(args);
+      case 'codegraph_blast': return await this.handleBlast(args);
       case 'codegraph_search': return await this.handleSearch(args);
       case 'codegraph_callers': return await this.handleCallers(args);
       case 'codegraph_callees': return await this.handleCallees(args);
@@ -3339,6 +3382,46 @@ export class ToolHandler {
       case 'codegraph_files': return await this.handleFiles(args);
       default: return this.errorResult(`Unknown tool: ${toolName}`);
     }
+  }
+
+  /** Handle codegraph_suspects: ranked audit candidates, sharing the CLI's read-only derivation. */
+  private async handleSuspects(args: Record<string, unknown>): Promise<ToolResult> {
+    const { parseSuspectCount } = await import('../graph/suspects-options');
+    let limit: number | undefined;
+    let edges: number | undefined;
+    try { limit = parseSuspectCount(args.limit ?? 25, true, 1); }
+    catch { return this.textResult('limit must be a positive integer or "all".'); }
+    try { edges = parseSuspectCount(args.maxEdgesPerTarget ?? 5, false, 0); }
+    catch { return this.textResult('maxEdgesPerTarget must be a non-negative integer.'); }
+    if (args.format != null && args.format !== 'text' && args.format !== 'json') {
+      return this.textResult('format must be text or json.');
+    }
+    const root = this.getCodeGraph(args.projectPath as string | undefined).getProjectRoot();
+    const { findSuspects, formatSuspects, suspectsToJson } = await import('../graph/suspects');
+    const list = findSuspects(root, { limit, maxEdgesPerTarget: edges });
+    return this.textResult(args.format === 'json' ? JSON.stringify(suspectsToJson(list), null, 2) : formatSuspects(list));
+  }
+
+  /**
+   * The dependents of a diff, through the CLI's entry point. Every expected
+   * failure (a bad argument, an unknown base, no git repository) is
+   * success-shaped guidance, never `isError`.
+   */
+  private async handleBlast(args: Record<string, unknown>): Promise<ToolResult> {
+    // null is absent, as the projectPath check treats it.
+    const absent = (v: unknown): unknown => (v === null ? undefined : v);
+    const base = absent(args.base);
+    const depth = absent(args.depth);
+    const format = absent(args.format);
+    const strict = absent(args.strict);
+    if (base !== undefined && typeof base !== 'string') return this.textResult('base must be a git ref given as a string, e.g. "origin/main".');
+    if (depth !== undefined && typeof depth !== 'string' && typeof depth !== 'number') return this.textResult('depth must be a positive number or "all".');
+    if (format !== undefined && typeof format !== 'string') return this.textResult('format must be text, markdown or json.');
+    if (strict !== undefined && typeof strict !== 'boolean') return this.textResult('strict must be true or false.');
+    const root = this.getCodeGraph(args.projectPath as string | undefined).getProjectRoot();
+    const { runBlast } = await import('../graph/blast-run');
+    const result = runBlast(root, { base, depth, format, strict });
+    return this.textResult(result.ok ? result.output : result.message);
   }
 
   /**
