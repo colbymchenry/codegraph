@@ -46,7 +46,7 @@ import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { clearRubyConstantPathMemos, matchRubyConstantPathRef } from './ruby-constant-paths';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
-import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
+import { ResolverPool, minRefsForPool, resolveWorkersWorthStarting, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } from './frameworks';
 import { clearDeclaredDependencies } from './frameworks/package-deps';
@@ -2681,10 +2681,10 @@ export class ReferenceResolver {
     // tryCreate's sizing probes shouldn't re-run every batch on hosts that
     // declined.
     let poolEngageTried = false;
-    const createPool = (t0: number, why: string): ResolverPool | null => {
+    const createPool = (t0: number, why: string, worth?: number): ResolverPool | null => {
       poolEngageTried = true;
       if (!parallel) return null;
-      const p = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot, parallel.shareFrameworks ? this.getDetectedFrameworks() : undefined);
+      const p = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot, parallel.shareFrameworks ? this.getDetectedFrameworks() : undefined, worth);
       if (p && parallel.shareFrameworks) {
         const scans = this.projectScans();
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] project scans: ${scans.cpp ? 'shared' : 'none'}`);
@@ -2822,6 +2822,8 @@ export class ReferenceResolver {
     // phase boundary before cleanup without re-reading the current batch.
     let prerequisites = true;
     let afterRowId = 0;
+    // Was the batch read last past the prerequisites?
+    let readDependents = false;
     const readNextBatch = (): UnresolvedReference[] => {
       let next = this.queries.getUnresolvedReferencesBatchAfter(afterRowId, batchSize, prerequisites);
       if (next.length === 0 && prerequisites) {
@@ -2830,11 +2832,13 @@ export class ReferenceResolver {
         next = this.queries.getUnresolvedReferencesBatchAfter(afterRowId, batchSize, prerequisites);
       }
       if (next.length > 0) afterRowId = next[next.length - 1]!.rowId!;
+      readDependents = !prerequisites;
       return next;
     };
     tLp = Date.now();
     let batch = readNextBatch();
     lp('read', tLp);
+    let batchIsDependents = readDependents;
     let inFlight: InFlight | null = batch.length > 0 ? beginBatch(batch) : null;
     while (batch.length > 0 && inFlight) {
       // Prefetch the NEXT batch before this one persists: this batch's rows
@@ -2845,6 +2849,20 @@ export class ReferenceResolver {
       tLp = Date.now();
       const nextBatch = readNextBatch();
       lp('read', tLp);
+      const nextIsDependents = readDependents;
+
+      // Past the prerequisites a batch makes no edge resolving reads (see
+      // RESOLUTION_READ_EDGE_KINDS below), so the next one can queue behind it
+      // right away: the workers go from one to the other, rather than waiting on
+      // the batch's slowest chunk with nothing to do. Should it make one after
+      // all, this start is dropped and the batch starts again after the edges
+      // are in. Not when the workers' connections are due for a recycle, which
+      // needs them idle.
+      let nextInFlight: InFlight | null = null;
+      if (batchIsDependents && inFlight.mode === 'pool' && nextBatch.length > 0 && batchesSinceRecycle + 1 < RECYCLE_EVERY_BATCHES) {
+        const ahead = beginBatch(nextBatch);
+        if (ahead.mode === 'pool') nextInFlight = ahead;
+      }
 
       const tBatch = Date.now();
       const result = await settleBatch(inFlight, batch);
@@ -2869,7 +2887,7 @@ export class ReferenceResolver {
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(`[pool-timing] adaptive engage: projected ${Math.round(projectedMs)}ms sequential settle over ${remaining} remaining refs`);
           }
-          pool = createPool(Date.now(), 'adaptive');
+          pool = createPool(Date.now(), 'adaptive', resolveWorkersWorthStarting(projectedMs));
         }
       }
 
@@ -2879,8 +2897,10 @@ export class ReferenceResolver {
       // are all between statements — so the backfill completes, readers
       // re-enter at SQLite's backfilled mark, and the next persist commit
       // WRAPS the WAL instead of growing it. No-op (one fstat) under the cap.
+      // With a batch queued ahead the pool isn't idle, so this waits for the
+      // next batch that has none, which the recycle's cadence guarantees.
       tLp = Date.now();
-      const bp = parallel?.backpressure?.();
+      const bp = nextInFlight ? null : parallel?.backpressure?.();
       if (bp) await bp;
       lp('backpressure', tLp);
 
@@ -2935,7 +2955,8 @@ export class ReferenceResolver {
       const edges = this.createEdges(result.resolved);
       lp('createEdges', tLp);
       const readEdge = edges.some((e) => RESOLUTION_READ_EDGE_KINDS.includes(e.kind));
-      let nextInFlight = !readEdge && nextBatch.length > 0 ? beginBatch(nextBatch) : null;
+      if (readEdge) nextInFlight = null;
+      else if (!nextInFlight && nextBatch.length > 0) nextInFlight = beginBatch(nextBatch);
       tLp = Date.now();
       for (let i = 0; i < edges.length; i += PERSIST_CHUNK) {
         this.queries.insertEdges(edges.slice(i, i + PERSIST_CHUNK));
@@ -3036,6 +3057,7 @@ export class ReferenceResolver {
       // Advance the pipeline: the prefetched batch (already fanned out when
       // the pool is on) becomes the current one.
       batch = nextBatch;
+      batchIsDependents = nextIsDependents;
       inFlight = nextInFlight;
     }
     } finally {

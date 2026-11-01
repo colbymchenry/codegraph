@@ -43,6 +43,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Indexing a small project takes much less CPU and memory: CodeGraph starts only the threads a project needs, and a file that's slow to parse no longer holds up the others.
 - Set `CODEGRAPH_SYNTH_MIN_INTERVAL_MS` to limit how often live syncs rebuild the callback and event links across the whole project, which on a large TypeScript or Vue repo otherwise happens on almost every edit; a rebuild that's put off runs when the interval is up even if no edit follows, and until then those links can be that far behind your code. A full `codegraph index` is never held. Thanks @danusha2345. (#2911)
 - Indexing a large project takes about a quarter less memory at its peak.
+- Indexing a large project runs fewer threads and finishes as soon, with less CPU and memory.
 - For contributors, the test suite now runs on Vitest 4 and working in this repository needs Node 22.12 or newer; installing and using CodeGraph doesn't change. Thanks @danusha2345.
 - New `codegraph cycles` command lists the groups of files that import each other in a circle, as text or `--json`, and exits 1 when it finds any, so it works as a pre-commit or CI check (#888). Thanks @jiangyq9 and @goutham80808.
 - `codegraph init --local-only` keeps `.codegraph/` out of git entirely, so nothing of CodeGraph's shows in `git status`, and it works on a project that's already set up, leaving a `.codegraph/.gitignore` you've edited or committed alone (#910). Thanks @jadchene, @jiangyq9, @Wood-Q and @walterf3.
