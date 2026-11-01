@@ -14465,6 +14465,350 @@ export function matchByExactName(
   return null;
 }
 
+/** A parameter of a Java method: its type (`String[]`, generics and package dropped), and whether it is `...`. */
+interface JavaParameter {
+  type: string;
+  /** Its type as declared, type arguments and all. */
+  written: string;
+  varargs: boolean;
+}
+
+const JAVA_PRIMITIVE_TYPES: ReadonlySet<string> = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double']);
+/** Each Java primitive's wrapper. */
+const JAVA_BOXED: Readonly<Record<string, string>> = {
+  boolean: 'Boolean', byte: 'Byte', char: 'Character', short: 'Short', int: 'Integer', long: 'Long', float: 'Float', double: 'Double',
+};
+/** What each Java primitive widens to. */
+const JAVA_WIDENED: Readonly<Record<string, readonly string[]>> = {
+  byte: ['short', 'int', 'long', 'float', 'double'], short: ['int', 'long', 'float', 'double'], char: ['int', 'long', 'float', 'double'],
+  int: ['long', 'float', 'double'], long: ['float', 'double'], float: ['double'],
+};
+/** `java.lang.String`'s supertypes. */
+const JAVA_STRING_SUPERTYPES: ReadonlySet<string> = new Set(['CharSequence', 'Comparable', 'Serializable', 'Constable', 'ConstantDesc']);
+/** Words a declaration pattern can take for a type: `return key;`, `else x`. */
+const JAVA_STATEMENT_WORDS: ReadonlySet<string> = new Set(['return', 'throw', 'new', 'else', 'case', 'yield', 'assert', 'instanceof', 'final']);
+
+/** A Java type as an overload compares it: no type arguments or package, its array markers kept. */
+function javaBareType(written: string): string {
+  let type = written;
+  for (let prev = ''; prev !== type;) {
+    prev = type;
+    type = type.replace(/<[^<>]*>/g, '');
+  }
+  type = type.replace(/\s+/g, '');
+  const dims = /(?:\[\])*$/.exec(type)![0];
+  const base = type.slice(0, type.length - dims.length);
+  return base.slice(base.lastIndexOf('.') + 1) + dims;
+}
+
+/** The parameters a Java method's signature (`Node (String html)`) declares; null when it can't be read. */
+function javaParameters(signature: string | undefined): JavaParameter[] | null {
+  if (!signature) return null;
+  const open = signature.indexOf('(');
+  const close = signature.lastIndexOf(')');
+  if (open < 0 || close < open) return null;
+  const list = signature.slice(open + 1, close).replace(/\/\*[\s\S]*?\*\//g, ' ').trim();
+  if (list === '') return [];
+  const params: JavaParameter[] = [];
+  for (const written of splitCppTopLevel(list)) {
+    const plain = written.replace(/@[\w.]+(?:\([^()]*\))?/g, ' ').replace(/\bfinal\b/g, ' ').trim();
+    const m = /^([\s\S]+?)(\.\.\.)?\s+[\w$]+((?:\s*\[\s*\])*)$/.exec(plain) ?? /^([\s\S]+?)(\.\.\.)\s*[\w$]+()$/.exec(plain);
+    if (!m) return null;
+    params.push({ type: javaBareType(m[1]! + m[3]!), written: m[1]!, varargs: m[2] !== undefined });
+  }
+  return params;
+}
+
+/** Per context: a Java overload's id → its parameters; null when they can't be read. */
+const JAVA_PARAMETERS = new WeakMap<ResolutionContext, Map<string, JavaParameter[] | null>>();
+
+function javaOverloadParameters(n: Node, context: ResolutionContext): JavaParameter[] | null {
+  let memo = JAVA_PARAMETERS.get(context);
+  if (!memo) JAVA_PARAMETERS.set(context, (memo = new Map()));
+  let params = memo.get(n.id);
+  if (params === undefined) {
+    params = n.language === 'java' ? javaParameters(n.signature) : null;
+    memo.set(n.id, params);
+  }
+  return params;
+}
+
+/** The JDK's functional interfaces: for each parameter of a lambda written for one, the type argument it has. */
+const JAVA_FUNCTIONAL_PARAMETERS: Readonly<Record<string, readonly number[]>> = {
+  Consumer: [0], Predicate: [0], Function: [0], UnaryOperator: [0], BinaryOperator: [0, 0], Comparator: [0, 0],
+  BiConsumer: [0, 1], BiFunction: [0, 1], BiPredicate: [0, 1],
+  ToIntFunction: [0], ToLongFunction: [0], ToDoubleFunction: [0],
+  ObjIntConsumer: [0], ObjLongConsumer: [0], ObjDoubleConsumer: [0],
+};
+
+/**
+ * The type of a Java lambda's parameter `name`, read off the method the lambda
+ * is passed to: jsoup's `assertAdoptionRecovery(new HtmlTreeBuilder(), tb -> {
+ * tb.process(…); }, …)` hands `tb` to a `Consumer<HtmlTreeBuilder>`. Only for a
+ * call with no receiver, to methods of the calling file, which must agree on a
+ * JDK functional interface with a type argument of its own: the written type,
+ * or null. (`list.forEach(x -> …)` says nothing of `x` until `list` is typed.)
+ */
+function javaLambdaParameterType(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (!/^[A-Za-z_$][\w$]*$/.test(name)) return null;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const start = enclosingScopeStartLine(ref, context) - 1;
+  const r = escapeRegExp(name);
+  const head = new RegExp(`(?<![\\w$.])(?:${r}|\\(\\s*((?:[\\w$]+\\s*,\\s*)*)${r}(?:\\s*,\\s*[\\w$]+)*\\s*\\))\\s*->`);
+  for (let i = Math.min(ref.line, lines.length) - 1; i >= start; i--) {
+    const line = lines[i];
+    if (line === undefined || !line.includes('->') || !line.includes(name)) continue;
+    const m = head.exec(line);
+    if (!m) continue;
+    // Back from the lambda to the `(` of the call it is an argument of.
+    const text = lines.slice(start, i + 1).join('\n');
+    let at = text.length - line.length + m.index;
+    let index = 0;
+    for (let depth = 0; --at >= 0;) {
+      const c = text[at];
+      if (c === ')' || c === ']' || c === '}') depth++;
+      else if (c === '(' || c === '[' || c === '{') {
+        if (depth === 0) break;
+        depth--;
+      } else if (c === ',' && depth === 0) index++;
+    }
+    if (at < 0 || text[at] !== '(') return null;
+    const called = /(?:^|[^\w$.])(?:this\s*\.\s*)?([A-Za-z_$][\w$]*)\s*(?:<[^<>()]*>)?\s*$/.exec(text.slice(0, at))?.[1];
+    if (!called) return null;
+    const position = m[1] ? m[1].split(',').length - 1 : 0;
+    const found = new Set<string>();
+    for (const method of context.getNodesInFile(ref.filePath)) {
+      if (method.kind !== 'method' || method.name !== called) continue;
+      const written = javaParameters(method.signature)?.[index]?.written;
+      if (written === undefined) continue;
+      const functional = /^(?:[\w$]+\.)*([A-Z][\w$]*)\s*</.exec(written);
+      const typeArgument = functional ? JAVA_FUNCTIONAL_PARAMETERS[functional[1]!]?.[position] : undefined;
+      if (typeArgument === undefined) continue;
+      const argument = angleArguments(written)[typeArgument]?.replace(/^\?\s*(?:super|extends)\s+/, '');
+      if (!argument || argument === '?' || /^[A-Z][A-Z0-9]{0,2}$/.test(argument)) return null;
+      found.add(argument);
+    }
+    return found.size === 1 ? [...found][0]! : null;
+  }
+  return null;
+}
+
+/** The type a Java local or parameter is declared with, in the method around `ref`: the nearest declaration above it, `var` as written. */
+function javaLocalDeclaredType(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const start = enclosingScopeStartLine(ref, context);
+  // (Its array markers may follow the name: rocksdb's `final byte key1[] = …`. And a `T... names` is an array here.)
+  const declared = new RegExp(`((?:[A-Za-z_$][\\w$]*\\.)*[A-Za-z_$][\\w$]*(?:\\s*<[^;=(){}]*>)?(?:\\s*\\[\\s*\\])*)(\\s*\\.\\.\\.)?\\s+${escapeRegExp(name)}((?:\\s*\\[\\s*\\])*)\\s*(?:[=;,):]|$)`);
+  for (let i = Math.min(ref.line, lines.length) - 1; i >= start - 1; i--) {
+    const line = lines[i];
+    if (line === undefined || !line.includes(name) || /^\s*(?:\/\/|\*|\/\*)/.test(line)) continue;
+    const m = declared.exec(line);
+    if (m?.[1] === 'var') return 'var';
+    if (!m || JAVA_STATEMENT_WORDS.has(m[1]!)) continue;
+    const type = javaBareType(m[1]! + (m[2] ? '[]' : '') + m[3]!);
+    if (/^[A-Z]/.test(type) || JAVA_PRIMITIVE_TYPES.has(type.replace(/(?:\[\])+$/, ''))) return type;
+  }
+  return null;
+}
+
+/** The type a Java field, a constant or an enum's constant holds. */
+function javaFieldType(field: Node): string | null {
+  if (field.kind === 'enum_member') return field.qualifiedName.split('::').slice(-2, -1)[0] ?? null;
+  const type = field.signature ? javaBareType(field.signature.slice(0, field.signature.lastIndexOf(field.name))) : '';
+  return type === '' ? null : type;
+}
+
+/** The declared type of a field of a class around `ref`, its own or one it inherits, the tightest class first. */
+function javaFieldDeclaredType(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const around = context.getNodesInFile(ref.filePath)
+    .filter((n) => JAVA_TYPE_KINDS_VISIBLE.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine);
+  for (const cls of around) {
+    const field = javaStaticField(cls, name, context);
+    if (field) return javaFieldType(field);
+  }
+  return null;
+}
+
+/** The type a Java name holds: a local's or a parameter's, else a field's. (A `var` hides the field and says nothing.) */
+function javaNamedType(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const local = javaLocalDeclaredType(name, ref, context);
+  return local === 'var' ? null : local ?? javaFieldDeclaredType(name, ref, context);
+}
+
+/** The type a Java receiver names or holds: `Type` of `Type.f()`, or a value's, `x` or `CONSTANT`. */
+function javaReceiverType(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  return /^[A-Z].*[a-z]/.test(name) ? name : javaNamedType(name, ref, context);
+}
+
+/** The type of the field `x.name` or `Type.name` reads, where `x` has a project type or is an array. */
+function javaFieldAccessType(receiver: string, name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const type = javaReceiverType(receiver, ref, context);
+  if (!type) return null;
+  if (type.endsWith('[]')) return name === 'length' ? 'int' : null;
+  const written = javaTypeName(type);
+  const found = written ? javaTypeRef(written, ref.filePath, context) : null;
+  if (!found) return null;
+  const owners = found.decl ? [found.decl]
+    : jvmTypeDecls(found.name.split('::').pop()!, context).filter((d) => d.language === 'java' &&
+      (d.qualifiedName === found.name || d.qualifiedName.endsWith(`::${found.name}`)) && isJavaTypeNameable(d, ref.filePath, context));
+  const field = owners.length === 1 ? javaStaticField(owners[0]!, name, context) : undefined;
+  return field ? javaFieldType(field) : null;
+}
+
+/** Where the parentheses opened at `open` close in a Java expression; -1 when they don't. */
+function javaClosingParen(text: string, open: number): number {
+  for (let i = open, depth = 0; i < text.length; i++) {
+    if (text[i] === '(') depth++;
+    else if (text[i] === ')' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * What a Java call written as an argument returns: `e.getErrors()`, with `e` an
+ * `ErrorsException`, is an `Errors`. The receiver is a local, a parameter, a
+ * field or a type, and the method's overloads of that count must agree. Null
+ * for anything longer: `a.b().c()` would need `b`'s type read in `b`'s own file.
+ */
+function javaCalledType(arg: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const call = /^(?:this\s*\.\s*)?([A-Za-z_$][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)\s*\(/.exec(arg);
+  const close = call ? javaClosingParen(arg, call[0].length - 1) : -1;
+  if (!call || close !== arg.length - 1) return null;
+  const declared = javaReceiverType(call[1]!, ref, context);
+  const written = declared && javaTypeName(declared);
+  const type = written ? javaTypeRef(written, ref.filePath, context) : null;
+  const found = type ? resolveOnJavaType(type, call[2]!, ref, context) : null;
+  const method = found ? context.getNodeById?.(found.targetNodeId) : undefined;
+  if (!method) return null;
+  const list = arg.slice(call[0].length, close).trim();
+  const count = list === '' ? 0 : splitCppTopLevel(list).length;
+  const overloads = context.getNodesInFile(method.filePath).filter((n) => n.kind === 'method' && n.qualifiedName === method.qualifiedName &&
+    javaParameters(n.signature)?.length === count);
+  const returned = overloads[0]?.returnType;
+  return returned && overloads.every((n) => n.returnType === returned) ? javaBareType(returned) : null;
+}
+
+/**
+ * The static type of a Java argument, where its text alone says: a literal, a
+ * cast, a `new`, `this`, a local, a parameter or a field, an element of one, or
+ * a field of one or a call on it. Null for anything else (`null` fits every
+ * reference type).
+ */
+function javaArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (/^"(?:[^"\\]|\\.)*"(?:\s*\+[\s\S]*)?$/.test(arg)) return 'String';
+  if (/^'(?:[^'\\]|\\.)+'$/.test(arg)) return 'char';
+  if (arg === 'true' || arg === 'false') return 'boolean';
+  if (/^-?(?:0[xX][\da-fA-F_]+|0[bB][01_]+|\d[\d_]*)$/.test(arg)) return 'int';
+  if (/^-?(?:0[xX][\da-fA-F_]+|0[bB][01_]+|\d[\d_]*)[lL]$/.test(arg)) return 'long';
+  if (/^-?\d[\d_]*(?:\.[\d_]*)?(?:[eE][-+]?\d+)?[fF]$/.test(arg)) return 'float';
+  if (/^-?(?:\d[\d_]*\.[\d_]*(?:[eE][-+]?\d+)?|\d[\d_]*[eE][-+]?\d+)[dD]?$/.test(arg)) return 'double';
+  // (Only when nothing follows it: `new Foo().bar()` is what `bar` returns.)
+  const built = /^new\s+([\w$.]+)\s*(?:<[^()]*>)?\s*(\(|\[)/.exec(arg);
+  if (built) {
+    if (built[2] === '[') return `${javaBareType(built[1]!)}[]`;
+    const end = javaClosingParen(arg, built[0].length - 1);
+    return end >= 0 && /^\s*(?:\{[\s\S]*\})?$/.test(arg.slice(end + 1)) ? javaBareType(built[1]!) : null;
+  }
+  const cast = /^\(\s*([\w$.]+(?:\s*<[^()]*>)?(?:\s*\[\s*\])*)\s*\)\s*[\w$("']/.exec(arg);
+  if (cast) return javaBareType(cast[1]!);
+  if (arg === 'this') {
+    const around = context.getNodesInFile(ref.filePath)
+      .filter((n) => JAVA_TYPE_KINDS_VISIBLE.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
+      .sort((a, b) => b.startLine - a.startLine)[0];
+    return around && !isAnonymousClass(around) ? around.name : null;
+  }
+  if (arg === 'null') return null;
+  const own = /^this\s*\.\s*([A-Za-z_$][\w$]*)$/.exec(arg);
+  if (own) return javaFieldDeclaredType(own[1]!, ref, context);
+  const element = /^([A-Za-z_$][\w$]*)\s*\[[^[\]]*\]$/.exec(arg);
+  if (element) {
+    const array = javaNamedType(element[1]!, ref, context);
+    return array?.endsWith('[]') ? array.slice(0, -2) : null;
+  }
+  const field = /^([A-Za-z_$][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)$/.exec(arg);
+  if (field) return javaFieldAccessType(field[1]!, field[2]!, ref, context);
+  return /^[A-Za-z_$][\w$]*$/.test(arg) ? javaNamedType(arg, ref, context) : javaCalledType(arg, ref, context);
+}
+
+/**
+ * How a Java argument of static type `arg` fits a parameter of type `param`:
+ * 2 the same type, 1.5 by widening, which Java tries before boxing, 1 by boxing
+ * or a supertype, 0 when it can't be told (a type parameter, one library type
+ * against another), -1 when the compiler would refuse it.
+ */
+function javaArgumentFit(arg: string, param: string, context: ResolutionContext): number {
+  if (arg === param) return 2;
+  const typeVariable = /^[A-Z][A-Z0-9]{0,2}(?:\[\])*$/;
+  if (typeVariable.test(arg) || typeVariable.test(param)) return 0;
+  const projectType = (name: string): Node[] => jvmTypeDecls(name.replace(/(?:\[\])+$/, ''), context).filter((n) => n.language === 'java');
+  // A name the project doesn't declare may be a type parameter (`Item`), which takes anything.
+  const refused = (type: string): number => (type === 'String' || projectType(type).length > 0 ? -1 : 0);
+  // A number or a string is no function.
+  const valueRefused = (type: string): number => (JAVA_FUNCTIONAL_PARAMETERS[type] ? -1 : refused(type));
+  const argPrimitive = JAVA_PRIMITIVE_TYPES.has(arg);
+  const paramPrimitive = JAVA_PRIMITIVE_TYPES.has(param);
+  if (argPrimitive && paramPrimitive) return JAVA_WIDENED[arg]?.includes(param) ? 1.5 : -1;
+  if (argPrimitive) return param === JAVA_BOXED[arg] || param === 'Object' || param === 'Number' || param === 'Comparable' || param === 'Serializable' ? 1 : valueRefused(param);
+  if (paramPrimitive) {
+    const unboxed = Object.keys(JAVA_BOXED).find((p) => JAVA_BOXED[p] === arg);
+    return unboxed !== undefined && (unboxed === param || JAVA_WIDENED[unboxed]?.includes(param)) ? 1 : -1;
+  }
+  if (param === 'Object') return 1;
+  if (arg.endsWith('[]') !== param.endsWith('[]')) return param === 'Serializable' || param === 'Cloneable' ? 1 : param.endsWith('[]') ? -1 : refused(param);
+  if (arg === 'String') return JAVA_STRING_SUPERTYPES.has(param) ? 1 : valueRefused(param);
+  const bare = param.replace(/(?:\[\])+$/, '');
+  if (projectType(arg).some((d) => javaAncestorNames(d.qualifiedName, context).has(bare))) return 1;
+  return refused(param);
+}
+
+/**
+ * Of one class's overloads of a method, those a Java call's arguments fit: by
+ * count, then by what each argument's type says (javaArgumentFit), best first,
+ * and a private one only from its own file. Null when a signature can't be
+ * read (a Kotlin overload's isn't Java's) or none fits. jsoup's
+ * `super.before(node)`, with `node` a `Node`, is `before(Node)`, and rocksdb's
+ * `it.seek(k2)`, with `k2` a `ByteBuffer`, is `seek(ByteBuffer)`: not the first
+ * declared.
+ */
+function javaOverloadsFitting(overloads: Node[], written: string, ref: UnresolvedRef, context: ResolutionContext): Node[] | null {
+  const args = written.trim() === '' ? [] : splitCppTopLevel(written);
+  const counted: Array<{ n: Node; params: JavaParameter[] }> = [];
+  for (const n of overloads) {
+    const params = javaOverloadParameters(n, context);
+    if (!params) return null;
+    const last = params[params.length - 1];
+    if (n.visibility === 'private' && n.filePath !== ref.filePath) continue;
+    if (last?.varargs ? args.length >= params.length - 1 : args.length === params.length) counted.push({ n, params });
+  }
+  if (counted.length < 2) return counted.length === 1 ? [counted[0]!.n] : null;
+  const types = args.map((a) => javaArgumentType(a, ref, context));
+  let best = -1;
+  let fitting: Node[] = [];
+  for (const { n, params } of counted) {
+    const last = params[params.length - 1];
+    let score = 0;
+    for (let i = 0; i < args.length && score >= 0; i++) {
+      const type = types[i];
+      if (type === null || type === undefined) continue;
+      const param = params[Math.min(i, params.length - 1)]!;
+      const whole = i < params.length - 1 || !param.varargs;
+      const fit = whole ? javaArgumentFit(type, param.type, context)
+        : Math.max(javaArgumentFit(type, `${param.type}[]`, context), Math.min(1, javaArgumentFit(type, param.type, context)));
+      score = fit < 0 ? -1 : score + fit;
+    }
+    if (score < 0) continue;
+    // Java tries a call without variable arity first, if it can make that call:
+    // an argument that can't be read says nothing of that.
+    const rank = last?.varargs && types.every((type) => type) ? score - 0.5 : score;
+    if (rank > best) {
+      best = rank;
+      fitting = [n];
+    } else if (rank === best) fitting.push(n);
+  }
+  return fitting.length > 0 ? fitting : null;
+}
+
 /** Languages whose supertypes are written through their enclosing type with a dot: `Outer.Inner`. */
 const DOTTED_SUPERTYPE_LANGUAGES: ReadonlySet<string> = new Set(['java', 'kotlin', 'csharp']);
 const DOTTED_SUPERTYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'struct', 'trait', 'enum']);
@@ -21929,6 +22273,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   GO_UNREAD_METHODS.delete(context);
   JAVA_FILE_SCOPES.delete(context);
   JAVA_ANCESTORS.delete(context);
+  JAVA_PARAMETERS.delete(context);
   SCALA_SUPERS.delete(context);
   SCALA_IMPORTS.delete(context);
   ESM_EXPORT_LISTS.delete(context);
@@ -24279,6 +24624,12 @@ export function matchMethodCall(
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveOnJavaType(declared, methodName!, ref, context));
       if (typedMatch) return typedMatch;
       if (isUndeclaredTypeName(declared.name.split('::').pop()!, ref, context)) return null;
+    } else {
+      const lambda = javaLambdaParameterType(objectOrClass!, ref, context);
+      const written = lambda && javaTypeName(lambda);
+      const type = written ? javaTypeRef(written, ref.filePath, context) : null;
+      const typedMatch = type ? resolveOnJavaType(type, methodName!, ref, context) : null;
+      if (typedMatch) return typedMatch;
     }
   }
 
@@ -31658,6 +32009,19 @@ export function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, co
   if (!set || set.own === null) return result;
   const args = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), set.name, context);
   if (args === null) return result;
+  // Java picks by the arguments' types as well as their count.
+  if (ref.language === 'java') {
+    const overloads = [result.targetNodeId, ...set.siblings.map((sib) => sib.id)].flatMap((id) => context.getNodeById?.(id) ?? []);
+    const fitting = javaOverloadsFitting(overloads, args, ref, context);
+    if (fitting?.some((n) => n.id === result.targetNodeId)) return result;
+    if (fitting) {
+      // A private overload of another file can't be the call, but when the arguments
+      // don't say which of the rest is, it stays that, unresolved, and not a guess.
+      const target = context.getNodeById?.(result.targetNodeId);
+      return fitting.length > 1 && target?.visibility === 'private' && target.filePath !== ref.filePath
+        ? result : { ...result, targetNodeId: fitting[0]!.id };
+    }
+  }
   // Swift overloads by argument label as much as by count: Alamofire's
   // `self.tableView(tableView, numberOfRowsInSection: section)` inside
   // `tableView(_:titleForHeaderInSection:)` is the other `tableView`.
