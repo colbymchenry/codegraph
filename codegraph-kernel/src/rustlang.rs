@@ -10,12 +10,11 @@
 //!   fn/method carries isAsync **false** (present-false, never absent).
 //! - impl blocks push NO scope: members re-dispatch at file scope, so an impl
 //!   associated `const` becomes a FILE-level `variable`, and the method↔owner
-//!   `contains` edge is a source-order name scan (an impl ABOVE its struct
-//!   gets no edge). The receiver (method QN prefix, `contains` owner,
-//!   `implements` source) is the impl_item's `type` field via
-//!   impl_type_name — both sides moved to the grammar's trait:/type: fields
-//!   together in #1588 (the earlier positional scan qualified every
-//!   parameterized impl's methods by the TRAIT).
+//!   `contains` edge comes from the lexical lookup `implements` uses (an impl
+//!   ABOVE its struct gets no edge). The method QN prefix is the impl_item's
+//!   `type` field via impl_type_name; the lookup reads that same field. The
+//!   `trait:` and `type:` fields are read as fields, so a parameterized impl's
+//!   methods are qualified by the implementing type, never the trait.
 //! - `const_item`/`static_item` ride the generic extractVariable fallback:
 //!   kind is always `variable`, no signature, and EVERY direct `identifier`
 //!   child mints a node (`const MAX: u32 = OTHER;` → two nodes, `MAX` + the
@@ -57,6 +56,9 @@ use std::sync::OnceLock;
 use tree_sitter::{Node, Parser};
 
 const MAX_VALUE_REF_NODES: usize = 20_000;
+
+/// Most `use` bindings find_type_in_scope follows for one impl type.
+const MAX_USE_REWRITES: usize = 8;
 
 /// JS `/<[^>]*>/g` — the non-nested generic strip (breaks on nested generics
 /// by design: `Result<Vec<Foo>, E>` → `Result, E>` → returnType undefined).
@@ -107,12 +109,11 @@ struct Cand {
     row: usize,
 }
 
-/// Per-node metadata for the receiver-method owner lookup and
-/// findNodeByName (mirrors the TS scans over `this.nodes` — FIRST match
-/// wins, earlier-in-file only).
+/// Declaration identity for earlier-extracted impl targets. AST scopes preserve
+/// inline-module identity even though those modules mint no graph scope node.
+/// Shared by method ownership and trait edges, mirroring TS's rustTypeIds.
 struct NodeMeta {
-    kind: &'static str,
-    name: String,
+    type_syntax_id: Option<usize>,
 }
 
 pub struct Walker<'t> {
@@ -190,7 +191,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         return_type: NONE_STR,
         extra_json: NONE_STR,
     });
-    w.nodes_meta.push(NodeMeta { kind: "file", name: base_name.to_string() });
+    w.nodes_meta.push(NodeMeta { type_syntax_id: None });
     w.node_ids.push(ids::file_node_id(file_path));
     w.stack.push(Scope { row: 0, kind: "file", name: base_name.to_string() });
 
@@ -313,10 +314,12 @@ impl<'t> Walker<'t> {
             return_type: ret_ref,
             extra_json: NONE_STR,
         });
-        self.nodes_meta.push(NodeMeta { kind, name: name.to_string() });
+        let parent_row = self.top_row();
+        self.nodes_meta.push(NodeMeta {
+            type_syntax_id: matches!(kind, "struct" | "union" | "enum" | "class").then_some(node.id()),
+        });
         self.node_ids.push(id);
 
-        let parent_row = self.top_row();
         self.tables.push_edge(&EdgeRow {
             source_idx: parent_row,
             target_idx: row,
@@ -588,18 +591,15 @@ impl<'t> Walker<'t> {
         let kind: &'static str = if as_method { "method" } else { "function" };
         let Some(row) = self.create_node(kind, &name, node, extra) else { return };
 
-        // Contains edge from the owner: receiver present AND not class-like —
-        // FIRST earlier-in-file struct/class/enum/trait of the receiver's name.
+        // Receiver methods use the same scoped impl target as `implements`,
+        // so another function's or module's namesake cannot take the method.
         if as_method && !self.inside_class_like() {
-            if let Some(receiver) = &receiver {
-                let owner_row = self
-                    .nodes_meta
-                    .iter()
-                    .position(|m| {
-                        m.name == *receiver
-                            && matches!(m.kind, "struct" | "union" | "class" | "enum" | "trait")
-                    })
-                    .map(|i| i as u32);
+            if receiver.is_some() {
+                let mut imp = node.parent();
+                while let Some(n) = imp.filter(|n| n.kind() != "impl_item") {
+                    imp = n.parent();
+                }
+                let owner_row = imp.and_then(|imp| self.find_type_in_scope(imp));
                 if let Some(owner_row) = owner_row {
                     self.tables.push_edge(&EdgeRow {
                         source_idx: owner_row,
@@ -1167,29 +1167,187 @@ impl<'t> Walker<'t> {
         }
     }
 
-    /// extractRustImplItem — `impl Trait for Type` back-reference from the
-    /// grammar's `trait` / `type` fields (#1588; an inherent impl has no
-    /// `trait` field and emits nothing). Target = FIRST earlier node of kind
-    /// struct/union/enum/class (never trait) named by impl_type_name; ref FROM
-    /// the type's node, named by the trait's full text (scoped path / generic
-    /// args kept), at the trait node's position.
+    /// extractRustImplItem — trait back-reference from the scoped implementing
+    /// type, shared with method ownership. An inherent impl emits no trait ref.
+    /// The trait's full text and source position are preserved.
     fn extract_rust_impl_item(&mut self, node: Node<'t>) {
         let Some(trait_node) = node.child_by_field_name("trait") else {
             return;
         };
         let trait_name = self.text(trait_node).to_string();
-        let Some(type_name) = self.impl_type_name(node.child_by_field_name("type")) else {
-            return;
-        };
-
-        let target_row = self
-            .nodes_meta
-            .iter()
-            .position(|m| m.name == type_name && matches!(m.kind, "struct" | "union" | "enum" | "class"))
-            .map(|i| i as u32);
+        let target_row = self.find_type_in_scope(node);
         if let Some(target_row) = target_row {
             self.push_ref_at(target_row, &trait_name, edge_kind_index("implements").unwrap(), trait_node);
         }
+    }
+
+    /// Structural impl type path, discarding only reference/generic wrappers.
+    fn impl_type_path(&self, node: Option<Node<'t>>) -> Vec<String> {
+        let Some(node) = node else { return Vec::new() };
+        match node.kind() {
+            "generic_type" | "reference_type" => self.impl_type_path(node.child_by_field_name("type")),
+            "scoped_type_identifier" | "scoped_identifier" => {
+                // A scoped node with no `path` that starts with `::` is an absolute path.
+                let mut path = Vec::new();
+                if node.child_by_field_name("path").is_none() && self.text(node).starts_with("::") {
+                    path.push("::".to_string());
+                }
+                path.extend(self.impl_type_path(node.child_by_field_name("path")));
+                path.extend(self.impl_type_path(node.child_by_field_name("name")));
+                path
+            }
+            "type_identifier" | "identifier" | "crate" | "self" | "super" => vec![self.text(node).to_string()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Mirror TS's findTypeInScope: lexical AST scopes and inline-module
+    /// bodies, using declaration identity rather than graph parent/name pairs.
+    /// Only already-extracted types can own an impl; no cross-file lookup.
+    ///
+    /// Each segment is looked up in a scope: a declaration of it (a `mod` for a
+    /// head, a struct/union/enum for the last segment), else a same-file `use`
+    /// that binds it (`use a::X;`, `use a::X as Y;`, `use a::{X, c::W};`;
+    /// wildcards bind nothing). A declaration wins over a `use` in the same
+    /// scope. A bare head searches the impl's scope and the scopes around it;
+    /// `crate`, `self`, `super` and every segment after a module name search
+    /// that one module body. A `use` replaces the segment by its path, read
+    /// again from the `use`'s own scope (so a `pub use` in a module body is
+    /// followed), at most MAX_USE_REWRITES times per reading, so a cycle of
+    /// aliases names nothing. A leading `::` names an external crate (2018
+    /// paths): it finds nothing here, and a 2015 `::` path, which names the crate
+    /// root, is not followed. Each `crate::` path, including one reached through
+    /// a `use`, tries two readings from the file root: first strip a matching
+    /// non-empty file module path (file_module_path) and resolve the rest; if
+    /// that finds no type, resolve the path as written. Both readings follow
+    /// `use` rewrites. Stripped-first resolves module files; the as-written
+    /// fallback supports Cargo `[lib] path` crate roots, whose Cargo.toml the
+    /// extractor cannot read, so the file module path is only a guess. So in a
+    /// module file, a `crate::` path that does not start with the module path
+    /// can match one of that file's own items.
+    fn find_type_in_scope(&self, imp: Node<'t>) -> Option<u32> {
+        fn resolve<'a>(walker: &Walker<'a>, mut parts: Vec<String>, mut scope: Option<Node<'a>>, mut rewrites: usize) -> Option<u32> {
+            let mut exact = false; // search `scope` alone, not the scopes around it
+            loop {
+                if parts.is_empty() || parts[0] == "::" { return None; }
+                if !exact && matches!(parts[0].as_str(), "crate" | "self" | "super") {
+                    exact = true;
+                    if parts[0] == "crate" {
+                        while let Some(parent) = scope.and_then(|s| s.parent()) { scope = Some(parent); }
+                        parts.remove(0);
+                        let module_path = walker.file_module_path();
+                        if !module_path.is_empty() && module_path.iter().enumerate().all(|(i, segment)| parts.get(i) == Some(segment)) {
+                            // Resolve the stripped reading completely before trying the path as written.
+                            if let Some(found) = resolve(walker, parts[module_path.len()..].to_vec(), scope, rewrites) {
+                                return Some(found);
+                            }
+                        }
+                    } else {
+                        while let Some(parent) = scope.and_then(|s| s.parent()).filter(|p| p.kind() != "mod_item") {
+                            scope = Some(parent);
+                        }
+                        if parts[0] == "self" { parts.remove(0); }
+                        while parts.first().is_some_and(|p| p == "super") {
+                            scope = scope.and_then(|s| s.parent()).and_then(|s| s.parent());
+                            while let Some(parent) = scope.and_then(|s| s.parent()).filter(|p| p.kind() != "mod_item") {
+                                scope = Some(parent);
+                            }
+                            parts.remove(0);
+                        }
+                    }
+                    if parts.is_empty() { return None; }
+                }
+                let mut next = false;
+                while let Some(s) = scope {
+                    let head = (0..s.named_child_count()).filter_map(|i| s.named_child(i)).find(|child| {
+                        let kind_matches = if parts.len() > 1 { child.kind() == "mod_item" }
+                            else { matches!(child.kind(), "struct_item" | "union_item" | "enum_item") };
+                        kind_matches && child.child_by_field_name("name")
+                            .is_some_and(|name| walker.text(name) == parts[0])
+                    });
+                    if let Some(head) = head {
+                        if parts.len() == 1 {
+                            return walker.nodes_meta.iter().position(|m| m.type_syntax_id == Some(head.id())).map(|i| i as u32);
+                        }
+                        // Continue in the module's body, which only that module's items name.
+                        scope = Some(head.child_by_field_name("body")?);
+                        parts.remove(0);
+                        exact = true;
+                        next = true;
+                        break;
+                    }
+                    // A declaration in the scope wins over a `use` there; otherwise a
+                    // `use` that binds the first segment replaces it, read from this scope.
+                    let bound = (0..s.named_child_count())
+                        .filter_map(|i| s.named_child(i))
+                        .filter(|child| child.kind() == "use_declaration")
+                        .find_map(|decl| {
+                            let argument = decl.child_by_field_name("argument")?;
+                            walker.use_binding(argument, &[], &parts[0])
+                        });
+                    if let Some(mut path) = bound {
+                        if rewrites >= MAX_USE_REWRITES { return None; }
+                        rewrites += 1;
+                        path.extend_from_slice(&parts[1..]);
+                        parts = path;
+                        exact = false;
+                        next = true;
+                        break;
+                    }
+                    if exact || s.kind() == "source_file" { return None; }
+                    scope = s.parent();
+                }
+                if !next { return None; }
+            }
+        }
+        resolve(self, self.impl_type_path(imp.child_by_field_name("type")), imp.parent(), 0)
+    }
+
+    /// The full path a `use` tree binds `name` to, or None. `prefix` is the path
+    /// of the enclosing `{ ... }` group; a `self` leaf stands for the prefix.
+    fn use_binding(&self, node: Node<'t>, prefix: &[String], name: &str) -> Option<Vec<String>> {
+        let extend = |tail: Vec<String>| -> Vec<String> {
+            let skip = usize::from(!prefix.is_empty() && tail.first().is_some_and(|t| t == "self"));
+            prefix.iter().cloned().chain(tail.into_iter().skip(skip)).collect()
+        };
+        match node.kind() {
+            "identifier" | "scoped_identifier" | "self" => {
+                let full = extend(self.impl_type_path(Some(node)));
+                (full.last().map(String::as_str) == Some(name)).then_some(full)
+            }
+            "use_as_clause" => {
+                let alias = node.child_by_field_name("alias")?;
+                (self.text(alias) == name).then(|| extend(self.impl_type_path(node.child_by_field_name("path"))))
+            }
+            "scoped_use_list" => {
+                let list = node.child_by_field_name("list")?;
+                self.use_binding(list, &extend(self.impl_type_path(node.child_by_field_name("path"))), name)
+            }
+            "use_list" => (0..node.named_child_count())
+                .filter_map(|i| node.named_child(i))
+                .find_map(|child| self.use_binding(child, prefix, name)),
+            _ => None,
+        }
+    }
+
+    /// The module path of this Rust file, read from its location: the components
+    /// after the last `src` directory with `.rs` dropped and a final `mod` dropped
+    /// (`src/a/b.rs` and `src/a/b/mod.rs` are `["a", "b"]`). `src/lib.rs`,
+    /// `src/main.rs`, anything under `src/bin/` and a file with no `src`
+    /// directory are crate roots: an empty path. Mirrors TS's rustFileModulePath.
+    fn file_module_path(&self) -> Vec<String> {
+        let components: Vec<&str> = self.file_path.split(['/', '\\']).collect();
+        let Some(src) = components.iter().rposition(|c| *c == "src") else { return Vec::new() };
+        let rest = &components[src + 1..];
+        let mut module_path: Vec<String> = rest
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (if i + 1 == rest.len() { c.strip_suffix(".rs").unwrap_or(c) } else { c }).to_string())
+            .collect();
+        if module_path.len() == 1 && matches!(module_path[0].as_str(), "lib" | "main") { return Vec::new(); }
+        if module_path.len() > 1 && module_path[0] == "bin" { return Vec::new(); }
+        if module_path.last().is_some_and(|c| c == "mod") { module_path.pop(); }
+        module_path
     }
 
     /// extractTypeAnnotations — parameters + return_type subtrees, one
@@ -1244,6 +1402,11 @@ impl<'t> Walker<'t> {
         // Rocket route macros: handler paths live in a raw token tree.
         if kind == "macro_invocation" {
             self.extract_rust_route_macro(node);
+        }
+        // `impl Trait for Type` in a body: the implements back-reference, as at
+        // module scope; the walk below still descends for the impl's methods.
+        if kind == "impl_item" {
+            self.extract_rust_impl_item(node);
         }
 
         if kind == "call_expression" {

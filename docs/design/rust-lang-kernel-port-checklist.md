@@ -186,13 +186,12 @@ undefined; **no isConst means `const_item`/`static_item` extract as kind
   again (1742). Gate at 1747: not class-like AND no methodsAreTopLevel AND no
   receiver → back to extractFunction (trait members pass via class-like; impl
   fns via receiver). extraProps.qualifiedName = `Type::name` when receiver
-  (1790). **Contains edge from the owner (1798-1813): only when receiver
-  present AND not class-like — finds the FIRST node in `this.nodes` with
-  `name === receiverType && filePath === this.filePath && kind ∈
-  {struct,class,enum,trait}`. Source-order dependent: an impl ABOVE its struct
-  gets no contains edge. Since #1588 `impl Trait for Generic<T>` links to the
-  implementing TYPE's node (it used to link to the TRAIT node, the receiver
-  bug).** Then type annotations, decorators
+  (1790). **Contains edge from the owner: only when receiver present AND not
+  class-like — resolves the nearest enclosing impl's `type` through the same
+  AST-scoped lookup as its `implements` reference. Inline-module paths retain
+  module identity, and a type local to another function cannot own the method.
+  Only already-extracted types are eligible, so an impl above its struct gets
+  no contains edge.** Then type annotations, decorators
   (no-op), body walk with the method pushed.
 - **Nested `fn` inside an impl-method's body**: visitFunctionBody:5245 →
   named → extractFunction → getReceiverType walks parents THROUGH the outer fn
@@ -322,25 +321,63 @@ nothing: the Go struct-embedding branch (5496) runs for Go only (it was inert
 here anyway — rust `field_declaration` always carries a `field_identifier`
 name), so rustlang.rs has no `field_declaration` arm.
 
-### impl Trait for Type — extractRustImplItem (5690)
+### impl Trait for Type — extractRustImplItem / extract_rust_impl_item
 
-- hasFor = any child (ALL children) with `type === 'for' && !isNamed` — plain
-  `impl Type { }` → return (no edge; getReceiverType handles member attachment).
-- typeIdents = DIRECT namedChildren of type `type_identifier` | `generic_type`
-  | `scoped_type_identifier`; need ≥2 else return (v0.24.2 has `trait:` and
-  `type:` FIELDS, but the code deliberately uses positional filtering —
-  PRESERVE the positional logic).
-- traitNode = FIRST, typeNode = LAST. traitName: scoped_type_identifier →
-  `source.substring(startIndex,endIndex)` (full `fmt::Display`); else
-  getNodeText. typeName: generic_type → inner type_identifier text (`Container`)
-  else text.
-- targetId = `findNodeByName(typeName)` (5740): FIRST node in `this.nodes`
-  with that name and kind ∈ {struct, enum, class} — **NOT trait**, and
-  source-order dependent (the type must be defined EARLIER in the same file;
-  cross-file impls emit nothing). If found: push
-  {fromNodeId: **the TYPE's node id** (a back-reference), referenceName:
-  traitName (full path text), referenceKind:'implements', line/col of the
-  trait node}.
+- Called for every `impl_item`, both at module scope and inside function
+  bodies (TS: the main visit and the function-body walk; kernel: the same two
+  sites).
+- Reads the grammar's `trait` and `type` FIELDS (#1588). No `trait` field →
+  inherent `impl Type { }` → return, nothing emitted (getReceiverType handles
+  member attachment).
+- traitName = full text of the `trait` node (getNodeText / `self.text`), so a
+  scoped path (`std::fmt::Display`) and generic args (`From<u32>`) keep their
+  spelling.
+- Target lookup (TS: `findTypeInScope`; kernel: `find_type_in_scope`):
+  unwrap `generic_type` / `reference_type` via `type`, retaining the `path`
+  and `name` segments of scoped identifiers. Unsupported shapes (tuple,
+  `dyn`, pointer, primitive…) remain unresolved.
+  - Bare name: search direct declarations in the impl's enclosing AST scope,
+    then scopes outward to the file; sibling functions and blocks are not
+    searched. A matching declaration must already have been extracted.
+  - Path: the head is a `mod` found lexically like a bare name; each later
+    segment is searched in the body of the module before it alone (a `mod` for an
+    intermediate segment, struct/union/enum for the last), never outward.
+    `self` and `super` start at the current or parent module. Function-local
+    inline modules are eligible.
+  - A same-file `use` binds a name (`use a::X;`, `use a::X as Y;`, grouped and
+    nested `use a::{X, Y as Z, c::W};`; wildcards bind nothing). In any scope
+    searched (the impl's scopes and every module body descended into), a
+    declaration of the segment wins; failing that, a `use` binding it replaces
+    the segment: the path becomes the `use`'s path plus the remaining segments
+    and is resolved again from the `use`'s own scope. So a `pub use` inside a
+    module is followed while descending. At most 8 such rewrites, so a cycle of
+    aliases names nothing.
+  - A leading `::` (written directly or in a `use`) names an external crate
+    (2018 paths): no target, never a module of this file. A 2015 `::` path,
+    which names the crate root, is not followed.
+  - `crate` starts at the file root. The file's module path is guessed from its
+    location: the components after the last `src` directory, `.rs` dropped, a
+    final `mod` dropped (TS: `rustFileModulePath`; kernel: `file_module_path`);
+    `src/lib.rs`, `src/main.rs`, anything under `src/bin/` and a file with no
+    `src` directory have an empty path. For each `crate::` path, including one
+    reached through a `use`, first strip a matching non-empty module path and
+    resolve the rest; if that finds no type, resolve the path as written. Both
+    readings start at the file root and follow `use` rewrites, bounded at 8 per
+    reading. Stripped-first resolves module files; the as-written fallback
+    supports Cargo `[lib] path` crate roots, whose Cargo.toml the extractor
+    cannot read. So in a module file, a `crate::` path that does not start with
+    the module path can match one of that file's own items. A path to a module
+    the file does not contain finds nothing.
+  - Resolve the final declaration by AST identity (TS: `rustTypeIds`; kernel:
+    `NodeMeta.type_syntax_id`), not graph parent/name pairs: inline modules
+    mint no graph nodes and may contain identically named types. Only
+    struct/union/enum/class nodes already extracted from this file are
+    eligible, never traits; cross-file targets emit nothing.
+  - Method containment uses this same lookup, keeping trait dispatch attached
+    to the exact type that owns the `implements` reference.
+- If found: push {fromNodeId: **the TYPE's node id** (a back-reference),
+  referenceName: traitName, referenceKind: 'implements', line/col of the
+  trait node}. Not found → nothing.
 
 ### Type-annotation references (5752-6112)
 
