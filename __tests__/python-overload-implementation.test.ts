@@ -129,6 +129,30 @@ describe('a call to a Python name declared with typing.overload', () => {
     expect(calleeLines('caller', 'pick')).toEqual([9]);
   });
 
+  it('reads a decorator with a blank line between it and the def', async () => {
+    await index({
+      'spaced.py': [
+        'from typing import overload',
+        '',
+        '@overload',
+        '',
+        'def pick(a: int) -> int: ...',              // 5
+        '',
+        'def pick(a):',                              // 7
+        '    return a',
+        '',
+      ].join('\n'),
+      'use.py': [
+        'from spaced import pick',
+        '',
+        'def caller():',
+        '    return pick(1)',
+        '',
+      ].join('\n'),
+    });
+    expect(calleeLines('caller', 'pick')).toEqual([7]);
+  });
+
   it('takes the implementation below the stub it reached, when a file has two sets', async () => {
     await index({
       'twice.py': [

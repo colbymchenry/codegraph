@@ -36,7 +36,7 @@ function isOverloadStub(n: Node, context: ResolutionContext): boolean {
   let open = 0;
   for (let i = n.startLine - 2; i >= 0 && i >= n.startLine - 1 - DECORATOR_LOOKBACK; i--) {
     const text = lines[i]?.trim() ?? '';
-    if (text.startsWith('#')) continue;
+    if (text === '' || text.startsWith('#')) continue;
     // Each `)` opens a span upward that ends at its `(`: inside it, a decorator's arguments.
     open += (text.match(/\)/g)?.length ?? 0) - (text.match(/\(/g)?.length ?? 0);
     if (open > 0) continue;
