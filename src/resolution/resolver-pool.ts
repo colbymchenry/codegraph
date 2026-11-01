@@ -14,6 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import type { Edge, UnresolvedReference } from '../types';
+import type { ProjectScans } from './project-scans';
 import type { ResolvedRef, UnresolvedRef } from './types';
 import { memoryBudgetBytes } from './memory-budget';
 import { terminateOnceStarted, workerStarted } from '../worker-teardown';
@@ -253,6 +254,11 @@ export class ResolverPool {
     // owns rejection, and the recycle caller checks this.failed next round.
     for (const [, done] of this.recycleWaiters) done();
     this.recycleWaiters.clear();
+  }
+
+  /** Give every worker what the main thread read from the whole project, ahead of any reference it is sent. */
+  shareScans(scans: ProjectScans): void {
+    for (const pw of this.workers) pw.worker.postMessage({ type: 'scans', scans });
   }
 
   /** Number of workers — how many passes the synthesis fan-out keeps in flight. */

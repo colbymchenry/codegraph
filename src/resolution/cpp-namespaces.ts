@@ -7,7 +7,15 @@
 import type { ResolutionContext } from './types';
 import { stripCommentsForRegex } from './strip-comments';
 
-const CPP_NS_MACROS = new WeakMap<ResolutionContext, { openers: Map<string, string[]>; openerFns: Set<string>; closers: Map<string, number>; aliases: Map<string, string> }>();
+/** The project's namespace-opening macros (cppNamespaceMacros). */
+interface CppNamespaceMacros {
+  openers: Map<string, string[]>;
+  openerFns: Set<string>;
+  closers: Map<string, number>;
+  aliases: Map<string, string>;
+}
+
+const CPP_NS_MACROS = new WeakMap<ResolutionContext, CppNamespaceMacros>();
 const CPP_NS_FRAMES = new WeakMap<ResolutionContext, Map<string, Array<{ start: number; end: number; path: string[] }>>>();
 /** A closing macro's body: `}` / `} }`, maybe beside a pragma macro (`PYBIND11_WARNING_POP }`). */
 const CPP_CLOSER_BODY = /^(?:[A-Za-z_]\w*\s+)*\}(?:\s*\})*\s*;?$/;
@@ -37,7 +45,7 @@ export function cppNamespaceAliases(context: ResolutionContext): Map<string, str
  * rapidjson`) — as the namespace path each opens (inline namespaces are
  * transparent), and the closing macros as how many scopes each closes.
  */
-function cppNamespaceMacros(context: ResolutionContext): { openers: Map<string, string[]>; openerFns: Set<string>; closers: Map<string, number>; aliases: Map<string, string> } {
+function cppNamespaceMacros(context: ResolutionContext): CppNamespaceMacros {
   const hit = CPP_NS_MACROS.get(context);
   if (hit) return hit;
   const openers = new Map<string, string[]>();
@@ -117,6 +125,31 @@ export function cppMacroNamespaceFrames(file: string, context: ResolutionContext
   }
   memo.set(file, frames);
   return frames;
+}
+
+/** The files the scans above read: every C and C++ source and header. */
+const CPP_SCANNED_FILE = /\.(?:h|hh|hpp|hxx|h\+\+|inl|ipp|tcc|c|cc|cpp|cxx)$/i;
+
+/** How many files a thread reading the scans above has to read. */
+export function cppScannedFileCount(context: ResolutionContext): number {
+  let count = 0;
+  for (const file of context.getAllFiles()) if (CPP_SCANNED_FILE.test(file)) count++;
+  return count;
+}
+
+/** What the scans of every source file above found, for a thread that hasn't read them (ProjectScans). */
+export interface CppNamespaceScans {
+  aliases: Map<string, string>;
+  macros: CppNamespaceMacros;
+}
+
+export function cppNamespaceScans(context: ResolutionContext): CppNamespaceScans {
+  return { aliases: cppNamespaceAliases(context), macros: cppNamespaceMacros(context) };
+}
+
+export function adoptCppNamespaceScans(context: ResolutionContext, scans: CppNamespaceScans): void {
+  CPP_NS_ALIASES.set(context, scans.aliases);
+  CPP_NS_MACROS.set(context, scans.macros);
 }
 
 /** Drop the per-context namespace memos (see ReferenceResolver.clearCaches). */

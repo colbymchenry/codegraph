@@ -112,6 +112,30 @@ function includesByStem(context: ResolutionContext, memo: Memo): Map<string, Inc
 }
 
 /**
+ * Past this many, a project's `#include`s are left to the threads that ask
+ * about them: reading them all up front would hold the main thread for seconds,
+ * and a Linux-sized project's threads ask about few.
+ */
+const INCLUDES_READ_UP_FRONT = 100_000;
+
+/** Every `#include` of the project, by its import node, as the indexed file it names (ProjectScans). */
+export function cppIncludeTargets(context: ResolutionContext): Map<string, string | null> {
+  const memo = memoFor(context);
+  const byName = includesByName(context, memo);
+  let count = 0;
+  for (const includes of byName.values()) count += includes.length;
+  if (count > INCLUDES_READ_UP_FRONT) return memo.targets;
+  for (const includes of byName.values()) {
+    for (const include of includes) includedFile(include, context, memo);
+  }
+  return memo.targets;
+}
+
+export function adoptCppIncludeTargets(context: ResolutionContext, targets: Map<string, string | null>): void {
+  memoFor(context).targets = targets;
+}
+
+/**
  * The headers in `filePath`'s folder named like it (`field_def.c` →
  * `field_def.h`) that it includes, directly or through other headers. upb's
  * reflection/field_def.c includes only reflection/internal/field_def.h, which

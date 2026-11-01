@@ -24,6 +24,7 @@ import { ReferenceResolver } from './index';
 import { SYNTH_PASSES } from './callback-synthesizer';
 import { createYielder } from './cooperative-yield';
 import { collectBeforeExit } from '../worker-teardown';
+import type { ProjectScans } from './project-scans';
 import type { UnresolvedReference } from '../types';
 
 if (!parentPort) {
@@ -37,6 +38,7 @@ let resolver: ReferenceResolver | null = null;
 
 type InMessage =
   | { type: 'open'; dbPath: string; projectRoot: string; frameworks?: string[] }
+  | { type: 'scans'; scans: ProjectScans }
   | { type: 'recycle'; id: number }
   | { type: 'resolve'; id: number; refs: UnresolvedReference[] }
   | { type: 'synth'; id: number; pass: string }
@@ -60,6 +62,10 @@ port.on('message', (msg: InMessage) => {
         resolver.initialize(msg.frameworks);
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker open: db=${tDb - tOpen}ms init=${Date.now() - tDb}ms`);
         port.postMessage({ type: 'ready' });
+        break;
+      }
+      case 'scans': {
+        resolver?.adoptProjectScans(msg.scans);
         break;
       }
       case 'recycle': {

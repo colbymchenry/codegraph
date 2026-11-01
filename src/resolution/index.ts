@@ -35,6 +35,7 @@ import {
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
+import { adoptProjectScans, readProjectScans, type ProjectScans } from './project-scans';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCMacroRenames } from './c-macro-renames';
 import { isObjcDeclaredTypeRef, matchByExactName } from './name-matcher';
@@ -632,6 +633,16 @@ export class ReferenceResolver {
     this.knownNames = names;
 
     this.cachesWarmed = true;
+  }
+
+  /** What this resolver has read from the whole project, or reads now, for the workers (see ./project-scans). */
+  private projectScans(): ProjectScans {
+    return readProjectScans(this.context, this.queries, this.fileExistsMemo);
+  }
+
+  /** Take another thread's reads of the whole project instead of making them here. */
+  adoptProjectScans(scans: ProjectScans): void {
+    adoptProjectScans(this.context, scans, this.fileExistsMemo);
   }
 
   /** `queries.getNodeById` through the resolver's own id → node cache. */
@@ -2605,7 +2616,10 @@ export class ReferenceResolver {
     // a 22GB WAL on a 4.6GB DB (migration plan §7a.1).
     parallel?: {
       dbPath: string;
-      /** The workers may take this resolver's frameworks, detected on this same index. */
+      /**
+       * A full index: the workers may take this resolver's frameworks, detected
+       * on this same index, and its reads of files the parse has just read.
+       */
       shareFrameworks?: boolean;
       bulkEdgeLoad?: {
         begin: () => void;
@@ -2671,6 +2685,11 @@ export class ReferenceResolver {
       poolEngageTried = true;
       if (!parallel) return null;
       const p = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot, parallel.shareFrameworks ? this.getDetectedFrameworks() : undefined);
+      if (p && parallel.shareFrameworks) {
+        const scans = this.projectScans();
+        if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] project scans: ${scans.cpp ? 'shared' : 'none'}`);
+        if (scans.cpp) p.shareScans(scans);
+      }
       p?.ready().then(
         () => {
           poolReady = true;
