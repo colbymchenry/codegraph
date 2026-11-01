@@ -26,7 +26,37 @@ export function clearCppRawStringMemos(context: ResolutionContext): void {
   RAW_STRING_LINES.delete(context);
 }
 
-const isWordChar = (c: string | undefined): boolean => c !== undefined && /[A-Za-z0-9_$]/.test(c);
+/** Is this UTF-16 code unit a letter, digit, `_` or `$`? (NaN, past either end of a string, is not.) */
+const isWordCode = (c: number): boolean =>
+  (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c === 95 || c === 36;
+
+const SLASH = 47;
+const STAR = 42;
+const QUOTE = 34;
+const APOSTROPHE = 39;
+const BACKSLASH = 92;
+const NEWLINE = 10;
+const CARRIAGE_RETURN = 13;
+const CAPITAL_R = 82;
+
+/** The `\r`s of `text` in [from, to), which a column doesn't count. */
+function carriageReturnsIn(text: string, from: number, to: number): number {
+  let count = 0;
+  for (let k = from; k < to; k++) if (text.charCodeAt(k) === CARRIAGE_RETURN) count++;
+  return count;
+}
+
+/** Where a string or character literal opened at `open` ends: past its closing quote, or at the end of the line. */
+function literalEnd(text: string, open: number, quote: number): number {
+  const n = text.length;
+  let k = open + 1;
+  for (; k < n; k++) {
+    const c = text.charCodeAt(k);
+    if (c === quote || c === NEWLINE) break;
+    if (c === BACKSLASH) k++;
+  }
+  return Math.min(n, text.charCodeAt(k) === quote ? k + 1 : k);
+}
 
 /**
  * The 1-based lines of a C or C++ file that raw string literals or block
@@ -40,68 +70,63 @@ export function cppNonCodeLines(file: string, context: ResolutionContext): Map<n
   const lines = new Map<number, Ranges>();
   const text = context.readFile(file);
   if (text && (text.includes('R"') || text.includes('/*'))) {
-    let line = 1;
-    let column = 0;
     const n = text.length;
-    let i = 0;
+    const hasCarriageReturns = text.includes('\r');
+    // The line holding offset `i`, reached only when something on it is marked.
+    let line = 1;
+    let lineStart = 0;
+    const seek = (to: number): void => {
+      for (let nl = text.indexOf('\n', lineStart); nl >= 0 && nl < to; nl = text.indexOf('\n', lineStart)) {
+        line++;
+        lineStart = nl + 1;
+      }
+    };
     // Mark [from, to) of the text, which may span lines, as raw string contents.
-    const mark = (from: number, fromLine: number, fromColumn: number, to: number): void => {
-      let l = fromLine;
-      let start = fromColumn;
-      let c = fromColumn;
-      for (let k = from; k < to; k++) {
-        if (text[k] === '\n') {
-          if (c > start) (lines.get(l) ?? lines.set(l, []).get(l)!).push([start, c]);
-          l++;
-          start = 0;
-          c = 0;
-        } else if (text[k] !== '\r') c++;
-      }
-      if (c > start) (lines.get(l) ?? lines.set(l, []).get(l)!).push([start, c]);
-    };
-    // Advance over [i, to), keeping line and column.
-    const advance = (to: number): void => {
-      for (; i < to; i++) {
-        if (text[i] === '\n') {
-          line++;
-          column = 0;
-        } else if (text[i] !== '\r') column++;
+    const mark = (from: number, to: number): void => {
+      seek(from);
+      let l = line;
+      let start = from - lineStart - (hasCarriageReturns ? carriageReturnsIn(text, lineStart, from) : 0);
+      for (let k = from; ;) {
+        const nl = text.indexOf('\n', k);
+        const end = nl < 0 || nl >= to ? to : nl;
+        const width = end - k - (hasCarriageReturns ? carriageReturnsIn(text, k, end) : 0);
+        if (width > 0) (lines.get(l) ?? lines.set(l, []).get(l)!).push([start, start + width]);
+        if (end === to) break;
+        k = end + 1;
+        l++;
+        start = 0;
       }
     };
+    let i = 0;
     while (i < n) {
-      const c = text[i]!;
-      const next = text[i + 1];
-      if (c === '/' && next === '/') {
-        const end = text.indexOf('\n', i);
-        advance(end < 0 ? n : end);
-      } else if (c === '/' && next === '*') {
-        const end = text.indexOf('*/', i + 2);
-        const to = end < 0 ? n : end + 2;
-        mark(i, line, column, to);
-        advance(to);
-      } else if (c === '"') {
+      const c = text.charCodeAt(i);
+      if (c === SLASH) {
+        const next = text.charCodeAt(i + 1);
+        if (next === SLASH) {
+          const end = text.indexOf('\n', i);
+          i = end < 0 ? n : end;
+        } else if (next === STAR) {
+          const end = text.indexOf('*/', i + 2);
+          const to = end < 0 ? n : end + 2;
+          mark(i, to);
+          i = to;
+        } else i++;
+      } else if (c === QUOTE) {
         // `R"`, `u8R"`, `uR"`, `UR"`, `LR"`, not part of a longer name.
-        const prefix = /(?:u8|[uUL])?R$/.exec(text.slice(Math.max(0, i - 3), i));
-        const open = prefix && !isWordChar(text[i - prefix[0].length - 1]) ? text.indexOf('(', i + 1) : -1;
+        const prefix = text.charCodeAt(i - 1) === CAPITAL_R ? /(?:u8|[uUL])?R$/.exec(text.slice(Math.max(0, i - 3), i)) : null;
+        const open = prefix && !isWordCode(text.charCodeAt(i - prefix[0].length - 1)) ? text.indexOf('(', i + 1) : -1;
         const delimiter = open > i ? text.slice(i + 1, open) : null;
         if (delimiter !== null && delimiter.length <= 16 && /^[^\s()\\]*$/.test(delimiter)) {
           // From the opening quote through the closing one: `"cc( … )cc"`.
           const close = text.indexOf(`)${delimiter}"`, open + 1);
           const end = close < 0 ? n : close + delimiter.length + 2;
-          mark(i, line, column, end);
-          advance(end);
-        } else {
-          // An ordinary string: to its closing quote, or the end of the line.
-          let k = i + 1;
-          while (k < n && text[k] !== '"' && text[k] !== '\n') k += text[k] === '\\' ? 2 : 1;
-          advance(Math.min(n, text[k] === '"' ? k + 1 : k));
-        }
-      } else if (c === '\'' && !isWordChar(text[i - 1])) {
+          mark(i, end);
+          i = end;
+        } else i = literalEnd(text, i, QUOTE); // An ordinary string, to its closing quote or the end of the line.
+      } else if (c === APOSTROPHE && !isWordCode(text.charCodeAt(i - 1))) {
         // A character literal (`'"'`); after a digit it is a digit separator (`1'000`).
-        let k = i + 1;
-        while (k < n && text[k] !== '\'' && text[k] !== '\n') k += text[k] === '\\' ? 2 : 1;
-        advance(Math.min(n, text[k] === '\'' ? k + 1 : k));
-      } else advance(i + 1);
+        i = literalEnd(text, i, APOSTROPHE);
+      } else i++;
     }
   }
   memo.set(file, lines);
@@ -114,27 +139,46 @@ export function cppNonCodeLines(file: string, context: ResolutionContext): Map<n
  */
 export function cppLiteralsBlanked(text: string, line: number, rawLines: Map<number, Ranges>): string {
   const raw = rawLines.get(line);
-  if (!raw && !text.includes('"') && !text.includes('\'')) return text;
-  const out = text.split('');
-  if (raw) for (const [start, end] of raw) for (let k = start; k < end && k < out.length; k++) out[k] = ' ';
-  if (!text.includes('"') && !text.includes('\'')) return out.join('');
-  const inRaw = (k: number): boolean => !!raw?.some(([start, end]) => k >= start && k < end);
-  for (let k = 0; k < text.length; k++) {
-    const c = text[k]!;
-    if (inRaw(k)) continue;
-    if (c === '/' && text[k + 1] === '/') break;
-    if (c === '/' && text[k + 1] === '*') {
-      // A comment's quotes are no string's (cppCodeOf blanks the comment).
-      const close = text.indexOf('*/', k + 2);
-      if (close < 0) break;
-      k = close + 1;
-      continue;
+  const hasQuotes = text.includes('"') || text.includes('\'');
+  if (!raw && !hasQuotes) return text;
+  const blanks: Ranges = raw ? raw.slice() : [];
+  if (hasQuotes) {
+    const inRaw = (k: number): boolean => !!raw?.some(([start, end]) => k >= start && k < end);
+    for (let k = 0; k < text.length; k++) {
+      const c = text.charCodeAt(k);
+      if (c !== SLASH && c !== QUOTE && c !== APOSTROPHE) continue;
+      if (inRaw(k)) continue;
+      if (c === SLASH) {
+        const next = text.charCodeAt(k + 1);
+        if (next === SLASH) break;
+        if (next !== STAR) continue;
+        // A comment's quotes are no string's (cppCodeOf blanks the comment).
+        const close = text.indexOf('*/', k + 2);
+        if (close < 0) break;
+        k = close + 1;
+        continue;
+      }
+      if (c === APOSTROPHE && isWordCode(text.charCodeAt(k - 1))) continue;
+      let end = k + 1;
+      while (end < text.length && text.charCodeAt(end) !== c) end += text.charCodeAt(end) === BACKSLASH ? 2 : 1;
+      blanks.push([k + 1, Math.min(end, text.length)]);
+      k = end;
     }
-    if (c !== '"' && !(c === '\'' && !isWordChar(text[k - 1]))) continue;
-    let end = k + 1;
-    while (end < text.length && text[end] !== c) end += text[end] === '\\' ? 2 : 1;
-    for (let b = k + 1; b < Math.min(end, text.length); b++) out[b] = ' ';
-    k = end;
   }
-  return out.join('');
+  return blankRanges(text, blanks);
+}
+
+/** `text` with spaces over each of `ranges`, which may overlap and may run past its end. */
+function blankRanges(text: string, ranges: Ranges): string {
+  ranges.sort((a, b) => a[0] - b[0]);
+  let out = '';
+  let at = 0;
+  for (const [start, end] of ranges) {
+    const from = Math.max(start, at);
+    const to = Math.min(end, text.length);
+    if (from >= to) continue;
+    out += text.slice(at, from) + ' '.repeat(to - from);
+    at = to;
+  }
+  return out + text.slice(at);
 }

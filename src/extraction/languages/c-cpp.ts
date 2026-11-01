@@ -731,7 +731,7 @@ const CPP_COMMENT_OR_LITERAL_RE =
  * still lines up with the source.
  */
 function maskCppCommentsAndLiterals(source: string): string {
-  return source.replace(CPP_COMMENT_OR_LITERAL_RE, (m) => m.replace(/[^\r\n]/g, ' '));
+  return source.replace(CPP_COMMENT_OR_LITERAL_RE, (m) => (m.includes('\n') || m.includes('\r') ? m.replace(/[^\r\n]/g, ' ') : ' '.repeat(m.length)));
 }
 
 /**
@@ -774,14 +774,18 @@ function pushCppRunTokens(spans: Array<[number, number]>, run: string, start: nu
  */
 function blankCppSpans(source: string, spans: ReadonlyArray<readonly [number, number]>, code?: string): string {
   if (spans.length === 0) return source;
+  const ordered = [...spans].sort((a, b) => a[0] - b[0]);
   const blank = (text: string): string => {
-    const chars = text.split('');
-    for (const [start, end] of spans) {
-      for (let k = start; k < end; k++) {
-        if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
-      }
+    let out = '';
+    let at = 0;
+    for (const [start, end] of ordered) {
+      const from = Math.max(start, at);
+      if (from >= end) continue;
+      const span = text.slice(from, end);
+      out += text.slice(at, from) + (span.includes('\n') || span.includes('\r') ? span.replace(/[^\r\n]/g, ' ') : ' '.repeat(span.length));
+      at = end;
     }
-    return chars.join('');
+    return out + text.slice(at);
   };
   const out = blank(source);
   if (code !== undefined) cppMaskMemo = { source: out, code: blank(code) };
@@ -1308,7 +1312,7 @@ export function blankCppAnnotationMacroCalls(source: string, options: { keepCRet
   if (!/^[ \t]*[A-Z][A-Z0-9_]{2,}\s*\(/m.test(source)) return source;
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
-  const chars = source.split('');
+  let chars: string[] | null = null;
   const re = /^([ \t]*)([A-Z][A-Z0-9_]{2,})(\s*)\(/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(source)) !== null) {
@@ -1342,12 +1346,13 @@ export function blankCppAnnotationMacroCalls(source: string, options: { keepCRet
     // (`;`), init-list item (`,`/`{`), or expression fragment (operator) is not.
     if (!after || !/[A-Za-z_~#]/.test(after)) continue;
     if (options.keepCReturnTypes && macroStart === m.index && isCReturnTypeMacro(source, m.index, open, end, j)) continue;
+    chars ??= source.split('');
     for (let k = macroStart; k < end; k++) {
       if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
     }
     re.lastIndex = end;
   }
-  return rawStrings.restore(chars.join(''));
+  return rawStrings.restore(chars ? chars.join('') : source);
 }
 
 /** A macro argument that reads as a C type: `char *`, `const cJSON *`, `unsigned long`, `git_repository *`. */
@@ -1574,7 +1579,7 @@ export function blankCppInlineAnnotationMacros(source: string): string {
   if (!/\b(?:UMETA|UPARAM|UE_DEPRECATED)/.test(source)) return source;
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
-  const chars = source.split('');
+  let chars: string[] | null = null;
   const re = new RegExp(CPP_INLINE_ANNOTATION_RE.source, 'g');
   let m: RegExpExecArray | null;
   while ((m = re.exec(source)) !== null) {
@@ -1599,12 +1604,13 @@ export function blankCppInlineAnnotationMacros(source: string): string {
       }
     }
     if (end < 0) continue;
+    chars ??= source.split('');
     for (let k = m.index; k < end; k++) {
       if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
     }
     re.lastIndex = end;
   }
-  return rawStrings.restore(chars.join(''));
+  return rawStrings.restore(chars ? chars.join('') : source);
 }
 
 /**
@@ -2735,7 +2741,7 @@ export function blankCDesignatedMacroArgs(source: string): string {
   if (source.indexOf('=') === -1) return source;
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
-  const out = source.split('');
+  let out: string[] | null = null;
   const re = /^[ \t]*([A-Z_][A-Z0-9_]*)\s*\(/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(source))) {
@@ -2753,10 +2759,11 @@ export function blankCDesignatedMacroArgs(source: string): string {
     // A designator at argument depth: `.name =` or `[index] =`.
     if (!/(^|[,{(\s])(\.[A-Za-z_]\w*|\[[^\]]+\])\s*=[^=]/.test(args)) continue;
     if (!/^\s*;/.test(source.slice(close + 1))) continue;
+    out ??= source.split('');
     for (let k = open + 1; k < close; k++) if (out[k] !== '\n') out[k] = ' ';
     re.lastIndex = close;
   }
-  return rawStrings.restore(out.join(''));
+  return rawStrings.restore(out ? out.join('') : source);
 }
 
 /**

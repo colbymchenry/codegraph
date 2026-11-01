@@ -938,10 +938,8 @@ export class ReferenceResolver {
       fileExists: (filePath: string) => {
         // Check pre-built known files set first (O(1))
         if (this.knownFiles) {
-          const normalized = filePath.replace(/\\/g, '/');
-          if (this.knownFiles.has(filePath) || this.knownFiles.has(normalized)) {
-            return true;
-          }
+          if (this.knownFiles.has(filePath)) return true;
+          if (filePath.includes('\\') && this.knownFiles.has(filePath.replace(/\\/g, '/'))) return true;
         }
         // Fall back to filesystem for files not yet indexed. `path.join` does
         // not clamp, and relative-import resolution hands us paths carrying

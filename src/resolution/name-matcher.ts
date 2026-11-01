@@ -2322,6 +2322,13 @@ function isTestSuiteFile(filePath: string, context: ResolutionContext): boolean 
 function isInCppTranslationUnit(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (candidate.filePath === ref.filePath) return true;
   if (candidate.language !== 'c' && candidate.language !== 'cpp') return false;
+  const memo = cppFileMemo(CPP_IN_UNIT, ref.filePath, context);
+  let within = memo.get(candidate.id);
+  if (within === undefined) memo.set(candidate.id, (within = cppCandidateInUnit(candidate, ref, context)));
+  return within;
+}
+
+function cppCandidateInUnit(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (cppIncluders(candidate.filePath, context).has(ref.filePath)) return true;
   if (!C_SOURCE_EXT.test(candidate.filePath) || isCppTranslationUnitLocal(candidate, ref, context) ||
       ((candidate.kind === 'function' || candidate.kind === 'variable' || candidate.kind === 'constant') &&
@@ -2741,6 +2748,26 @@ const CPP_TYPE_DECLS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
 const CPP_INCLUDE_LINES = new WeakMap<ResolutionContext, Map<string, Array<[number, string | null]>>>();
 /** Per context: a C/C++ file → the line spans of its unnamed namespaces. */
 const CPP_UNNAMED_NAMESPACES = new WeakMap<ResolutionContext, Map<string, Array<[number, number]>>>();
+/** Per context: a reference's C/C++ file → candidate id → isCppTranslationUnitLocal's answer. */
+const CPP_UNIT_LOCAL = new WeakMap<ResolutionContext, Map<string, Map<string, boolean>>>();
+/** Per context: a reference's C/C++ file → candidate id → isInCppTranslationUnit's answer. */
+const CPP_IN_UNIT = new WeakMap<ResolutionContext, Map<string, Map<string, boolean>>>();
+
+/**
+ * The memo of a question about a candidate from one reference's file. A file's
+ * references come together, so a worker has no use for those of files it has
+ * left, and a project of tens of thousands of files shouldn't fill it with them.
+ */
+function cppFileMemo(memos: WeakMap<ResolutionContext, Map<string, Map<string, boolean>>>, file: string, context: ResolutionContext): Map<string, boolean> {
+  let byFile = memos.get(context);
+  if (!byFile) memos.set(context, (byFile = new Map()));
+  let memo = byFile.get(file);
+  if (!memo) {
+    if (byFile.size >= 256) byFile.clear();
+    byFile.set(file, (memo = new Map()));
+  }
+  return memo;
+}
 
 /**
  * Whether only another C or C++ translation unit can name `candidate`: a
@@ -2757,6 +2784,13 @@ const CPP_UNNAMED_NAMESPACES = new WeakMap<ResolutionContext, Map<string, Array<
  */
 function isCppTranslationUnitLocal(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (ref.language !== 'c' && ref.language !== 'cpp') return false;
+  const memo = cppFileMemo(CPP_UNIT_LOCAL, ref.filePath, context);
+  let local = memo.get(candidate.id);
+  if (local === undefined) memo.set(candidate.id, (local = cppTranslationUnitLocal(candidate, ref, context)));
+  return local;
+}
+
+function cppTranslationUnitLocal(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const seenFrom = (decl: Node, file: string): boolean => !C_SOURCE_EXT.test(decl.filePath) || decl.filePath === file ||
     cppIncluders(decl.filePath, context).has(file) || cppIncludesAfter(decl.filePath, decl.startLine, file, context);
   const seen = (decl: Node): boolean => seenFrom(decl, ref.filePath);
@@ -2867,7 +2901,7 @@ function cppUnnamedNamespaceSpans(file: string, context: ResolutionContext): Arr
         i = end;
         continue;
       }
-      if (!/\s/.test(c)) lineStart = false;
+      if (lineStart && !/\s/.test(c)) lineStart = false;
       if (c === '/' && text[i + 1] === '/') {
         const end = text.indexOf('\n', i);
         i = end < 0 ? text.length : end;
@@ -16492,6 +16526,9 @@ function cppMacroMethodHead(fn: Node): string | null {
   return new RegExp(`::\\s*${name}\\s*\\(`).test(fn.signature) ? fn.signature : null;
 }
 
+/** Per context: a C or C++ function → the return type its declaration writes. */
+const CPP_RETURN_TYPES = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
 /**
  * The return type of a C or C++ function, as its declaration writes it:
  * `std::vector<const FieldDescriptor*>` for `std::vector<const
@@ -16500,6 +16537,14 @@ function cppMacroMethodHead(fn: Node): string | null {
  * `decltype(…)`. A method a macro defines is read from its expansion.
  */
 function cppWrittenReturnType(fn: Node, context: ResolutionContext): string | null {
+  let memo = CPP_RETURN_TYPES.get(context);
+  if (!memo) CPP_RETURN_TYPES.set(context, (memo = new Map()));
+  let written = memo.get(fn.id);
+  if (written === undefined) memo.set(fn.id, (written = cppReturnTypeWritten(fn, context)));
+  return written;
+}
+
+function cppReturnTypeWritten(fn: Node, context: ResolutionContext): string | null {
   const macro = cppMacroMethodHead(fn);
   const lines = macro === null ? context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/) : null;
   if (macro === null && !lines) return null;
@@ -17464,6 +17509,14 @@ function cppTypesNamed(name: string, context: ResolutionContext): Node[] {
  * matcher classes.
  */
 function isCppLibraryType(raw: string, context: ResolutionContext): boolean {
+  let memo = CPP_LIBRARY_TYPES.get(context);
+  if (!memo) CPP_LIBRARY_TYPES.set(context, (memo = new Map()));
+  let library = memo.get(raw);
+  if (library === undefined) memo.set(raw, (library = cppWrittenTypeIsLibrary(raw, context)));
+  return library;
+}
+
+function cppWrittenTypeIsLibrary(raw: string, context: ResolutionContext): boolean {
   if ((raw.match(/</g)?.length ?? 0) !== (raw.match(/>/g)?.length ?? 0)) return false;
   const segments = cppTypeSegments(raw);
   if (!segments || segments.length < 2) return false;
@@ -17809,6 +17862,15 @@ function isCppOutsideQualifiedType(raw: string, site: CppNameSite, context: Reso
  * declaration begun on an earlier line.
  */
 function cppFindsOnlyNamesakes(raw: string, context: ResolutionContext, method?: string): boolean {
+  let memo = CPP_ONLY_NAMESAKES.get(context);
+  if (!memo) CPP_ONLY_NAMESAKES.set(context, (memo = new Map()));
+  const key = `${raw}\u0000${method ?? ''}`;
+  let only = memo.get(key);
+  if (only === undefined) memo.set(key, (only = cppWrittenFindsOnlyNamesakes(raw, context, method)));
+  return only;
+}
+
+function cppWrittenFindsOnlyNamesakes(raw: string, context: ResolutionContext, method?: string): boolean {
   if ((raw.match(/</g)?.length ?? 0) !== (raw.match(/>/g)?.length ?? 0)) return false;
   const segments = cppTypeSegments(raw);
   if (!segments || segments.length < 2) return false;
@@ -18262,6 +18324,14 @@ function cppClassDecls(qualifiedName: string, context: ResolutionContext): Node[
 function cppMemberOwner(caller: Node, context: ResolutionContext): string | null {
   if (CPP_CLASS_KINDS.has(caller.kind)) return caller.qualifiedName;
   if (caller.kind !== 'method' && caller.kind !== 'function') return null;
+  let memo = CPP_MEMBER_OWNERS.get(context);
+  if (!memo) CPP_MEMBER_OWNERS.set(context, (memo = new Map()));
+  let owner = memo.get(caller.id);
+  if (owner === undefined) memo.set(caller.id, (owner = cppWrittenMemberOwner(caller, context)));
+  return owner;
+}
+
+function cppWrittenMemberOwner(caller: Node, context: ResolutionContext): string | null {
   const cut = caller.qualifiedName.lastIndexOf('::');
   if (cut <= 0) return null;
   const owner = caller.qualifiedName.slice(0, cut);
@@ -18278,6 +18348,15 @@ function cppMemberOwner(caller: Node, context: ResolutionContext): string | null
   const outer = owner.lastIndexOf('::');
   return outer > 0 && cppClassDecls(owner.slice(0, outer), context).length > 0 ? owner : null;
 }
+
+/** Per context: a C++ type as written → isCppLibraryType's answer. */
+const CPP_LIBRARY_TYPES = new WeakMap<ResolutionContext, Map<string, boolean>>();
+/** Per context: a C++ type as written, with a method of it → cppFindsOnlyNamesakes's answer. */
+const CPP_ONLY_NAMESAKES = new WeakMap<ResolutionContext, Map<string, boolean>>();
+/** Per context: a C++ caller → the class whose scope its body is in. */
+const CPP_MEMBER_OWNERS = new WeakMap<ResolutionContext, Map<string, string | null>>();
+/** Per context: a C++ caller and that class → the classes its name lookup passes through. */
+const CPP_ENCLOSING_CLASSES = new WeakMap<ResolutionContext, Map<string, CppClassScope[]>>();
 
 /** One class C++ lookup passes through, with the declarations that are the class there. */
 interface CppClassScope {
@@ -18298,6 +18377,15 @@ interface CppClassScope {
  * those in its file, else those its file includes, else all of them.
  */
 function cppEnclosingClasses(owner: string, caller: Node, context: ResolutionContext): CppClassScope[] {
+  let memo = CPP_ENCLOSING_CLASSES.get(context);
+  if (!memo) CPP_ENCLOSING_CLASSES.set(context, (memo = new Map()));
+  const key = `${caller.id}\u0000${owner}`;
+  let scopes = memo.get(key);
+  if (!scopes) memo.set(key, (scopes = cppClassScopesAround(owner, caller, context)));
+  return scopes;
+}
+
+function cppClassScopesAround(owner: string, caller: Node, context: ResolutionContext): CppClassScope[] {
   const scopes: CppClassScope[] = [];
   let qualifiedName = owner;
   let inner = caller;
@@ -21717,6 +21805,13 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CPP_UNNAMED_NAMESPACES.delete(context);
   CPP_LOCAL_BINDINGS.delete(context);
   CPP_CALLER_HEADS.delete(context);
+  CPP_UNIT_LOCAL.delete(context);
+  CPP_IN_UNIT.delete(context);
+  CPP_MEMBER_OWNERS.delete(context);
+  CPP_ENCLOSING_CLASSES.delete(context);
+  CPP_RETURN_TYPES.delete(context);
+  CPP_LIBRARY_TYPES.delete(context);
+  CPP_ONLY_NAMESAKES.delete(context);
   RUST_TRAIT_IMPL_MEMO.delete(context);
   RUST_USES.delete(context);
   RUST_USE_ITEMS.delete(context);
@@ -32133,11 +32228,28 @@ function cppParenListAfter(file: string, line: number, column: number, name: str
   return cppParenListIn(lines.slice(line - 1, line + 11).join('\n'), column, name);
 }
 
+/** What may stand between a name and its argument list: `<int>`, spaces. */
+const CPP_ARGUMENT_LIST_AHEAD = /\s*(?:<[^<>()]*>)?\s*\(/y;
+
+/** Where the `(` of the first `\bname\s*(?:<[^<>()]*>)?\s*\(` of `text` from `column` on is, or -1. */
+function cppOpeningParenAfter(text: string, column: number, name: string): number {
+  if (!isWordCode(name.charCodeAt(0))) {
+    const at = new RegExp(`\\b${escapeRegExp(name)}\\s*(?:<[^<>()]*>)?\\s*\\(`).exec(text.slice(column));
+    return at ? column + at.index + at[0].length - 1 : -1;
+  }
+  for (let at = text.indexOf(name, column); at >= 0; at = text.indexOf(name, at + 1)) {
+    // (The search starts at `column`, whatever stands before it.)
+    if (at > column && isWordCode(text.charCodeAt(at - 1))) continue;
+    CPP_ARGUMENT_LIST_AHEAD.lastIndex = at + name.length;
+    if (CPP_ARGUMENT_LIST_AHEAD.test(text)) return CPP_ARGUMENT_LIST_AHEAD.lastIndex - 1;
+  }
+  return -1;
+}
+
 /** The `( … )` that follows `name` in `text`, from `column` on, without its parentheses. */
 function cppParenListIn(text: string, column: number, name: string): string | null {
-  const at = new RegExp(`\\b${escapeRegExp(name)}\\s*(?:<[^<>()]*>)?\\s*\\(`).exec(text.slice(column));
-  if (!at) return null;
-  const open = column + at.index + at[0].length - 1;
+  const open = cppOpeningParenAfter(text, column, name);
+  if (open < 0) return null;
   let depth = 0;
   for (let i = open; i < text.length; i++) {
     if (text[i] === '(') depth++;
@@ -32191,13 +32303,18 @@ const CPP_OVERLOAD_PARAMETERS = new WeakMap<ResolutionContext, Map<string, strin
  * not at all. A method a macro defines writes its list in its expansion.
  */
 function cppOverloadParameters(n: Node, name: string, context: ResolutionContext): string | null {
+  let memo = CPP_OVERLOAD_PARAMETERS.get(context);
+  if (!memo) CPP_OVERLOAD_PARAMETERS.set(context, (memo = new Map()));
+  const key = `${n.id}\u0000${name}`;
+  let list = memo.get(key);
+  if (list === undefined) memo.set(key, (list = cppParametersGivingDefaults(n, name, context)));
+  return list;
+}
+
+function cppParametersGivingDefaults(n: Node, name: string, context: ResolutionContext): string | null {
   const macro = cppMacroMethodHead(n);
   const own = macro !== null ? cppParenListIn(macro, 0, name) : cppParenListAfter(n.filePath, n.startLine, 0, name, context);
   if (own === null || n.kind !== 'method') return own;
-  let memo = CPP_OVERLOAD_PARAMETERS.get(context);
-  if (!memo) CPP_OVERLOAD_PARAMETERS.set(context, (memo = new Map()));
-  const hit = memo.get(n.id);
-  if (hit !== undefined) return hit;
   let found = own;
   const classes = cppClassDecls(cppParentScope(n.qualifiedName), context);
   if (!classes.some((c) => c.filePath === n.filePath && rangeWithin(n, c))) {
@@ -32220,7 +32337,6 @@ function cppOverloadParameters(n: Node, name: string, context: ResolutionContext
       }
     }
   }
-  memo.set(n.id, found);
   return found;
 }
 

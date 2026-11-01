@@ -114,6 +114,8 @@ function seenFrom(site: CppNameSite, context: ResolutionContext, unit?: string):
 }
 
 const LOCAL_TO = new WeakMap<ResolutionContext, Map<string, Node | null>>();
+/** Per context: cppClassWritten's answers, `false` for undefined. */
+const CLASSES_WRITTEN = new WeakMap<ResolutionContext, Map<string, CppWrittenClass | null | false>>();
 
 /**
  * The function a C or C++ class is local to: the one of the scope its
@@ -246,6 +248,19 @@ export interface CppWrittenClass {
  * several classes could be.
  */
 export function cppClassWritten(written: string, site: CppNameSite, ref: UnresolvedRef, context: ResolutionContext): CppWrittenClass | null | undefined {
+  // One reference asks about one name several times, a strategy at a time.
+  let memo = CLASSES_WRITTEN.get(context);
+  if (!memo) CLASSES_WRITTEN.set(context, (memo = new Map()));
+  const key = `${written}\0${site.scope}\0${site.file}\0${site.line}\0${site.classScope ?? ''}\0${site.declared ? 1 : 0}\0${site.self?.id ?? ''}\0${site.parameters.size > 0 ? [...site.parameters].join() : ''}\0${ref.filePath}\0${ref.fromNodeId}\0${ref.referenceKind}\0${ref.referenceName}\0${ref.line}\0${ref.column}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit === false ? undefined : hit;
+  const found = lookUpCppClass(written, site, ref, context);
+  if (memo.size >= 100_000) memo.clear();
+  memo.set(key, found === undefined ? false : found);
+  return found;
+}
+
+function lookUpCppClass(written: string, site: CppNameSite, ref: UnresolvedRef, context: ResolutionContext): CppWrittenClass | null | undefined {
   const segments = cppTypeSegments(written);
   if (!segments) return null;
   const global = written.startsWith('::');
@@ -454,6 +469,7 @@ const USINGS = new WeakMap<ResolutionContext, Map<string, CppUsing[]>>();
 export function clearCppSupertypeMemos(context: ResolutionContext): void {
   USINGS.delete(context);
   LOCAL_TO.delete(context);
+  CLASSES_WRITTEN.delete(context);
 }
 
 const PATH = String.raw`(?:::\s*)?[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*`;

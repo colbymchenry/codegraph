@@ -396,9 +396,13 @@ function exportedByName(filePath: string, idx: FileExportIndex, name: string, co
   return idx.clauseAliases.get(name);
 }
 
+/** Per context: an include path, by language → where the project's include directories find it. */
+const cppIncludeSearches = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
 /** Drop the per-context memo tables (see ReferenceResolver.clearCaches). */
 export function clearImportResolverMemos(context: ResolutionContext): void {
   importPathMemos.delete(context);
+  cppIncludeSearches.delete(context);
   exportedSymbolMemos.delete(context);
   fileExportIndexes.delete(context);
   luaFileBasenameIndexes.delete(context);
@@ -1894,6 +1898,21 @@ function loadCppIncludeDirsHeuristic(projectRoot: string): string[] {
  * Called as a fallback after relative and aliased resolution fail.
  */
 function resolveCppIncludePath(
+  importPath: string,
+  language: Language,
+  context: ResolutionContext
+): string | null {
+  // (The search doesn't depend on the including file, and a project's files
+  // include one header from hundreds of places.)
+  let memo = cppIncludeSearches.get(context);
+  if (!memo) cppIncludeSearches.set(context, (memo = new Map()));
+  const key = `${language}\0${importPath}`;
+  let found = memo.get(key);
+  if (found === undefined) memo.set(key, (found = searchCppIncludeDirs(importPath, language, context)));
+  return found;
+}
+
+function searchCppIncludeDirs(
   importPath: string,
   language: Language,
   context: ResolutionContext

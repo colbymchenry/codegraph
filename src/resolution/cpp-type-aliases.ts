@@ -85,6 +85,15 @@ export function stripCppTemplateArguments(text: string): string {
 
 /** The `::` segments of a written type, or null when it is not a plain (possibly qualified) type name. */
 function cppTypeName(raw: string): TypeName | null {
+  let name = TYPE_NAMES.get(raw);
+  if (name === undefined) {
+    if (TYPE_NAMES.size >= 50_000) TYPE_NAMES.clear();
+    TYPE_NAMES.set(raw, (name = readCppTypeName(raw)));
+  }
+  return name;
+}
+
+function readCppTypeName(raw: string): TypeName | null {
   const parts: string[] = [];
   const templated: boolean[] = [];
   let depth = 0;
@@ -121,6 +130,9 @@ function cppTypeName(raw: string): TypeName | null {
   if (parts.length === 0 || !parts.every((p) => /^[A-Za-z_]\w*$/.test(p))) return null;
   return global ? { names: parts, templated, global } : { names: parts, templated };
 }
+
+/** Each written type's name, which depends on nothing else. Callers only read it. */
+const TYPE_NAMES = new Map<string, TypeName | null>();
 
 /** The scopes a written name is looked up from: the global scope alone for `::Name`. */
 function scopesFor(name: TypeName, scopes: readonly string[]): readonly string[] {
@@ -323,8 +335,14 @@ type Visible = (n: Node) => boolean;
 
 /** C and C++ declarations named `name` that can stand for a type or scope. */
 function typeDeclarations(name: string, context: ResolutionContext, visible?: Visible): Node[] {
-  return context.getNodesByName(name).filter((n) =>
-    isCFamily(n) && (n.kind === 'type_alias' || DECLARING_KINDS.has(n.kind)) && (!visible || visible(n)));
+  let memo = TYPE_DECLARATIONS.get(context);
+  if (!memo) TYPE_DECLARATIONS.set(context, (memo = new Map()));
+  let declared = memo.get(name);
+  if (!declared) {
+    declared = context.getNodesByName(name).filter((n) => isCFamily(n) && (n.kind === 'type_alias' || DECLARING_KINDS.has(n.kind)));
+    memo.set(name, declared);
+  }
+  return visible ? declared.filter((n) => visible(n)) : declared;
 }
 
 function declaredIn(
@@ -370,11 +388,14 @@ function pickAlias(aliases: Node[], ref: UnresolvedRef, context: ResolutionConte
 }
 
 const BASES = new WeakMap<ResolutionContext, Map<string, string[]>>();
+/** Per context: a name → the C and C++ declarations of a type of that name. */
+const TYPE_DECLARATIONS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
 const TEMPLATE_PARAMETERS = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
 
 /** Drop the memos of class bases, template parameters and local aliases (see ReferenceResolver.clearCaches). */
 export function clearCppTypeAliasMemos(context: ResolutionContext): void {
   BASES.delete(context);
+  TYPE_DECLARATIONS.delete(context);
   TEMPLATE_PARAMETERS.delete(context);
   LOCAL_ALIAS_LINES.delete(context);
 }
