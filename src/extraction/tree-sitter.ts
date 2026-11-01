@@ -8271,18 +8271,23 @@ export class TreeSitterExtractor {
       }
 
       // Swift: inheritance_specifier > user_type > type_identifier
-      // Used for class inheritance, protocol conformance, and protocol inheritance
+      // Used for class inheritance, protocol conformance, and protocol inheritance.
+      // A qualified entry (`: Kit.Runner`, `: A.B.C`) is flat type_identifier
+      // siblings in one user_type; the ref is their texts joined with '.', the
+      // full dotted path the resolver places the entry by. Generic arguments
+      // sit in a separate type_arguments child and are dropped
+      // (`Kit.Runner<Int>` is `Kit.Runner`); an unqualified `B` stays `B`. The
+      // position is the user_type's, which is also its first segment's.
       if (child.type === 'inheritance_specifier') {
         const userType = child.namedChildren.find((c: SyntaxNode) => c.type === 'user_type');
-        const typeId = userType?.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
-        if (typeId) {
-          const name = getNodeText(typeId, this.source);
+        const segments = userType?.namedChildren.filter((c: SyntaxNode) => c.type === 'type_identifier') ?? [];
+        if (userType && segments.length > 0) {
           this.unresolvedReferences.push({
             fromNodeId: classId,
-            referenceName: name,
+            referenceName: segments.map((s: SyntaxNode) => getNodeText(s, this.source)).join('.'),
             referenceKind: 'extends',
-            line: typeId.startPosition.row + 1,
-            column: typeId.startPosition.column,
+            line: userType.startPosition.row + 1,
+            column: userType.startPosition.column,
           });
         }
       }
