@@ -4491,11 +4491,13 @@ function pythonCallShape(ref: UnresolvedRef, context: ResolutionContext): Python
 function fitsPythonCallShape(n: Node, shape: PythonCallShape, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (shape.kind === 'bare') {
     if (n.kind === 'method') return false;
-    if (n.filePath === ref.filePath) return true;
     // `from django.shortcuts import render`: the call is the package's.
-    if (isPythonNameImportedFromOutside(ref.referenceName, ref, context)) return false;
-    // `view = UserView.as_view()` … `view(request)`: the file's own value —
-    // unless it is a pytest fixture, which a test takes as a parameter of that name.
+    if (n.filePath !== ref.filePath && isPythonNameImportedFromOutside(ref.referenceName, ref, context)) return false;
+    // A name the function around the call binds itself — a parameter, an
+    // assignment (`flat = lambda …`), a `for`/`with … as`/`except … as`
+    // target — is that value, and shadows the module `def flat` beside it in
+    // the same file as much as one in another (#3037) — unless the candidate
+    // is a pytest fixture, which a test takes as a parameter of that name.
     return isFixtureInReach(n, ref.filePath, context) || !isPythonLocallyBound(ref.referenceName, ref, context);
   }
   // A member of what the chain names: a method of a class of that name, or a
