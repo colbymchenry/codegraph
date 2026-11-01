@@ -21945,6 +21945,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PY_LOCAL_FILE.delete(context);
   PY_LOCAL_LAST.delete(context);
   OVERLOAD_SETS.delete(context);
+  SWIFT_PARAMETERS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
   PY_IMPORTS.delete(context);
@@ -31656,6 +31657,10 @@ export function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, co
   }
   // Only an overload set has a sibling to move to.
   if (!set || set.own === null) return result;
+  if (ref.language === 'swift') {
+    const byClosure = swiftOverloadForClosure(result.targetNodeId, set, ref, context);
+    if (byClosure) return byClosure === result.targetNodeId ? result : { ...result, targetNodeId: byClosure };
+  }
   const args = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), set.name, context);
   if (args === null) return result;
   // Swift overloads by argument label as much as by count: Alamofire's
@@ -31676,6 +31681,92 @@ export function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, co
   if (argc >= set.own.min && argc <= set.own.max) return result;
   const fits = set.siblings.filter((s) => s.arity !== null && argc >= s.arity.min && argc <= s.arity.max);
   return fits.length === 1 ? { ...result, targetNodeId: fits[0]!.id } : result;
+}
+
+/** Whether a Swift parameter (`_ body: @escaping (Int) -> Void`) takes a function: its type has a `->` outside any brackets of the type's own. */
+function isSwiftFunctionParameter(param: string): boolean {
+  const type = param.slice(param.indexOf(':') + 1).replace(/=[\s\S]*$/, '');
+  // (An `@autoclosure` parameter is passed a value.)
+  return type.includes('->') && !type.includes('@autoclosure') && !/^\s*\[/.test(type) && !/^\s*[A-Za-z_][\w.]*\s*</.test(type);
+}
+
+/** Per context: a Swift overload's id → its parameters as written; null when they can't be read. */
+const SWIFT_PARAMETERS = new WeakMap<ResolutionContext, Map<string, string[] | null>>();
+
+function swiftParameters(id: string, name: string, context: ResolutionContext): string[] | null {
+  let memo = SWIFT_PARAMETERS.get(context);
+  if (!memo) SWIFT_PARAMETERS.set(context, (memo = new Map()));
+  let params = memo.get(id);
+  if (params === undefined) {
+    const decl = context.getNodeById?.(id);
+    const list = decl ? cppParenListAfter(decl.filePath, decl.startLine, 0, name, context) : null;
+    params = list === null ? null : list.trim() === '' ? [] : splitCppTopLevel(list);
+    memo.set(id, params);
+  }
+  return params;
+}
+
+/**
+ * The overload a Swift call means when its last argument says which: of a
+ * type's overloads alike in their labels, a closure — trailing or in the
+ * parentheses — goes to the one whose last parameter takes a function, and
+ * any other value to the one whose last parameter doesn't. Alamofire's
+ * `didStop.write(true)` is `Protected.write(_ value:)`, and `write { $0 = value
+ * }`, in that method's own body, is `write(_ closure:)`. Null when the
+ * overloads don't differ that way, or the arguments can't be read.
+ */
+function swiftOverloadForClosure(
+  target: string,
+  set: { name: string; siblings: Array<{ id: string }> },
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const overloads = [target, ...set.siblings.map((sib) => sib.id)];
+  if (!overloads.some((id) => swiftParameters(id, set.name, context)?.some(isSwiftFunctionParameter))) return null;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const text = lines.slice(ref.line - 1, ref.line + 11).join('\n');
+  const from = Math.max(0, ref.column);
+  const named = new RegExp(`\\b${escapeRegExp(set.name)}\\s*(?:<[^<>()]*>)?\\s*(?=[({])`).exec(text.slice(from));
+  if (!named) return null;
+  const after = from + named.index + named[0].length;
+  let close = after - 1;
+  if (text[after] === '(') {
+    let depth = 0;
+    for (close = after; close < text.length; close++) {
+      if (text[close] === '(') depth++;
+      else if (text[close] === ')' && --depth === 0) break;
+    }
+    if (close >= text.length) return null;
+  }
+  const written = text.slice(after + 1, Math.max(after + 1, close));
+  const args = written.trim() === '' ? [] : splitCppTopLevel(written);
+  const labelOf = (arg: string): string => /^\s*([A-Za-z_]\w*)\s*:(?!:)/.exec(arg)?.[1] ?? '_';
+  // (The `{` after a condition is the statement's own: Swift takes no trailing closure there.)
+  const trailing = /^\s*\{/.test(text.slice(close + 1)) && !/^\s*(?:\}\s*else\s+)?(?:if|guard|while|for|switch)\b/.test(lines[ref.line - 1] ?? '');
+  if (!trailing && args.length === 0) return null;
+  const closure = trailing || args[args.length - 1]!.replace(/^\s*[A-Za-z_]\w*\s*:(?!:)/, '').trim().startsWith('{');
+  const labels = args.map(labelOf);
+  // Whether the parameter the last argument binds to takes a function; null
+  // when the call doesn't fit the declaration.
+  const takesFunction = (id: string): boolean | null => {
+    const params = swiftParameters(id, set.name, context);
+    if (!params) return null;
+    let next = 0;
+    let bound: string | null = null;
+    let trailed = !trailing;
+    for (const param of params) {
+      if (next < labels.length && swiftLabelsFit([labels[next]!], param)) {
+        next++;
+        if (next === labels.length && !trailing) bound = param;
+      } else if (!trailed && next === labels.length && isSwiftFunctionParameter(param)) {
+        trailed = true;
+        bound = param;
+      } else if (!swiftLabelsFit([], param)) return null;
+    }
+    return next === labels.length && bound !== null ? isSwiftFunctionParameter(bound) : null;
+  };
+  const chosen = overloads.filter((id) => takesFunction(id) === closure);
+  return chosen.length === 1 ? chosen[0]! : null;
 }
 
 /**
