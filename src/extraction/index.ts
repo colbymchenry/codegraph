@@ -4137,6 +4137,13 @@ export class ExtractionOrchestrator {
       // have been recreated locally; a previously indexed dirty path may have
       // vanished from git status after restore. Classify current disk vs DB once.
       const candidates = new Set([...gitChanges.deleted, ...gitChanges.modified, ...gitChanges.added, ...dirtyPaths!]);
+      const include = loadIncludeMatcher(this.rootDir);
+      if (include) {
+        for (const file of collectIncludedFilesForRoot(this.rootDir)) candidates.add(file);
+        for (const file of this.queries.getAllFiles()) {
+          if (include.ignores(file.path)) candidates.add(file.path);
+        }
+      }
       const scope = this.scopedSyncMatcher();
       const overrides = loadExtensionOverrides(this.rootDir);
       for (const filePath of candidates) {
