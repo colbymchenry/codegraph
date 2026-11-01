@@ -21,6 +21,7 @@
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph implementations <symbol>  List the types that implement or extend a trait, interface or class
  *   codegraph suspects          Audit questionable call edges
+ *   codegraph blast              List what depends on the lines a diff changed
  *   codegraph affected [files]   Find test files affected by changes
  *   codegraph cycles [path]      List circular imports between files
  *   codegraph ui [path]          Open the browser viewer (alias: web; not released yet — needs CODEGRAPH_UI=1)
@@ -2922,6 +2923,35 @@ program
         const list = findSuspects(cg.getProjectRoot(), { limit, maxEdgesPerTarget: edges });
         console.log(options.json ? JSON.stringify(suspectsToJson(list), null, 2) : formatSuspects(list));
       } finally { cg.destroy(); }
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    }
+  });
+
+/**
+ * The symbols and files that depend on the lines a diff changed: against the
+ * merge base of `--base`, or the working tree (the last commit when it is
+ * clean). The same entry point serves `codegraph_blast`.
+ */
+program
+  .command('blast')
+  .description('List the symbols and files that depend on the lines changed since a base ref, grouped by directory')
+  .option('-p, --path <path>', 'Project path')
+  .option('-b, --base <ref>', 'Git ref to compare against through the merge base (default: uncommitted changes against HEAD, or the last commit when the tree is clean)')
+  .option('-d, --depth <n|all>', 'Dependent hops to walk, or "all"', '2')
+  .option('-f, --format <format>', 'Output format: text, markdown or json', 'text')
+  .option('--strict', 'Leave out dependents reached only through name-matched (questionable) call edges')
+  .action(async (options: { path?: string; base?: string; depth: string; format: string; strict?: boolean }) => {
+    try {
+      const projectPath = resolveProjectPath(options.path);
+      const { runBlast } = await import('../graph/blast-run');
+      const result = runBlast(projectPath, options);
+      if (result.ok) process.stdout.write(result.output);
+      else {
+        error(result.message);
+        process.exitCode = 1;
+      }
     } catch (err) {
       error(err instanceof Error ? err.message : String(err));
       process.exitCode = 1;
