@@ -34,6 +34,7 @@ import {
 } from './pascal-scope';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
+import { preferPythonImplementation, clearPythonOverloadMemos } from './python-overloads';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { adoptProjectScans, readProjectScans, type ProjectScans } from './project-scans';
 import { clearCppIncluderMemos } from './cpp-includers';
@@ -764,6 +765,7 @@ export class ReferenceResolver {
       clearPascalScopeMemos(this.context);
       clearTypeParameterMemos(this.context);
       clearDartLocalScopeMemos(this.context);
+      clearPythonOverloadMemos(this.context);
       clearCppTypeAliasMemos(this.context);
       clearCppSupertypeMemos(this.context);
       clearCppIncluderMemos(this.context);
@@ -1628,6 +1630,10 @@ export class ReferenceResolver {
       const declaringFile = specifier === undefined ? undefined : this.nodeById(resolved.targetNodeId)?.filePath;
       if (declaringFile !== undefined && declaringFile !== ref.filePath &&
           !reachesAmbientModule(ref, specifier!, declaringFile, this.context)) return null;
+    }
+    if (resolved && ref.language === 'python') {
+      const implemented = preferPythonImplementation(resolved, this.nodeById(resolved.targetNodeId), this.context);
+      if (implemented !== resolved) return implemented;
     }
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
     // A Pascal call to data runs only a routine the data holds, in scope, and
