@@ -4410,12 +4410,30 @@ function isJsGlobalSelf(head: string, ref: UnresolvedRef, context: ResolutionCon
 }
 
 /**
- * Whether a Python call recorded by its bare name was written on the instance,
- * `self.get_ip(request)`. The extractor drops the `self.`, so a same-named name
- * the file imports would otherwise claim the method call (#2074 follow-up).
+ * Whether a Python call recorded by its bare name was written on the instance
+ * or its class, `self.get_ip(request)` or `cls.build()`. The extractor drops the
+ * receiver, so a same-named name the file imports would otherwise claim the
+ * method call (#2074 follow-up).
  */
 export function isPythonSelfCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
-  return ref.language === 'python' && bareCallReceiver(ref, context)?.receiver === 'self';
+  if (ref.language !== 'python') return false;
+  const receiver = bareCallReceiver(ref, context)?.receiver;
+  return receiver === 'self' || (receiver !== undefined && /(?:^|[^\w.])cls$/.test(receiver));
+}
+
+/**
+ * Whether a Python `self.x()` or `cls.x()` landed on a module-level name of
+ * another file. That call names a member, and with no method of the name it's an
+ * attribute holding a callable, so nothing says which: flask's `self.create_app()`
+ * is the callable `ScriptInfo` was handed, not an example app's `create_app`.
+ * The caller's own file stays, since it can put its functions on a class: attrs'
+ * `_cmp.py` builds `_is_comparable_to` into the classes it makes. So does a class,
+ * which an attribute usually holds under its own name: networkx's `self.Graph()`
+ * after `self.Graph = nx.Graph`.
+ */
+export function isSelfCallOnForeignName(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return target.kind !== 'class' && target.filePath !== ref.filePath && !target.qualifiedName.includes('::') &&
+    isPythonSelfCall(ref, context);
 }
 
 /** Whether a call recorded by its bare name is written on something other than the caller's own object. */
