@@ -167,18 +167,29 @@ export function isMissingPathError(err: unknown): boolean {
  * serves them to an agent, so this does not widen the #527 leak surface. The
  * content-serving sinks must never pass this flag.
  *
+ * `readOnly` is for a caller that will only ever read what the path names, and
+ * changes one thing: a missing path comes straight back instead of being judged
+ * by its ancestors. That walk is for a caller about to create the path, which
+ * would follow a link out of the root on the way; a read of a missing path finds
+ * nothing wherever it leads, and the walk costs a `realpathSync` per missing
+ * folder. A path that exists is judged in full either way. Anything that may
+ * write must leave this off.
+ *
  * @param projectRoot - The project root directory
  * @param filePath - The (relative or absolute) file path to validate
  * @param options.allowSymlinkEscape - Follow in-root symlinks out of the root
  *   (indexing read path only); defaults to the strict, leak-safe behavior.
+ * @param options.readOnly - The caller only reads the path, so a missing one
+ *   needs no walk; defaults to the check a write needs.
  * @returns The resolved absolute path (realpath when it exists), or null if it
  *   escapes the root. A path that does not exist yet is judged by its nearest
- *   existing ancestor, and every path under a root that does not exist is null.
+ *   existing ancestor unless `readOnly` or `allowSymlinkEscape` is set, and every
+ *   path under a root that does not exist is null.
  */
 export function validatePathWithinRoot(
   projectRoot: string,
   filePath: string,
-  options?: { allowSymlinkEscape?: boolean }
+  options?: { allowSymlinkEscape?: boolean; readOnly?: boolean }
 ): string | null {
   // 1. Lexical containment — cheap, catches `../` traversal. Applies even on
   //    the indexing read path: a crafted `../` escape is still rejected.
@@ -207,22 +218,23 @@ export function validatePathWithinRoot(
     }
     return isWithinDir(realResolved, realRoot) ? realResolved : null;
   } catch (err) {
-    // A missing leaf may still sit below an EXISTING symlink. Resolve the
-    // nearest existing ancestor before allowing a write path: otherwise
-    // `project/.codegraph/ui -> /outside` plus a missing `trails/` directory
-    // passes the lexical check and mkdir follows the symlink out of the root.
     // A path under a file (ENOTDIR on POSIX) is a missing leaf too.
     if (!isMissingPathError(err)) return null;
   }
 
+  // Nothing to read, and with the root in place the indexing read path takes
+  // whatever ancestor a walk would find, so neither needs one.
+  if (options?.readOnly || options?.allowSymlinkEscape) return resolved;
+
+  // A missing leaf may still sit below an EXISTING symlink. Resolve the
+  // nearest existing ancestor before allowing a write path: otherwise
+  // `project/.codegraph/ui -> /outside` plus a missing `trails/` directory
+  // passes the lexical check and mkdir follows the symlink out of the root.
   let ancestor = path.dirname(resolved);
   while (isWithinDir(ancestor, normalizedRoot)) {
     try {
       const realAncestor = fs.realpathSync(ancestor);
-      if (options?.allowSymlinkEscape || isWithinDir(realAncestor, realRoot)) {
-        return resolved;
-      }
-      return null;
+      return isWithinDir(realAncestor, realRoot) ? resolved : null;
     } catch (err) {
       if (!isMissingPathError(err)) return null;
       const parent = path.dirname(ancestor);

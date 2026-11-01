@@ -1164,7 +1164,7 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
       );
       const repoIgnore = buildDefaultIgnore(repoAbs);
       for (const entry of staged.split('\0')) {
-        if (!entry || entry.slice(0, 6) !== '160000') continue;
+        if (!entry || !isGitlinkEntry(entry)) continue;
         const tab = entry.indexOf('\t');
         if (tab === -1) continue;
         const rel = entry.slice(tab + 1);
@@ -1285,7 +1285,7 @@ function findIgnoredEmbeddedRepos(repoDir: string, includeIgnored: Ignore | null
 }
 
 /**
- * `git ls-files -z -s`, expanding submodules where git allows it.
+ * `git ls-files -z -s -t`, expanding submodules where git allows it.
  *
  * `--recurse-submodules` could not be combined with `-s` before git 2.36:
  * `builtin/ls-files.c` listed `show_stage` among the modes that die, and the
@@ -1302,10 +1302,15 @@ function findIgnoredEmbeddedRepos(repoDir: string, includeIgnored: Ignore | null
  */
 function lsFilesStaged(gitOpts: Parameters<typeof execFileSync>[2]): string {
   try {
-    return execFileSync('git', ['ls-files', '-z', '-s', '--recurse-submodules'], gitOpts) as unknown as string;
+    return execFileSync('git', ['ls-files', '-z', '-s', '-t', '--recurse-submodules'], gitOpts) as unknown as string;
   } catch {
-    return execFileSync('git', ['ls-files', '-z', '-s'], gitOpts) as unknown as string;
+    return execFileSync('git', ['ls-files', '-z', '-s', '-t'], gitOpts) as unknown as string;
   }
+}
+
+/** Whether an {@link lsFilesStaged} entry, `<tag> <mode> <object> <stage>\t<path>`, is a gitlink. */
+function isGitlinkEntry(entry: string): boolean {
+  return entry.slice(2, 8) === '160000';
 }
 
 /**
@@ -1352,17 +1357,26 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
   // (the core.quotepath default), and the quoted form never matches a real file
   // on disk → those files are silently dropped from the index. (#541) With -s the
   // path follows a TAB after the `<mode> <object> <stage>` prefix.
+  //
+  // -t puts a status letter and a space before that prefix, and `S` is
+  // skip-worktree: git lists the path without looking for it. A sparse checkout
+  // leaves such files out of the working tree, so a sparse clone of a large repo
+  // names tens of thousands of files that are not there, and every later pass
+  // would try to read them. The bit alone does not say the file is gone, though:
+  // `update-index --skip-worktree` hides local edits to a file that stays where
+  // it is, so the disk decides.
   const gitlinkRels: string[] = [];
   const tracked = lsFilesStaged(gitOpts);
   for (const entry of tracked.split('\0')) {
     if (!entry) continue;
     const tab = entry.indexOf('\t');
-    if (tab === -1) continue; // --stage always emits "<mode> <object> <stage>\t<path>"
+    if (tab === -1) continue; // --stage always emits "<tag> <mode> <object> <stage>\t<path>"
     const rel = entry.slice(tab + 1);
-    if (entry.slice(0, 6) === '160000') {
+    if (isGitlinkEntry(entry)) {
       gitlinkRels.push(rel); // an unexpanded gitlink — recursed into below, not a source file itself
       continue;
     }
+    if (entry[0] === 'S' && !fs.existsSync(path.join(repoDir, rel))) continue;
     files.add(normalizePath(prefix + rel));
   }
 
@@ -2171,7 +2185,7 @@ export class ExtractionOrchestrator {
       const rel = normalizePath(relativePath);
       let known = reads?.get(rel);
       if (!known) {
-        const full = validatePathWithinRoot(rootDir, relativePath);
+        const full = validatePathWithinRoot(rootDir, relativePath, { readOnly: true });
         if (!full) return null;
         known = { full, signature: diskSignature(full) };
         reads?.set(rel, known);
