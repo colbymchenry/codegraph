@@ -5,7 +5,7 @@
  * `before`, the `String` one, and rocksdb's `it.seek(k2)`, with `k2` a
  * `ByteBuffer`, reached `seek(byte[])`. The arguments are read where their text
  * says: a literal, a cast, a `new`, `this`, a local, a parameter, a field, a call
- * on one of those.
+ * on one of those. A lambda or a method reference fits a functional interface.
  *
  * A lambda's parameter has the type the method it is passed to declares: `tb`
  * in `check(new HtmlTreeBuilder(), tb -> tb.process())` is a `HtmlTreeBuilder`
@@ -64,6 +64,8 @@ public class Element extends Node {
         pick(true);
         pick('c');
         pick(1.5);
+        pick(.5);
+        pick(2d);
         pick("s");
         pick("a" + label);
         pick(new Node());
@@ -341,6 +343,76 @@ public class DbTest {
     }
 }
 `,
+  // Minestom's Graph.Builder and Codec: a lambda or a method reference among overloads.
+  'src/f/Execution.java': 'package f;\n\npublic interface Execution {\n    boolean test(Object value);\n    void reset();\n}\n',
+  'src/f/TwoArguments.java': 'package f;\n\n@FunctionalInterface\npublic interface TwoArguments<T> {\n    T apply(T left, T right);\n}\n',
+  'src/f/Registry.java': 'package f;\n\npublic interface Registry<T> {\n    T get(String key);\n    int size();\n}\n',
+  'src/f/Plain.java': 'package f;\n\npublic class Plain {\n}\n',
+  'src/f/Graph.java': `package f;
+
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+public class Graph {
+    public Graph defaulted(Supplier<String> supplier) { return this; }
+    public Graph defaulted(Function<String, String> function) { return this; }
+    public Graph defaulted(BiFunction<String, String, String> function) { return this; }
+    public Graph append(String name, Execution execution) { return this; }
+    public Graph append(String name, Consumer<Graph> consumer) { return this; }
+    public Graph parsed(Checked<String> one) { return this; }
+    public Graph parsed(TwoArguments<String> two) { return this; }
+    public Graph value(int size) { return this; }
+    public Graph value(String name) { return this; }
+    public Graph value(Plain plain) { return this; }
+    public Graph value(Object[] all) { return this; }
+    public Graph value(Supplier<String> supplier) { return this; }
+    public Graph open(Execution execution) { return this; }
+    public Graph open(Registry<String> registry) { return this; }
+    public Graph primed(Runnable run, Plain plain) { return this; }
+    public Graph primed(Execution execution, Plain plain) { return this; }
+}
+`,
+  'src/f/GraphTest.java': `package f;
+
+public class GraphTest {
+    private void work() {}
+
+    void lambda(Graph graph) {
+        graph.append("foo", child -> child.append("bar", other -> {}));
+        graph.append("two", (a) -> child());
+    }
+
+    void methodReference(Graph graph) {
+        graph.append("foo", this::take);
+    }
+
+    void refused(Graph graph) {
+        graph.value(() -> "x");
+        graph.value(GraphTest::name);
+    }
+
+    void byParameters(Graph graph) {
+        graph.defaulted(() -> "x");
+        graph.defaulted(s -> s);
+        graph.defaulted((a, b) -> a);
+    }
+
+    void cantTell(Graph graph) {
+        graph.open(x -> true);
+        graph.parsed(p -> p);
+    }
+
+    void withTheOthers(Graph graph, Plain plain) {
+        graph.primed(this::work, plain);
+    }
+
+    private void take(Graph graph) {}
+    private static String name() { return ""; }
+    private Graph child() { return null; }
+}
+`,
   'src/r/Iter.java': `package r;
 
 import java.nio.ByteBuffer;
@@ -443,6 +515,34 @@ describe('a Java call\'s arguments pick its overload', () => {
     expect(calledFrom('throughFields', 'db.put(key.length)', 'put')).toEqual(['(int size)']);
   });
 
+  it('takes a lambda for a functional interface over what only may be one', () => {
+    expect(calledFrom('lambda', 'graph.append("foo", child', 'append')).toContain('(String name, Consumer<Graph> consumer)');
+    expect(calledFrom('lambda', 'graph.append("foo", child', 'append')).not.toContain('(String name, Execution execution)');
+    expect(calledFrom('lambda', 'graph.append("two", (a)', 'append')).toEqual(['(String name, Consumer<Graph> consumer)']);
+  });
+
+  it('takes a method reference the same way', () => {
+    expect(calledFrom('methodReference', 'graph.append("foo", this::take)', 'append')).toEqual(['(String name, Consumer<Graph> consumer)']);
+    expect(calledFrom('withTheOthers', 'graph.primed(this::work, plain)', 'primed')).toEqual(['(Runnable run, Plain plain)']);
+  });
+
+  it('takes no lambda for a number, a string, an array or a class', () => {
+    expect(calledFrom('refused', 'graph.value(() -> "x")', 'value')).toEqual(['(Supplier<String> supplier)']);
+    expect(calledFrom('refused', 'graph.value(GraphTest::name)', 'value')).toEqual(['(Supplier<String> supplier)']);
+  });
+
+  it('tells JDK functional interfaces apart by a lambda\'s parameters', () => {
+    expect(calledFrom('byParameters', 'graph.defaulted(() -> "x")', 'defaulted')).toEqual(['(Supplier<String> supplier)']);
+    expect(calledFrom('byParameters', 'graph.defaulted(s -> s)', 'defaulted')).toEqual(['(Function<String, String> function)']);
+    expect(calledFrom('byParameters', 'graph.defaulted((a, b) -> a)', 'defaulted')).toEqual(['(BiFunction<String, String, String> function)']);
+  });
+
+  it('keeps the ranking\'s pick between two that may each be functional', () => {
+    expect(calledFrom('cantTell', 'graph.open(x -> true)', 'open')).toEqual(['(Execution execution)']);
+    // elasticsearch's `parseList`: a project interface marked functional, and another out of the index.
+    expect(calledFrom('cantTell', 'graph.parsed(p -> p)', 'parsed')).toEqual(['(Checked<String> one)']);
+  });
+
   it('takes no number or string for a function', () => {
     expect(calledFrom('literalIsNoFunction', 'syntax.value(6)', 'value')).toEqual(['(T plain)']);
     expect(calledFrom('literalIsNoFunction', 'syntax.value("six")', 'value')).toEqual(['(T plain)']);
@@ -503,6 +603,8 @@ describe('a Java call\'s arguments pick its overload', () => {
       ['pick(true)', '(boolean flag)'],
       ["pick('c')", '(char c)'],
       ['pick(1.5)', '(double d)'],
+      ['pick(.5)', '(double d)'],
+      ['pick(2d)', '(double d)'],
       ['pick("s")', '(String s)'],
       ['pick("a" + label)', '(String s)'],
       ['pick(new Node())', '(Node node)'],

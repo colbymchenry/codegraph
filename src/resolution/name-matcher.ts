@@ -14662,6 +14662,13 @@ function javaOverloadParameters(n: Node, context: ResolutionContext): JavaParame
   return params;
 }
 
+/** The JDK's functional interfaces: java.util.function's, and `Runnable`, `Callable`, `Comparator`. */
+const JAVA_FUNCTIONAL_TYPE = /^(?:Runnable|Callable|Comparator|(?:Bi|Boolean|Double|Int|Long|Obj(?:Double|Int|Long)|To(?:Double|Int|Long)(?:Bi)?|(?:Double|Int|Long)To(?:Double|Int|Long))?(?:Consumer|Function|Predicate|Supplier)|(?:Double|Int|Long)?(?:Binary|Unary)Operator)$/;
+/** What javaArgumentType says of a method reference, and of a lambda with its parameters' count after it: no type of its own until a parameter gives it one. */
+const JAVA_FUNCTION_VALUE = '->';
+/** `Type::method`, `this::method`, `Outer.Inner::new`, `int[]::new`. */
+const JAVA_METHOD_REFERENCE = /^[\w$.]+(?:<[^()]*>)?(?:\[\])*\s*::\s*[A-Za-z_$][\w$]*$/;
+
 /** The JDK's functional interfaces: for each parameter of a lambda written for one, the type argument it has. */
 const JAVA_FUNCTIONAL_PARAMETERS: Readonly<Record<string, readonly number[]>> = {
   Consumer: [0], Predicate: [0], Function: [0], UnaryOperator: [0], BinaryOperator: [0, 0], Comparator: [0, 0],
@@ -14821,17 +14828,20 @@ function javaCalledType(arg: string, ref: UnresolvedRef, context: ResolutionCont
 /**
  * The static type of a Java argument, where its text alone says: a literal, a
  * cast, a `new`, `this`, a local, a parameter or a field, an element of one, or
- * a field of one or a call on it. Null for anything else (`null` fits every
- * reference type).
+ * a field of one or a call on it. A lambda or a method reference is
+ * JAVA_FUNCTION_VALUE. Null for anything else (`null` fits every reference type).
  */
 function javaArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const lambda = /^(?:\(([^()]*)\)|[A-Za-z_$][\w$]*)\s*->/.exec(arg);
+  if (lambda) return `${JAVA_FUNCTION_VALUE}${lambda[1] === undefined ? 1 : lambda[1].trim() === '' ? 0 : splitCppTopLevel(lambda[1]).length}`;
+  if (JAVA_METHOD_REFERENCE.test(arg)) return JAVA_FUNCTION_VALUE;
   if (/^"(?:[^"\\]|\\.)*"(?:\s*\+[\s\S]*)?$/.test(arg)) return 'String';
   if (/^'(?:[^'\\]|\\.)+'$/.test(arg)) return 'char';
   if (arg === 'true' || arg === 'false') return 'boolean';
   if (/^-?(?:0[xX][\da-fA-F_]+|0[bB][01_]+|\d[\d_]*)$/.test(arg)) return 'int';
   if (/^-?(?:0[xX][\da-fA-F_]+|0[bB][01_]+|\d[\d_]*)[lL]$/.test(arg)) return 'long';
-  if (/^-?\d[\d_]*(?:\.[\d_]*)?(?:[eE][-+]?\d+)?[fF]$/.test(arg)) return 'float';
-  if (/^-?(?:\d[\d_]*\.[\d_]*(?:[eE][-+]?\d+)?|\d[\d_]*[eE][-+]?\d+)[dD]?$/.test(arg)) return 'double';
+  if (/^-?(?:\d[\d_]*(?:\.[\d_]*)?|\.\d[\d_]*)(?:[eE][-+]?\d+)?[fF]$/.test(arg)) return 'float';
+  if (/^-?(?:(?:\d[\d_]*\.[\d_]*|\.\d[\d_]*)(?:[eE][-+]?\d+)?[dD]?|\d[\d_]*(?:[eE][-+]?\d+[dD]?|[dD]))$/.test(arg)) return 'double';
   // (Only when nothing follows it: `new Foo().bar()` is what `bar` returns.)
   const built = /^new\s+([\w$.]+)\s*(?:<[^()]*>)?\s*(\(|\[)/.exec(arg);
   if (built) {
@@ -14861,6 +14871,22 @@ function javaArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionCo
 }
 
 /**
+ * How a lambda or a method reference fits a parameter of Java type `param`: 1 a
+ * functional interface of the JDK's, 0 what may be one (another interface, a
+ * library type), -1 what can't take one, or a JDK interface whose method takes
+ * another number of arguments than the lambda's.
+ */
+function javaFunctionFit(arg: string, param: string, context: ResolutionContext): number {
+  if (JAVA_FUNCTIONAL_TYPE.test(param)) {
+    const takes = /Supplier$|^Runnable$|^Callable$/.test(param) ? 0 : /^Bi|BiFunction$|Binary|^Obj|^Comparator$/.test(param) ? 2 : 1;
+    return arg === JAVA_FUNCTION_VALUE || arg === `${JAVA_FUNCTION_VALUE}${takes}` ? 1 : -1;
+  }
+  if (param === 'Object' || param === 'String' || param.endsWith('[]') || JAVA_PRIMITIVE_TYPES.has(param)) return -1;
+  const decls = jvmTypeDecls(param, context).filter((n) => n.language === 'java');
+  return decls.length > 0 && decls.every((n) => n.kind !== 'interface') ? -1 : 0;
+}
+
+/**
  * How a Java argument of static type `arg` fits a parameter of type `param`:
  * 2 the same type, 1.5 by widening, which Java tries before boxing, 1 by boxing
  * or a supertype, 0 when it can't be told (a type parameter, one library type
@@ -14870,11 +14896,12 @@ function javaArgumentFit(arg: string, param: string, context: ResolutionContext)
   if (arg === param) return 2;
   const typeVariable = /^[A-Z][A-Z0-9]{0,2}(?:\[\])*$/;
   if (typeVariable.test(arg) || typeVariable.test(param)) return 0;
+  if (arg.startsWith(JAVA_FUNCTION_VALUE)) return javaFunctionFit(arg, param, context);
   const projectType = (name: string): Node[] => jvmTypeDecls(name.replace(/(?:\[\])+$/, ''), context).filter((n) => n.language === 'java');
   // A name the project doesn't declare may be a type parameter (`Item`), which takes anything.
   const refused = (type: string): number => (type === 'String' || projectType(type).length > 0 ? -1 : 0);
   // A number or a string is no function.
-  const valueRefused = (type: string): number => (JAVA_FUNCTIONAL_PARAMETERS[type] ? -1 : refused(type));
+  const valueRefused = (type: string): number => (JAVA_FUNCTIONAL_TYPE.test(type) ? -1 : refused(type));
   const argPrimitive = JAVA_PRIMITIVE_TYPES.has(arg);
   const paramPrimitive = JAVA_PRIMITIVE_TYPES.has(param);
   if (argPrimitive && paramPrimitive) return JAVA_WIDENED[arg]?.includes(param) ? 1.5 : -1;
