@@ -132,9 +132,12 @@ fi
 # it. See issues #293/#298 and src/extraction/wasm-runtime-flags.ts. (The CLI
 # also self-relaunches with this flag when launched without it, so non-bundled
 # runs are covered too; passing it here avoids that extra spawn.)
+#
+# `--max-semi-space-size=16`: V8's space for new objects at Node 22's size, in
+# every thread; see NODE_RUNTIME_FLAGS in the same file.
 if [ "$OSFAM" = "win32" ]; then
   cp "$NODE_BIN" "$STAGE/node.exe"
-  printf '@"%%~dp0..\\node.exe" --liftoff-only --disable-warning=ExperimentalWarning "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
+  printf '@"%%~dp0..\\node.exe" --liftoff-only --disable-warning=ExperimentalWarning --max-semi-space-size=16 "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
     > "$STAGE/bin/codegraph.cmd"
   # Git Bash (including Claude Code hooks) does not resolve .cmd via PATHEXT.
   cat > "$STAGE/bin/codegraph" <<'LAUNCH'
@@ -142,7 +145,7 @@ if [ "$OSFAM" = "win32" ]; then
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # Preserve an inherited CODEGRAPH_HOST_PPID; do not replace it with MSYS's
 # $PPID, which is not a native Windows PID usable by the orphan watchdog.
-exec "$DIR/node.exe" --liftoff-only --disable-warning=ExperimentalWarning "$DIR/lib/dist/bin/codegraph.js" "$@"
+exec "$DIR/node.exe" --liftoff-only --disable-warning=ExperimentalWarning --max-semi-space-size=16 "$DIR/lib/dist/bin/codegraph.js" "$@"
 LAUNCH
   chmod +x "$STAGE/bin/codegraph"
 else
@@ -168,7 +171,8 @@ export CODEGRAPH_HOST_PPID
 # --liftoff-only: avoid the V8 turboshaft WASM Zone OOM (issues #293/#298).
 # --disable-warning=ExperimentalWarning: mute node:sqlite's per-thread
 # "experimental feature" warning that otherwise interleaves with the progress UI.
-exec "$DIR/node" --liftoff-only --disable-warning=ExperimentalWarning "$DIR/lib/dist/bin/codegraph.js" "$@"
+# --max-semi-space-size=16: V8's space for new objects at Node 22's size.
+exec "$DIR/node" --liftoff-only --disable-warning=ExperimentalWarning --max-semi-space-size=16 "$DIR/lib/dist/bin/codegraph.js" "$@"
 LAUNCH
   chmod +x "$STAGE/bin/codegraph"
 fi

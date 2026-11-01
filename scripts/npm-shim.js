@@ -100,10 +100,11 @@ function launcherIn(dir) {
 // launcher already passes it; on Windows we invoke node.exe directly so add it.
 // --disable-warning=ExperimentalWarning mutes node:sqlite's per-thread
 // "experimental feature" warning, which otherwise prints once per parse worker
-// mid-index, shredding the progress UI. The bundled node.exe is always new
-// enough for both flags.
+// mid-index, shredding the progress UI. --max-semi-space-size=16 keeps V8's
+// space for new objects at Node 22's size in every thread. The bundled node.exe
+// is always new enough for all three flags.
 function liftoff(entry) {
-  return ['--liftoff-only', '--disable-warning=ExperimentalWarning', entry].concat(process.argv.slice(2));
+  return ['--liftoff-only', '--disable-warning=ExperimentalWarning', '--max-semi-space-size=16', entry].concat(process.argv.slice(2));
 }
 
 // Download + cache the platform bundle from GitHub Releases. Returns

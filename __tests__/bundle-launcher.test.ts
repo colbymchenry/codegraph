@@ -64,7 +64,7 @@ function checkForwarding(bundle: string) {
   expect(result.status, result.stderr).toBe(23);
   const output = JSON.parse(result.stdout);
   expect(output.args).toEqual(args);
-  expect(output.flags).toEqual(['--liftoff-only', '--disable-warning=ExperimentalWarning']);
+  expect(output.flags).toEqual(['--liftoff-only', '--disable-warning=ExperimentalWarning', '--max-semi-space-size=16']);
   expect(output.host).toBe('12345');
   expect(fs.realpathSync(output.exe)).toBe(fs.realpathSync(path.join(bundle, windows ? 'node.exe' : 'node')));
 }

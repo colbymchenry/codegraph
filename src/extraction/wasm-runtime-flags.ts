@@ -48,6 +48,12 @@ export const WASM_RUNTIME_FLAGS: readonly string[] = ['--liftoff-only'];
  * prints repeatedly, interleaved with the progress UI. Node options apply
  * process-wide (workers inherit them), so the command line covers everything.
  *
+ * `--max-semi-space-size=16` keeps V8's space for new objects at Node 22's size.
+ * Node 24 lets it grow to three times 64 MB in every thread, and allocating
+ * freely is enough to get there: a sync's peak memory was that space, not what
+ * it kept. Keeping it here costs no measurable CPU. It can only be set at
+ * start-up: a running thread's limit is fixed.
+ *
  * Deliberately NOT part of the {@link processHasWasmRuntimeFlags} re-exec
  * gate: a launcher passing only the WASM flags (an older installed bundle
  * running a newer dist) must not trigger a whole re-exec over a cosmetic
@@ -60,7 +66,7 @@ export function nodeRuntimeFlagsFor(nodeVersion: string): readonly string[] {
   // instead of a cryptic spawn failure.
   const [major = 0, minor = 0] = nodeVersion.split('.').map(Number);
   const supported = major > 21 || (major === 21 && minor >= 3) || (major === 20 && minor >= 11);
-  return supported ? ['--disable-warning=ExperimentalWarning'] : [];
+  return supported ? ['--disable-warning=ExperimentalWarning', '--max-semi-space-size=16'] : [];
 }
 
 export const NODE_RUNTIME_FLAGS: readonly string[] = nodeRuntimeFlagsFor(process.versions.node);

@@ -59,6 +59,17 @@ describe('NODE_RUNTIME_FLAGS', () => {
     expect(res.stderr).not.toMatch(/ExperimentalWarning/);
   });
 
+  it('keeps a thread\'s space for new objects at 16 MB a semi-space', () => {
+    expect(NODE_RUNTIME_FLAGS).toContain('--max-semi-space-size=16');
+    const res = spawnSync(
+      process.execPath,
+      [...NODE_RUNTIME_FLAGS, '-e', 'let a = []; for (let i = 0; i < 4e6; i++) { a.push({ i }); if (a.length > 2e5) a = []; } console.log(require("v8").getHeapSpaceStatistics().find((s) => s.space_name === "new_space").space_size)'],
+      { encoding: 'utf8' }
+    );
+    expect(res.status, res.stderr).toBe(0);
+    expect(Number(res.stdout)).toBeLessThanOrEqual(33 * 1024 * 1024);
+  });
+
   it('is empty on nodes too old for --disable-warning (fatal "bad option" there)', () => {
     expect(nodeRuntimeFlagsFor('20.10.0')).toEqual([]);
     expect(nodeRuntimeFlagsFor('21.2.0')).toEqual([]);
