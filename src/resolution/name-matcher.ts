@@ -21806,6 +21806,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUBY_FILE_SCOPES.delete(context);
   CSHARP_TYPE_ARITY.delete(context);
   CSHARP_EXTENSION_METHODS.delete(context);
+  JS_ASSIGNED_MEMBERS.delete(context);
   CFML_CHAINS.delete(context);
   NO_RECEIVER_LINES.delete(context);
   OBJC_SUPERS.delete(context);
@@ -24575,6 +24576,7 @@ export function matchMethodCall(
     // `node.loc` on a rubocop-ast node went to the one `loc` in the project
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
     if (targetMethods.length === 1 && !narrowed && !scopedOut && !pythonChain && targetMethods[0]!.language === ref.language &&
+        !(JS_FAMILY.has(ref.language) && targetMethods[0]!.filePath !== ref.filePath && jsFileAssignsMember(ref.filePath, methodName!, context)) &&
         // A test double is only what a test names — as in the scoring below:
         // allauth's `resp.json()` on a Django test response is not the one
         // `json` of its `MockedResponse`.
@@ -24712,6 +24714,27 @@ function isImportedModuleReceiver(receiver: string, ref: UnresolvedRef, context:
   const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === root);
   if (!binding) return false;
   return binding.isNamespace || context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+}
+
+const JS_ASSIGNED_MEMBERS = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
+
+/**
+ * Whether a JS file gives an object a function member of that name itself,
+ * `Sha256.prototype.update = function…`, inside the bundle's closure where the
+ * index holds no node for it. The one method of the name elsewhere is no
+ * likelier then: rails' `buffer.update(data)` in activestorage.js is the
+ * bundled sha256's, not the guides' turbo `History#update`.
+ */
+function jsFileAssignsMember(file: string, name: string, context: ResolutionContext): boolean {
+  let memo = JS_ASSIGNED_MEMBERS.get(context);
+  if (!memo) JS_ASSIGNED_MEMBERS.set(context, (memo = new Map()));
+  let members = memo.get(file);
+  if (!members) {
+    const found = new Set<string>();
+    for (const m of (context.readFile(file) ?? '').matchAll(/\.prototype\.([\w$]+)\s*=\s*(?:async\s+)?function\b/g)) found.add(m[1]!);
+    memo.set(file, (members = found));
+  }
+  return members.has(name);
 }
 
 /** The methods React calls on a class component itself. */
