@@ -9918,6 +9918,8 @@ interface RustModule {
   root: boolean;
   /** The package's other root, which holds crate-root items too: the `main.rs` beside its `lib.rs`. */
   alt?: string;
+  /** Each file a `#[path]` names for it, one per cfg: `file` is only the first (rustCfgChoiceItems reads them all). */
+  choices?: readonly RustModule[];
 }
 
 const rustJoin = (dir: string, name: string): string => (dir === '' ? name : `${dir}/${name}`);
@@ -10250,17 +10252,22 @@ function rustLibModule(crateDir: string, context: ResolutionContext): RustModule
  * that name — dioxus's `pub use dioxus_hooks as hooks;`. One a `#[path]`
  * puts elsewhere is the file it names when `m` declares it once, whatever
  * else loads that file too (a helper several tests load is each test's);
- * null when cfg alternatives name a file each (tokio's `process::imp` is
- * `unix/mod.rs` or `windows.rs`) or a `cfg_attr` sets the path, as for one
- * with no file.
+ * cfg alternatives that name a file each (tokio's `process::imp` is
+ * `unix/mod.rs` or `windows.rs`) are all of them (rustCfgChoiceItems); null
+ * when a `cfg_attr` sets the path, as for one with no file.
  */
 function rustSubmodule(m: RustModule, name: string, context: ResolutionContext, depth = 0): RustModule | null {
+  if (m.choices) return rustCfgChoice(m.choices.map((c) => rustSubmodule(c, name, context, depth)).filter((c) => c !== null));
   const dir = rustJoin(m.dir, name);
   const layout = rustUsesOf(m.file, context);
   if (layout.pathMods.has(name)) {
     const decls = rustPathDeclsIn(m.file, context).filter((d) => d.name === name && rustBlockAt(layout.blocks, d.at) === m.block);
-    const target = decls.length === 1 ? decls[0]!.target : null;
-    return target !== null && context.fileExists(target) ? { file: target, dir: rustParentDir(target), block: null, root: false } : null;
+    const files = new Set<string>();
+    for (const { target } of decls) {
+      if (target === null || !context.fileExists(target)) return null;
+      files.add(target);
+    }
+    return rustCfgChoice([...files].map((file) => ({ file, dir: rustParentDir(file), block: null, root: false })));
   }
   const block = layout.blocks.find((b) => b.name === name && b.parent === m.block);
   if (block) return { file: m.file, dir, block, root: false };
@@ -10274,6 +10281,11 @@ function rustSubmodule(m: RustModule, name: string, context: ResolutionContext, 
     if (passed !== null && passed !== 'outside') return passed;
   }
   return null;
+}
+
+/** One module for the cfg alternatives `mods`; null for none. */
+function rustCfgChoice(mods: RustModule[]): RustModule | null {
+  return mods.length > 1 ? { ...mods[0]!, choices: mods } : mods[0] ?? null;
 }
 
 /**
@@ -10363,6 +10375,7 @@ function rustDeclaredItems(m: RustModule, name: string, context: ResolutionConte
  * use_effect::*` doesn't pass on that module's own `use dioxus_core::*`.
  */
 function rustModuleItems(m: RustModule, name: string, context: ResolutionContext, seen: Set<string>, publicOnly = false): Node[] | null {
+  if (m.choices) return rustCfgChoiceItems(m.choices, name, context, seen, publicOnly);
   const key = `${m.file}\0${m.block?.open ?? -1}\0${name}\0${publicOnly ? 1 : 0}`;
   if (seen.has(key)) return [];
   if (seen.size >= 32) return null;
@@ -10390,6 +10403,28 @@ function rustModuleItems(m: RustModule, name: string, context: ResolutionContext
   } finally {
     seen.delete(key);
   }
+}
+
+/**
+ * The items named `name` in a module whose cfg alternatives name a file each.
+ * What only one of them holds is that one's, whichever the build takes:
+ * tokio's `crate::process::unix::GlobalOrphanQueue` reaches `unix/mod.rs`
+ * through `mod unix { pub(crate) use super::imp::*; }`, as `windows.rs` has
+ * none. A name two of them hold is the build's choice: null, as for any module
+ * that can't be followed.
+ */
+function rustCfgChoiceItems(choices: readonly RustModule[], name: string, context: ResolutionContext, seen: Set<string>, publicOnly: boolean): Node[] | null {
+  let found: Node[] = [];
+  let unknown = false;
+  for (const choice of choices) {
+    const items = rustModuleItems(choice, name, context, seen, publicOnly);
+    if (items === null) unknown = true;
+    else if (items.length > 0) {
+      if (found.length > 0) return null;
+      found = items;
+    }
+  }
+  return found.length > 0 || !unknown ? found : null;
 }
 
 /**

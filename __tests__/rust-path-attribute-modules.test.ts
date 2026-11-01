@@ -4,8 +4,9 @@
  * module, wherever the file lies, so `use super::*` brings in that module's
  * items, private ones included, and `crate::` is the declaring file's crate.
  * The path is read from the declaring file's directory, or from an inline
- * module's own directory. A module whose cfg alternatives each name a file,
- * or whose path a `cfg_attr` sets, depends on the build and stays unread.
+ * module's own directory. A name only one of a module's cfg alternatives holds
+ * is that one's; a name two of them hold, or a module whose path a `cfg_attr`
+ * sets, depends on the build and stays unread.
  * A file several declarations load is each one's from its own side, and an
  * example the manifest places at a path of its own is its own crate's root.
  */
@@ -23,7 +24,13 @@ beforeAll(async () => {
   const files: Record<string, string> = {
     'Cargo.toml': '[workspace]\nmembers = ["crates/core", "crates/py"]\nresolver = "2"\n',
     'crates/core/Cargo.toml': '[package]\nname = "core-crate"\nversion = "0.1.0"\nedition = "2021"\n\n[[example]]\nname = "demo"\npath = "examples/nested/demo.rs"\n',
-    'crates/core/src/lib.rs': 'pub mod scaling;\npub mod platform;\npub mod util;\n\npub fn root_helper() -> i32 {\n    0\n}\n\npub mod gen_user;\n',
+    'crates/core/src/lib.rs': 'pub mod scaling;\npub mod platform;\npub mod util;\n\npub fn root_helper() -> i32 {\n    0\n}\n\npub mod gen_user;\npub mod process;\npub mod park;\n',
+    // tokio's process module: an inline module globs what a `#[path]` loads, one file per cfg.
+    'crates/core/src/process/mod.rs': '#[path = "unix/mod.rs"]\n#[cfg(unix)]\nmod imp;\n\n#[cfg(unix)]\npub(crate) mod unix {\n    pub(crate) use super::imp::*;\n}\n\n#[path = "windows.rs"]\n#[cfg(windows)]\nmod imp;\n\npub(crate) fn via_windows() {\n    imp::only_on_windows();\n}\n\npub(crate) fn via_either() {\n    imp::on_each();\n}\n',
+    'crates/core/src/process/unix/mod.rs': 'pub(crate) mod orphan;\n\npub(crate) struct GlobalOrphanQueue;\n\npub(crate) fn on_each() {}\n',
+    'crates/core/src/process/unix/orphan.rs': 'pub(crate) trait OrphanQueue {}\n',
+    'crates/core/src/process/windows.rs': 'pub(crate) fn only_on_windows() {}\n\npub(crate) fn on_each() {}\n',
+    'crates/core/src/park.rs': 'use crate::process::imp::orphan::OrphanQueue;\nuse crate::process::unix::GlobalOrphanQueue;\n\npub fn park(queue: GlobalOrphanQueue, orphans: &dyn OrphanQueue) {}\n',
     'crates/core/src/util.rs': 'pub fn helper() -> i32 {\n    10\n}\n',
     // A folder whose name only starts with two dots is inside the project.
     'crates/core/src/gen_user.rs': '#[path = "..generated/gen.rs"]\nmod gen;\n\npub fn via_gen() -> i32 {\n    gen::make_gen()\n}\n',
@@ -141,8 +148,23 @@ describe('Rust modules a #[path] attribute loads', () => {
     expect(calls('crates/core/examples/nested/demo.rs', 'main')).toEqual(['helper crates/core/examples/nested/util.rs:1']);
   });
 
-  it('leave a module whose cfg alternatives name a file each, or whose path a cfg_attr sets, unread', () => {
+  it('leave a name two cfg alternatives hold, or a module whose path a cfg_attr sets, unread', () => {
     expect(calls('crates/core/src/platform.rs', 'via_imp')).toEqual([]);
+    expect(calls('crates/core/src/process/mod.rs', 'via_either')).toEqual([]);
     expect(calls('crates/core/src/platform.rs', 'via_documented')).toEqual([]);
+  });
+
+  it('reach what only one of its cfg alternatives holds', () => {
+    expect(calls('crates/core/src/process/mod.rs', 'via_windows')).toEqual(['only_on_windows crates/core/src/process/windows.rs:1']);
+  });
+
+  it('let a `use` through a glob of cfg alternatives, or on through a module of one, reach the item', () => {
+    const park = cg.getNodesInFile('crates/core/src/park.rs').find((n) => n.kind === 'file');
+    const imported = cg.getOutgoingEdgesFrom([park!.id]).filter((e) => e.kind === 'imports')
+      .map((e) => cg.getNode(e.target)!).map((t) => `${t.name} ${t.filePath}:${t.startLine}`).sort();
+    expect(imported).toEqual([
+      'GlobalOrphanQueue crates/core/src/process/unix/mod.rs:3',
+      'OrphanQueue crates/core/src/process/unix/orphan.rs:1',
+    ]);
   });
 });
