@@ -63,8 +63,9 @@ Every payload carries this envelope:
 And one of four events:
 
 - **`install`** — when `codegraph install` configures agents: which agents
-  (`["claude","cursor",…]`), global vs project-local, and whether it was a fresh install,
-  an upgrade, or a re-run.
+  (`["claude","cursor",…]`; a target you defined yourself with `codegraph targets add` is
+  recorded as `custom-<family>`, never by the name you gave it), global vs project-local, and
+  whether it was a fresh install, an upgrade, or a re-run.
 - **`index`** — when a full index completes: the **language names** present (e.g.
   `["typescript","go"]`), the file count as a **coarse bucket** (`<100`, `100-1k`,
   `1k-10k`, `10k+`), and the duration as a bucket (`<10s`, `10-60s`, `1-5m`, `5m+`).
