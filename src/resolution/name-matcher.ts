@@ -4079,6 +4079,7 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // `job.OPCommand` result type is not the method `Context.OPCommand`.
   if (ref.language === 'go' && candidate.language === 'go' &&
       (isGoExternalQualified(ref, context) || !isInGoQualifierPackage(candidate, ref, context))) return false;
+  if ((ref.language === 'csharp' || ref.language === 'razor') && !csharpTypeArityFits(candidate, ref, context)) return false;
   if (candidate.filePath === ref.filePath) return true;
   // A vendored minified bundle's names are mangled: healthchecks' 369 `$(…)`
   // (jQuery, a global) went to a one-letter helper inside bootstrap-native.min.js.
@@ -8009,6 +8010,101 @@ function isCsharpTypeVisible(n: Node, ref: UnresolvedRef, context: ResolutionCon
   if (aliased !== undefined) return aliased === `${ns}.${n.qualifiedName.slice(cut + 2).replace(/::/g, '.')}`;
   if (scope.namespaces.some((own) => own === ns || own.startsWith(ns + '.'))) return true;
   return scope.usings.has(ns);
+}
+
+/** Space, comments and preprocessor lines, which may stand between C# attribute lists. */
+const CSHARP_TRIVIA = /(?:\s|\/\/[^\n]*|\/\*[\s\S]*?\*\/|#[^\n]*)*/y;
+/** What decides where a C# attribute list ends: a bracket, or a literal that may hold one. */
+const CSHARP_ATTRIBUTE_PIECE = /@"(?:[^"]|"")*"|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|[[\]]/g;
+
+/** Where `text` goes on past the C# attribute lists that open at `from`. */
+function csharpPastAttributes(text: string, from: number): number {
+  let at = from;
+  for (;;) {
+    CSHARP_TRIVIA.lastIndex = at;
+    CSHARP_TRIVIA.test(text);
+    at = CSHARP_TRIVIA.lastIndex;
+    if (text[at] !== '[') return at;
+    CSHARP_ATTRIBUTE_PIECE.lastIndex = at;
+    let depth = 0;
+    let piece: RegExpExecArray | null;
+    do {
+      piece = CSHARP_ATTRIBUTE_PIECE.exec(text);
+      if (piece?.[0] === '[') depth++;
+      else if (piece?.[0] === ']') depth--;
+    } while (piece && depth > 0);
+    if (!piece) return at;
+    at = CSHARP_ATTRIBUTE_PIECE.lastIndex;
+  }
+}
+
+/**
+ * A C# declaration's source from past its attributes: its node starts at them,
+ * so its first line may be `[MethodImpl(…)]`, and more of them may follow.
+ */
+function csharpDeclarationSource(node: Node, context: ResolutionContext): string {
+  const lines = context.getFileLines?.(node.filePath) ?? context.readFile(node.filePath)?.split(/\r?\n/) ?? [];
+  const source = lines.slice(node.startLine - 1, node.endLine).join('\n');
+  return source.slice(csharpPastAttributes(source, 0));
+}
+
+const CSHARP_TYPE_ARITY = new WeakMap<ResolutionContext, Map<string, number>>();
+
+/** How many type parameters a C# type declares: `class Cache<K, V>` 2, `class List` 0. */
+function csharpDeclaredArity(type: Node, context: ResolutionContext): number {
+  let memo = CSHARP_TYPE_ARITY.get(context);
+  if (!memo) CSHARP_TYPE_ARITY.set(context, (memo = new Map()));
+  const hit = memo.get(type.id);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(type.filePath) ?? context.readFile(type.filePath)?.split(/\r?\n/) ?? [];
+  if (type.kind === 'component') {
+    const arity = lines.filter((l) => /^\s*@typeparam\b/.test(l)).length;
+    memo.set(type.id, arity);
+    return arity;
+  }
+  // The first `class Name` is the declaration; a later one is a comment or a string.
+  const params = new RegExp(String.raw`\b(?:class|struct|interface|record|enum)\s+(?:(?:class|struct)\s+)?${escapeRegExp(type.name)}\b(?:\s*<([^<>]*)>)?`).exec(csharpDeclarationSource(type, context))?.[1];
+  const arity = params === undefined ? 0 : params.split(',').length;
+  memo.set(type.id, arity);
+  return arity;
+}
+
+/**
+ * How many type arguments the C# type named at `ref` is written with: 2 for
+ * `Cache<string, List<int>>`, 0 for none, null when the list doesn't close on
+ * its line.
+ */
+function csharpWrittenArity(ref: UnresolvedRef, context: ResolutionContext): number | null {
+  const name = ref.referenceName.split('.').pop()!;
+  const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [])[ref.line - 1] ?? '';
+  const at = line.indexOf(name, Math.max(0, ref.column));
+  if (at < 0) return 0;
+  let i = at + name.length;
+  while (line[i] === ' ') i++;
+  if (line[i] !== '<') return 0;
+  let depth = 0;
+  let args = 1;
+  for (; i < line.length; i++) {
+    const c = line[i]!;
+    if (c === '<' || c === '(' || c === '[') depth++;
+    else if (c === '>' || c === ')' || c === ']') {
+      if (--depth === 0) return args;
+    } else if (c === ',' && depth === 1) args++;
+  }
+  return null;
+}
+
+/**
+ * Whether a C# type can be what `ref` names, by type arguments: a name written
+ * with them means a type declaring as many. `new List<CatalogBrand>()` is the
+ * BCL's `List<T>`, not the Blazor page `List` around it, whose namespace would
+ * win for a bare `List`.
+ */
+export function csharpTypeArityFits(type: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if ((ref.referenceKind !== 'references' && ref.referenceKind !== 'instantiates') ||
+      !(CSHARP_TYPE_KINDS.has(type.kind) || (type.kind === 'component' && type.language === 'razor'))) return true;
+  const written = csharpWrittenArity(ref, context);
+  return !written || written === csharpDeclaredArity(type, context);
 }
 
 /**
@@ -14237,6 +14333,7 @@ export function matchByExactName(
     // Source()` in one test class is not the previous test class's `Source`.
     !(ref.language === 'csharp' && n.language === 'csharp' && CSHARP_TYPE_KINDS.has(n.kind) && /^[A-Za-z_]\w*$/.test(ref.referenceName) &&
       (!isCsharpNestedTypeInScope(n, ref, context) || (n.filePath !== ref.filePath && !isCsharpTypeVisible(n, ref, context)))) &&
+    !((ref.language === 'csharp' || ref.language === 'razor') && !csharpTypeArityFits(n, ref, context)) &&
     // Preserve import ranking; calls reject the winner without promoting another.
     (!importRef || n.filePath === ref.filePath ||
       !ESM_FAMILY.has(n.language) || !isSealedModule(n.filePath, context)) &&
@@ -21707,6 +21804,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUBY_MIXINS.delete(context);
   RUBY_METHOD_OWNERS.delete(context);
   RUBY_FILE_SCOPES.delete(context);
+  CSHARP_TYPE_ARITY.delete(context);
+  CSHARP_EXTENSION_METHODS.delete(context);
   CFML_CHAINS.delete(context);
   NO_RECEIVER_LINES.delete(context);
   OBJC_SUPERS.delete(context);
@@ -21886,6 +21985,7 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_][\\w.]*)`), // = new Logger()
         new RegExp(`\\b([A-Z][\\w.]*)\\s*${TYPE_ARGS}\\??\\s+${r}\\b\\s*[=;,)]`), // Logger lg;  / List<string> names / JProperty? p
         new RegExp(`\\bforeach\\s*\\(\\s*([A-Z][\\w.]*)\\s*${TYPE_ARGS}\\??\\s+${r}\\s+in\\b`), // foreach (JProperty p in props)
+        new RegExp(`\\b(bool|byte|sbyte|char|decimal|double|float|int|uint|long|ulong|short|ushort|string)\\??\\s+${r}\\b\\s*(?:[=;,)]|in\\b)`), // int year = 0
       ];
     case 'objc':
       return [
@@ -23643,6 +23743,8 @@ export function matchMethodCall(
   let javaDeclared: ReturnType<typeof javaReceiverDeclaredType> | undefined;
   // A declaration read for the receiver, so its name names no class (Strategy 2).
   let declaredReceiver = false;
+  // A C# keyword type: an extension method is the only project method it has.
+  let csharpBuiltInReceiver = false;
   if (inferableReceiver) {
     // A VB.NET receiver's declared type decides the call, or that there is no
     // project method to call: SCrawler's `ThumbnailFile.Delete(…)` on an
@@ -23899,6 +24001,7 @@ export function matchMethodCall(
         // through `__call`: a namesake's method may well be the one meant.)
         phpWholeType = declaredReceiver && !phpAncestry([qn], context).leavesRepo && !phpTypeMethod(qn, '__call', context)?.method;
       }
+      if (ref.language === 'csharp' && /^[a-z]/.test(inferredType)) declaredReceiver = csharpBuiltInReceiver = true;
       const typedMatch = phpWholeType ? null : nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
         methodName!,
@@ -24328,9 +24431,13 @@ export function matchMethodCall(
         // instance of it (rubocop's `cop.cop_name` runs over its registry's
         // cop classes, so it is `def self.cop_name`), so neither of a class's
         // two methods of the name is preferred: the first declared is taken.
+        // (A standard name a class only inherits, `ToString` on C#'s `year`, says
+        // nothing of a receiver that shares a word with the class.)
         const methodNode = ref.language === 'php' && !phpNamed.includes(classNode)
           ? phpUnnamedClassMethod(classNode, methodName!, fuzzyClassCandidates.filter((c) => c.language === 'php').length === 1, context)
-          : classStrategyMethod(classNode, methodName!, context);
+          : ref.language === 'csharp' && isStdMethodName('csharp', methodName!)
+            ? findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName!)
+            : classStrategyMethod(classNode, methodName!, context);
 
         if (methodNode && !(ref.language === 'kotlin' && !isKotlinExtensionInScope(methodNode, ref, context))) {
           if (throughCppNamespace()) return null;
@@ -24392,6 +24499,7 @@ export function matchMethodCall(
     // Filter to same-language candidates first
     const sameLanguageMethods = methods.filter(m => m.language === ref.language);
     let targetMethods = sameLanguageMethods.length > 0 ? sameLanguageMethods : methods;
+    if (csharpBuiltInReceiver) targetMethods = targetMethods.filter((m) => isCsharpExtensionMethod(m, context));
     // A receiver the file imports is another module's value: never a method
     // declared in the calling file. expo-camera's `CameraManager.isAvailableAsync()`
     // (`import CameraManager from './ExpoCameraManager'`) went to `CameraView`'s
@@ -24483,7 +24591,7 @@ export function matchMethodCall(
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
           !(ref.language === 'php' && phpReceiverReaches(objectOrClass!, targetMethods[0]!, context)))) {
       if (throughCppNamespace() && !isCppConstructorThrough(objectOrClass!, targetMethods[0]!, context)) return null;
-      if (isForeignReceiverSelfLoop(targetMethods[0]!, objectOrClass!, ref)) return null;
+      if (isForeignReceiverSelfLoop(targetMethods[0]!, objectOrClass!, ref, context)) return null;
       return {
         original: ref,
         targetNodeId: targetMethods[0]!.id,
@@ -24827,8 +24935,48 @@ const SELF_RECEIVERS = new Set(['this', 'self', 'Self', 'super', 'cls']);
  * children — cobra's `sub.checkCommandGroups()` over `c.commands`, etcd's
  * `child.Repr(…)` — which is real recursion.
  */
-function isForeignReceiverSelfLoop(candidate: Node, receiver: string, ref: UnresolvedRef): boolean {
-  return candidate.id === ref.fromNodeId && !SELF_RECEIVERS.has(receiver) && ref.language !== 'go';
+function isForeignReceiverSelfLoop(candidate: Node, receiver: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return candidate.id === ref.fromNodeId && !SELF_RECEIVERS.has(receiver) && ref.language !== 'go' &&
+    !isCsharpExtensionElementCall(candidate, receiver, ref, context);
+}
+
+/**
+ * Whether a C# extension method calls itself on an element a lambda of its
+ * body receives: serilog's `sequence.Elements.Select(e => e.LiteralValue())`
+ * inside `LiteralValue(this LogEventPropertyValue @this)` walks a value's
+ * children, as a Go range variable does (see above).
+ */
+function isCsharpExtensionElementCall(method: Node, receiver: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!isCsharpExtensionMethod(method, context)) return false;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const before = [...lines.slice(method.startLine - 1, ref.line - 1), (lines[ref.line - 1] ?? '').slice(0, Math.max(0, ref.column))].join('\n');
+  return new RegExp(String.raw`(?:^|[^\w.])\(?${escapeRegExp(receiver)}\)?\s*=>`).test(before);
+}
+
+const CSHARP_EXTENSION_METHODS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+/** A first parameter past its attributes, written `this`: `this T x`, `ref this int x`. */
+const CSHARP_THIS_PARAMETER = /(?:(?:ref|in|scoped|readonly)\s+)*this\s/y;
+
+/**
+ * Whether a C# method is an extension method: its first parameter is written
+ * `this T x`. The list is found from the method's name, since attributes may
+ * stand above the name, the return type may be a tuple, and the list may wrap.
+ */
+function isCsharpExtensionMethod(method: Node, context: ResolutionContext): boolean {
+  if (method.language !== 'csharp') return false;
+  let memo = CSHARP_EXTENSION_METHODS.get(context);
+  if (!memo) CSHARP_EXTENSION_METHODS.set(context, (memo = new Map()));
+  const hit = memo.get(method.id);
+  if (hit !== undefined) return hit;
+  const source = csharpDeclarationSource(method, context);
+  const list = new RegExp(String.raw`\b${escapeRegExp(method.name)}\s*(?:<[^()]*>\s*)?\(`).exec(source);
+  let extension = false;
+  if (list) {
+    CSHARP_THIS_PARAMETER.lastIndex = csharpPastAttributes(source, list.index + list[0].length);
+    extension = CSHARP_THIS_PARAMETER.test(source);
+  }
+  memo.set(method.id, extension);
+  return extension;
 }
 
 /** The directory of a Go file, which is its package: Go keeps one package per directory. */

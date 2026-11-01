@@ -8,6 +8,7 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { pickByNameAndKind } from './name-heuristic';
+import { csharpTypeArityFits } from '../name-matcher';
 
 export const aspnetResolver: FrameworkResolver = {
   name: 'aspnet',
@@ -421,5 +422,7 @@ function resolveByNameAndKind(
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  return pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context);
+  const picked = pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context);
+  const type = picked ? context.getNodeById?.(picked) : undefined;
+  return type && !csharpTypeArityFits(type, ref, context) ? null : picked;
 }
