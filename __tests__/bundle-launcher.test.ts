@@ -136,7 +136,9 @@ describe('bundled Node runtime (#2617)', () => {
     const pin = /^NODE_VERSION="\$\{2:-v(\d+)\.(\d+)\.(\d+)\}"\r?$/m.exec(recipe);
     expect(pin, 'default NODE_VERSION in scripts/build-bundle.sh').not.toBeNull();
     const [major, minor] = pin!.slice(1, 3).map(Number);
-    // The CLI refuses to run on Node 25 and later.
+    // The bundle is pinned to the 24.x release line, the line its security
+    // releases are taken from (24.22.1 and later, issue #2780; see the pin's
+    // comment in scripts/build-bundle.sh).
     expect(major).toBe(24);
     // Node 24 before 24.20.0 can abort on Windows as the process exits, after
     // the command's work is done (0xC0000409, nodejs/node#56645).

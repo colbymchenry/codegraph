@@ -6,8 +6,9 @@
  * arena while compiling these grammars on a background thread, aborting the
  * whole process with `Fatal process out of memory: Zone` — even with tens of
  * GB of system memory free, because the Zone is a V8-internal arena, not the
- * JS heap. Reproduced on Node 22 and 24; Node 25 is already hard-blocked for
- * the same crash (see ../bin/node-version-check.ts). See issues #293 and #298.
+ * JS heap. Reproduced on Node 22 and 24; reported on Node 25 in #81.
+ * `--liftoff-only` keeps compilation off that tier, which is why the CLI
+ * sets no upper Node bound. See issues #293 and #298.
  *
  * `--liftoff-only` forces every WASM module to the Liftoff baseline compiler
  * and never runs turboshaft, which eliminates the crash. Parsing stays fully
