@@ -271,6 +271,155 @@ describe.each(ARMS)('a Python call through super() ($arm)', ({ env }) => {
     expect(callees('Site::__init__')).toEqual([]);
   });
 
+  it('stops at a base from outside the project, which may define the name itself', async () => {
+    await index({
+      'mixed.py': [
+        'from django.db import models',
+        '',
+        'class Local:',
+        '    def run(self):',
+        '        return 1',
+        '',
+        'class After(models.Model, Local):',
+        '    def run(self):',
+        '        return super().run()',
+        '',
+        'class Before(Local, models.Model):',
+        '    def run(self):',
+        '        return super().run()',
+      ],
+    });
+    expect(callees('After::run')).toEqual([]);
+    expect(callees('Before::run')).toEqual(['Local::run']);
+  });
+
+  it('stops at an outside base that a project base brings in', async () => {
+    await index({
+      'deep.py': [
+        'class Ext(dict):',
+        '    pass',
+        '',
+        'class Local:',
+        '    def get(self):',
+        '        return 1',
+        '',
+        'class Both(Ext, Local):',
+        '    def get(self):',
+        '        return super().get()',
+      ],
+    });
+    expect(callees('Both::get')).toEqual([]);
+  });
+
+  it('passes over the bases that define nothing a call could reach', async () => {
+    await index({
+      'plain.py': [
+        'from abc import ABC',
+        'from typing import Generic, Protocol, TypeVar',
+        '',
+        'T = TypeVar("T")',
+        '',
+        'class Base:',
+        '    def run(self):',
+        '        return 1',
+        '',
+        'class Typed(Generic[T], ABC, Base, metaclass=type):',
+        '    def run(self):',
+        '        return super().run()',
+      ],
+    });
+    expect(callees('Typed::run')).toEqual(['Base::run']);
+  });
+
+  it('follows the written order of bases that share a name, through import aliases', async () => {
+    await index({
+      'a.py': ['class Base:', '    def run(self):', '        return 1'],
+      'b.py': ['class Base:', '    def run(self):', '        return 2'],
+      'use.py': [
+        'from a import Base as First',
+        'from b import Base as Second',
+        '',
+        'class AB(First, Second):',
+        '    def run(self):',
+        '        return super().run()',
+        '',
+        'class BA(Second, First):',
+        '    def run(self):',
+        '        return super().run()',
+      ],
+    });
+    const target = (caller: string): string[] => cg.getCallees(method(caller).id)
+      .filter((c) => c.node.kind === 'method').map((c) => c.node.filePath);
+    expect(target('AB::run')).toEqual(['a.py']);
+    expect(target('BA::run')).toEqual(['b.py']);
+  });
+
+  it('reads a base list wrapped over lines, with a comment in it', async () => {
+    await index({
+      'wrapped.py': [
+        'class First:',
+        '    def run(self):',
+        '        return 1',
+        '',
+        'class Second:',
+        '    def run(self):',
+        '        return 2',
+        '',
+        'class Both(',
+        '    Second,  # this one, first',
+        '    First,',
+        '):',
+        '    def run(self):',
+        '        return super().run()',
+      ],
+    });
+    expect(callees('Both::run')).toEqual(['Second::run']);
+  });
+
+  it('reads the header of a decorated class', async () => {
+    await index({
+      'decorated.py': [
+        'from dataclasses import dataclass',
+        '',
+        'class A:',
+        '    def run(self):',
+        '        return 1',
+        '',
+        '@dataclass(',
+        '    frozen=True,',
+        ')',
+        'class B(A):',
+        '    def run(self):',
+        '        return super().run()',
+      ],
+    });
+    expect(callees('B::run')).toEqual(['A::run']);
+  });
+
+  it('keeps each super call on a line to its own form', async () => {
+    await index({
+      'twice.py': [
+        'class A:',
+        '    def foo(self):',
+        '        return 1',
+        '',
+        'class Mixin:',
+        '    def bar(self):',
+        '        return 2',
+        '',
+        'class B(A, Mixin):',
+        '    def named_first(self):',
+        '        return super(A, self).foo() + super().bar()',
+        '',
+        '    def plain_first(self):',
+        '        return super().bar() + super(A, self).foo()',
+      ],
+    });
+    // `super(A, self)` names a class other than the caller's, so it stays out; `super()` beside it doesn't.
+    expect(callees('B::named_first')).toEqual(['Mixin::bar']);
+    expect(callees('B::plain_first')).toEqual(['Mixin::bar']);
+  });
+
   it('stays unlinked in a mixin, whose next class is not written down', async () => {
     await index({
       'mixin.py': [

@@ -1161,6 +1161,11 @@ export class ReferenceResolver {
         return nodes;
       },
 
+      getSuperclassEdges: (id: string) => this.queries.getOutgoingEdges(id, ['extends']).flatMap((edge) => {
+        const target = this.nodeById(edge.target);
+        return target ? [{ target, line: edge.line, column: edge.column }] : [];
+      }),
+
       getImportMappings: (filePath: string, language) => {
         const cacheKey = filePath;
         const cached = this.importMappingCache.get(cacheKey);
