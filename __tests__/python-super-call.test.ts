@@ -331,6 +331,37 @@ describe.each(ARMS)('a Python call through super() ($arm)', ({ env }) => {
     expect(callees('Typed::run')).toEqual(['Base::run']);
   });
 
+  it('stops at Generic or Protocol for the hooks they do define', async () => {
+    await index({
+      'hooks.py': [
+        'from typing import Generic, Protocol, TypeVar',
+        '',
+        'T = TypeVar("T")',
+        '',
+        'class Local:',
+        '    def __init_subclass__(cls):',
+        '        pass',
+        '',
+        '    def run(self):',
+        '        return 1',
+        '',
+        'class ViaGeneric(Generic[T], Local):',
+        '    def __init_subclass__(cls):',
+        '        super().__init_subclass__()',
+        '',
+        '    def run(self):',
+        '        return super().run()',
+        '',
+        'class ViaProtocol(Protocol, Local):',
+        '    def __init_subclass__(cls):',
+        '        super().__init_subclass__()',
+      ],
+    });
+    expect(callees('ViaGeneric::__init_subclass__')).toEqual([]);
+    expect(callees('ViaProtocol::__init_subclass__')).toEqual([]);
+    expect(callees('ViaGeneric::run')).toEqual(['Local::run']);
+  });
+
   it('follows the written order of bases that share a name, through import aliases', async () => {
     await index({
       'a.py': ['class Base:', '    def run(self):', '        return 1'],
