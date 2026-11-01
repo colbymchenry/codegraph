@@ -127,6 +127,8 @@ interface FileExportIndex {
    * until first read through {@link statedDefaultExport}.
    */
   statedDefault?: StatedDefault;
+  /** What `module.exports =` says, once read (see commonJsDefaultExport). */
+  commonJsDefault?: { source?: string; name?: string } | null;
   /**
    * Names a local export clause (`export { impl as alias }`) binds to a
    * declaration the extractor never flagged isExported, for names not in
@@ -273,11 +275,12 @@ const COMMONJS_DEFAULT_EXPORT =
 function commonJsDefaultExport(filePath: string, context: ResolutionContext): { source?: string; name?: string } | null {
   if (!JS_FAMILY_FILE.test(filePath)) return null;
   if (context.fileContains && !context.fileContains(filePath, 'module.exports')) return null;
+  const idx = getFileExportIndex(filePath, context);
+  if (idx.commonJsDefault !== undefined) return idx.commonJsDefault;
   const source = context.readFile(filePath);
-  if (!source || !source.includes('module.exports')) return null;
-  const m = COMMONJS_DEFAULT_EXPORT.exec(source);
-  if (!m) return null;
-  return m[1] ? { source: m[1] } : { name: m[2] ?? m[3] ?? m[4] };
+  const m = source && source.includes('module.exports') ? COMMONJS_DEFAULT_EXPORT.exec(source) : null;
+  idx.commonJsDefault = !m ? null : m[1] ? { source: m[1] } : { name: m[2] ?? m[3] ?? m[4] };
+  return idx.commonJsDefault;
 }
 
 function getFileExportIndex(filePath: string, context: ResolutionContext): FileExportIndex {
@@ -358,12 +361,14 @@ function hasEsmDefaultExport(filePath: string, idx: FileExportIndex, context: Re
 
 /**
  * Whether `node` is what its own file says it default-exports: what an `export
- * default` statement declares or names, a single-file component, or the name
- * `module.exports` is set to. Anything else a default import lands on is the
- * guess at the module's first export ({@link esmDefaultExport}).
+ * default` statement declares or names, a single-file component, the name
+ * `module.exports` is set to, or a declaration file's answer, which an `export
+ * =` gives too. Anything else a default import lands on is the guess at the
+ * module's first export ({@link esmDefaultExport}).
  */
 export function isStatedDefaultExport(node: Node, context: ResolutionContext): boolean {
   if (!JS_FAMILY_FILE.test(node.filePath)) return node.kind === 'component';
+  if (isDeclarationFile(node.filePath)) return true;
   const stated = statedDefaultExport(node.filePath, getFileExportIndex(node.filePath, context), context);
   return typeof stated === 'object' ? stated.id === node.id : commonJsDefaultExport(node.filePath, context)?.name === node.name;
 }
@@ -3384,6 +3389,19 @@ export function resolveViaImport(
         const want = { isDefault: imp.isDefault, isNamespace: imp.isNamespace, exportedName, memberName };
 
         const targetNode = findImportedExport(imp.source, resolvedPath, want, ref, context);
+        const memberRead = !imp.isNamespace && ref.referenceName.startsWith(imp.localName + '.');
+
+        // `named.second()` through a default binding: what the module exports
+        // as `second`. `require('./m')` is the whole module, and so is a
+        // default import of a CommonJS one. Where the module states no default
+        // the name it exports comes first, since all that was found is the
+        // guess at its first export, and nothing else can be the answer.
+        const throughDefault = memberRead && imp.isDefault && ESM_IMPORT_LANGUAGES.has(ref.language);
+        const exported = throughDefault
+          ? findImportedExport(imp.source, resolvedPath, { ...want, isDefault: false, isNamespace: true, memberName: ref.referenceName.slice(imp.localName.length + 1) }, ref, context)
+          : undefined;
+        const guessed = throughDefault && !(targetNode && isStatedDefaultExport(targetNode, context));
+        if (guessed && exported) return { original: ref, targetNodeId: exported.id, confidence: 0.9, resolvedBy: 'import' };
 
         if (targetNode) {
           // `Foo.bar()` / `Foo.CONST` — a NAMED (non-namespace) class import
@@ -3393,7 +3411,7 @@ export function resolveViaImport(
           // class and `createEdges` then mis-promotes the call to an
           // `instantiates` edge, so the static method shows zero callers and a
           // hollow impact radius. (#825)
-          if (!imp.isNamespace && ref.referenceName.startsWith(imp.localName + '.')) {
+          if (memberRead) {
             const memberNode = resolveStaticMember(targetNode, ref, imp.localName, context);
             if (memberNode) {
               return {
@@ -3432,12 +3450,19 @@ export function resolveViaImport(
             const instanceMember = resolveImportedInstanceMember(targetNode, ref, imp.localName, context);
             if (instanceMember) return instanceMember;
 
+            // `module.exports = main; module.exports.extra = …`, then `m.extra()`.
+            if (exported) return { original: ref, targetNodeId: exported.id, confidence: 0.9, resolvedBy: 'import' };
+
             // Finding a named Python import proves the receiver exists, not
             // its requested attribute. In particular, task.delay() enqueues
             // work; it does not call the imported task function directly.
             // Keep unknown members unresolved (including callback values)
             // instead of falling back to the receiver as their target.
             if (ref.language === 'python') return null;
+
+            // A member of the guess at a module's first export is no member of
+            // the module: the receiver isn't known, so there is nothing to name.
+            if (guessed) continue;
           }
 
           return {
@@ -4252,7 +4277,22 @@ function findExportedSymbolWalk(
   if (want.isDefault) {
     // What the file's own `export default` statement exports beats any
     // guess; an anonymous default is no node at all, and no neighbour is it.
-    if (statedDefaultExport(filePath, exportIndex, context) === 'anonymous') return undefined;
+    const stated = statedDefaultExport(filePath, exportIndex, context);
+    if (stated === 'anonymous') return undefined;
+    // CommonJS: `module.exports = createApplication`, or `= require('./lib/express')`.
+    // Said outright, so it beats the guess below at a neighbour assigned to
+    // `exports.x = function …`, which is flagged exported.
+    const commonJs = typeof stated === 'object' ? null : commonJsDefaultExport(filePath, context);
+    if (commonJs?.source) {
+      const next = resolveImportPath(commonJs.source, filePath, language, context);
+      const forwarded = next ? findExportedSymbol(next, want, language, context, visited, depth + 1) : undefined;
+      if (forwarded) return forwarded;
+    } else if (commonJs?.name) {
+      const bound = moduleBindingsFirst(filePath, nodesInFileNamed(filePath, commonJs.name, context)
+        .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
+        .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn))[0];
+      if (bound) return bound;
+    }
     // Svelte/Vue single-file components ARE the module's default export,
     // but are extracted as kind 'component' (not function/class), so the
     // fallback prefers the component node. Without it, an `export { default
@@ -4260,20 +4300,14 @@ function findExportedSymbolWalk(
     // a false 0 callers (#629).
     const direct = esmDefaultExport(filePath, exportIndex, context);
     if (direct) return direct;
-    // CommonJS: `module.exports = createApplication`, or `= require('./lib/express')`.
-    const commonJs = commonJsDefaultExport(filePath, context);
-    if (commonJs?.source) {
-      const next = resolveImportPath(commonJs.source, filePath, language, context);
-      if (next) return findExportedSymbol(next, want, language, context, visited, depth + 1);
-    } else if (commonJs?.name) {
-      const bound = moduleBindingsFirst(filePath, nodesInFileNamed(filePath, commonJs.name, context)
-        .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
-        .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn))[0];
-      if (bound) return bound;
-    }
   } else if (want.isNamespace && want.memberName) {
     const direct = exportedByName(filePath, exportIndex, want.memberName, context);
     if (direct) return direct;
+    // `module.exports = require('./lib/m')` forwards the whole module.
+    const source = commonJsDefaultExport(filePath, context)?.source;
+    const next = source ? resolveImportPath(source, filePath, language, context) : null;
+    const forwarded = next ? findExportedSymbol(next, want, language, context, visited, depth + 1) : undefined;
+    if (forwarded) return forwarded;
   } else {
     const direct = exportedByName(filePath, exportIndex, want.exportedName, context);
     if (direct) return direct;
