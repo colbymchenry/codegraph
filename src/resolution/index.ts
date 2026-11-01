@@ -46,7 +46,7 @@ import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { clearRubyConstantPathMemos, matchRubyConstantPathRef } from './ruby-constant-paths';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
-import { ResolverPool, minRefsForPool, resolveWorkersWorthStarting, shouldEngageAdaptively } from './resolver-pool';
+import { ResolverPool, minRefsForPool, poolStartSettled, resolveWorkersWorthStarting, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } from './frameworks';
 import { clearDeclaredDependencies } from './frameworks/package-deps';
@@ -2668,11 +2668,16 @@ export class ReferenceResolver {
       byMethod: {} as Record<string, number>,
     };
 
-    // Parallel pool, started immediately but never awaited up front: early
-    // batches run sequentially while the workers boot (module load + readonly
-    // DB open + framework detect + cache warm ≈ hundreds of ms), and the loop
-    // switches to fan-out the moment the pool reports ready — so pool boot
-    // costs zero wall-clock. Any failure downgrades to sequential permanently.
+    // Parallel pool. A run large enough to start one up front waits for it to
+    // boot (module load + readonly DB open + framework detect + cache warm ≈
+    // hundreds of ms) rather than resolve on this thread meanwhile: the first
+    // batch is the prerequisites, and in C++ the first qualified base class reads
+    // every source file for the project's namespace aliases, one synchronous
+    // stretch on the thread the liveness watchdog watches (#1091), 20 s or more
+    // on a project the size of LLVM. The wait is bounded and a failure ends it
+    // (poolStartSettled), and any failure downgrades to sequential permanently.
+    // A pool engaged mid-loop keeps the loop running while it boots: a run under
+    // that bar is too small for the first batch to matter.
     let pool: ResolverPool | null = null;
     let poolReady = false;
     // True once pool creation has been attempted by EITHER engage site (the
@@ -2704,6 +2709,7 @@ export class ReferenceResolver {
     };
     if (parallel && total >= minRefsForPool()) {
       pool = createPool(Date.now(), 'ref-count');
+      if (pool) await poolStartSettled(pool.ready());
     }
     // Adaptive engagement bar (see the batch-loop hook): projected remaining
     // sequential settle above this boots the pool mid-loop. Boot is async and

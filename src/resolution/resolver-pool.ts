@@ -105,6 +105,25 @@ export function resolveWorkersWorthStarting(projectedMs: number): number {
 }
 
 /**
+ * The longest a run that starts the pool before its first batch waits for it, in
+ * ms. A full index's workers are up in a second or two; a sync's detect the
+ * project's frameworks for themselves, which can read every source file. Past
+ * this the run goes on on its own thread, as it would with no pool, and takes the
+ * pool up if it does come.
+ */
+export const POOL_START_WAIT_MS = 30_000;
+
+/** Waits for a pool's start to settle, however it goes, for at most POOL_START_WAIT_MS. */
+export async function poolStartSettled(start: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    start.catch(() => undefined),
+    new Promise<void>((resolve) => { timer = setTimeout(resolve, POOL_START_WAIT_MS); }),
+  ]);
+  clearTimeout(timer);
+}
+
+/**
  * What a resolver worker's heap may hold of new objects. Resolving keeps many
  * of them alive for a while, so V8 grows this space as far as it may: 192 MB a
  * worker on Node 24, where it was the larger part of a big repo's peak memory,
@@ -122,6 +141,8 @@ export class ResolverPool {
   private synthWaiters = new Map<number, { resolve: (r: SynthPassResult) => void; reject: (e: Error) => void }>();
   private recycleWaiters = new Map<number, () => void>();
   private failed: Error | null = null;
+  /** Fail the workers still starting: a failure is a pool that will never be ready. */
+  private failStarts: Array<(err: Error) => void> = [];
 
   /**
    * Pool size from CPU headroom, memory headroom, and the explicit override.
@@ -216,6 +237,7 @@ export class ResolverPool {
         readyResolve = resolve;
         readyReject = reject;
       });
+      this.failStarts.push(readyReject);
       const pw: PoolWorker = { worker, ready, started, busy: 0 };
       worker.on('message', (msg: { type: string; id?: number; message?: string; edges?: Edge[]; ms?: number } & Partial<ChunkResult>) => {
         if (msg.type === 'ready') {
@@ -261,10 +283,9 @@ export class ResolverPool {
         readyReject(this.failed!);
       });
       worker.on('exit', (code) => {
-        if (code !== 0) {
-          this.fail(new Error(`resolver worker exited with code ${code}`));
-          readyReject(this.failed!);
-        }
+        if (code !== 0) this.fail(new Error(`resolver worker exited with code ${code}`));
+        // (Gone before it said ready, it never will. Once it has, this does nothing.)
+        readyReject(this.failed ?? new Error('resolver worker exited before it was ready'));
       });
       worker.postMessage({ type: 'open', dbPath, projectRoot, frameworks });
       this.workers.push(pw);
@@ -273,6 +294,7 @@ export class ResolverPool {
 
   private fail(err: Error): void {
     if (!this.failed) this.failed = err;
+    for (const failStart of this.failStarts) failStart(this.failed);
     for (const [, waiter] of this.waiters) waiter.reject(this.failed);
     this.waiters.clear();
     for (const [, waiter] of this.synthWaiters) waiter.reject(this.failed);
