@@ -29664,6 +29664,26 @@ function matchJavaCsharpNewReceiverCall(cls: string, written: string, method: st
     const byPath = (n: Node) => n.filePath.replace(/\.java$/, '').endsWith('/' + fqn!.replace(/\./g, '/'));
     const ownPackage = twins.filter((n) => dirOf(n.filePath) === dirOf(ref.filePath));
     chosen = fqn ? twins.find(byPath) : ownPackage.length === 1 ? ownPackage[0] : undefined;
+    // An on-demand import (`import com.x.b.*`) binds the simple name too, but
+    // the import mappings don't list it, so `new Util().run()` under one —
+    // beside a bare `new Util()` that the bare-type visibility resolved —
+    // constructed nothing when two packages held a Util (#2976). The class
+    // the file can see by simple name — its own package's, an explicit
+    // import's, or a package an on-demand import covers — is the one
+    // constructed; the file's own shadows the imported ones, and two seen
+    // only through on-demand imports are ambiguous, which Java cannot pick.
+    if (!chosen && ref.language === 'java') {
+      const here = javaFileScope(ref.filePath, context);
+      const visible = twins.filter((n) => {
+        if (n.language !== 'java') return false;
+        if (n.filePath === ref.filePath) return true;
+        const pkg = javaFileScope(n.filePath, context).pkg;
+        const top = n.qualifiedName.split('::')[pkg ? 1 : 0] ?? '';
+        return pkg === here.pkg || here.single.has(`${pkg}.${top}`) || here.demand.has(pkg);
+      });
+      const own = visible.find((n) => n.filePath === ref.filePath);
+      chosen = own ?? (visible.length === 1 ? visible[0] : undefined);
+    }
   }
   if (!chosen) return null;
   const own = context.getNodesInFile(chosen.filePath).find((n) =>
