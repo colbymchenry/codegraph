@@ -29,8 +29,8 @@
  *   - The handshake "hello" line that lets a proxy verify it found a
  *     same-version daemon before piping any JSON-RPC through it.
  *   - The lockfile (`.codegraph/daemon.pid`) competing daemons arbitrate
- *     against — atomic `O_EXCL` create with the full record written in the same
- *     breath (no empty-file window) + cleanup on exit.
+ *     against — complete-file publication or guarded exclusive-create fallback,
+ *     with every ownership mutation serialized by its `.break` lock.
  *   - Reference counting + idle timeout.
  *   - Graceful shutdown on SIGTERM/SIGINT and idle exit.
  *
@@ -64,6 +64,7 @@ import {
   type WriterLockInfo,
 } from './writer-lock';
 import { registerDaemon, deregisterDaemon } from './daemon-registry';
+import { isPidLockPending, withPidLock } from './pid-lock';
 
 /** Default idle linger after the last client disconnects. */
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
@@ -321,12 +322,8 @@ export class Daemon {
       // spin respawning us on a stale lock pointing at our now-dying pid. Then
       // re-throw so the caller (the bin's try/catch) exits this detached daemon
       // cleanly and every launcher falls back to direct mode (#974).
+      this.cleanupArtifacts(candidates);
       this.cleanupLockfile();
-      if (process.platform !== 'win32') {
-        for (const candidate of candidates) {
-          try { fs.unlinkSync(candidate); } catch { /* may not exist */ }
-        }
-      }
       throw err;
     }
 
@@ -343,13 +340,16 @@ export class Daemon {
       startedAt: Date.now(),
     };
 
-    // Refresh the lock on every successful bind, not only relocation. The
-    // writer lock prevents stale-artifact cleanup from racing this ownership
-    // check, and the exact snapshot prevents overwriting a replacement record.
+    // Refresh on every successful bind, not only relocation. The writer slot
+    // excludes socket cleanup, the PID barrier excludes record mutations, and
+    // the exact snapshot prevents overwriting changed ownership.
     try {
       refreshDaemonLock(this.pidPath, initialLockContents, lock);
     } catch (err) {
-      try { bound.server.close(); } catch { /* best-effort */ }
+      await new Promise<void>((resolve) => {
+        try { bound.server.close(() => resolve()); } catch { resolve(); }
+      });
+      this.cleanupArtifacts([this.socketPath]);
       this.cleanupLockfile();
       throw err;
     }
@@ -420,12 +420,11 @@ export class Daemon {
       await new Promise<void>((resolve) => this.server!.close(() => resolve()));
       this.server = null;
     }
+    // Engine teardown can release writer ownership. Sweep first, while both
+    // ownership records still exclude a successor from publishing/binding.
+    this.cleanupArtifacts([this.socketPath]);
     await this.engine.stop();
     this.cleanupLockfile();
-    deregisterDaemon(this.projectRoot);
-    if (process.platform !== 'win32') {
-      try { fs.unlinkSync(this.socketPath); } catch { /* may already be gone */ }
-    }
     // POSIX exits here; Windows drains first (engine.stop() above began closing
     // the file watcher, and exiting mid-teardown aborts the process). See
     // finalizeDaemonExit / DAEMON_SHUTDOWN_BACKSTOP_MS.
@@ -607,19 +606,30 @@ export class Daemon {
     return reaped;
   }
 
-  private cleanupLockfile(): void {
-    releaseWriterLock(this.projectRoot);
-    try {
-      if (fs.existsSync(this.pidPath)) {
-        // Only remove if it still belongs to us — another daemon may have
-        // already taken over while we were shutting down (extremely rare).
-        const raw = fs.readFileSync(this.pidPath, 'utf8');
-        const info = decodeLockInfo(raw);
-        if (info && info.pid === process.pid) {
-          fs.unlinkSync(this.pidPath);
+  /** Sweep only this daemon's artifacts, before teardown can release its writer slot. */
+  private cleanupArtifacts(socketPaths: readonly string[]): void {
+    withPidLock(this.pidPath, () => {
+      try {
+        if (decodeLockInfo(fs.readFileSync(this.pidPath, 'utf8'))?.pid !== process.pid) return;
+        deregisterDaemon(this.projectRoot);
+        if (process.platform !== 'win32') {
+          for (const socketPath of socketPaths) {
+            try { fs.unlinkSync(socketPath); } catch { /* may already be gone */ }
+          }
         }
-      }
-    } catch { /* best-effort; we're exiting anyway */ }
+      } catch { /* inconclusive ownership: preserve the artifacts */ }
+    }, () => {}, { wait: true });
+  }
+
+  /** Release PID ownership last; a handover may change it while this process lives. */
+  private cleanupLockfile(): void {
+    withPidLock(this.pidPath, () => {
+      try {
+        const info = decodeLockInfo(fs.readFileSync(this.pidPath, 'utf8'));
+        if (info?.pid === process.pid) fs.unlinkSync(this.pidPath);
+      } catch { /* best-effort; we're exiting anyway */ }
+    }, () => {}, { wait: true });
+    releaseWriterLock(this.projectRoot);
   }
 }
 
@@ -638,7 +648,8 @@ const LOCK_REFRESH_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 400, 400];
  * Windows sharing violation. Keep this startup step synchronous: accepting a
  * client before ownership is refreshed could initialize an engine too early.
  * Retries wait per {@link LOCK_REFRESH_RETRY_DELAYS_MS}; permanent failures
- * still abort startup.
+ * still abort startup. The PID-record barrier excludes acquisition and cleanup
+ * across the ownership check, rename, and all retries.
  */
 export function refreshDaemonLock(
   pidPath: string,
@@ -646,29 +657,31 @@ export function refreshDaemonLock(
   lock: DaemonLockInfo,
   platform: NodeJS.Platform = process.platform,
 ): void {
-  const tmpPid = `${pidPath}.${process.pid}.bound`;
-  try {
-    fs.writeFileSync(tmpPid, encodeLockInfo(lock), { mode: 0o600 });
-    for (let attempt = 0; ; attempt++) {
-      // A retry must never replace a record whose owner changed while waiting.
-      if (fs.readFileSync(pidPath, 'utf8') !== initialContents) {
-        throw new Error('Lost daemon lock ownership after binding.');
-      }
-      try {
-        fs.renameSync(tmpPid, pidPath);
-        return;
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        const delay = LOCK_REFRESH_RETRY_DELAYS_MS[attempt];
-        if (platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(code ?? '') || delay === undefined) {
-          throw error;
+  withPidLock(pidPath, () => {
+    const tmpPid = `${pidPath}.${process.pid}.bound`;
+    try {
+      fs.writeFileSync(tmpPid, encodeLockInfo(lock), { mode: 0o600 });
+      for (let attempt = 0; ; attempt++) {
+        // Check on every retry as well as excluding cooperating mutations.
+        if (fs.readFileSync(pidPath, 'utf8') !== initialContents) {
+          throw new Error('Lost daemon lock ownership after binding.');
         }
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+        try {
+          fs.renameSync(tmpPid, pidPath);
+          return;
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          const delay = LOCK_REFRESH_RETRY_DELAYS_MS[attempt];
+          if (platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(code ?? '') || delay === undefined) {
+            throw error;
+          }
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+        }
       }
+    } finally {
+      try { fs.unlinkSync(tmpPid); } catch { /* renamed, or best-effort cleanup */ }
     }
-  } finally {
-    try { fs.unlinkSync(tmpPid); } catch { /* renamed, or best-effort cleanup */ }
-  }
+  }, () => { throw new Error(`Timed out refreshing daemon ownership; inspect ${pidPath}.break for its current owner.`); }, { wait: true });
 }
 
 /**
@@ -687,35 +700,15 @@ export type AcquireResult =
     };
 
 /**
- * Atomically create the daemon pidfile with its full record already in place.
- * Returns either an `acquired` result (the caller is the daemon-elect and may
- * construct a {@link Daemon}) or a `taken` result.
+ * Publish the daemon pidfile under its PID-record mutation barrier. Returns an
+ * `acquired` result (the caller is daemon-elect) or `taken`, including when
+ * another process is mutating the record.
  *
- * must-fix 1 (issue #411 review): the lockfile must appear in ONE atomic step,
- * already complete — never empty, even momentarily. The first attempt at this
- * (`O_EXCL` create then a separate `writeSync`) left a microsecond window where
- * the file existed but was empty; under concurrent daemon startup a third
- * candidate could read that empty file, decode it as `null`, and `unlink` the
- * winner's lock → two daemons (two watchers, two writers). The window was
- * normally too small to hit, but the file watcher's extra startup time made
- * concurrent daemons overlap enough to reproduce it reliably.
- *
- * The fix writes the complete record to a private temp file, then hard-links it
- * into place: `link()` is atomic AND exclusive (EEXIST if the target exists), so
- * the pidfile becomes visible in one step already containing a full record.
- * Whoever links first wins; everyone else gets EEXIST and reads a complete file.
- * There is no empty-file window at all.
- *
- * Filesystems without hard links (#997): ExFAT/FAT external volumes and some
- * network mounts can't `link()` at all — it throws ENOTSUP/EPERM, which would
- * otherwise kill the daemon before it ever reaches the socket bind. There we
- * fall back to an O_EXCL create (`acquireLockViaExclusiveOpen`): still exclusive
- * ("first writer wins"), but the full record is written through the fd in a
- * second step, so the empty-file window the link approach removed is reopened —
- * only on these filesystems, only for the microseconds between create and write
- * (far narrower than the original bug, which the file watcher's startup latency
- * widened). The race's worst case is two daemons briefly; on a single external
- * drive that's strictly better than the daemon never starting at all.
+ * A private complete file is hard-linked into place atomically and exclusively.
+ * Filesystems without hard links (#997), including ExFAT/FAT and some network
+ * mounts, use O_EXCL create followed by write through the same fd instead. The
+ * barrier excludes cleanup throughout both steps; a fresh empty record also
+ * gets FileLock's ten-second grace before it can be judged stale.
  */
 export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
   const pidPath = getDaemonPidPath(projectRoot);
@@ -730,56 +723,49 @@ export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
     startedAt: Date.now(),
   };
 
-  // Temp name is pid-scoped so racing candidates never collide on it.
-  const tmp = `${pidPath}.${process.pid}.tmp`;
-  let acquired = false;
-  try {
-    fs.writeFileSync(tmp, encodeLockInfo(info), { mode: 0o600 });
+  const taken = (): AcquireResult => {
+    let existing: DaemonLockInfo | null = null;
+    let lockContents: string | null = null;
     try {
-      fs.linkSync(tmp, pidPath); // atomic + exclusive (race-free; see must-fix 1)
-      acquired = true;
-    } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
-        // Lost the race — another candidate already holds it. Fall through to read.
-      } else {
-        // link() failed for a non-conflict reason — nearly always "this filesystem
-        // has no hard links" (ExFAT/FAT external volumes, some network mounts),
-        // which surfaces as a DIFFERENT errno on every OS: ENOTSUP on macOS, EPERM
-        // on Linux, EISDIR on Windows (#997). Enumerating them is whack-a-mole and
-        // unnecessary: the `tmp` write above already proved this directory is
-        // writable, so an O_EXCL create is a valid atomic+exclusive substitute. If
-        // IT fails too, that's a genuine error and propagates. EEXIST ⇒ taken.
-        acquired = acquireLockViaExclusiveOpen(pidPath, info);
+      lockContents = fs.readFileSync(pidPath, 'utf8');
+      existing = decodeLockInfo(lockContents);
+    } catch { /* unreadable is not proof of staleness */ }
+    return { kind: 'taken', existing, lockContents, pidPath };
+  };
+  return withPidLock<AcquireResult>(pidPath, () => {
+    // Temp publication and its cleanup are inside the barrier, too.
+    const tmp = `${pidPath}.${process.pid}.tmp`;
+    let acquired = false;
+    try {
+      fs.writeFileSync(tmp, encodeLockInfo(info), { mode: 0o600 });
+      try {
+        fs.linkSync(tmp, pidPath);
+        acquired = true;
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+          // The temp write proved the directory writable. A non-conflict link
+          // failure can mean hard links are unavailable; O_EXCL is still valid.
+          acquired = createDaemonPidFile(pidPath, info);
+        }
       }
+    } finally {
+      try { fs.unlinkSync(tmp); } catch { /* temp already gone */ }
     }
-  } finally {
-    try { fs.unlinkSync(tmp); } catch { /* temp already gone */ }
-  }
-
-  if (acquired) return { kind: 'acquired', pidPath, info };
-
-  // Taken. Because the pidfile was link'd atomically it always holds a complete
-  // record — `existing` is null only for a genuinely corrupt leftover, never a
-  // mid-write race.
-  let existing: DaemonLockInfo | null = null;
-  let lockContents: string | null = null;
-  try {
-    lockContents = fs.readFileSync(pidPath, 'utf8');
-    existing = decodeLockInfo(lockContents);
-  } catch { /* unreadable lockfile — treat as malformed */ }
-  return { kind: 'taken', existing, lockContents, pidPath };
+    return acquired ? { kind: 'acquired', pidPath, info } : taken();
+  }, taken);
 }
 
 /**
- * Exclusive-create the pidfile (O_CREAT|O_EXCL via the `wx` flag) and write the
- * full record through the same fd — the hard-link-free fallback used by
- * {@link tryAcquireDaemonLock} on filesystems without `link()`. Returns true if
- * we created it (acquired the lock), false on EEXIST (another candidate holds
- * it). Any other error propagates. Still exclusive, so "first writer wins" holds
- * exactly as the link path does; the only difference is the brief empty-file
- * window between create and write. Exported for testing.
+ * Exclusive-create and write under the PID-record barrier, matching the
+ * hard-link-free publication path. False on contention or an existing record;
+ * publication errors propagate. Exported for testing.
  */
 export function acquireLockViaExclusiveOpen(pidPath: string, info: DaemonLockInfo): boolean {
+  return withPidLock(pidPath, () => createDaemonPidFile(pidPath, info), () => false);
+}
+
+/** O_EXCL publication primitive; the caller must hold the PID-record barrier. */
+function createDaemonPidFile(pidPath: string, info: DaemonLockInfo): boolean {
   let fd: number;
   try {
     fd = fs.openSync(pidPath, 'wx', 0o600); // O_CREAT | O_EXCL | O_WRONLY
@@ -796,43 +782,38 @@ export function acquireLockViaExclusiveOpen(pidPath: string, info: DaemonLockInf
 }
 
 /**
- * Remove a stale pidfile. Re-reads the file immediately before unlinking so a
- * different daemon that acquired the lock in the meantime is never disturbed.
- *
- * must-fix 1 (issue #411 review): the original unconditionally `unlink`'d,
- * which let a racing candidate delete a healthy daemon's lock. Passing
- * `expectedDeadPid` (the pid the caller believed was dead) makes the clear a
- * compare-and-delete: bail if the file now holds a different pid. By default a
- * live pid is also preserved; `allowLivePid` is reserved for callers that have
- * already disproved daemon identity with the socket hello (#1553). Returns true
- * when the stale lock is gone (or was already gone).
+ * Remove a stale pidfile under the PID-record barrier, rereading the inspected
+ * snapshot before unlink. Acquisition and refresh cannot publish a successor
+ * between that check and removal. Fresh empty publications are preserved.
+ * `expectedDeadPid` and `expectedLockContents` restrict removal to the inspected
+ * identity. By default live PIDs are preserved; `allowLivePid` is reserved for
+ * callers that disproved daemon identity with the socket hello (#1553).
+ * Returns true when the stale lock is gone (or was already gone), false on
+ * changed ownership, contention, or inconclusive I/O.
  */
 export function clearStaleDaemonLock(
   pidPath: string,
   expectedDeadPid?: number,
   opts: { allowLivePid?: boolean; expectedLockContents?: string } = {}
 ): boolean {
-  try {
-    const raw = fs.readFileSync(pidPath, 'utf8');
-    // The identity record changed after the caller inspected it. Even the same
-    // PID may now advertise a newly-bound socket, so this snapshot was never
-    // disproved and must not be deleted.
-    if (opts.expectedLockContents !== undefined && raw !== opts.expectedLockContents) return false;
-    const info = decodeLockInfo(raw);
-    if (info) {
-      // A different pid took over since we read it — not ours to clear.
-      if (expectedDeadPid !== undefined && info.pid !== expectedDeadPid) return false;
-      // PID liveness is normally sufficient. The takeover caller may override
-      // it only after a failed identity handshake proves PID reuse.
-      if (!opts.allowLivePid && info.pid > 0 && isProcessAlive(info.pid)) return false;
+  return withPidLock(pidPath, () => {
+    try {
+      const raw = fs.readFileSync(pidPath, 'utf8');
+      // Even the same PID may advertise a newly-bound socket; only the inspected
+      // snapshot was disproved by the caller.
+      if (opts.expectedLockContents !== undefined && raw !== opts.expectedLockContents) return false;
+      if (isPidLockPending(pidPath, raw)) return false;
+      const info = decodeLockInfo(raw);
+      if (info) {
+        if (expectedDeadPid !== undefined && info.pid !== expectedDeadPid) return false;
+        if (!opts.allowLivePid && info.pid > 0 && isProcessAlive(info.pid)) return false;
+      }
+      fs.unlinkSync(pidPath);
+      return true;
+    } catch (err: unknown) {
+      return (err as NodeJS.ErrnoException).code === 'ENOENT';
     }
-    fs.unlinkSync(pidPath);
-    return true;
-  } catch (err: unknown) {
-    const e = err as NodeJS.ErrnoException;
-    if (e.code === 'ENOENT') return true; // already gone
-    return false;
-  }
+  }, () => false);
 }
 
 /**

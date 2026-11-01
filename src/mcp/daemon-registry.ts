@@ -42,6 +42,7 @@ import {
 import { classifyLockHolder, describeProcess } from './process-identity';
 import { isOlderRelease } from './version';
 import { WORKER_START_SETTLE_MS } from '../worker-teardown';
+import { isPidLockPending, withPidLock } from './pid-lock';
 
 export interface DaemonRecord {
   /** Realpath'd project root the daemon serves. */
@@ -166,9 +167,9 @@ function cleanupDaemonArtifacts(
   root: string,
   expectedLockContents: string | null,
 ): boolean {
-  // A daemon owns writer.pid before binding or relocating its socket. Claiming
-  // the writer slot therefore freezes every legitimate daemon artifact writer
-  // while we compare the inspected lock snapshot and clean it up.
+  // The writer slot excludes socket bind/relocation, but initial daemon.pid
+  // publication precedes that claim. removeDaemonArtifacts also takes the
+  // daemon PID-record barrier to exclude those initial publications.
   if (readWriterLock(root)?.pid === process.pid) return false;
   const claim = tryAcquireWriterLock(root, 'cleanup');
   if (claim.kind === 'taken') return false;
@@ -180,31 +181,32 @@ function cleanupDaemonArtifacts(
   }
 }
 
-/** The removal behind {@link cleanupDaemonArtifacts}, for a caller already holding the writer slot. */
+/** Remove artifacts under the daemon barrier; the caller already holds the writer slot. */
 function removeDaemonArtifacts(root: string, expectedLockContents: string | null): boolean {
   const pidPath = getDaemonPidPath(root);
-  if (expectedLockContents === null) {
-    if (fs.existsSync(pidPath)) return false;
-  } else {
+  return withPidLock(pidPath, () => {
     try {
-      if (fs.readFileSync(pidPath, 'utf8') !== expectedLockContents) return false;
-    } catch {
-      return false;
+      const raw = fs.readFileSync(pidPath, 'utf8');
+      if (expectedLockContents === null || raw !== expectedLockContents || isPidLockPending(pidPath, raw)) return false;
+    } catch (err) {
+      // Missing is safe, but unreadable is not evidence of staleness. A vanished
+      // expected snapshot is also safe: the barrier excludes its successor.
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return false;
     }
-  }
-  // POSIX sockets are real files; Windows named pipes vanish with the process.
-  // Sweep every candidate before releasing daemon.pid, so no successor can
-  // acquire the lock and bind a socket that this cleanup then removes.
-  if (process.platform !== 'win32') {
-    for (const candidate of getDaemonSocketCandidates(root)) {
-      try { fs.unlinkSync(candidate); } catch { /* gone */ }
+    // POSIX sockets are files; Windows named pipes vanish with the process.
+    // Keep both the writer slot and daemon barrier throughout the sweep so no
+    // successor can publish or bind a socket that cleanup would then remove.
+    if (process.platform !== 'win32') {
+      for (const candidate of getDaemonSocketCandidates(root)) {
+        try { fs.unlinkSync(candidate); } catch { /* gone */ }
+      }
     }
-  }
-  deregisterDaemon(root);
-  try { fs.unlinkSync(pidPath); } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return false;
-  }
-  return true;
+    deregisterDaemon(root);
+    try { fs.unlinkSync(pidPath); } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+    }
+    return true;
+  }, () => false);
 }
 
 /** Remove daemon artifacts only when no matching daemon answers the socket hello. */
