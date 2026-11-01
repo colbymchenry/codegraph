@@ -19,6 +19,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- `codegraph grep` and the opt-in `codegraph_grep` tool group indexed search hits by symbol and rank them by incoming links, marking questionable calls or excluding them with `--strict`.
 - `codegraph suspects` and the opt-in `codegraph_suspects` tool rank questionable call edges so you can review ambiguous bindings before trusting them.
 - `codegraph blast` and the opt-in `codegraph_blast` tool show what depends on the lines a branch or your uncommitted work changed, grouped by folder with a note on whether tests reach each changed area, and can print a pull-request comment; dependents reached only through questionable calls are marked, and `--strict` leaves them out.
 - `codegraph files --format package` and `codegraph_files` with `format: "package"` now list a project's files by the package that owns them, the nearest `package.json` or `composer.json` above each file that names one, so a monorepo splits into its workspace members with no setup and files nothing claims get a section of their own (#1871). Thanks @LuisAlbertoMK.
