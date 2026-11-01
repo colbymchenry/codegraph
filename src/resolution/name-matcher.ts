@@ -1573,10 +1573,11 @@ export function matchFunctionRef(
           (n.qualifiedName === ref.referenceName ||
             n.qualifiedName.endsWith(`::${ref.referenceName}`))
       );
-    if (scoped.length === 0) return null;
-    const sameFileScoped = scoped.filter((n) => n.filePath === ref.filePath);
-    const pool = sameFileScoped.length > 0 ? sameFileScoped : scoped;
-    if (sameFileScoped.length === 0 && scoped.length > 1) return null;
+    const members = ref.language === 'java' && scoped.length > 1 ? javaMembersOfVisibleType(scoped, ref, context) : scoped;
+    if (members.length === 0) return null;
+    const sameFileScoped = members.filter((n) => n.filePath === ref.filePath);
+    const pool = sameFileScoped.length > 0 ? sameFileScoped : members;
+    if (sameFileScoped.length === 0 && members.length > 1) return null;
     const target = pool.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
     return {
       original: ref,
@@ -1695,6 +1696,21 @@ export function matchFunctionRef(
     };
   }
   return null;
+}
+
+/**
+ * Of the members a Java `Type::method` could name, those of a `Type` the
+ * file can see, as for a bare type name: elasticsearch's `Template::lifecycle`
+ * under `import …metadata.Template` is that class's method, not the accessor
+ * of a record `Template` nested elsewhere.
+ */
+function javaMembersOfVisibleType(members: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  const type = { ...ref, referenceName: ref.referenceName.slice(0, ref.referenceName.lastIndexOf('::')) };
+  return members.filter((n) => {
+    const ownerQn = n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf('::'));
+    const owner = context.getNodesByQualifiedName(ownerQn).find((t) => t.filePath === n.filePath && JAVA_TYPE_KINDS_VISIBLE.has(t.kind));
+    return !owner || isJavaTypeVisible(owner, type, context);
+  });
 }
 
 /** Languages with no nested named functions: nesting in the graph is never a scope. */
@@ -3783,32 +3799,78 @@ function javaFileScope(file: string, context: ResolutionContext): { pkg: string;
   return scope;
 }
 
-/** The simple names of the Java types `qn` extends or implements, a few levels up. */
-function javaAncestorNames(qn: string, context: ResolutionContext, depth = 0): Set<string> {
+/** The simple names a Java type's own header extends or implements. */
+function javaHeaderSupertypes(decl: Node, context: ResolutionContext): string[] {
+  const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+  let header = '';
+  for (let i = decl.startLine - 1; i < Math.min(lines.length, decl.startLine + 6) && !header.includes('{'); i++) header += `${lines[i] ?? ''} `;
+  const list = /\b(?:extends|implements)\b([^{]*)/.exec(header.split('{')[0]!)?.[1] ?? '';
+  const names: string[] = [];
+  for (const m of list.replace(/<[^<>]*(?:<[^<>]*>[^<>]*)*>/g, '').matchAll(/([A-Za-z_]\w*)\s*(?=,|$|\bimplements\b|\s*$)/g)) {
+    if (m[1] !== 'implements' && m[1] !== 'extends') names.push(m[1]!);
+  }
+  return names;
+}
+
+/**
+ * The Java types a supertype `name` in `from`'s header can mean: those its file
+ * has in reach (its own, its package's, imported) when it has any, else every
+ * type of the name. elasticsearch's `InternalGeoGrid implements GeoGrid` is its
+ * package's interface, and so inherits nothing from a record `GeoGrid` nested
+ * in another package.
+ */
+function javaSupertypeDecls(name: string, from: Node, context: ResolutionContext): Node[] {
+  const all = context.getNodesByName(name).filter((t) => t.language === 'java' && JAVA_TYPE_KINDS_VISIBLE.has(t.kind));
+  if (all.length < 2) return all;
+  const here = javaFileScope(from.filePath, context);
+  const inReach = all.filter((t) => {
+    if (t.filePath === from.filePath) return true;
+    const pkg = javaFileScope(t.filePath, context).pkg;
+    if (pkg === here.pkg) return true;
+    const segs = t.qualifiedName.split('::');
+    const path = pkg && segs[0] === pkg ? segs.slice(1) : segs;
+    const fqn = [pkg, ...path].filter((p) => p !== '').join('.');
+    return here.single.has(fqn) || here.demand.has(fqn.slice(0, fqn.lastIndexOf('.'))) ||
+      (path.length > 1 && here.single.has([pkg, path[0]!].filter((p) => p !== '').join('.')));
+  });
+  return inReach.length > 0 ? inReach : all;
+}
+
+/**
+ * The simple names of the Java types `qn` extends or implements, all the way
+ * up. Only a finished answer is memoized, so the answer is the index's alone: a
+ * memo filled along the way held what a type's ancestors were at the depth it
+ * was first reached, so what a nested `Reader` could mean turned on which
+ * reference a worker resolved first.
+ */
+function javaAncestorNames(qn: string, context: ResolutionContext): Set<string> {
   let memo = JAVA_ANCESTORS.get(context);
   if (!memo) JAVA_ANCESTORS.set(context, (memo = new Map()));
   const hit = memo.get(qn);
   if (hit) return hit;
   const names = new Set<string>();
-  memo.set(qn, names);
-  for (const decl of context.getNodesByQualifiedName(qn)) {
-    if (decl.language !== 'java' || !JAVA_TYPE_KINDS_VISIBLE.has(decl.kind)) continue;
-    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
-    let header = '';
-    for (let i = decl.startLine - 1; i < Math.min(lines.length, decl.startLine + 6) && !header.includes('{'); i++) header += `${lines[i] ?? ''} `;
-    const list = /\b(?:extends|implements)\b([^{]*)/.exec(header.split('{')[0]!)?.[1] ?? '';
-    for (const m of list.replace(/<[^<>]*(?:<[^<>]*>[^<>]*)*>/g, '').matchAll(/([A-Za-z_]\w*)\s*(?=,|$|\bimplements\b|\s*$)/g)) {
-      if (m[1] !== 'implements' && m[1] !== 'extends') names.add(m[1]!);
-    }
-  }
-  if (depth < 4) {
-    for (const base of [...names]) {
-      for (const t of context.getNodesByName(base)) {
-        if (t.language !== 'java' || !JAVA_TYPE_KINDS_VISIBLE.has(t.kind) || t.qualifiedName === qn) continue;
-        for (const up of javaAncestorNames(t.qualifiedName, context, depth + 1)) names.add(up);
+  const seen = new Set<string>([qn]);
+  let level = [qn];
+  while (level.length > 0) {
+    const next: string[] = [];
+    for (const name of level) {
+      for (const decl of context.getNodesByQualifiedName(name)) {
+        if (decl.language !== 'java' || !JAVA_TYPE_KINDS_VISIBLE.has(decl.kind)) continue;
+        for (const base of javaHeaderSupertypes(decl, context)) {
+          names.add(base);
+          for (const t of javaSupertypeDecls(base, decl, context)) {
+            if (seen.has(t.qualifiedName)) continue;
+            seen.add(t.qualifiedName);
+            const finished = memo.get(t.qualifiedName);
+            if (!finished) next.push(t.qualifiedName);
+            else for (const up of finished) names.add(up);
+          }
+        }
       }
     }
+    level = next;
   }
+  memo.set(qn, names);
   return names;
 }
 
@@ -3818,6 +3880,10 @@ interface JavaNameRead {
   innerNew: boolean;
   /** What the line writes before the name: `RequestFactory`, `java.util`. */
   qualifiers: string[];
+  /** What is written right before this very reference, when its column is on the name. */
+  written: string | null;
+  /** Whether a type of the name is nested in `written`, read when a nested candidate needs it. */
+  nestedThere?: boolean;
   /** The types around the reference, read when a nested candidate needs them. */
   enclosing?: Node[];
 }
@@ -3827,6 +3893,8 @@ let lastJavaNameRead: { ref: UnresolvedRef; context: ResolutionContext; read: Ja
 
 /** `outer.new Inner()` on `name\0line`, `\1` being the name, compiled once (see CPP_DECLARATOR_OF). */
 const JAVA_INNER_NEW_OF = /^([^\0]*)\0[\s\S]*?\.\s*new\s+\1\b/;
+/** What's written right before a column. */
+const JAVA_QUALIFIER_BEFORE = /([A-Za-z_$][\w$.]*)\s*\.\s*(?:@[\w.]+(?:\([^)]*\))?\s+)*$/;
 /** What's written before the name: group 2. (A type annotation may sit between: jsoup's `Range.@Nullable Spans`.) */
 const JAVA_QUALIFIER_OF = /^([^\0]*)\0[\s\S]*?([A-Za-z_$][\w$.]*)\s*\.\s*(?:@[\w.]+(?:\([^)]*\))?\s+)*\1\b/;
 
@@ -3847,6 +3915,7 @@ function javaNameRead(ref: UnresolvedRef, context: ResolutionContext): JavaNameR
   const read: JavaNameRead = {
     innerNew: JAVA_INNER_NEW_OF.test(`${name}\0${line}`),
     qualifiers: javaQualifiersOf(line, name),
+    written: line.startsWith(name, ref.column) ? JAVA_QUALIFIER_BEFORE.exec(line.slice(Math.max(0, ref.column - 240), ref.column))?.[1] ?? null : null,
   };
   lastJavaNameRead = { ref, context, read };
   return read;
@@ -3897,7 +3966,8 @@ function isJavaTypeVisible(candidate: Node, ref: UnresolvedRef, context: Resolut
   // Written with a qualifier — `RequestFactory.Builder`, `java.util.Map`, an
   // inner class's `outer.new Inner()` — the qualifier says which: the owner
   // (or the package) of this candidate.
-  const { innerNew, qualifiers } = javaNameRead(ref, context);
+  const named = javaNameRead(ref, context);
+  const { innerNew, qualifiers, written } = named;
   if (innerNew) return true;
   // Nested only inside a type the file declares; a class local to a method is
   // the lexical rule's to judge.
@@ -3909,13 +3979,17 @@ function isJavaTypeVisible(candidate: Node, ref: UnresolvedRef, context: Resolut
   const nested = ownerNode !== undefined;
   const ownerName = nested ? ownerNode.name : '';
   if (qualifiers.some((q) => (nested && (q === ownerName || q.endsWith(`.${ownerName}`))) || (!nested && q === candidateScope.pkg))) return true;
+  // Through a package it is that package's: `java.io.Reader` is no
+  // `Writeable.Reader` the class inherits. And through a type that declares one
+  // of the name it is that one: `Bucket.Reader`.
+  if (written !== null && /^[a-z_$]/.test(written)) return false;
+  if (nested && written !== null && (named.nestedThere ??= javaNestedInQualifier(ref, written, context))) return false;
   if (!nested) {
     if (candidate.filePath === ref.filePath || candidateScope.pkg === here.pkg) return true;
     return here.single.has(fqn) || here.demand.has(candidateScope.pkg);
   }
   // Nested: inside its owner, a subtype of it, or imported.
-  const read = javaNameRead(ref, context);
-  const enclosing = (read.enclosing ??= context.getNodesInFile(ref.filePath)
+  const enclosing = (named.enclosing ??= context.getNodesInFile(ref.filePath)
     .filter((p) => JAVA_TYPE_KINDS_VISIBLE.has(p.kind) && p.startLine <= ref.line && p.endLine >= ref.line));
   if (enclosing.some((p) => p.qualifiedName === ownerQn || p.qualifiedName.startsWith(`${ownerQn}::`))) return true;
   // An anonymous class (`new NodeFilter() { … }`, named `<NodeFilter$anon@N>`) derives from what it instantiates.
@@ -3929,6 +4003,16 @@ function isJavaTypeVisible(candidate: Node, ref: UnresolvedRef, context: Resolut
   if (enclosing.some((p) => supertypesAround(p).includes(ownerName))) return true;
   const ownerFqn = fqn.slice(0, fqn.lastIndexOf('.'));
   return here.single.has(fqn) || here.demand.has(ownerFqn);
+}
+
+/** Whether a type of `ref`'s name is nested in the type `qualifier` ends in. */
+function javaNestedInQualifier(ref: UnresolvedRef, qualifier: string, context: ResolutionContext): boolean {
+  const owner = qualifier.slice(qualifier.lastIndexOf('.') + 1);
+  return context.getNodesByName(ref.referenceName).some((n) => {
+    if (n.language !== 'java' || !JAVA_TYPE_KINDS_VISIBLE.has(n.kind)) return false;
+    const segs = n.qualifiedName.split('::');
+    return segs.length > 1 && segs[segs.length - 2] === owner;
+  });
 }
 
 const SCALA_OBJECT_PACKAGES = new WeakMap<ResolutionContext, Map<string, string | null>>();
@@ -8166,32 +8250,42 @@ function isCsharpNestedTypeInScope(n: Node, ref: UnresolvedRef, context: Resolut
 const CSHARP_ANCESTORS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
 
 /** The simple names of the C# types `qn` derives from, through every partial part and base, a few levels up. */
-function csharpAncestorNames(qn: string, context: ResolutionContext, depth = 0): Set<string> {
+function csharpAncestorNames(qn: string, context: ResolutionContext): Set<string> {
   let memo = CSHARP_ANCESTORS.get(context);
   if (!memo) CSHARP_ANCESTORS.set(context, (memo = new Map()));
   const hit = memo.get(qn);
   if (hit) return hit;
   const names = new Set<string>();
-  memo.set(qn, names); // a cycle reads what is gathered so far
-  for (const decl of context.getNodesByQualifiedName(qn)) {
-    if (decl.language !== 'csharp' || !CSHARP_TYPE_KINDS.has(decl.kind)) continue;
-    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
-    let header = '';
-    for (let i = decl.startLine - 1; i < Math.min(lines.length, decl.startLine + 6) && !header.includes('{'); i++) header += `${lines[i] ?? ''} `;
-    const list = /:\s*([^{;]*)/.exec(header.split('{')[0]!.replace(/\bwhere\b[\s\S]*$/, ''))?.[1] ?? '';
-    for (const base of splitCppTopLevel(list)) {
-      const name = /([A-Za-z_]\w*)\s*(?:<.*)?$/.exec(base.trim())?.[1];
-      if (name) names.add(name);
-    }
-  }
-  if (depth < 4) {
-    for (const base of [...names]) {
-      for (const t of context.getNodesByName(base)) {
-        if (t.language !== 'csharp' || !CSHARP_TYPE_KINDS.has(t.kind) || t.qualifiedName === qn) continue;
-        for (const up of csharpAncestorNames(t.qualifiedName, context, depth + 1)) names.add(up);
+  const seen = new Set<string>([qn]);
+  let level = [qn];
+  // A walk of its own for every type, as for Java (javaAncestorNames).
+  while (level.length > 0) {
+    const bases = new Set<string>();
+    for (const type of level) {
+      for (const decl of context.getNodesByQualifiedName(type)) {
+        if (decl.language !== 'csharp' || !CSHARP_TYPE_KINDS.has(decl.kind)) continue;
+        const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+        let header = '';
+        for (let i = decl.startLine - 1; i < Math.min(lines.length, decl.startLine + 6) && !header.includes('{'); i++) header += `${lines[i] ?? ''} `;
+        const list = /:\s*([^{;]*)/.exec(header.split('{')[0]!.replace(/\bwhere\b[\s\S]*$/, ''))?.[1] ?? '';
+        for (const base of splitCppTopLevel(list)) {
+          const name = /([A-Za-z_]\w*)\s*(?:<.*)?$/.exec(base.trim())?.[1];
+          if (name) bases.add(name);
+        }
       }
     }
+    const next: string[] = [];
+    for (const base of bases) {
+      names.add(base);
+      for (const t of context.getNodesByName(base)) {
+        if (t.language !== 'csharp' || !CSHARP_TYPE_KINDS.has(t.kind) || seen.has(t.qualifiedName)) continue;
+        seen.add(t.qualifiedName);
+        next.push(t.qualifiedName);
+      }
+    }
+    level = next;
   }
+  memo.set(qn, names);
   return names;
 }
 
