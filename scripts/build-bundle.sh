@@ -22,8 +22,8 @@ set -euo pipefail
 
 TARGET="${1:?usage: build-bundle.sh <target> [node-version]}"
 # The release workflow passes no version, so this default is the Node every
-# release bundles. Keep it on 24.x (the CLI refuses Node 25+) and at 24.22.1 or
-# later. 24.22.1 is Node's October 2026 security release (issue #2780). Before
+# release bundles. Keep it on 24.x, the LTS line release bundles take their
+# security releases from, and at 24.22.1 or later. 24.22.1 is Node's October 2026 security release (issue #2780). Before
 # 24.20.0, Node 24 can abort on Windows just as the process exits, after its
 # work is done, with 0xC0000409 and "Assertion failed: !(handle->flags &
 # UV_HANDLE_CLOSING), file src\win\async.c" (nodejs/node#56645, fixed by

@@ -58,7 +58,7 @@ import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 import { ansiColorsEnabled } from '../ui/color';
 
-import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
+import { buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { installFatalHandlers } from './fatal-handler';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 import { installCommandSupervision, watchParent } from './command-supervision';
@@ -103,25 +103,14 @@ async function loadCodeGraph(): Promise<typeof import('../index')> {
 const importESM = new Function('specifier', 'return import(specifier)') as
   (specifier: string) => Promise<typeof import('@clack/prompts')>;
 
-// Block CodeGraph on Node.js 25.x — V8's turboshaft WASM JIT has a Zone
-// allocator bug that reliably crashes when compiling tree-sitter
-// grammars (see #54, #81, #140). The previous behaviour was a soft
-// console.warn that scrolls off-screen before the OOM crash 30 seconds
-// later, leading to a steady stream of "what is this OOM" reports.
-// Hard-exit before any WASM work; allow override via env var for users
-// who patched V8 themselves or want to test a future fix.
-const nodeVersion = process.versions.node;
-const nodeMajor = parseInt(nodeVersion.split('.')[0] ?? '0', 10);
-if (nodeMajor >= 25) {
-  process.stderr.write(buildNode25BlockBanner(nodeVersion) + '\n');
-  if (!process.env.CODEGRAPH_ALLOW_UNSAFE_NODE) {
-    process.exit(1);
-  }
-  // Override active — banner shown for visibility, continuing.
-}
 // Enforce the supported Node floor. `engines` in package.json only *warns* on
 // install (unless engine-strict), so hard-block here to actually keep users off
-// unsupported versions. Mirrors the 25+ block above. See package.json `engines`.
+// unsupported versions. There is no upper bound: Node 25+ is safe because a
+// normal launch runs with `--liftoff-only` (the bundled launcher passes it, or
+// the re-exec below adds it; CODEGRAPH_NO_RELAUNCH or a failed re-exec runs
+// without it). See package.json `engines`.
+const nodeVersion = process.versions.node;
+const nodeMajor = parseInt(nodeVersion.split('.')[0] ?? '0', 10);
 if (nodeMajor < MIN_NODE_MAJOR) {
   process.stderr.write(buildNodeTooOldBanner(nodeVersion) + '\n');
   if (!process.env.CODEGRAPH_ALLOW_UNSAFE_NODE) {
