@@ -28,6 +28,7 @@
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 import { escapeRegExp } from '../utils';
+import { stripCommentsForRegex } from './strip-comments';
 
 const TYPE_KINDS: ReadonlySet<Node['kind']> = new Set<Node['kind']>(['class', 'struct', 'enum', 'interface', 'protocol', 'type_alias']);
 
@@ -84,7 +85,7 @@ export function declaresExtension(lines: readonly string[], node: Pick<Node, 'st
 }
 
 /** A declaration's inheritance clause: `struct HomeView: View, Sendable {` → `View, Sendable`. */
-const INHERITANCE_CLAUSE = /\b(?:class|struct|enum|actor|protocol|extension)\s+[A-Za-z_][\w.]*\s*(?:<[^{}]*?>)?\s*:\s*([^{]*?)\s*(?:\bwhere\b[^{]*)?\{/;
+const INHERITANCE_CLAUSE = /^(?:class|struct|enum|actor|protocol|extension)\s+[A-Za-z_][\w.]*\s*(?:<[^{}]*?>)?\s*:\s*([^{]*?)\s*(?:\bwhere\b[^{]*)?\{/;
 
 /** The supertypes a Swift type node's own declaration names: `View`, `Sendable` for `struct HomeView: View, Sendable {`. */
 function declaredSupertypes(node: Node, context: ResolutionContext): string[] {
@@ -94,8 +95,13 @@ function declaredSupertypes(node: Node, context: ResolutionContext): string[] {
   let names: string[] = [];
   const lines = linesOf(node.filePath, context);
   if (lines) {
-    const head = [(lines[node.startLine - 1] ?? '').slice(node.startColumn), ...lines.slice(node.startLine, Math.min(node.endLine, node.startLine + 6))].join(' ');
-    const clause = INHERITANCE_CLAUSE.exec(head.replace(/"(?:[^"\\\n]|\\.)*"/g, '""'))?.[1];
+    const head = [(lines[node.startLine - 1] ?? '').slice(node.startColumn), ...lines.slice(node.startLine, Math.min(node.endLine, node.startLine + 6))].join('\n');
+    // Blank strings first, preserving the line boundaries needed by line comments.
+    const withoutStrings = head.replace(/"(?:[^"\\]|\\.)*"/gs, (literal) => literal.replace(/[^\n]/g, ' '));
+    const declaration = stripCommentsForRegex(withoutStrings, 'swift').replace(/\n/g, ' ');
+    const keyword = DECLARATION_KEYWORD.exec(declaration);
+    // Only this declaration's header may supply a clause, never a nested type.
+    const clause = keyword && INHERITANCE_CLAUSE.exec(declaration.slice(keyword.index))?.[1];
     if (clause) {
       names = clause
         .split(',')
