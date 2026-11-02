@@ -470,8 +470,10 @@ function clientPath(raw: string, baseURL: string | null): { segs: string[]; suff
   const cut = p.search(/[?#]/);
   if (cut >= 0) p = p.slice(0, cut);
   let suffix = false;
-  const absolute = /^(?:[a-z][a-z0-9+.-]*:)?\/\/[^/]*(\/.*)?$/i.exec(p);
-  if (absolute) p = absolute[1] ?? '/';
+  // An absolute URL (`https://host/…`, `//host/…`) names a specific external
+  // host — it can never reach this project's own routes. Only a relative URL
+  // links to an own route.
+  if (/^(?:[a-z][a-z0-9+.-]*:)?\/\/[^/]*/i.test(p)) return null;
   else if (!p.startsWith('/')) {
     if (p.startsWith(HOLE)) {
       const rest = p.slice(1);
