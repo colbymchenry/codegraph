@@ -94,7 +94,7 @@ export const laravelResolver: FrameworkResolver = {
     const controllerMatch = ref.referenceName.match(CONTROLLER_ACTION);
     if (controllerMatch) {
       const [, controller, method] = controllerMatch;
-      const result = resolveControllerMethod(controller!, method!, context);
+      const result = resolveControllerMethod(controller!, method!, context, ref.filePath);
       if (result) {
         return {
           original: ref,
@@ -583,6 +583,29 @@ function resolveControllerClass(controller: string, context: ResolutionContext):
   return classes.length === 1 ? classes[0]!.id : null;
 }
 
+/** Per context: route file → its PHP `use` imports, local name (or `as` alias) → imported FQN. */
+const PHP_ROUTE_USES = new WeakMap<ResolutionContext, Map<string, Map<string, string>>>();
+
+/**
+ * The PHP `use` statements of a route file, as a map from the name the file
+ * writes to the class they import: `use App\Http\Controllers\Admin\UserController;`
+ * keys `UserController`, `use … as AdminUsers;` keys `AdminUsers` (#2975).
+ * Group and function/const uses are left out — a route file's controller
+ * handlers are plain class imports.
+ */
+function phpRouteUseMap(filePath: string, context: ResolutionContext): Map<string, string> {
+  let memo = PHP_ROUTE_USES.get(context);
+  if (!memo) PHP_ROUTE_USES.set(context, (memo = new Map()));
+  const hit = memo.get(filePath);
+  if (hit) return hit;
+  const uses = new Map<string, string>();
+  for (const m of (context.readFile(filePath) ?? '').matchAll(/^\s*use\s+((?:\\?[\w-]+(?:\\[\w-]+)+))\s*(?:as\s+(\w+))?\s*;/gm)) {
+    uses.set(m[2] ?? m[1]!.split('\\').pop()!, m[1]!);
+  }
+  memo.set(filePath, uses);
+  return uses;
+}
+
 /**
  * Resolve a Controller@method reference: the file the path names under
  * `app/Http/Controllers/`, else a class of that name in a controllers
@@ -592,11 +615,30 @@ function resolveControllerClass(controller: string, context: ResolutionContext):
 function resolveControllerMethod(
   controller: string,
   method: string,
-  context: ResolutionContext
+  context: ResolutionContext,
+  routeFile?: string,
 ): string | null {
   const rel = controller.replace(/\\/g, '/');
   const methodIn = (filePath: string): string | null =>
     context.getNodesInFile(filePath).find((n) => n.kind === 'method' && n.name === method)?.id ?? null;
+
+  // The name the route file wrote is what its `use` imports — by short name
+  // or by an `as` alias — and that class is the handler, wherever it sits
+  // (#2975): `use App\Http\Controllers\Admin\UserController;` beside a
+  // same-named top-level controller must not fall for the convention below.
+  // A name the file does not import keeps the convention.
+  if (routeFile) {
+    const fqn = phpRouteUseMap(routeFile, context).get(controller);
+    if (fqn) {
+      const sep = fqn.lastIndexOf('\\');
+      const qn = sep < 0 ? fqn : `${fqn.slice(0, sep)}::${fqn.slice(sep + 1)}`;
+      const cls = context.getNodesByQualifiedName(qn).find((n) => n.kind === 'class' && n.language === 'php');
+      // The import decided: its class is the handler's home, whether or not
+      // the method is on it here — falling to the convention would link a
+      // same-named controller the route does not name.
+      return cls ? methodIn(cls.filePath) : null;
+    }
+  }
 
   const controllerPath = `app/Http/Controllers/${rel}.php`;
   if (context.fileExists(controllerPath)) {
