@@ -1,46 +1,14 @@
 /**
- * Pin the Node-25 block banner content. The banner replaced a soft
- * `console.warn` because the warning was scrolling off-screen before
- * the OOM crash 30 seconds later, generating duplicate bug reports
- * (#54, #81, #140). The recipe and override env var below are
- * load-bearing — if any of them get edited away, this test catches it.
+ * Pin the Node-floor banner content. The CLI hard-exits below
+ * MIN_NODE_MAJOR (there is no upper bound), and this banner is all the user
+ * sees. The recipe and override env var below are load-bearing: if any of
+ * them get edited away, this test catches it.
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { describe, it, expect } from 'vitest';
-import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from '../src/bin/node-version-check';
-
-describe('buildNode25BlockBanner', () => {
-  it('embeds the reported Node version in the header', () => {
-    expect(buildNode25BlockBanner('25.9.0')).toContain(
-      'Unsupported Node.js version: 25.9.0'
-    );
-  });
-
-  it('names the V8 turboshaft WASM root cause and the OOM symptom', () => {
-    const banner = buildNode25BlockBanner('25.7.0');
-    expect(banner).toContain('V8 WASM JIT');
-    expect(banner).toContain('turboshaft');
-    expect(banner).toContain('Fatal process out of memory: Zone');
-  });
-
-  it('points users to Node 22 LTS via nvm and Homebrew', () => {
-    const banner = buildNode25BlockBanner('25.7.0');
-    expect(banner).toContain('Node.js 22 LTS');
-    expect(banner).toContain('nvm install 22');
-    expect(banner).toContain('brew install node@22');
-  });
-
-  it('documents the CODEGRAPH_ALLOW_UNSAFE_NODE override', () => {
-    const banner = buildNode25BlockBanner('25.7.0');
-    expect(banner).toContain('CODEGRAPH_ALLOW_UNSAFE_NODE=1');
-  });
-
-  it('links to issue #81 for the root-cause writeup', () => {
-    expect(buildNode25BlockBanner('25.7.0')).toContain(
-      'github.com/colbymchenry/codegraph/issues/81'
-    );
-  });
-});
+import { buildNodeTooOldBanner, MIN_NODE_MAJOR } from '../src/bin/node-version-check';
 
 describe('buildNodeTooOldBanner', () => {
   it('embeds the reported Node version in the header', () => {
@@ -65,5 +33,12 @@ describe('buildNodeTooOldBanner', () => {
 
   it('documents the CODEGRAPH_ALLOW_UNSAFE_NODE override', () => {
     expect(buildNodeTooOldBanner('18.0.0')).toContain('CODEGRAPH_ALLOW_UNSAFE_NODE=1');
+  });
+});
+
+describe('supported Node range', () => {
+  it('has a floor at MIN_NODE_MAJOR and no upper bound in package.json engines', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf8'));
+    expect(pkg.engines.node).toBe(`>=${MIN_NODE_MAJOR}.0.0`);
   });
 });

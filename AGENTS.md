@@ -54,7 +54,7 @@ condition, and applied globally it hands the engine's suites the browser builds 
 `web-tree-sitter` and friends. The root config (`vitest.config.mts`, `.mts` because the plugin is
 ESM-only and the repo is CJS) is the shared base; note that a project with `extends: true` **concatenates** the base's `include` with its own, which is why the `ui` project sets `extends: false`.
 
-Node engines: `>=20.0.0 <25.0.0`. There is a hard exit on Node 25.x and below 20 (see `src/bin/node-version-check.ts`). That range is what users run. Working in this repo needs Node 22.12 or newer: `devEngines` makes `npm ci` and `npm run` stop on anything older, for Vite 7 and Vitest 4.
+Node engines: `>=20.0.0` (no upper bound; Node 25 and later are supported because a normal launch runs with `--liftoff-only`: the bundled launcher passes it, otherwise the CLI re-execs itself with it (`CODEGRAPH_NO_RELAUNCH` or a failed re-exec runs without it), see `src/extraction/wasm-runtime-flags.ts`). The only hard exit is below 20 (see `src/bin/node-version-check.ts`). That range is what users run. Working in this repo needs Node 22.12 or newer: `devEngines` makes `npm ci` and `npm run` stop on anything older, for Vite 7 and Vitest 4.
 
 ## Architecture
 
