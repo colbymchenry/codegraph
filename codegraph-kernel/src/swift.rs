@@ -14,7 +14,7 @@
 //! internal visibility, everything-is-`extends` inheritance (first
 //! type_identifier of each specifier), no instantiates refs ever (`Foo()` is
 //! a plain call), subscript reads as `calls arr`, `defer` as `calls defer`,
-//! multi-case enum entries minting only the first case, `/** */` block docs
+//! `/** */` block docs
 //! ignored AND chain-breaking, init/deinit/subscript minting no nodes with
 //! their bodies routed through visitNode (calls → class, static reads →
 //! nothing). Positions in UTF-16 code units. Files with parse errors defer
@@ -973,12 +973,24 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_enum_members(&mut self, node: Node<'t>) {
-        // `name` field = the FIRST case name only — `case put, delete` mints
-        // ONLY `put` (the identifier-scan fallback is dead, the field always
-        // resolves). Associated/raw values never walked.
-        if let Some(name_node) = node.child_by_field_name("name") {
-            let name = self.text(name_node).to_string();
+        // One `name` field per case. A single-case entry (`case put`) mints
+        // one member spanning the whole entry; a multi-case entry (`case put,
+        // delete`, `case object([Int]), null`) mints one member per case,
+        // each spanning its own name. Ids come from name and line; the
+        // column only separates a collision. Same rule as
+        // extractEnumMembers. The identifier-scan fallback there is dead for
+        // Swift (every enum_entry has a name field). Associated/raw values
+        // never walked.
+        let mut cursor = node.walk();
+        let names: Vec<Node<'t>> = node.children_by_field_name("name", &mut cursor).collect();
+        if let [only] = names.as_slice() {
+            let name = self.text(*only).to_string();
             self.create_node("enum_member", &name, node, Extra::default());
+        } else {
+            for case_name in names {
+                let name = self.text(case_name).to_string();
+                self.create_node("enum_member", &name, case_name, Extra::default());
+            }
         }
     }
 

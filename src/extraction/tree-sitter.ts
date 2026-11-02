@@ -3096,14 +3096,27 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Extract enum member names from an enum member node.
-   * Handles multi-case declarations (Swift: `case put, delete`) and single-case patterns.
+   * Extract enum member names from an enum member node and return the first.
+   * A member node with one `name` field (Rust enum_variant, Swift `case put`)
+   * mints one member spanning the whole node. A Swift multi-case entry
+   * (`case put, delete`, `case object([Int]), null`) carries one `name` field
+   * per case; each case mints its own member spanning its own name. Ids come
+   * from name and line; the column only separates a collision.
    */
   private extractEnumMembers(node: SyntaxNode): Node | null {
-    // Try field-based name first (e.g. Rust enum_variant has a 'name' field)
-    const nameNode = getChildByField(node, 'name');
-    if (nameNode) {
-      return this.createNode('enum_member', getNodeText(nameNode, this.source), node);
+    // Field-based names first. Only Swift's enum_entry marks `name` multiple;
+    // every other grammar's member node has at most one.
+    const nameNodes = node.childrenForFieldName('name');
+    if (nameNodes.length === 1) {
+      return this.createNode('enum_member', getNodeText(nameNodes[0]!, this.source), node);
+    }
+    if (nameNodes.length > 1) {
+      let firstCase: Node | null = null;
+      for (const caseName of nameNodes) {
+        const created = this.createNode('enum_member', getNodeText(caseName, this.source), caseName);
+        firstCase ??= created;
+      }
+      return firstCase;
     }
 
     // Check for identifier-like children (Swift: simple_identifier, TS: property_identifier)

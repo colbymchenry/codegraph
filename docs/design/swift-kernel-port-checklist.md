@@ -293,7 +293,7 @@ children through hidden rules. Probed truth-table, IDENTICAL on both grammars
 | property_declaration `name` | the `pattern` node |
 | property_declaration `value` | the initializer expression |
 | property_declaration `computed_value` | computed_property |
-| enum_entry `name` | the FIRST case-name simple_identifier only |
+| enum_entry `name` | the FIRST case-name simple_identifier (`getChildByField`); `childrenForFieldName('name')` returns every case name — extractEnumMembers uses the latter |
 
 The Rust walker must reproduce these exact resolutions (tree-sitter's native
 `child_by_field_name` has the same semantics — but pin them in the parity
@@ -452,13 +452,17 @@ bodiless → no node. Kind `enum` {docstring, visibility, isExported:undefined}.
 extractInheritance (the raw-value type rides it — `enum Suit: String` →
 `extends String`; extends refs have NO builtin filter, probed `extends Int`).
 NO decorates. Body loop: `enum_entry` ∈ enumMemberTypes → extractEnumMembers
-(:1958): **`name` field path — `getChildByField(node,'name')` returns the
-FIRST case name → ONE `enum_member` node, positioned at the enum_entry, then
-RETURN.** QUIRKS, PRESERVE (probed): multi-case `case put, delete` → ONLY
-`put` (delete DROPPED — the identifier-scan fallback :1967 is dead for swift
-since the field always exists); associated values (`case success(Data)` —
-`data_contents: enum_type_parameters`) and raw values (`= "H"`) are never
-walked → NO refs from them; `indirect case` same. Non-enum_entry children
+(:1958): **`name` field path — every `name` field of the enum_entry mints an
+`enum_member`, then RETURN.** A single-case entry (`case put`) → ONE member
+spanning the whole enum_entry; a multi-case entry (`case put, delete`,
+`case object([Int]), null`) → one member PER CASE, each spanning its own name
+node (ids come from name and line; the column only separates a collision).
+Both arms (TS `extractEnumMembers`, kernel `extract_enum_members`) follow
+this rule. The identifier-scan fallback :1967
+is dead for swift since the field always exists. QUIRKS, PRESERVE (probed):
+associated values (`case success(Data)` — `data_contents:
+enum_type_parameters`) and raw values (`= "H"`) are never walked → NO refs
+from them; `indirect case` same. Non-enum_entry children
 (computed properties, methods, nested types) → visitNode with the enum pushed.
 
 classify → 'class' (incl. actor + extension): **extractClass (:1679)** — no
@@ -998,7 +1002,7 @@ regression construct, above), and keep every line traceable to a branch:
 - class family: plain class; `public final class C: Base, Proto1, Proto2`
   (extends ×3, all 'extends'); struct + bodiless-skip N/A; enum backed
   (`: String` → extends String) + `case a = "H"` + **multi-case `case put,
-  delete` (ONLY `put` minted)** + associated values (no refs) + indirect +
+  delete` (both `put` and `delete` minted, each spanning its name)** + associated values (no refs) + indirect +
   computed property + static method in enum; actor (→ class); `extension
   Point: Hashable` (second class node, extends); `extension KF.Builder`
   (resolveName → `Builder`); `extension Array where Element: Equatable`
