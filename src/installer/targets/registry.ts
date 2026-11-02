@@ -1,10 +1,15 @@
 /**
  * Registry of all known agent targets.
  *
- * Adding a new target = create `targets/<id>.ts` exporting an
+ * Adding a new builtin target = create `targets/<id>.ts` exporting an
  * `AgentTarget`, then add it to the array below. Order here is the
  * order they appear in the multiselect prompt, in `--target=all`,
  * and in `--print-config`'s help listing — keep it stable.
+ *
+ * User defined targets (`./custom.ts`, managed by `codegraph targets add`)
+ * follow the builtin ones in `getAllTargets()`. Every lookup below goes
+ * through it, so `--target`, detection, the picker, uninstall's sweep,
+ * `--refresh` and `--print-config` treat them like builtin targets.
  */
 
 import { AgentTarget, Location, TargetId } from './types';
@@ -28,6 +33,7 @@ import { grokTarget } from './grok';
 import { kimiTarget } from './kimi';
 import { qoderTarget } from './qoder';
 import { piTarget } from './pi';
+import { customTargetFamily, loadCustomTargets } from './custom';
 
 export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   claudeTarget,
@@ -52,12 +58,27 @@ export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   piTarget,
 ]);
 
+/** The builtin targets, then the user defined ones from `~/.codegraph/targets.json`. */
+export function getAllTargets(): AgentTarget[] {
+  return [...ALL_TARGETS, ...loadCustomTargets(ALL_TARGETS).targets];
+}
+
+/**
+ * What telemetry records for a target: a builtin id as it is, and
+ * `custom-<family>` for a user defined target, never the name the user gave
+ * it. TELEMETRY.md promises agent names only.
+ */
+export function telemetryTargetId(id: string): string {
+  const family = customTargetFamily(id, ALL_TARGETS);
+  return family ? `custom-${family}` : id;
+}
+
 export function getTarget(id: string): AgentTarget | undefined {
-  return ALL_TARGETS.find((t) => t.id === id);
+  return getAllTargets().find((t) => t.id === id);
 }
 
 export function listTargetIds(): TargetId[] {
-  return ALL_TARGETS.map((t) => t.id);
+  return getAllTargets().map((t) => t.id);
 }
 
 /**
@@ -70,7 +91,7 @@ export function detectAll(loc: Location): Array<{
   target: AgentTarget;
   detection: ReturnType<AgentTarget['detect']>;
 }> {
-  return ALL_TARGETS.map((target) => ({
+  return getAllTargets().map((target) => ({
     target,
     detection: target.detect(loc),
   }));
@@ -83,13 +104,13 @@ export function detectAll(loc: Location): Array<{
  *   - `auto` — return all targets whose `detect().installed` is true,
  *     or `['claude']` as a fallback if none detected (least-surprise
  *     for existing users).
- *   - `all` — every target in the registry.
+ *   - `all` — every target in the registry, user defined ones included.
  *   - `none` — empty list (caller skips agent writes entirely).
  *   - csv list — `'claude,cursor'` etc. Unknown ids throw.
  */
 export function resolveTargetFlag(value: string, loc: Location): AgentTarget[] {
   if (value === 'none') return [];
-  if (value === 'all') return [...ALL_TARGETS];
+  if (value === 'all') return getAllTargets();
   if (value === 'auto') {
     const detected = detectAll(loc).filter(({ detection }) => detection.installed);
     if (detected.length > 0) return detected.map(({ target }) => target);

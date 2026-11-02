@@ -15,11 +15,19 @@
 export type Location = 'global' | 'local';
 
 /**
- * Stable string id used in the `--target` CLI flag and the registry
- * lookup. New targets add a value here when they're added to the
- * registry. Keep these short and lowercase.
+ * The ids of the targets compiled into the registry. A new builtin target
+ * adds a value here when it's added to the registry. Keep these short and
+ * lowercase.
  */
-export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro' | 'copilot-vscode' | 'copilot-cli' | 'copilot-jetbrains' | 'bob' | 'droid' | 'windsurf' | 'qwen' | 'dsh' | 'grok' | 'kimi' | 'qoder' | 'pi';
+export type BuiltinTargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro' | 'copilot-vscode' | 'copilot-cli' | 'copilot-jetbrains' | 'bob' | 'droid' | 'windsurf' | 'qwen' | 'dsh' | 'grok' | 'kimi' | 'qoder' | 'pi';
+
+/**
+ * Stable string id used in the `--target` CLI flag and the registry
+ * lookup: a `BuiltinTargetId`, or the id of a user defined target
+ * (`targets/custom.ts`), whose shape, reserved words and collisions with
+ * the builtin ids are checked when its spec is loaded, not by the type.
+ */
+export type TargetId = string;
 
 /**
  * Result of `target.detect(location)`.
