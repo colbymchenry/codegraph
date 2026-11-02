@@ -187,6 +187,27 @@ extension Socket.Option {
     }
   });
 
+  it.each(['// use class alternatives', '/* use class alternatives */'])(
+    'ignores a type keyword in an attribute comment: %s',
+    async (comment) => {
+      const cg = await project({
+        'Sources/Core/Comment.swift': `class Base {
+    enum State { case idle }
+}
+@available(*, deprecated) ${comment}
+final class Child: Base {
+    var state: State?
+}
+`,
+      });
+      try {
+        expect(edges(cg)).toContain('references Child -> Base::State (Comment.swift:2)');
+      } finally {
+        cg.close();
+      }
+    },
+  );
+
   it('keeps an attributed, multiline generic declaration tied to its own base', async () => {
     const cg = await project({
       'Sources/Core/Generic.swift': `class Base {
@@ -195,7 +216,10 @@ extension Socket.Option {
 class Other {
     enum State { case idle }
 }
-@available(*, deprecated, message: "class Decoy: Other {")
+@available(*, deprecated, message: """
+use \\
+/* class Decoy: Other {
+""")
 final class Child<T>:
     Base
 where T: Equatable {
