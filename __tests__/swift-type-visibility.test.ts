@@ -121,6 +121,35 @@ enum LoadError: Error {
 });
 
 describe('Swift: the scopes that can name a nested type bare', () => {
+  it("does not borrow a nested declaration's inheritance clause", async () => {
+    const cg = await project({
+      'Sources/Core/Scope.swift': `class Base {
+    enum State { case idle }
+}
+struct Screen {
+    class Helper: Base {}
+    var state: State
+}
+struct Plain {
+    class Helper {}
+    var state: State
+}
+`,
+    });
+    try {
+      const nodes = cg.getNodesInFile('Sources/Core/Scope.swift');
+      const state = nodes.find((node) => node.qualifiedName === 'Base::State')!;
+      expect(state).toBeDefined();
+      expect(nodes.some((node) => node.qualifiedName === 'Screen::state')).toBe(true);
+      expect(edges(cg).filter((edge) => edge.includes(' -> Base::State '))).toEqual([]);
+      const affected = [...cg.getImpactRadius(state.id, 2).nodes.values()].map((node) => node.qualifiedName);
+      expect(affected).not.toContain('Screen');
+      expect(affected).not.toContain('Screen::state');
+    } finally {
+      cg.close();
+    }
+  });
+
   it('reaches a supertype, a generic qualifier and the type itself', async () => {
     const cg = await project({
       'Sources/Core/Channel.swift': `class BaseChannel {
@@ -153,6 +182,32 @@ extension Socket.Option {
       expect(all).toContain('references Waiter -> Future::Isolated (Future.swift:2)');
       // Inside `extension Socket.Option`, `Option` is the type itself.
       expect(all.filter((e) => e.includes(' -> Socket::Option '))).toEqual(['instantiates Option -> Socket::Option (Socket.swift:2)']);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('keeps an attributed, multiline generic declaration tied to its own base', async () => {
+    const cg = await project({
+      'Sources/Core/Generic.swift': `class Base {
+    enum State { case idle }
+}
+class Other {
+    enum State { case idle }
+}
+@available(*, deprecated, message: "class Decoy: Other {")
+final class Child<T>:
+    Base
+where T: Equatable {
+    class Helper: Other {}
+    var state: State?
+}
+`,
+    });
+    try {
+      const all = edges(cg);
+      expect(all).toContain('references Child -> Base::State (Generic.swift:2)');
+      expect(all.filter((edge) => edge.includes('references Child -> Other::State '))).toEqual([]);
     } finally {
       cg.close();
     }
