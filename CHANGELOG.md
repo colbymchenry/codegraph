@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes GDScript and Godot's text scenes and resources, so `codegraph_explore` and `codegraph callers` follow calls through typed receivers, inheritance and autoloads, signals to their handlers, and node paths and scene connections to the scripts they reach. Thanks @cosmicnag, @i-snyder and @tien226anh. (#1218)
+
 
 ## [1.6.4] - 2026-11-20
 
