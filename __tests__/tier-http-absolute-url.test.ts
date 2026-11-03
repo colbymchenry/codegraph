@@ -52,6 +52,19 @@ beforeAll(async () => {
       "export async function loadLocal(id) {\n" +
       "  const r = await fetch(`/users/${id}`)\n" +
       "  return r\n" +
+      "}\n" +
+      "export async function loadLoopback(id) {\n" +
+      "  const r = await fetch(`http://localhost:3000/users/${id}`)\n" +
+      "  return r\n" +
+      "}\n" +
+      "export const api = axios.create({ baseURL: 'https://api.example.com' })\n" +
+      "export async function loadSameHost(id) {\n" +
+      "  const r = await api.get(`https://api.example.com/users/${id}`)\n" +
+      "  return r\n" +
+      "}\n" +
+      "export async function loadThirdPartyViaClient(id) {\n" +
+      "  const r = await api.get(`https://other.com/users/${id}`)\n" +
+      "  return r\n" +
       "}\n"
   );
   cg = CodeGraph.initSync(tmpDir);
@@ -88,5 +101,25 @@ describe('http-client: absolute third-party URLs must not link to own routes', (
     expect(edges[0]!.kind).toBe('calls');
     expect((edges[0]!.metadata as Record<string, unknown>).href).toBe('/users/${…}');
     expect((edges[0]!.metadata as Record<string, unknown>).tier).toBe('client→server');
+  });
+});
+
+describe('http-client: same-host absolute URLs link to own routes', () => {
+  it('links fetch(`http://localhost:3000/users/${id}`) (loopback host) to GET /users/:id', () => {
+    const edges = synthesized(sym('loadLoopback'), 'http-client');
+    expect(edges).toHaveLength(1);
+    expect(edges[0]!.target).toBe(route('GET /users/:id').id);
+    expect((edges[0]!.metadata as Record<string, unknown>).href).toBe('/users/${…}');
+  });
+
+  it('links api.get(`https://api.example.com/users/${id}`) when the client baseURL host matches', () => {
+    const edges = synthesized(sym('loadSameHost'), 'http-client');
+    expect(edges).toHaveLength(1);
+    expect(edges[0]!.target).toBe(route('GET /users/:id').id);
+    expect((edges[0]!.metadata as Record<string, unknown>).href).toBe('/users/${…}');
+  });
+
+  it('still produces no edge for api.get(`https://other.com/users/${id}`) (third-party host via a client)', () => {
+    expect(synthesized(sym('loadThirdPartyViaClient'), 'http-client')).toHaveLength(0);
   });
 });
