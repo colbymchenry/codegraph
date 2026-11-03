@@ -51,6 +51,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  openscad: 'tree-sitter-openscad.wasm',
 };
 
 /**
@@ -171,6 +172,9 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  // OpenSCAD parametric CAD scripts. `module`/`function` definitions and
+  // `include`/`use` directives; no classes or types in the language.
+  '.scad': 'openscad',
 };
 
 /** MPEG transport stream: fixed 188-byte packets, each opening with 0x47. */
@@ -448,6 +452,16 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
   // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
   'dart',
+  // OpenSCAD: the OpenSCAD org's @openscad/tree-sitter-openscad 0.6.2 (MIT),
+  // source tag v0.6.2 at 2cc7d1abe20d5ee00db687fa25392ee18adfcf52. Vendored
+  // because tree-sitter-wasms ships no OpenSCAD build. The wasm is the official
+  // release asset, byte-identical rather than locally rebuilt:
+  // https://github.com/openscad/tree-sitter-openscad/releases/download/v0.6.2/tree-sitter-openscad.wasm
+  // sha256 ad3e76af7199bd068095cf21b01189f2d0c629908fa59cd17a1ddf1307abd825
+  // Complete source: the tree-sitter-openscad.tar.gz asset in that release,
+  // sha256 b162631662487c53fb59d1d49465de568ac590f5ae1be22062011a89e54195d3.
+  // ABI 15, no external scanner; the MIT license ships beside the wasm.
+  'openscad',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
@@ -958,6 +972,7 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    openscad: 'OpenSCAD',
     unknown: 'Unknown',
   };
   return names[language] || language;

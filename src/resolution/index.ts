@@ -45,7 +45,7 @@ import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { clearRubyConstantPathMemos, matchRubyConstantPathRef } from './ruby-constant-paths';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, CPP_COMPILE_DB_FILES, loadCppIncludeDirsFromCompileDB, loadCppIncludeDirsHeuristic, readCompileDbIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, CPP_COMPILE_DB_FILES, loadCppIncludeDirsFromCompileDB, loadCppIncludeDirsHeuristic, readCompileDbIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isOpenscadIncludeRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
 import { ResolverPool, minRefsForPool, poolStartSettled, resolveWorkersWorthStarting, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { readCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
@@ -1840,6 +1840,9 @@ export class ReferenceResolver {
     const preFilterPass =
       isNixPathImportRef(ref) ||
       isJsPathImportRef(ref) ||
+      // OpenSCAD `include <p>`/`use <p>` names a FILE, so the symbol-existence
+      // gate does not apply — same reason as Nix static path imports above.
+      isOpenscadIncludeRef(ref) ||
       this.hasAnyPossibleMatch(existenceName) ||
       // PHP, Pascal, CFML, COBOL and VB.NET names ignore case: `formatprice()`
       // calls `FormatPrice`, which the exact-name set never lists.
@@ -2024,7 +2027,11 @@ export class ReferenceResolver {
     // is a Dart import's URI: `package:flutter/foundation.dart` matched by
     // its last segment went to riverpod's own foundation.dart. And a Lua
     // `require`, whose leaf matched the local it is assigned to.
-    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref) || isDartImportRef(ref) || isLuaRequireRef(ref) || ref.language === 'terraform') {
+    // OpenSCAD include/use are paths too: resolved against the including file's
+    // directory then the project's library roots, and never name-matched. The
+    // fallback is what invented an edge for `include <math.scad>` where no
+    // search root holds one and OpenSCAD reports "Can't open include file".
+    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref) || isOpenscadIncludeRef(ref) || isDartImportRef(ref) || isLuaRequireRef(ref) || ref.language === 'terraform') {
       return candidates.length > 0
         ? candidates.reduce((best, curr) =>
             curr.confidence > best.confidence ? curr : best
