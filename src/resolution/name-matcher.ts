@@ -546,6 +546,41 @@ function pythonLocalType(receiver: string, ref: UnresolvedRef, context: Resoluti
   return caller?.signature?.match(new RegExp(`\\b${receiver}\\s*:\\s*["']?([\\w.]+)`))?.[1] ?? null;
 }
 
+/** A `with … as x:` / `async with … as x:` match of the receiver patterns (group 1: `async`). */
+const PYTHON_WITH_TARGET = /(?:\0|;)\s*(async\s+)?with\s[^\0]*\bas\s+\w+$/;
+
+/**
+ * Whether a Python local the receiver patterns typed holds an instance of the
+ * class they read. A class reached through a module (`client =
+ * pkg.AsyncClient()`) must be the project's: an outside module's class says
+ * nothing about a same-named project class. `with X() as x` binds what
+ * `X.__enter__` returns (`__aenter__` under `async with`), which is the
+ * instance only when every `return` of it gives `self`; `with Tx() as conn`
+ * may hand out a connection.
+ */
+function pythonInferredClassHolds(match: string, written: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const viaModule = /^[a-z_]/.test(written) && written.includes('.');
+  const withForm = PYTHON_WITH_TARGET.exec(match);
+  if (!viaModule && !withForm) return true;
+  const cls = pythonRefClass(written, ref, context);
+  if (!cls) return false;
+  if (!withForm) return true;
+  const enter = pythonMembers(cls, withForm[1] ? '__aenter__' : '__enter__', ref, context);
+  return enter.length > 0 && enter.every(n => n.kind === 'method' && pythonReturnsSelf(n, context));
+}
+
+/**
+ * Whether a Python method has a `return` and every `return` in it gives
+ * `self`. The `def` line counts too, for a body written on it (`def
+ * __enter__(self): return self`), and a `return` may follow `;` or `:`.
+ */
+function pythonReturnsSelf(method: Node, context: ResolutionContext): boolean {
+  const body = pythonMemberLines(method.filePath, context).slice(method.startLine - 1, method.endLine);
+  // `\s*$` and not `.*$`: a line of a CRLF file ends in `\r`, which `.` doesn't match.
+  const returns = body.map(l => /(?:^|[:;])\s*return\b(.*?)\s*$/.exec(l)?.[1]?.trim()).filter((v): v is string => v !== undefined);
+  return returns.length > 0 && returns.every(v => v === 'self');
+}
+
 /** A module-scope Python variable (not a class attribute or a function local). */
 function isPythonModuleGlobal(node: Node, context: ResolutionContext): boolean {
   return node.language === 'python' && (node.kind === 'variable' || node.kind === 'constant') &&
@@ -22627,8 +22662,14 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         // returns one instance of the model (not `filter`/`all`, a QuerySet).
         new RegExp(`(?:^|;)\\s*${r}\\s*=(?!=)\\s*([A-Z]\\w*)\\.objects\\.(?:create|get|first|last|latest|earliest|get_by_natural_key)\\s*\\(`),
         // lg = Logger(...) — a statement of its own: `prefix=IPNetwork(…),`
-        // inside a call's arguments is a keyword argument, not a binding.
-        new RegExp(`(?:^|;)\\s*${r}\\s*=(?!=)\\s*([A-Z][\\w.]*)\\s*\\((?![^\\n]*,\\s*$)`),
+        // inside a call's arguments is a keyword argument, not a binding. The
+        // class may be reached through a module (`lg = log.Logger(…)`), which
+        // pythonInferredClassHolds checks is the project's.
+        new RegExp(`(?:^|;)\\s*${r}\\s*=(?!=)\\s*((?:[a-z_]\\w*\\.)*[A-Z][\\w.]*)\\s*\\((?![^\\n]*,\\s*$)`),
+        // with Logger(…) as lg: / async with log.Logger(…) as lg: — the local
+        // holds what `__enter__` / `__aenter__` returns, which
+        // pythonInferredClassHolds checks is the instance.
+        new RegExp(`(?:^|;)\\s*(?:async\\s+)?with\\s+(?:[^#]*?,\\s*)?((?:[a-z_]\\w*\\.)*[A-Z]\\w*)\\s*\\((?:[^()]|\\([^()]*\\))*\\)\\s+as\\s+${r}\\b`),
         // A quoted forward reference (`lg: "Logger"`, `lg: 'pkg.Logger'`) is the
         // same annotation — and what every file under `from __future__ import
         // annotations` or with a not-yet-defined class writes. The unquoted
@@ -23464,6 +23505,7 @@ export function inferLocalReceiverType(
     for (const re of i >= ownFrom ? withListed : patterns) {
       const m = re.exec(input);
       if (m && m[2]) {
+        if (ref.language === 'python' && !pythonInferredClassHolds(m[0], m[2], ref, context)) continue;
         let type = ref.language === 'java' ? javaTypeName(m[2]) : normalizeInferredTypeName(m[2]);
         // Delphi dereferences a pointer for a member (`P.Method` is
         // `P^.Method`), and a class reference reaches its class's methods.
