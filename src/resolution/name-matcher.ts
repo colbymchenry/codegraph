@@ -170,6 +170,9 @@ const LANGUAGE_FAMILY: Record<string, string> = {
   csharp: 'dotnet', razor: 'dotnet', vbnet: 'dotnet',
   svelte: 'web', vue: 'web', astro: 'web',
   cfml: 'cfml', cfscript: 'cfml',
+  // A script's `$Panel/Label` is a node its `.tscn` declares, and a scene's
+  // `script = ExtResource(...)` is a script: one project across the two.
+  gdscript: 'godot', godot_resource: 'godot',
 };
 export function sameLanguageFamily(a: string, b: string): boolean {
   if (a === b) return true;

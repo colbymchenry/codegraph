@@ -22,6 +22,7 @@ import {
   CPP_DEFINE_SIGNATURE,
 } from './types';
 import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
+import { matchGodotReference } from './gdscript';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -1787,6 +1788,12 @@ export class ReferenceResolver {
       if (included && this.nodeById(included.targetNodeId)?.filePath === ref.filePath) return null;
       return this.gateLanguage(included, ref);
     }
+
+    // A GDScript name means what its script's scope says, and a Godot `res://`
+    // path is one file of its project. The pre-filter below knows neither
+    // `$Panel/Label` nor `res://a.gd`, and no name strategy may guess past them.
+    const godot = matchGodotReference(ref, this.context);
+    if (godot !== undefined) return this.gateLanguage(godot, ref);
 
     // A PHP class written with a namespace in it — `new Alias\X()` through a
     // `use Ns as Alias;` namespace alias, `extends Sub\Base`, `\Ns\X::make()`

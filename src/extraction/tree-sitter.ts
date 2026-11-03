@@ -37,6 +37,7 @@ import { PASCAL_SYSTEM_NAMES } from './languages/pascal-system';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
+import { GodotResourceExtractor } from './godot-resource-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
 import { commonJsRequireRefs } from './commonjs-requires';
 import { frameworks } from './lazy-frameworks';
@@ -7619,6 +7620,13 @@ export class TreeSitterExtractor {
       if (nodeType === 'variable_declarator' && this.extractLocalObjectOwner(node)) return;
       if (nodeType === 'assignment_expression' && this.extractAssignedObjectOwner(node, false)) return;
 
+      // Language-specific body hook (see LanguageExtractor.visitBodyNode):
+      // a claimed node skips the generic call/instantiation handling below;
+      // its children are still walked.
+      const bodyHandled = this.extractor!.visitBodyNode
+        ? this.extractor!.visitBodyNode(node, this.makeExtractorContext())
+        : false;
+
       // Rocket route-registration macros (`routes![…]` / `catchers![…]`): the
       // handler paths live in a raw token tree the call walker can't see.
       if (nodeType === 'macro_invocation') this.extractRustRouteMacro(node);
@@ -7627,7 +7635,9 @@ export class TreeSitterExtractor {
       // there, as it does at component scope (#2651).
       if (nodeType === 'include_statement' && this.language === 'cfscript') this.extractImport(node);
 
-      if (this.extractor!.callTypes.includes(nodeType)) {
+      if (bodyHandled) {
+        // claimed by the language hook — no generic handling
+      } else if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);
       } else if (INSTANTIATION_KINDS.has(nodeType) || this.isVbnetConstructorShapedArrayCreation(node)) {
         // `new Foo()` inside a function body — emit an `instantiates`
@@ -10000,6 +10010,11 @@ export function extractFromSource(
   } else if (detectedLanguage === 'liquid') {
     // Use custom extractor for Liquid
     const extractor = new LiquidExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'godot_resource') {
+    // Use custom extractor for Godot text scenes/resources (.tscn/.tres/project.godot):
+    // scene nodes, script attachments and signal connections.
+    const extractor = new GodotResourceExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'razor') {
     // Use custom extractor for ASP.NET Razor (.cshtml) / Blazor (.razor) markup

@@ -477,6 +477,7 @@ export class QueryBuilder {
     getNodeById?: NodeStatement;
     getNodesByFile?: NodeStatement;
     getNodesByKind?: NodeStatement;
+    getNodesByKindAndLanguage?: NodeStatement;
     insertEdge?: SqliteStatement;
     upsertFile?: SqliteStatement;
     deleteEdgesBySource?: SqliteStatement;
@@ -1626,6 +1627,14 @@ export class QueryBuilder {
       this.stmts.getNodesByKind = prepareNodeStatement(this.db, 'SELECT * FROM nodes WHERE kind = ? ORDER BY file_path, start_line, id');
     }
     return this.stmts.getNodesByKind.all(kind);
+  }
+
+  /** The nodes of one kind in one language, for a kind other languages have many of. */
+  getNodesByKindAndLanguage(kind: NodeKind, language: Language): Node[] {
+    if (!this.stmts.getNodesByKindAndLanguage) {
+      this.stmts.getNodesByKindAndLanguage = prepareNodeStatement(this.db, 'SELECT * FROM nodes WHERE kind = ? AND language = ?');
+    }
+    return this.stmts.getNodesByKindAndLanguage.all(kind, language);
   }
 
   /**
@@ -4558,6 +4567,12 @@ export class QueryBuilder {
       this.stmts.getAllFilePaths = this.db.prepare('SELECT path FROM files ORDER BY path');
     }
     const rows = this.stmts.getAllFilePaths.all() as Array<{ path: string }>;
+    return rows.map((r) => r.path);
+  }
+
+  /** The tracked paths of some languages, read by the files table's language index. */
+  getFilePathsByLanguages(languages: readonly Language[]): string[] {
+    const rows = this.db.prepare(`SELECT path FROM files WHERE language IN (${languages.map(() => '?').join(',')})`).all(...languages) as Array<{ path: string }>;
     return rows.map((r) => r.path);
   }
 
