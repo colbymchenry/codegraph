@@ -1,0 +1,24 @@
+diff --git a/common/define-grammar.js b/common/define-grammar.js
+index efb0b76..2949f97 100644
+--- a/common/define-grammar.js
++++ b/common/define-grammar.js
+@@ -1004,7 +1004,18 @@ module.exports = function defineGrammar(dialect) {
+ 
+       type_parameter: $ => seq(
+         optional('const'),
+-        field('name', $._type_identifier),
++        // TS 4.7 variance annotations: `in T`, `out T`, `in out T`
++        // (tree-sitter-typescript#364). `out` stays usable as a parameter
++        // name (`<out>`, `<in out>`), as tsc accepts it (brajevicm@9fcaa13).
++        // Known limit: where an expression `<` could also open type
++        // parameters, `in`/`out` now lex as keywords, so a type or JSX tag
++        // literally named `out`/`in` there (`<out>x`, `<out>…</out>`) fails.
++        // Accepting them as type names everywhere broke `[out: T]` tuple
++        // labels instead, which real code uses.
++        // tsc takes `const` on either side of the variance (`<in const T>`).
++        optional(choice('in', seq(optional('in'), 'out'))),
++        optional('const'),
++        field('name', choice($._type_identifier, alias('out', $.type_identifier))),
+         field('constraint', optional($.constraint)),
+         field('value', optional($.default_type)),
+       ),
