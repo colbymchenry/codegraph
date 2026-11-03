@@ -16,6 +16,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `codegraph_callers` and `codegraph_callees` take an `offset`, so an agent can page through a list longer than `limit`, and a cut list names the offset of the next page. Thanks @blairjordan. (#3449)
 - `codegraph init` is faster on large projects: the background workers that link references start sooner, and they and the indexer's own writes no longer hold each other up. (#3472)
+- CodeGraph now indexes GDScript and Godot's text scenes and resources, so `codegraph_explore` and `codegraph callers` follow calls through typed receivers, inheritance and autoloads, signals to their handlers, and node paths and scene connections to the scripts they reach. Thanks @cosmicnag, @i-snyder and @tien226anh. (#1218)
 
 ### Fixes
 
