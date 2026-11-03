@@ -3797,8 +3797,9 @@ export class ExtractionOrchestrator {
     scopedPaths?: string[],
     /**
      * Writer-side WAL pressure valve (#1539). Called after every changed file
-     * is stored, when no extraction transaction is open, so a checkpoint can
-     * safely catch up before the next file grows the WAL further.
+     * is stored and after every unchanged file whose stat is refreshed, when
+     * no extraction transaction is open, so a checkpoint can safely catch up
+     * before the next file grows the WAL further.
      */
     backpressure?: () => Promise<void> | null,
     /** Inspect changed inputs before deletion/re-extraction cascades their edges. */
@@ -3977,9 +3978,10 @@ export class ExtractionOrchestrator {
       // change that preserves both exactly is the blind spot every mtime-based
       // incremental tool accepts; `index --force` is the escape hatch. Git bumps
       // mtime on every file it writes during checkout/merge, so pulls are caught.)
+      let stat: fs.Stats | undefined;
       if (tracked && !neverParsed) {
         try {
-          const stat = fs.statSync(fullPath);
+          stat = fs.statSync(fullPath);
           if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
             continue;
           }
@@ -4023,6 +4025,20 @@ export class ExtractionOrchestrator {
         changedFilePaths.push(filePath);
         if (tracked.nodeCount === 0 && (tracked.errors?.length ?? 0) > 0) indexedFromSkip.push(filePath);
         filesModified++;
+      } else if (stat) {
+        // Same bytes under a new size/mtime (a fresh checkout, a copied index,
+        // `touch`): record the stat the pre-filter compares, or every later
+        // sync reads and hashes this file again. The stat was taken before the
+        // read, so a write landing after it leaves a newer mtime on disk and
+        // the next sync still reads the file.
+        this.queries.upsertFile({ ...tracked, size: stat.size, modifiedAt: stat.mtimeMs });
+        // Each refresh is its own commit, so a checkout that moves thousands of
+        // mtimes appends thousands of WAL frames before the index loop below
+        // runs. Give the WAL valve the same between-commits check that loop
+        // gives it, so a reader pinning frames cannot let this one grow the WAL
+        // past the valve's caps.
+        const pause = backpressure?.();
+        if (pause) await pause;
       }
     }
 
