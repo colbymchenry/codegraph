@@ -32,21 +32,24 @@ tree-sitter gives up and parses the whole file as a single `ERROR`.
 
 `out` stays usable as a type-parameter name (`type F<out> = out[]`,
 `<out = X>`, `<out, T>`, and `<in out>`, which means modifier `in` on a
-parameter named `out`), as tsc accepts all of them. This is upstream PR
-#364's rule plus the name alias from brajevicm/tree-sitter-typescript@9fcaa13.
-Both upstream PRs (#361, #364) break `<out>` as a name without that alias.
+parameter named `out`), as tsc accepts all of them. The rule is upstream PR
+#364's, plus the name alias from brajevicm/tree-sitter-typescript@9fcaa13
+(both upstream PRs, #361 and #364, break `<out>` as a name without it), plus
+our own second `optional('const')` after the variance for `<in const T>`,
+which neither upstream PR has.
 
 ### Known limits
 
 Making `in` and `out` keywords where a type parameter can start means they
 lex as keywords wherever an expression `<` could also open type parameters.
 So a **type** or **JSX tag** literally named `out` or `in` in that position
-no longer parses: `<out>x` (a type assertion to a type named `out`),
-`<out>…</out>` and `<in>…</in>` in tsx. No HTML element and no conventional
-type has either name. The alternative was accepting `out` as a type name
-everywhere, and that broke `[out: T]` tuple labels, which real code uses
-(Effect's `JsonSchema.ts`). The parser also accepts some forms tsc rejects,
-such as `<out extends X>` (as before), `<in in T>` and `<out in T>`.
+no longer parses: `<out>x` (a type assertion to a type named `out`), and in
+tsx the tags `<out>…</out>`, `<out/>`, `<in>…</in>`, and a member tag on a
+binding named `out` such as `<out.Provider>`. No HTML element and no
+conventional type has either name. The alternative was accepting `out` as a
+type name everywhere, and that broke `[out: T]` tuple labels, which real code
+uses (Effect's `JsonSchema.ts`). The parser also accepts some forms tsc
+rejects, such as `<out extends X>` (as before) and `<out in>`.
 
 ## Measured
 
@@ -99,7 +102,9 @@ either side, rebuild the kernel (`npm run build:kernel`) and run
 
 ## Dropping the patch
 
-When upstream merges a variance fix, bump to that release, check that
-`<out>` still parses as a parameter name and `[out: T]` as a tuple label, and
-go back to the crate and the checked-in `parser.c`. Tracking:
+When upstream merges a variance fix, bump to that release and check that
+`<out>` still parses as a parameter name, `[out: T]` as a tuple label, and
+`<in const T>` with `const` after the variance
+(`__tests__/typescript-variance-parse.test.ts` covers all three). Then go back
+to the crate and the checked-in `parser.c`. Tracking:
 inth3shadows/codegraph#11.
