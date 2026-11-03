@@ -16,17 +16,20 @@
  *    subclass of it). `@State` in a view is SwiftUI's property wrapper, never
  *    `AccountsListViewModel.State` from another file. The index keeps a type
  *    reference by its last segment, so a site's qualifier (`Build.Id` vs
- *    `Package.Id`) is read back from the source line.
+ *    `Package.Id`) is read back from the source line. An inheritance entry
+ *    is the exception: its ref carries the dotted path the parse tree gives
+ *    it (`class QC: Kit.Runner` is a ref named `Kit.Runner`), used as is.
  *
  * Applied to every strategy's result at resolveOne's seam, so the framework
  * resolvers' name patterns and the name matcher obey it alike. A conformance
  * to a type the project only extends now resolves to nothing, so the
  * supertype walk reads such conformances from the declaration itself
  * (`swiftExtendedConformances`) and the extensions' members still reach the
- * conformer. Resolution only: extraction, and the kernel's, are unchanged.
+ * conformer.
  */
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
+import { isInheritanceRef } from './types';
 import { escapeRegExp } from '../utils';
 
 const TYPE_KINDS: ReadonlySet<Node['kind']> = new Set<Node['kind']>(['class', 'struct', 'enum', 'interface', 'protocol', 'type_alias']);
@@ -211,10 +214,12 @@ const QUALIFIER_BEFORE = new RegExp(String.raw`((?:${QUALIFIER_SEGMENT})+)$`);
 
 /**
  * The reference as its site writes it. The index keeps a Swift type
- * reference by its last segment — `Build.Id` is a ref named `Id` — so whether
- * the name was qualified is read back from the line: a type annotation's
- * column is the name's (`Build.|Id`), a construction's is the chain's
- * (`|API.PackageController.GetRoute.Model(`).
+ * annotation or construction by its last segment — `Build.Id` is a ref named
+ * `Id` — so whether the name was qualified is read back from the line: a type
+ * annotation's column is the name's (`Build.|Id`), a construction's is the
+ * chain's (`|API.PackageController.GetRoute.Model(`). Never called for an
+ * inheritance entry, whose ref already carries its dotted path
+ * (gateSwiftTypeTarget).
  */
 function writtenName(ref: UnresolvedRef, context: ResolutionContext): string {
   const name = ref.referenceName;
@@ -272,10 +277,20 @@ function sharedDirs(a: string, b: string): number {
   return n;
 }
 
-/** The project's own declaration of the type a site names, when exactly one fits. */
+/**
+ * The project's own declaration of the type a site names, when exactly one
+ * fits. An exact fit of a written path wins over a fallback fit: with `class
+ * Base {}` and `enum Kit { class Base {} }` in one file, `Kit.Base` is the
+ * nested one, though the top-level `Base` fits through fitsPath's same-file
+ * fallback. For a qualified inheritance entry the type's path is also read
+ * through the extension it is declared in (withExtendedPath): `class D:
+ * Right.Box.Base` is the `Base` in `extension Right.Box`, not one in
+ * `extension Left.Box`, though both are indexed as `Box::Base`.
+ */
 function declarationFor(name: string, written: string, ref: UnresolvedRef, from: Node | null, context: ResolutionContext): Node | null {
   const memo = memoFor(context).declaration;
-  const key = `${ref.filePath}\0${from?.qualifiedName ?? ''}\0${written}\0${name}`;
+  const inheritance = isInheritanceRef(ref);
+  const key = `${ref.filePath}\0${from?.qualifiedName ?? ''}\0${written}\0${name}\0${inheritance ? 'inherits' : ''}`;
   if (memo.has(key)) return memo.get(key)!;
 
   const bare = !written.includes('.');
@@ -284,13 +299,18 @@ function declarationFor(name: string, written: string, ref: UnresolvedRef, from:
   for (const node of context.getNodesByName(name)) {
     if (node.language !== 'swift' || !TYPE_KINDS.has(node.kind) || isSwiftExtension(node, context)) continue;
     if (path !== null) {
-      if (fitsPath(node, path, context)) scored.push({ node, depth: 0 });
+      const read = inheritance ? withExtendedPath(node, context) : node;
+      if (fitsPath(node, path, context) && (!inheritance || fitsPath(read, path, context))) {
+        const exact = read.qualifiedName === path || read.qualifiedName.endsWith(`::${path}`);
+        scored.push({ node, depth: exact ? 1 : 0 });
+      }
       continue;
     }
     const depth = bare ? bareScopeDepth(node, from, context) : 0;
     if (depth !== null) scored.push({ node, depth });
   }
-  // Swift looks a bare name up innermost scope first.
+  // Swift looks a bare name up innermost scope first. A written path's exact
+  // fit (depth 1) outranks one that fits only through fitsPath's fallbacks.
   const deepest = Math.max(-1, ...scored.map((s) => s.depth));
   // One declaration per file: a framework resolver's one-line twin of a
   // declaration (`@main struct App`) is the same type.
@@ -329,7 +349,22 @@ export function gateSwiftTypeTarget(result: ResolvedRef | null, ref: UnresolvedR
   const target = context.getNodeById?.(result.targetNodeId);
   if (!target || target.language !== 'swift' || !TYPE_KINDS.has(target.kind)) return result;
   const from = context.getNodeById?.(ref.fromNodeId) ?? null;
-  const written = writtenName(ref, context);
+  // An inheritance entry's ref is its dotted path from the parse tree
+  // (`Kit.Runner`), so its qualifier is taken as is, not read back from the
+  // source line.
+  const written = isInheritanceRef(ref) ? ref.referenceName : writtenName(ref, context);
+  // A supertype written with a qualifier none of whose segments names a
+  // project type (`struct Y: Swift.Error`, `class Z: Foundation.Operation`)
+  // names an external module's type: Swift never lets a project type be named
+  // through another module's qualifier. The extraction cannot tell a module
+  // from a type, and fitsPath reads such a qualifier as a module that fits a
+  // top-level project type of the same last segment, so the entry gets no
+  // target rather than a wrong one. Supertype refs only: a type annotation or
+  // a call keeps fitsPath's reading.
+  if ((ref.referenceKind === 'extends' || ref.referenceKind === 'implements') && written.includes('.')) {
+    const qualifier = written.split('.').slice(0, -1);
+    if (!qualifier.some((seg) => context.getNodesByName(seg).some((n) => n.language === 'swift' && TYPE_KINDS.has(n.kind)))) return null;
+  }
   if (!isSwiftExtension(target, context)) {
     if (!written.includes('.')) {
       if (bareScopeDepth(target, from, context) !== null) return result;
@@ -402,6 +437,24 @@ export function resolveSwiftTypePathCall(ref: UnresolvedRef, context: Resolution
   return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'qualified-name' };
 }
 
+/**
+ * A qualified Swift inheritance entry, `class QC: Kit.Runner`, whose ref is
+ * the dotted path the parse tree gives (`Kit.Runner`): the project's own
+ * declaration of the type on that path (declarationFor, by the last segment
+ * and, for a type declared in an extension, the extension's written path),
+ * or null. ResolveOne's gates still run on the result: gateSwiftTypeTarget
+ * drops it when no qualifier segment names a project type, and
+ * ReferenceResolver drops a target the reference's file cannot see.
+ * (createEdges later writes an `extends` onto a protocol as `implements` when
+ * the source is not itself an interface or protocol.)
+ */
+export function resolveSwiftQualifiedSupertype(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const name = ref.referenceName;
+  const from = context.getNodeById?.(ref.fromNodeId) ?? null;
+  const decl = declarationFor(name.slice(name.lastIndexOf('.') + 1), name, ref, from, context);
+  return decl ? { original: ref, targetNodeId: decl.id, confidence: 0.9, resolvedBy: 'qualified-name' } : null;
+}
+
 /** Is this case declared in a `@Reducer enum`? */
 function isReducerEnum(member: Node, context: ResolutionContext): boolean {
   const owner = context
@@ -446,6 +499,17 @@ function ownerPath(member: Node, context: ResolutionContext): string | null {
   }
   memo.set(member.id, path);
   return path;
+}
+
+/**
+ * A type node with its qualified name read through the extension it is
+ * declared in, as ownerPath reads a member's owner: `Base` in `extension
+ * Right.Box { class Base {} }` is indexed as `Box::Base` and read as
+ * `Right::Box::Base`. Any other type node is returned as is.
+ */
+function withExtendedPath(node: Node, context: ResolutionContext): Node {
+  const owner = ownerPath(node, context);
+  return owner === null ? node : { ...node, qualifiedName: `${owner}::${node.name}` };
 }
 
 /** `extension API.PackageController {` → `API::PackageController`; null for anything but an extension of a nested type. */
