@@ -169,6 +169,33 @@ describe.each(ARMS)('a Python local built from a class ($arm)', ({ env }) => {
     expect(callees('run')).toEqual(['Store::save']);
   });
 
+  it('reads an __enter__ written on one line', async () => {
+    await index({
+      'store.py': [
+        'class Store:',
+        '    def __enter__(self): return self',
+        '    def __exit__(self, *exc): pass',
+        '',
+        '    def save(self):',
+        '        return 1',
+        '',
+        '',
+        'class Storage:',
+        '    def save(self):',
+        '        return 2',
+      ],
+      'use.py': [
+        'import store',
+        '',
+        '',
+        'def run():',
+        '    with store.Store() as storage:',
+        '        storage.save()',
+      ],
+    });
+    expect(callees('run')).toEqual(['Store::save']);
+  });
+
   it('does not type a local bound by with when __enter__ returns something else', async () => {
     await index({
       'db.py': [

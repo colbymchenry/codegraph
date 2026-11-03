@@ -569,11 +569,15 @@ function pythonInferredClassHolds(match: string, written: string, ref: Unresolve
   return enter.length > 0 && enter.every(n => n.kind === 'method' && pythonReturnsSelf(n, context));
 }
 
-/** Whether a Python method has a `return` and every `return` in its body gives `self`. */
+/**
+ * Whether a Python method has a `return` and every `return` in it gives
+ * `self`. The `def` line counts too, for a body written on it (`def
+ * __enter__(self): return self`), and a `return` may follow `;` or `:`.
+ */
 function pythonReturnsSelf(method: Node, context: ResolutionContext): boolean {
-  const body = pythonMemberLines(method.filePath, context).slice(method.startLine, method.endLine);
+  const body = pythonMemberLines(method.filePath, context).slice(method.startLine - 1, method.endLine);
   // `\s*$` and not `.*$`: a line of a CRLF file ends in `\r`, which `.` doesn't match.
-  const returns = body.map(l => /^\s*return\b(.*?)\s*$/.exec(l)?.[1]?.trim()).filter((v): v is string => v !== undefined);
+  const returns = body.map(l => /(?:^|[:;])\s*return\b(.*?)\s*$/.exec(l)?.[1]?.trim()).filter((v): v is string => v !== undefined);
   return returns.length > 0 && returns.every(v => v === 'self');
 }
 
