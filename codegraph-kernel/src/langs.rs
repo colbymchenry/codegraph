@@ -39,6 +39,13 @@ extern "C" {
 extern "C" {
     fn tree_sitter_swift() -> *const ();
 }
+// Vendored typescript + tsx grammars (build.rs-compiled C — v0.23.2 with
+// docs/grammars/tree-sitter-typescript.patch, regenerated; see
+// grammars/typescript and docs/grammars/tree-sitter-typescript.md).
+extern "C" {
+    fn tree_sitter_typescript() -> *const ();
+    fn tree_sitter_tsx() -> *const ();
+}
 
 /// Languages this kernel binary can extract (reported by contractInfo;
 /// TS-side routing policy decides what actually routes).
@@ -49,8 +56,12 @@ pub const LANGUAGES: [&str; 20] = [
 
 pub fn grammar_for(language: &str) -> Option<Language> {
     match language {
-        "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
-        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        // v0.23.2 + docs/grammars/tree-sitter-typescript.patch, regenerated;
+        // vendored C compiled in build.rs, same sources as the vendored wasm.
+        "typescript" => Some(
+            unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_typescript) }.into(),
+        ),
+        "tsx" => Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_tsx) }.into()),
         "javascript" | "jsx" => Some(tree_sitter_javascript::LANGUAGE.into()),
         "java" => Some(tree_sitter_java::LANGUAGE.into()),
         "python" => Some(tree_sitter_python::LANGUAGE.into()),

@@ -343,6 +343,8 @@ to wasm is the universal fallback. Zero-native-build-on-install stays true.
   `generate`), tree-sitter-cli 0.25.10, emcc. So the production wasm TS/JS grammars are
   UPGRADED as of this change (full suite green, 2456 tests) and **R2/R3 parity diffs
   are grammar-neutral**. Bump crate + vendored wasm together, or the parity test fails.
+  (Later: typescript+tsx left the crate for vendored C carrying a variance-annotation
+  patch, regenerated — see `docs/grammars/tree-sitter-typescript.md`.)
 - **Release wiring:** `kernel` matrix job in release.yml (macos-14 ×2 targets,
   ubuntu-22.04, ubuntu-22.04-arm, windows-latest ×2 — all continue-on-error: kernel is
   optional, a toolchain flake never blocks a release) → artifacts → `release/kernel/` →

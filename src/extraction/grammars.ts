@@ -390,7 +390,12 @@ export async function initGrammars(): Promise<void> {
  *   - tree-sitter/tree-sitter-go v0.23.4 (3c3775f) → go
  * Built from each repo's CHECKED-IN parser.c (no `generate`) with
  * tree-sitter-cli 0.25.10 `build --wasm` — the same tables crates.io compiles
- * (parser.c sha-matched against the crates.io tarball).
+ * (parser.c sha-matched against the crates.io tarball). Exception:
+ * typescript + tsx carry docs/grammars/tree-sitter-typescript.patch (TS 4.7
+ * variance annotations), so they are
+ * REGENERATED with tree-sitter-cli 0.25.10 (ABI 15) and the kernel compiles
+ * the same generated C from codegraph-kernel/grammars/typescript instead of
+ * the crate.
  * The kernel-grammar-parity test asserts this alignment; bump the crate and
  * the vendored wasm together.
  */
