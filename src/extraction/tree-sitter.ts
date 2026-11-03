@@ -24,7 +24,7 @@ import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration, cAliasTypeNames, cDeclaratorIdentifier, cMemberTypeNames, isClassLikeDefinition, isUnnamedMemberType, type CTypeName } from './languages/c-cpp';
 import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { appendCppMacroMethods } from './languages/cpp-macro-methods';
-import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
+import { rustImplItemOwner } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
 import { cfmlConstructedComponent, cfmlCreatedComponent, isCfIncludeCall } from './languages/cfscript';
@@ -859,6 +859,9 @@ export class TreeSitterExtractor {
   private reExportImports = 0;
   private extractor: LanguageExtractor | null = null;
   private nodeStack: string[] = []; // Stack of parent node IDs
+  // Rust impl targets are resolved through AST scopes, including inline modules
+  // that mint no graph node. Keep declaration identity for earlier-extracted types.
+  private rustTypeIds = new Map<number, string>();
   // C/C++ enclosing `namespace ns { … }` names, prepended to every contained
   // symbol's qualifiedName (see visitNode). Prefix-only by design — no
   // namespace NODE is created: `namespace cutlass {` opens in thousands of
@@ -2057,7 +2060,8 @@ export class TreeSitterExtractor {
     // — extractClass / extractFunction / extractProperty — because the
     // decorator node sits BEFORE the symbol in the AST and the walker
     // would otherwise see the wrong nodeStack head.)
-    // Rust: `impl Trait for Type { ... }` — creates implements edge from Type to Trait
+    // Rust: `impl Trait for Type { ... }` — records an unresolved `implements`
+    // reference from Type to Trait
     else if (nodeType === 'impl_item') {
       this.extractRustImplItem(node);
     }
@@ -2142,6 +2146,9 @@ export class TreeSitterExtractor {
     }
 
     this.nodes.push(newNode);
+    if (this.language === 'rust' && TreeSitterExtractor.IMPL_TARGET_KINDS.has(kind)) {
+      this.rustTypeIds.set(node.startIndex, id);
+    }
 
     // Add containment edge from parent
     if (this.nodeStack.length > 0) {
@@ -2874,18 +2881,21 @@ export class TreeSitterExtractor {
     const methodNode = this.createNode('method', name, node, extraProps);
     if (!methodNode) return;
 
-    // For methods with a receiver type but no class-like parent on the stack
-    // (e.g., Rust impl blocks), add a contains edge from the owning struct/trait
+    // Receiver methods need a type containment edge in addition to lexical
+    // containment. Rust uses the same scoped impl target as `implements`, so
+    // a same-named type in another function or module cannot take the method.
     if (receiverType && !this.isInsideClassLikeNode()) {
-      const ownerNode = this.nodes.find(
-        (n) =>
-          n.name === receiverType &&
-          n.filePath === this.filePath &&
-          (n.kind === 'struct' || n.kind === 'union' || n.kind === 'class' || n.kind === 'enum' || n.kind === 'trait')
-      );
-      if (ownerNode) {
+      let impl = node.parent;
+      while (impl && impl.type !== 'impl_item') impl = impl.parent;
+      const ownerId = this.language === 'rust'
+        ? (impl ? this.findTypeInScope(impl) : undefined)
+        : this.nodes.find(
+          (n) => n.name === receiverType && n.filePath === this.filePath &&
+            (n.kind === 'struct' || n.kind === 'union' || n.kind === 'class' || n.kind === 'enum' || n.kind === 'trait')
+        )?.id;
+      if (ownerId) {
         this.edges.push({
-          source: ownerNode.id,
+          source: ownerId,
           target: methodNode.id,
           kind: 'contains',
         });
@@ -7623,6 +7633,11 @@ export class TreeSitterExtractor {
       // handler paths live in a raw token tree the call walker can't see.
       if (nodeType === 'macro_invocation') this.extractRustRouteMacro(node);
 
+      // A Rust `impl Trait for Type` in a body (a local type implementing a
+      // trait) records its `implements` reference as one at module scope does;
+      // the walk below still descends into it for the impl's methods.
+      if (nodeType === 'impl_item') this.extractRustImplItem(node);
+
       // A CFML `include "x.cfm";` in a function body includes the template
       // there, as it does at component scope (#2651).
       if (nodeType === 'include_statement' && this.language === 'cfscript') this.extractImport(node);
@@ -8340,8 +8355,11 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Rust `impl Trait for Type` — creates an implements edge from Type to Trait.
-   * For plain `impl Type { ... }` (no trait), no inheritance edge is needed.
+   * Rust `impl Trait for Type`, at module scope or in a function body: records
+   * an unresolved `implements` reference from the implementing type to the
+   * trait's full text. The implementing type is found by findTypeInScope:
+   * lexically for a bare name, through the named modules for a path. An
+   * inherent `impl Type { ... }` records nothing.
    */
   private extractRustImplItem(node: SyntaxNode): void {
     // `impl Trait for Type` carries the trait in the grammar's `trait` field;
@@ -8353,14 +8371,10 @@ export class TreeSitterExtractor {
     // (`From<u32>`) keep their spelling.
     const traitName = getNodeText(traitNode, this.source);
 
-    // The implementing type from the `type` field (#1588). The old positional
-    // scan took the LAST type-shaped child, which for a parameterized
-    // implementing type (`BufSource<T>`, `Parents<'a>`, `&Foo`) was the trait.
-    const typeName = rustImplTypeName(getChildByField(node, 'type'), this.source);
-    if (!typeName) return;
-
-    // Find the struct/type node for the implementing type
-    const typeNodeId = this.findNodeByName(typeName);
+    // The implementing type comes from the grammar's `type` field (#1588), so a
+    // parameterized implementing type (`BufSource<T>`, `Parents<'a>`, `&Foo`)
+    // is never taken for the trait.
+    const typeNodeId = this.findTypeInScope(node);
     if (typeNodeId) {
       this.unresolvedReferences.push({
         fromNodeId: typeNodeId,
@@ -8372,16 +8386,170 @@ export class TreeSitterExtractor {
     }
   }
 
+  /** Node kinds an `impl Trait for Type` can name as its implementing type. */
+  private static readonly IMPL_TARGET_KINDS: ReadonlySet<string> = new Set(['struct', 'union', 'enum', 'class']);
+
   /**
-   * Find a previously-extracted node by name (used for back-references like impl blocks)
+   * Resolve an impl's type through lexical AST scopes and inline-module bodies.
+   * The declaration map only contains extracted types, so forward declarations
+   * remain unresolved. AST identity distinguishes modules even though inline
+   * modules mint no graph scope node.
+   *
+   * Each segment is looked up in a scope: a declaration of it (a `mod` for a
+   * head, a struct/union/enum for the last segment), else a same-file `use`
+   * that binds it (`use a::X;`, `use a::X as Y;`, `use a::{X, c::W};`; wildcards
+   * bind nothing). A declaration wins over a `use` in the same scope. A bare head
+   * searches the impl's scope and the scopes around it; `crate`, `self`, `super`
+   * and every segment after a module name search that one module body. A `use`
+   * replaces the segment by its path, read again from the `use`'s own scope (so a
+   * `pub use` in a module body is followed), at most MAX_USE_REWRITES times per
+   * reading, so a cycle of aliases names nothing. A leading `::` names an
+   * external crate (2018 paths): it finds nothing here, and a 2015 `::` path,
+   * which names the crate root, is not followed. Each `crate::` path, including
+   * one reached through a `use`, tries two readings from the file root: first
+   * strip a matching non-empty file module path (rustFileModulePath) and resolve
+   * the rest; if that finds no type, resolve the path as written. Both readings
+   * follow `use` rewrites. Stripped-first resolves module files; the as-written
+   * fallback supports Cargo `[lib] path` crate roots, whose Cargo.toml the
+   * extractor cannot read, so the file module path is only a guess. So in a
+   * module file, a `crate::` path that does not start with the module path can
+   * match one of that file's own items.
+   * Shared by trait edges and method ownership; mirrored by
+   * find_type_in_scope in codegraph-kernel/src/rustlang.rs.
    */
-  private findNodeByName(name: string): string | undefined {
-    for (const node of this.nodes) {
-      if (node.name === name && (node.kind === 'struct' || node.kind === 'union' || node.kind === 'enum' || node.kind === 'class')) {
-        return node.id;
+  private findTypeInScope(impl: SyntaxNode): string | undefined {
+    const path = (node: SyntaxNode | null): string[] => {
+      if (!node) return [];
+      if (node.type === 'generic_type' || node.type === 'reference_type') {
+        return path(getChildByField(node, 'type'));
       }
-    }
-    return undefined;
+      if (node.type === 'scoped_type_identifier' || node.type === 'scoped_identifier') {
+        // A scoped node with no `path` that starts with `::` is an absolute path.
+        const absolute = !getChildByField(node, 'path') && getNodeText(node, this.source).startsWith('::');
+        return [...(absolute ? ['::'] : []), ...path(getChildByField(node, 'path')), ...path(getChildByField(node, 'name'))];
+      }
+      return ['type_identifier', 'identifier', 'crate', 'self', 'super'].includes(node.type)
+        ? [getNodeText(node, this.source)] : [];
+    };
+    // The full path a `use` tree binds `name` to, or undefined. `prefix` is the
+    // path of the enclosing `{ ... }` group; a `self` leaf stands for the prefix.
+    const useBinding = (node: SyntaxNode, prefix: string[], name: string): string[] | undefined => {
+      const extend = (tail: string[]): string[] =>
+        tail[0] === 'self' && prefix.length ? [...prefix, ...tail.slice(1)] : [...prefix, ...tail];
+      switch (node.type) {
+        case 'identifier':
+        case 'scoped_identifier':
+        case 'self': {
+          const full = extend(path(node));
+          return full[full.length - 1] === name ? full : undefined;
+        }
+        case 'use_as_clause': {
+          const alias = getChildByField(node, 'alias');
+          return alias && getNodeText(alias, this.source) === name
+            ? extend(path(getChildByField(node, 'path'))) : undefined;
+        }
+        case 'scoped_use_list': {
+          const list = getChildByField(node, 'list');
+          return list ? useBinding(list, extend(path(getChildByField(node, 'path'))), name) : undefined;
+        }
+        case 'use_list':
+          for (const child of node.namedChildren) {
+            const found = useBinding(child, prefix, name);
+            if (found) return found;
+          }
+          return undefined;
+        default:
+          return undefined;
+      }
+    };
+    const resolve = (parts: string[], scope: SyntaxNode | null, rewrites: number): string | undefined => {
+      let exact = false; // search `scope` alone, not the scopes around it
+      for (;;) {
+        if (!parts.length || parts[0] === '::') return undefined;
+        if (!exact && ['crate', 'self', 'super'].includes(parts[0] ?? '')) {
+          exact = true;
+          // Anchors refer to modules, not the containing function's declarations.
+          if (parts[0] === 'crate') {
+            while (scope?.parent) scope = scope.parent;
+            parts.shift();
+            const modulePath = this.rustFileModulePath();
+            if (modulePath.length && modulePath.every((segment, i) => parts[i] === segment)) {
+              // Resolve the stripped reading completely before trying the path as written.
+              const found = resolve(parts.slice(modulePath.length), scope, rewrites);
+              if (found !== undefined) return found;
+            }
+          } else {
+            while (scope?.parent && scope.parent.type !== 'mod_item') scope = scope.parent;
+            if (parts[0] === 'self') parts.shift();
+            while (parts[0] === 'super') {
+              scope = scope?.parent?.parent ?? null;
+              while (scope?.parent && scope.parent.type !== 'mod_item') scope = scope.parent;
+              parts.shift();
+            }
+          }
+          if (!parts.length) return undefined;
+        }
+        let next = false;
+        while (scope && !next) {
+          const head = scope.namedChildren.find((child) => {
+            if (parts.length > 1 ? child.type !== 'mod_item'
+              : !['struct_item', 'union_item', 'enum_item'].includes(child.type)) return false;
+            const name = getChildByField(child, 'name');
+            return name && getNodeText(name, this.source) === parts[0];
+          });
+          if (head) {
+            if (parts.length === 1) return this.rustTypeIds.get(head.startIndex);
+            // Continue in the module's body, which only that module's items name.
+            scope = getChildByField(head, 'body');
+            if (!scope) return undefined;
+            parts = parts.slice(1);
+            exact = true;
+            next = true;
+            continue;
+          }
+          // A declaration in the scope wins over a `use` there; otherwise a `use`
+          // that binds the first segment replaces it, read from this scope.
+          for (const child of scope.namedChildren) {
+            const argument = child.type === 'use_declaration' ? getChildByField(child, 'argument') : null;
+            const bound = argument && useBinding(argument, [], parts[0] ?? '');
+            if (bound) {
+              if (rewrites++ >= TreeSitterExtractor.MAX_USE_REWRITES) return undefined;
+              parts = [...bound, ...parts.slice(1)];
+              exact = false;
+              next = true;
+              break;
+            }
+          }
+          if (next) continue;
+          if (exact || scope.type === 'source_file') return undefined;
+          scope = scope.parent;
+        }
+        if (!next) return undefined;
+      }
+    };
+    return resolve(path(getChildByField(impl, 'type')), impl.parent, 0);
+  }
+
+  /** Most `use` bindings findTypeInScope follows for one impl type. */
+  private static readonly MAX_USE_REWRITES = 8;
+
+  /**
+   * The module path of this Rust file, read from its location: the components
+   * after the last `src` directory with `.rs` dropped and a final `mod` dropped
+   * (`src/a/b.rs` and `src/a/b/mod.rs` are `['a', 'b']`). `src/lib.rs`,
+   * `src/main.rs`, anything under `src/bin/` and a file with no `src` directory
+   * are crate roots: an empty path. Mirrored by file_module_path in
+   * codegraph-kernel/src/rustlang.rs.
+   */
+  private rustFileModulePath(): string[] {
+    const components = this.filePath.split(/[\\/]/);
+    const src = components.lastIndexOf('src');
+    if (src < 0) return [];
+    const modulePath = components.slice(src + 1).map((c, i, all) => (i === all.length - 1 ? c.replace(/\.rs$/, '') : c));
+    if (modulePath.length === 1 && (modulePath[0] === 'lib' || modulePath[0] === 'main')) return [];
+    if (modulePath.length > 1 && modulePath[0] === 'bin') return [];
+    if (modulePath[modulePath.length - 1] === 'mod') modulePath.pop();
+    return modulePath;
   }
 
   /**
