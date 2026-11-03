@@ -57,6 +57,8 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
       const direction = m.tier === 'client→server' ? ' → server' : m.tier === 'server→client' ? ' → client' : '';
       return hop(`${what} ${quoted(m.event, 'an event')}`, direction);
     }
+    case 'gdscript-signal':
+      return hop(`GDScript signal ${quoted(m.event, 'a signal')}`);
     case 'event-emitter':
       return hop(`event ${quoted(m.event, 'an event')}`);
     case 'tauri-command':
