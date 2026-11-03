@@ -40,6 +40,7 @@ function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
 describe.skipIf(process.platform === 'win32')('index/init orphan supervision (#999)', () => {
   let wrapper: ChildProcessWithoutNullStreams | null = null;
   let childPid: number | null = null;
+  let tmpDir: string | null = null;
 
   afterEach(() => {
     if (wrapper && !wrapper.killed) {
@@ -50,13 +51,13 @@ describe.skipIf(process.platform === 'win32')('index/init orphan supervision (#9
     }
     wrapper = null;
     childPid = null;
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = null;
   });
 
   it("self-terminates when its parent is SIGKILL'd mid-index", async () => {
-    const stderrLog = path.join(
-      fs.mkdtempSync(path.join(os.tmpdir(), 'cg-index-orphan-')),
-      'child.stderr.log',
-    );
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-index-orphan-'));
+    const stderrLog = path.join(tmpDir, 'child.stderr.log');
     // The child stands in for a running indexer: it installs the SAME command
     // supervision `index`/`init` install, then idles on a ref'd timer so it
     // stays alive until the watchdog (not the timer) takes it down.
