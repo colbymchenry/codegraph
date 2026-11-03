@@ -174,8 +174,12 @@ async function activate(root: string, project: Project): Promise<void> {
     }
   }
   await project.cg.sync();
-  project.caughtUp = true;
+  // Publishing can throw (the writer record's barrier stays busy past its
+  // deadline). caughtUp is set only once it succeeded, so ready() runs this
+  // again on the next access or timer tick instead of leaving writer.pid at
+  // `ready: false` until the project is released.
   markWriterReady(root);
+  project.caughtUp = true;
 }
 
 /** A tool request passes through the daemon's own first-query catch-up gate. */
