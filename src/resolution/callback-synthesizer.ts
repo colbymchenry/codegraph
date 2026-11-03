@@ -30,6 +30,7 @@ import { escapeRegExp } from '../utils';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
 import { goFuncFieldEdges } from './go-func-field-synthesizer';
+import { gdscriptSignalEdges } from './gdscript-synthesizer';
 import { expoRouterReturnEdges } from './expo-router-synthesizer';
 import { nextLinkEdges, nextProxyEdges } from './next-router-synthesizer';
 import { constAliasEdges, hasConstAliasShape } from './const-alias-synthesizer';
@@ -5315,6 +5316,8 @@ export function hasSynthesisPattern(filePath: string, content: string): boolean 
   if (/\.(?:c|h|cc|cpp|cxx|hpp|hh|hxx|cppm|ipp|inl|tcc|def|inc|tbl)$/i.test(filePath) &&
     /\b(?:struct|union|typedef|virtual|override)\b|#\s*(?:include|define|if)|=|->|\[/.test(content)) return true;
   if (/\b(?:class|interface|protocol|trait|impl|extends|implements|expect|actual)\b/.test(content)) return true;
+  // A GDScript file with no class or extends in it can still declare or use a signal.
+  if (/\.gd$/.test(filePath) && /\b(?:signal|connect|emit|emit_signal)\b/.test(content)) return true;
   // Every Go file: besides the declarations the interface passes read, a call
   // through a func field, or a function put in one, can sit in any of them.
   if (/\.go$/.test(filePath)) return true;
@@ -5363,6 +5366,14 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   // `$this->postJson('api/x')`) onto the route it reaches, so the handler
   // counts as tested.
   { name: 'testRequestEdges', gate: (has) => has('java', 'kotlin', 'php'), run: (_q, c, y) => testRequestEdges(c, y) },
+  // A GDScript signal is joined by its declaration, not its name. Before the
+  // in-process emitter pass for the same reason as the tier pass above: the
+  // same (source, target) pair keeps the edge that says which signal it is.
+  {
+    name: 'gdscriptSignalEdges',
+    gate: (has) => has('gdscript'),
+    run: (q, c, y) => gdscriptSignalEdges(q, c, y, EVENT_FANOUT_CAP),
+  },
   { name: 'emitterEdges', gate: ALWAYS, run: (_q, c, y) => eventEmitterEdges(c, y) },
   { name: 'renderEdges', gate: ALWAYS, run: (q, c, y) => reactRenderEdges(q, c, y) },
   { name: 'jsxEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactJsxChildEdges(c, y) },

@@ -280,6 +280,7 @@ const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
   '.build', 'Pods', 'Carthage', 'DerivedData', '.swiftpm',
   // Dart / Flutter
   '.dart_tool', '.pub-cache',
+  '.godot',
   // Native (Android NDK, C/C++ deps)
   '.cxx', '.externalNativeBuild', 'vcpkg_installed',
   // Scala tooling
