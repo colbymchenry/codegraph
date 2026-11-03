@@ -22,7 +22,7 @@ import {
   CPP_DEFINE_SIGNATURE,
 } from './types';
 import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
-import { matchGodotReference } from './gdscript';
+import { GODOT_PROJECT_FILE, GODOT_STRUCTURE_KEY, godotAutoloadSection, godotStructureText, matchGodotReference } from './gdscript';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -315,10 +315,25 @@ function moduleConfigEntry(abs: string, previous: string | undefined, projectRoo
 function moduleConfigDigest(abs: string, projectRoot: string): string {
   const file = path.basename(abs);
   const read = file === 'go.mod' ? loadGoModule(path.dirname(abs))?.modulePath ?? ''
+    : file === GODOT_PROJECT_FILE ? godotAutoloadDigestText(abs)
     : file === 'Cargo.toml' ? cargoManifestDigestText(abs)
     : file === 'compile_commands.json' ? (readCompileDbIncludeDirs(abs, projectRoot) ?? []).join('\n')
     : aliasConfigFields(abs) ?? '';
   return createHash('sha256').update(read).digest('hex').slice(0, 16);
+}
+
+function godotAutoloadDigestText(abs: string): string {
+  try {
+    return godotAutoloadSection(fs.readFileSync(abs, 'utf-8'));
+  } catch {
+    return '';
+  }
+}
+
+/** A snapshot entry with no file behind it: see `godotStructureText`. Null without Godot files. */
+function godotStructureDigest(queries: QueryBuilder): string | null {
+  const structure = godotStructureText(queries);
+  return structure === null ? null : createHash('sha256').update(structure).digest('hex').slice(0, 16);
 }
 
 function cargoManifestDigestText(abs: string): string {
@@ -342,12 +357,16 @@ export function changedModuleConfigs(was: ModuleConfigSnapshot, now: ModuleConfi
 /**
  * The languages whose imports a changed config file governs: the ES-module
  * family for a tsconfig / jsconfig, Go for a go.mod, Rust for a Cargo manifest,
- * C and C++ for a compile database.
+ * C and C++ for a compile database, GDScript for a Godot project's autoloads.
  */
 export function moduleConfigLanguages(changed: readonly string[]): Set<Language> {
   const languages = new Set<Language>();
   for (const rel of changed) {
     if (/(?:^|\/)go\.mod$/.test(rel)) languages.add('go');
+    else if (rel === GODOT_STRUCTURE_KEY || path.posix.basename(rel) === GODOT_PROJECT_FILE) {
+      languages.add('gdscript');
+      languages.add('godot_resource');
+    }
     else if (/(?:^|\/)Cargo\.toml$/.test(rel)) languages.add('rust');
     else if (/(?:^|\/)compile_commands\.json$/.test(rel)) for (const language of ['c', 'cpp'] as const) languages.add(language);
     else for (const language of ESM_IMPORT_LANGUAGES) languages.add(language);
@@ -3312,8 +3331,15 @@ export class ReferenceResolver {
     }
     const files = new Set<string>(this.moduleConfigFiles);
     for (const name of MODULE_CONFIG_ROOT_FILES) files.add(path.join(this.projectRoot, name));
+    // A monorepo has a project.godot per game, wherever each one sits.
+    for (const node of this.queries.getNodesByName(GODOT_PROJECT_FILE)) {
+      if (node.kind === 'file') files.add(path.join(this.projectRoot, node.filePath));
+    }
     for (const rel of Object.keys(was)) files.add(path.join(this.projectRoot, rel));
-    return moduleConfigSnapshot(this.projectRoot, files, was);
+    const snapshot = moduleConfigSnapshot(this.projectRoot, files, was);
+    const structure = godotStructureDigest(this.queries);
+    if (structure !== null) snapshot[GODOT_STRUCTURE_KEY] = structure;
+    return snapshot;
   }
 
   /** The Cargo workspace's crates, read from disk the first time; every member's manifest joins the snapshot. */
