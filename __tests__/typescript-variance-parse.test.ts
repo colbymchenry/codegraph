@@ -1,7 +1,8 @@
 /**
  * TS 4.7 variance annotations (`interface Stream<out A, in E>`, `<in out T>`)
- * were parse errors in tree-sitter-typescript v0.23.2 (upstream #370), and in
- * a big file such errors can pile up into a whole-file ERROR. The vendored
+ * were parse errors in tree-sitter-typescript v0.23.2 (upstream #370). The
+ * error could also make a later generic arrow parse as a type assertion, so
+ * codegraph indexed it as a constant (last test below). The vendored
  * grammar (wasm and kernel) is patched; see docs/grammars/tree-sitter-typescript.md.
  *
  * The patch makes `in`/`out` keywords where a type parameter starts, so the
@@ -113,6 +114,8 @@ describe('TypeScript variance annotations', () => {
 });
 
 describe('TypeScript variance annotations: extraction', () => {
+  // Keep `wrap` last: on the old grammar, a statement after it can steer error
+  // recovery back to an arrow, and the graph-level test would then pass unpatched.
   const source = `export interface Stream<out A, in out E = never> {
   map<B>(f: (a: A) => B): Stream<B, E>
 }
@@ -151,8 +154,9 @@ export const wrap = <A>(value: A): Box<A> => ({ value })
   it('indexes a generic arrow after a variance annotation as a function', () => {
     // On the old grammar the error at `<out A>` made the later `<A>(value) =>`
     // parse as a type assertion: `wrap` became a constant with no references.
-    const wrap = cg.getNodesInFile('src/stream.ts').find((n) => n.name === 'wrap');
-    expect(wrap?.kind).toBe('function');
+    const named = cg.getNodesInFile('src/stream.ts').filter((n) => n.name === 'wrap');
+    expect(named.map((n) => n.kind)).toEqual(['function']);
+    const wrap = named[0];
     const refs = cg.getCallees(wrap!.id).map((c) => `${c.edge.kind}:${c.node.name}`);
     expect(refs).toContain('references:Box');
   });

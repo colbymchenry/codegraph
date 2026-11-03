@@ -29,9 +29,13 @@ TypeScript 4.7 variance annotations, such as `interface Stream<out A, in E>`,
 issue #370). `type_parameter` now takes an optional `in`, `out` or `in out`,
 with `const` on either side. Each was a parse error, and its recovery could
 change how later code in the file parsed: after `interface Box<out A>`, a
-generic arrow such as `export const wrap = <A>(value: A): Box<A> => …` parsed
-as a type assertion, so codegraph indexed `wrap` as a constant with no type
-references.
+generic arrow such as `export const wrap = <A>(value: A): Box<A> => …` could
+parse as a type assertion (it depends on what follows), so codegraph indexed
+`wrap` as a constant with no type references. Any earlier parse error can do
+this, not only a variance annotation, and it still happens after the errors
+this patch leaves (#335 below). The patch removes one trigger; reading
+`<A>(…) => …` as a generic arrow whatever came before would be an extractor
+change, not in this patch.
 
 `out` stays usable as a type-parameter name (`type F<out> = out[]`,
 `<out = X>`, `<out, T>`, and `<in out>`, which means modifier `in` on a
@@ -67,12 +71,14 @@ types, fields and byte ranges.
 | microsoft/vscode ca43fc94 `src/` (.ts) | 11,265 | 11 → 11 | 11 → 11 | 0 |
 | excalidraw/excalidraw dd2f8fc (.ts / .tsx) | 372 / 323 | 2 / 3 → same | 3 / 3 → same | 0 / 0 |
 
-In codegraph's own index of Effect (the 1,995 `.ts` files, wasm path), the
-patch changes 7 of 59,104 nodes (each a generic arrow function that was
-indexed as a constant) and adds 9 of about 238,000 edges (their type
-references). Zod's declarations are unchanged.
+In codegraph's own index of Effect (wasm path, `CODEGRAPH_KERNEL=0`; the
+1,995 files codegraph indexes as TypeScript, of the 2,054 above), the patch
+changes 7 of 59,104 nodes (each a generic arrow function that was indexed as
+a constant) and adds 9 of about 238,000 edges (their type references). In
+Zod, the nodes and edges codegraph indexes are identical before and after.
+On these two corpora, variance errors alone did not fail whole files.
 
-Most of Effect's whole-file failures remain. Their next error is upstream
+Effect's whole-file failures are a different bug, upstream
 tree-sitter-typescript #335: a generic call signature, such as an overload
 `<A>(self: A): A`, on its own line after another member with no `;`. This
 patch does not cover that.
