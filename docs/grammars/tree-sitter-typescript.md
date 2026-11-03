@@ -27,8 +27,11 @@ external scanner (`common/scanner.h`) is unpatched.
 TypeScript 4.7 variance annotations, such as `interface Stream<out A, in E>`,
 `<in out T>`, `<const in T>` and `<in const T>`, were parse errors (upstream
 issue #370). `type_parameter` now takes an optional `in`, `out` or `in out`,
-with `const` on either side. In large files these errors can pile up until
-tree-sitter gives up and parses the whole file as a single `ERROR`.
+with `const` on either side. Each was a parse error, and its recovery could
+change how later code in the file parsed: after `interface Box<out A>`, a
+generic arrow such as `export const wrap = <A>(value: A): Box<A> => …` parsed
+as a type assertion, so codegraph indexed `wrap` as a constant with no type
+references.
 
 `out` stays usable as a type-parameter name (`type F<out> = out[]`,
 `<out = X>`, `<out, T>`, and `<in out>`, which means modifier `in` on a
@@ -63,6 +66,11 @@ types, fields and byte ranges.
 | colinhacks/zod 2554b70 | 481 | 4 → 0 | 21 → 0 | 4 |
 | microsoft/vscode ca43fc94 `src/` (.ts) | 11,265 | 11 → 11 | 11 → 11 | 0 |
 | excalidraw/excalidraw dd2f8fc (.ts / .tsx) | 372 / 323 | 2 / 3 → same | 3 / 3 → same | 0 / 0 |
+
+In codegraph's own index of Effect (the 1,995 `.ts` files, wasm path), the
+patch changes 7 of 59,104 nodes (each a generic arrow function that was
+indexed as a constant) and adds 9 of about 238,000 edges (their type
+references). Zod's declarations are unchanged.
 
 Most of Effect's whole-file failures remain. Their next error is upstream
 tree-sitter-typescript #335: a generic call signature, such as an overload

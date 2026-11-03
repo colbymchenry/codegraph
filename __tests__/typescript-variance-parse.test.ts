@@ -120,6 +120,12 @@ describe('TypeScript variance annotations: extraction', () => {
 export function runStream<A>(s: Stream<A>): A[] {
   return []
 }
+
+export interface Box<out A> {
+  readonly value: A
+}
+
+export const wrap = <A>(value: A): Box<A> => ({ value })
 `;
   let root = '';
   let cg: CodeGraph;
@@ -137,11 +143,17 @@ export function runStream<A>(s: Stream<A>): A[] {
   });
 
   it('parses the file clean and extracts its declarations', () => {
-    // A small file recovers locally even on the old grammar, so the parse
-    // check is what fails without the patch; the extraction check guards
-    // that the new `in`/`out` tokens don't disturb the extractor.
     expect(parse('typescript', source).hasError).toBe(false);
     const names = cg.getNodesInFile('src/stream.ts').map((n) => `${n.kind}:${n.name}`);
     expect(names).toEqual(expect.arrayContaining(['interface:Stream', 'method:map', 'function:runStream']));
+  });
+
+  it('indexes a generic arrow after a variance annotation as a function', () => {
+    // On the old grammar the error at `<out A>` made the later `<A>(value) =>`
+    // parse as a type assertion: `wrap` became a constant with no references.
+    const wrap = cg.getNodesInFile('src/stream.ts').find((n) => n.name === 'wrap');
+    expect(wrap?.kind).toBe('function');
+    const refs = cg.getCallees(wrap!.id).map((c) => `${c.edge.kind}:${c.node.name}`);
+    expect(refs).toContain('references:Box');
   });
 });
