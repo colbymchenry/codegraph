@@ -864,6 +864,7 @@ export class TreeSitterExtractor {
   }
 
   private filePath: string;
+  private projectRoot: string | undefined;
   private language: Language;
   private source: string;
   private tree: Tree | null = null;
@@ -977,9 +978,10 @@ export class TreeSitterExtractor {
     filePath: string,
     source: string,
     language?: Language,
-    options?: { sourceIsPreParsed?: boolean; sourceAsWritten?: string }
+    options?: { sourceIsPreParsed?: boolean; sourceAsWritten?: string; projectRoot?: string }
   ) {
     this.filePath = filePath;
+    this.projectRoot = options?.projectRoot;
     this.source = source;
     this.language = language || detectLanguage(filePath, source);
     this.extractor = EXTRACTORS[this.language] || null;
@@ -2315,6 +2317,7 @@ export class TreeSitterExtractor {
       pushScope: (nodeId) => self.nodeStack.push(nodeId),
       popScope: () => self.nodeStack.pop(),
       get filePath() { return self.filePath; },
+      get projectRoot() { return self.projectRoot; },
       get source() { return self.source; },
       get nodeStack() { return self.nodeStack; },
       get nodes() { return self.nodes; },
@@ -7870,16 +7873,17 @@ export class TreeSitterExtractor {
       } else if (this.language === 'kotlin' && nodeType === 'infix_expression') {
         this.extractKotlinInfixCall(node);
       } else if (this.extractor!.extractBareCall) {
-        const calleeName = this.extractor!.extractBareCall(node, this.source);
-        if (calleeName && this.nodeStack.length > 0) {
+        const bare = this.extractor!.extractBareCall(node, this.source);
+        const call = typeof bare === 'string' ? { name: bare, at: node } : bare;
+        if (call && call.name && this.nodeStack.length > 0) {
           const callerId = this.nodeStack[this.nodeStack.length - 1];
           if (callerId) {
             this.unresolvedReferences.push({
               fromNodeId: callerId,
-              referenceName: calleeName,
+              referenceName: call.name,
               referenceKind: 'calls',
-              line: node.startPosition.row + 1,
-              column: node.startPosition.column,
+              line: call.at.startPosition.row + 1,
+              column: call.at.startPosition.column,
             });
           }
         }
@@ -10215,7 +10219,8 @@ export function extractFromSource(
   filePath: string,
   source: string,
   language?: Language,
-  frameworkNames?: string[]
+  frameworkNames?: string[],
+  projectRoot?: string
 ): ExtractionResult {
   const detectedLanguage = language || detectLanguage(filePath, source);
   const fileExtension = path.extname(filePath).toLowerCase();
@@ -10285,7 +10290,7 @@ export function extractFromSource(
         filePath,
         deferredPre ?? source,
         detectedLanguage,
-        deferredPre != null ? { sourceIsPreParsed: true, sourceAsWritten: source } : undefined
+        deferredPre != null ? { sourceIsPreParsed: true, sourceAsWritten: source, projectRoot } : { projectRoot }
       );
       result = extractor.extract();
     }

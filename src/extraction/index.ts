@@ -2744,8 +2744,8 @@ export class ExtractionOrchestrator {
     const parseFile = (filePath: string, content: string): Promise<ExtractionResult> => {
       const language = detectLanguage(filePath, content, overrides, this.rootDir);
       const names = this.frameworksForFile(filePath, frameworkNames);
-      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, names));
-      return pool.requestParse({ filePath, content, language, frameworkNames: names });
+      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, names, this.rootDir));
+      return pool.requestParse({ filePath, content, language, frameworkNames: names, projectRoot: this.rootDir });
     };
 
     // --- Bounded rolling-window dispatch, ordered commit ---
@@ -3403,7 +3403,7 @@ export class ExtractionOrchestrator {
     // otherwise detect on the spot so single-file re-index paths still emit
     // route nodes / middleware / etc.
     const frameworkNames = this.frameworksForFile(relativePath, this.ensureDetectedFrameworks());
-    const result = extractFromSource(relativePath, content, language, frameworkNames);
+    const result = extractFromSource(relativePath, content, language, frameworkNames, this.rootDir);
 
     // Store in database
     await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());

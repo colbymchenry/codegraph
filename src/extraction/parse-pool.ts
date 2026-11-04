@@ -54,6 +54,8 @@ export interface ParseTask {
   content: string;
   language: Language;
   frameworkNames?: string[];
+  /** The root of the project the file is indexed into (`ExtractorContext.projectRoot`). */
+  projectRoot?: string;
 }
 
 /** Default upper bound on the pool size derived from the core count. */
@@ -458,6 +460,7 @@ export class ParseWorkerPool {
       content: job.task.content,
       frameworkNames: job.task.frameworkNames,
       language: job.task.language,
+      projectRoot: job.task.projectRoot,
     });
   }
 
