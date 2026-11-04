@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from '../src/bin/node-version-check';
+import { buildNode25BlockBanner, buildNodeTooOldBanner, isHardBlockedNodeMajor, MIN_NODE_MAJOR } from '../src/bin/node-version-check';
 
 describe('buildNode25BlockBanner', () => {
   it('embeds the reported Node version in the header', () => {
@@ -39,6 +39,16 @@ describe('buildNode25BlockBanner', () => {
     expect(buildNode25BlockBanner('25.7.0')).toContain(
       'github.com/colbymchenry/codegraph/issues/81'
     );
+  });
+});
+
+describe('isHardBlockedNodeMajor', () => {
+  it('blocks only the Node 25 turboshaft line', () => {
+    expect(isHardBlockedNodeMajor(25)).toBe(true);
+    expect(isHardBlockedNodeMajor(22)).toBe(false);
+    expect(isHardBlockedNodeMajor(24)).toBe(false);
+    expect(isHardBlockedNodeMajor(26)).toBe(false);
+    expect(isHardBlockedNodeMajor(20)).toBe(false);
   });
 });
 
