@@ -59,15 +59,35 @@ export function indexParseBudgetMs(contentLength: number): number {
 }
 
 /**
- * `parser.parse(source)`, or null when it runs past the budget. A cancelled
- * parse is reset: the parser would otherwise resume it on its next parse,
- * of whatever file that is.
+ * Grammars handed their source in small chunks rather than as one string. Their
+ * external scanner asks for the column of nearly every token (F#'s offside
+ * rule), and each ask makes the wasm parser walk the string it was handed from
+ * the start of its chunk: over one whole-file chunk that is quadratic, and real
+ * F# parses about three times as fast in 128-character chunks.
  */
-export function parseWithinBudget(parser: Parser, source: string, budgetMs = REQUEST_PARSE_BUDGET_MS): Tree | null {
+const CHUNKED_INPUT_LANGUAGES: ReadonlySet<string> = new Set(['fsharp']);
+
+/** What `parser.parse` is handed for `source` in `language`: the string, or a callback serving it in chunks. */
+export function parserInput(source: string, language: string): string | ((index: number) => string) {
+  if (!CHUNKED_INPUT_LANGUAGES.has(language)) return source;
+  return (index) => {
+    let end = index + 128;
+    // A surrogate pair is never cut in two.
+    if (end < source.length && (source.charCodeAt(end - 1) & 0xfc00) === 0xd800) end++;
+    return source.slice(index, end);
+  };
+}
+
+/**
+ * `parser.parse(source)` for a file in `language`, or null when it runs past
+ * the budget. A cancelled parse is reset: the parser would otherwise resume it
+ * on its next parse, of whatever file that is.
+ */
+export function parseWithinBudget(parser: Parser, source: string, language: string, budgetMs = REQUEST_PARSE_BUDGET_MS): Tree | null {
   const deadline = Date.now() + budgetMs;
   // The runtime hands the callback's return value to the parser: `true` cancels.
   const cancel = (() => Date.now() > deadline) as unknown as () => void;
-  const tree = parser.parse(source, null, { progressCallback: cancel }) ?? null;
+  const tree = parser.parse(parserInput(source, language), null, { progressCallback: cancel }) ?? null;
   if (!tree) parser.reset();
   return tree;
 }

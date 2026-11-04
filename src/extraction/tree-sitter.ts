@@ -1061,7 +1061,7 @@ export class TreeSitterExtractor {
       }
       // Within the file's budget: a parse that never ends (#3274) is cancelled.
       const budgetMs = indexParseBudgetMs(this.source.length);
-      this.tree = parseWithinBudget(parser, this.source, budgetMs);
+      this.tree = parseWithinBudget(parser, this.source, this.language, budgetMs);
       if (!this.tree) {
         throw new ParseTimeoutError(budgetMs);
       }

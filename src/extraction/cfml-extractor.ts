@@ -160,7 +160,7 @@ export class CfmlExtractor {
 
     // Within the file's budget, as every indexing parse (#3274).
     const budgetMs = indexParseBudgetMs(this.source.length);
-    const tree = parseWithinBudget(parser, this.source, budgetMs);
+    const tree = parseWithinBudget(parser, this.source, 'cfml', budgetMs);
     if (!tree) {
       this.errors.push({
         message: parseTimeoutMessage(budgetMs),

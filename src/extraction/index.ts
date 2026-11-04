@@ -24,7 +24,7 @@ import { ParseWorkerPool, parseWindowSize, resolveParsePoolSize, resolveParseTim
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isForeignToExtension, hasFsExtension, FSHARP_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -209,15 +209,16 @@ export function hashContent(content: string): string {
 /**
  * What change detection hashes for a file: its text when it is under the size
  * limit, the size stamp when it is over — an oversize file is never decoded.
- * `null` when the bytes show a `.ts` file is an MPEG transport stream, not
- * TypeScript (#1910): decided from the bytes already read, so it costs no I/O
- * and runs only for a file that is new or changed — never once per `.ts` file
+ * `null` when the bytes show the file is not the language its extension names
+ * (`isForeignToExtension`: a `.ts` MPEG transport stream, #1910, or a `.fs`
+ * GLSL shader or Forth file): decided from the bytes already read, so it costs
+ * no I/O and runs only for a file that is new or changed — never once per file
  * at discovery, which on a slow disk is a random read per file per scan.
  */
-function readSourceOrStamp(fullPath: string): string | null {
+function readSourceOrStamp(fullPath: string, overrides: Record<string, Language>): string | null {
   const { stats, bytes } = readBoundedSourceSync(fullPath);
   if (bytes === null) return oversizeStamp(stats.size);
-  return isMpegTsBytes(fullPath, bytes) ? null : bytes.toString('utf8');
+  return isForeignBytes(fullPath, bytes, overrides) ? null : bytes.toString('utf8');
 }
 
 /**
@@ -241,11 +242,12 @@ function diskSignature(fullPath: string, isFolder = false): string {
   }
 }
 
-/** Whether these bytes, read from `filePath`, are a `.ts` MPEG transport stream (#1910). */
-function isMpegTsBytes(filePath: string, bytes: Buffer): boolean {
-  if (!hasMpegTsExtension(filePath) || !isMpegTransportStream(bytes.subarray(0, MPEG_TS_SNIFF_BYTES))) return false;
-  logDebug('Skipping MPEG transport stream named .ts — not TypeScript', { filePath });
-  return true;
+/** Whether these bytes, read from `filePath`, are not source after all (see `isForeignToExtension`). */
+function isForeignBytes(filePath: string, bytes: Buffer, overrides: Record<string, Language>): boolean {
+  const foreign = isForeignToExtension(filePath, bytes, overrides);
+  if (foreign === 'mpeg-ts') logDebug('Skipping MPEG transport stream named .ts — not TypeScript', { filePath });
+  else if (foreign === 'not-fsharp') logDebug('Skipping .fs file that is not F# (a GLSL shader or Forth)', { filePath });
+  return foreign !== null;
 }
 
 /**
@@ -1025,7 +1027,20 @@ export function preloadLanguagesForFiles(
   overrides?: Record<string, Language>,
   rootDir?: string
 ): Language[] {
-  const languages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides, rootDir)))];
+  const detected = new Set<Language>();
+  // The F# grammar is 11 MB, and a `.fs` file may be a GLSL shader or Forth
+  // that is skipped when read (`isForeignToExtension`): load it only when one
+  // of them is F#, reading heads up to the first F# file. A `.fsx` file or a
+  // codegraph.json mapping for `.fs` decides without a look.
+  const fsFiles: string[] = [];
+  for (const f of files) {
+    if (hasFsExtension(f) && !(overrides && overrides['.fs'])) fsFiles.push(f);
+    else detected.add(detectLanguage(f, undefined, overrides, rootDir));
+  }
+  if (!detected.has('fsharp') && fsFiles.some((f) => fsharpHeadAt(f, rootDir === undefined ? f : path.join(rootDir, f)))) {
+    detected.add('fsharp');
+  }
+  const languages = [...detected];
   // A Flow-typed `.js` is read with the TSX grammar (see detectLanguage).
   if ((languages.includes('javascript') || languages.includes('jsx')) && !languages.includes('tsx')) languages.push('tsx');
   if (languages.includes('c')) {
@@ -1043,6 +1058,28 @@ export function preloadLanguagesForFiles(
     languages.push('pascal');
   }
   return languages;
+}
+
+/** Reused for every `.fs` head the preload reads: the reads are synchronous, so one buffer serves. */
+let fsharpHeadBuffer: Buffer | null = null;
+
+/**
+ * Whether the `.fs` file `filePath` (read at `fullPath`) is F#, by its head and
+ * the same gate its reader applies (`isForeignToExtension`). A file that can't
+ * be read is not: it isn't parsed either, so it needs no grammar.
+ */
+function fsharpHeadAt(filePath: string, fullPath: string): boolean {
+  fsharpHeadBuffer ??= Buffer.allocUnsafe(FSHARP_SNIFF_BYTES);
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(fullPath, 'r');
+    const read = fs.readSync(fd, fsharpHeadBuffer, 0, FSHARP_SNIFF_BYTES, 0);
+    return isForeignToExtension(filePath, fsharpHeadBuffer.subarray(0, read)) === null;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
 
 export class ScopeIgnore {
@@ -2914,9 +2951,9 @@ export class ExtractionOrchestrator {
               return { filePath: fp, content: oversizeStamp(stats.size), stats, error: null as Error | null };
             }
             // Read bytes, not text: a `.ts` that is really an MPEG transport
-            // stream (#1910) is recognised from its head here, at no extra I/O,
-            // and never decoded or parsed.
-            if (isMpegTsBytes(fp, bytes)) {
+            // stream (#1910) or a `.fs` that is a GLSL shader is recognised from
+            // its head here, at no extra I/O, and never decoded or parsed.
+            if (isForeignBytes(fp, bytes, overrides)) {
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: null as Error | null, skipped: true };
             }
             const content = bytes.toString('utf-8');
@@ -3278,8 +3315,8 @@ export class ExtractionOrchestrator {
       // An oversize file is stored as skipped; its bytes are never needed (#1910).
       const read = await readBoundedSource(fullPath);
       stats = read.stats;
-      // An MPEG transport stream named `.ts` is not TypeScript (#1910).
-      if (read.bytes !== null && isMpegTsBytes(relativePath, read.bytes)) {
+      // An MPEG transport stream named `.ts` is not TypeScript (#1910), nor a GLSL shader named `.fs` F#.
+      if (read.bytes !== null && isForeignBytes(relativePath, read.bytes, loadExtensionOverrides(this.rootDir))) {
         return { nodes: [], edges: [], unresolvedReferences: [], errors: [], durationMs: 0 };
       }
       content = read.bytes === null ? oversizeStamp(stats.size) : read.bytes.toString('utf8');
@@ -4049,6 +4086,7 @@ export class ExtractionOrchestrator {
     }
 
     // Adds / modifications.
+    const extensionOverrides = loadExtensionOverrides(this.rootDir);
     for (const filePath of currentFiles) {
       // Same cooperative yield as the removals loop — this is the other O(files)
       // synchronous-stat loop that wedges the main thread on a large repo (#905).
@@ -4086,14 +4124,14 @@ export class ExtractionOrchestrator {
       // (An oversize file hashes as its size stamp, unread — #1910.)
       let content: string | null;
       try {
-        content = readSourceOrStamp(fullPath);
+        content = readSourceOrStamp(fullPath, extensionOverrides);
       } catch (error) {
         logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
         failedFilePaths.push(filePath);
         continue;
       }
-      // Not source after all — an MPEG transport stream named `.ts` (#1910):
-      // a new one is ignored, a tracked file that became one is removed.
+      // Not source after all — an MPEG transport stream named `.ts` (#1910) or
+      // a GLSL shader named `.fs`: a new one is ignored, a tracked file that became one is removed.
       if (content === null) {
         if (tracked) {
           reopenReferencesThroughRemovedFiles(this.queries, importReader, [tracked]);
@@ -4359,7 +4397,7 @@ export class ExtractionOrchestrator {
           continue;
         }
         let content: string | null;
-        try { content = readSourceOrStamp(fullPath); }
+        try { content = readSourceOrStamp(fullPath, overrides); }
         catch (error) {
           logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
           continue;
@@ -4379,6 +4417,7 @@ export class ExtractionOrchestrator {
 
     // === Fallback: full scan (non-git project or git failure) ===
     const currentFiles = new Set(scanDirectory(this.rootDir));
+    const overrides = loadExtensionOverrides(this.rootDir);
     const trackedFiles = this.queries.getAllFiles();
 
     // Build Map for O(1) lookups
@@ -4403,14 +4442,14 @@ export class ExtractionOrchestrator {
       const fullPath = path.join(this.rootDir, filePath);
       let content: string | null;
       try {
-        content = readSourceOrStamp(fullPath);
+        content = readSourceOrStamp(fullPath, overrides);
       } catch (error) {
         logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
         continue;
       }
 
       const tracked = trackedMap.get(filePath);
-      // An MPEG transport stream named `.ts` (#1910) is not source.
+      // An MPEG transport stream named `.ts` (#1910) or a shader named `.fs` is not source.
       if (content === null) {
         if (tracked) removed.push(filePath);
         continue;
