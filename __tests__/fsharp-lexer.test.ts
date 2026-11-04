@@ -5,7 +5,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { fsharpNames, hasFsharpCode } from '../src/extraction/fsharp-lexer';
-import { fsprojCompileItems, signatureNames } from '../src/resolution/fsharp-scope';
+import { signatureNames } from '../src/resolution/fsharp-scope';
+import { fsprojCompileItems } from '../src/resolution/msbuild';
 
 describe('fsharpNames', () => {
   it('reads `(*)` as the multiplication operator, not a comment, and nested comments as one', () => {

@@ -45,6 +45,10 @@ import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCMacroRenames } from './c-macro-renames';
 import { isObjcDeclaredTypeRef, matchByExactName } from './name-matcher';
 import { pythonSelfCallReaches } from './name-matcher';
+import { fsharpConfigFiles, isFsharpSymbolReference, matchFsharpReference, signatureNames } from './fsharp-scope';
+import { matchDotnetReferenceInFsharp, prepareDotnetLookup } from './dotnet-lookup';
+import { dotnetProjectFiles } from './dotnet-projects';
+import { msbuildDigestText } from './msbuild';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
@@ -359,6 +363,8 @@ function moduleConfigDigest(abs: string, projectRoot: string): string {
     : file === 'Cargo.toml' ? cargoManifestDigestText(abs)
     : file === 'compile_commands.json' ? (readCompileDbIncludeDirs(abs, projectRoot) ?? []).join('\n')
     : file === 'package.json' ? packageJsonMainOf(abs)
+    : /\.(fsproj|csproj|props)$/i.test(file) ? msbuildDigestText(readTextOrEmpty(abs))
+    : /\.fsi$/i.test(file) ? signatureNames(readTextOrEmpty(abs)).join('\n')
     : aliasConfigFields(abs) ?? '';
   return createHash('sha256').update(read).digest('hex').slice(0, 16);
 }
@@ -391,6 +397,14 @@ function packageJsonMainOf(abs: string): string {
   }
 }
 
+function readTextOrEmpty(abs: string): string {
+  try {
+    return fs.readFileSync(abs, 'utf-8');
+  } catch {
+    return '';
+  }
+}
+
 function cargoManifestDigestText(abs: string): string {
   try {
     return cargoManifestFields(fs.readFileSync(abs, 'utf-8'));
@@ -412,7 +426,11 @@ export function changedModuleConfigs(was: ModuleConfigSnapshot, now: ModuleConfi
 /**
  * The languages whose imports a changed config file governs: the ES-module
  * family for a tsconfig / jsconfig, Go for a go.mod, Rust for a Cargo manifest,
- * C and C++ for a compile database.
+ * C and C++ for a compile database, F# for an `.fsproj`'s compile order, and
+ * C# and Razor for what an `.fsproj` compiles and a `.csproj` or `.props`
+ * references or imports, which decide the F# they see. An F# signature file
+ * governs only its own `.fs`: the sync re-opens what points there instead
+ * (see `CodeGraph.sync`).
  */
 export function moduleConfigLanguages(changed: readonly string[]): Set<Language> {
   const languages = new Set<Language>();
@@ -420,6 +438,8 @@ export function moduleConfigLanguages(changed: readonly string[]): Set<Language>
     if (/(?:^|\/)go\.mod$/.test(rel)) languages.add('go');
     else if (/(?:^|\/)Cargo\.toml$/.test(rel)) languages.add('rust');
     else if (/(?:^|\/)compile_commands\.json$/.test(rel)) for (const language of ['c', 'cpp'] as const) languages.add(language);
+    else if (/\.fsproj$/i.test(rel)) for (const language of ['fsharp', 'csharp', 'razor'] as const) languages.add(language);
+    else if (/\.(csproj|props)$/i.test(rel)) for (const language of ['csharp', 'razor'] as const) languages.add(language);
     else for (const language of ESM_IMPORT_LANGUAGES) languages.add(language);
   }
   return languages;
@@ -728,6 +748,15 @@ export class ReferenceResolver {
     }
     if (refs.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
     return refs.length;
+  }
+
+  /**
+   * Loads what resolution reads that only loads asynchronously, before the
+   * references are resolved, which is synchronous: the C# grammar, where a
+   * C# or Razor name may mean an F# declaration (see ./dotnet-lookup).
+   */
+  async prepare(): Promise<void> {
+    await prepareDotnetLookup(this.context);
   }
 
   /**
@@ -1155,6 +1184,8 @@ export class ReferenceResolver {
       getAllFiles: () => {
         return this.queries.getAllFilePaths();
       },
+
+      getFilePathsOfLanguage: (language) => this.queries.getFilePathsOfLanguage(language),
 
       listDirectories: (relativePath: string) => {
         const target = relativePath === '.' || relativePath === ''
@@ -1955,6 +1986,17 @@ export class ReferenceResolver {
     const rustBound = matchRustUseBoundName(ref, this.context);
     if (rustBound !== undefined) return this.gateLanguage(rustBound, ref);
 
+    // An F# name means what F#'s lookup says it does (see matchFsharpReference): the name as
+    // the extractor read it from the tree (where it is written, what it is written on) by F#'s scope rules, and
+    // no strategy past here guesses beyond that.
+    if (isFsharpSymbolReference(ref)) return this.gateLanguage(matchFsharpReference(ref, this.context), ref);
+
+    // A C# or Razor name of an F# declaration is the one C#'s own lookup finds for the name as the
+    // syntax tree has it (see ./dotnet-lookup). Where that is no F# declaration, C#'s resolution
+    // goes on below as it does in a project without F#: nothing there reaches an F# declaration.
+    const intoFsharp = matchDotnetReferenceInFsharp(ref, this.context);
+    if (intoFsharp) return intoFsharp;
+
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
     // necessary because re-export rename chains (`import { login }
@@ -2484,6 +2526,7 @@ export class ReferenceResolver {
    * a large edit lands many popular symbol names at once.
    */
   async resolveAndPersistListYielding(refs: UnresolvedReference[]): Promise<ResolutionResult> {
+    await this.prepare();
     const prerequisites = refs.filter(ReferenceResolver.isPrerequisite);
     if (prerequisites.length > 0 && prerequisites.length < refs.length) {
       const first = await this.resolveAndPersistListYielding(prerequisites);
@@ -2864,6 +2907,7 @@ export class ReferenceResolver {
     const lp = (k: string, t0: number): void => { if (loopProf) loopProf[k] = (loopProf[k] ?? 0) + (Date.now() - t0); };
     let tLp = 0;
 
+    await this.prepare();
     await this.warmCachesYielding(maybeYield);
 
     const total = this.queries.getUnresolvedReferencesCount();
@@ -3468,6 +3512,9 @@ export class ReferenceResolver {
     }
     const files = new Set<string>(this.moduleConfigFiles);
     for (const name of MODULE_CONFIG_ROOT_FILES) files.add(path.join(this.projectRoot, name));
+    for (const rel of fsharpConfigFiles(this.context)) files.add(path.join(this.projectRoot, rel));
+    // What C# and Razor see of F# depends on their projects; without F# the C# side reads none of them.
+    if ((this.context.getFilePathsOfLanguage?.('fsharp').length ?? 0) > 0) for (const rel of dotnetProjectFiles(this.context)) files.add(path.join(this.projectRoot, rel));
     for (const rel of Object.keys(was)) files.add(path.join(this.projectRoot, rel));
     return moduleConfigSnapshot(this.projectRoot, files, was);
   }
@@ -4070,6 +4117,7 @@ export class ReferenceResolver {
     const found = new Map<string, Node>();
     for (const ns of usings) {
       for (const cand of this.context.getNodesByQualifiedName(`${ns}::${ref.referenceName}`)) {
+        if (cand.language === 'fsharp') continue;
         found.set(cand.id, cand);
       }
     }

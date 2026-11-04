@@ -1356,7 +1356,19 @@ export class CodeGraph {
           if (changed.length > 0) {
             this.resolver.resetModuleConfig();
             let reopened = 0;
-            for (const language of moduleConfigLanguages(changed)) reopened += this.orchestrator.resurrectResolutionEdgesForLanguage(language);
+            // An F# signature decides only what its own `.fs` shows: re-open the edges into that file, from
+            // F# and C#, and the parked references naming what it declares — not every reference.
+            const signatures = changed.filter((rel) => /\.fsi$/i.test(rel));
+            for (const language of moduleConfigLanguages(changed.filter((rel) => !/\.fsi$/i.test(rel)))) {
+              reopened += this.orchestrator.resurrectResolutionEdgesForLanguage(language);
+            }
+            if (signatures.length > 0) {
+              const implementations = signatures.map((signature) => signature.slice(0, -1));
+              const declared = [...new Set(implementations.flatMap((file) => this.queries.getNodesByFile(file).map((n) => n.name)))];
+              for (const language of ['fsharp', 'csharp'] as const) {
+                reopened += this.orchestrator.resurrectResolutionEdgesTouching(language, { targetFiles: implementations, sourceDirs: [], moduleLeaves: declared }).length;
+              }
+            }
             refreshSynthesis = true;
             this.queries.setMetadata('synthesis_pending', '1');
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
@@ -1402,6 +1414,7 @@ export class CodeGraph {
         // And the last edge before this sync resolved anything: an importer's
         // edge up to it was bound before a module this sync adds was there.
         const edgesBeforeResolution = this.queries.getMaxEdgeId();
+        await this.resolver.prepare();
         if (filesChanged) {
           if (result.changedFilePaths) {
             // Scope resolution to changed files (git fast path — bounded set)

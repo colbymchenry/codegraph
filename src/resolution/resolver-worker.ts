@@ -61,7 +61,11 @@ port.on('message', (msg: InMessage) => {
         resolver = new ReferenceResolver(msg.projectRoot, queries);
         resolver.initialize(msg.frameworks);
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker open: db=${tDb - tOpen}ms init=${Date.now() - tDb}ms`);
-        port.postMessage({ type: 'ready' });
+        // What resolution reads that only loads asynchronously, before the first chunk arrives.
+        resolver.prepare().then(
+          () => port.postMessage({ type: 'ready' }),
+          (err) => port.postMessage({ type: 'error', message: err instanceof Error ? err.message : String(err) }),
+        );
         break;
       }
       case 'scans': {
