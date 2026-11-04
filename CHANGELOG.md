@@ -18,6 +18,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- CodeGraph now indexes **F#** (`.fs`, `.fsx`), so its namespaces, modules, functions, unions, records and classes with their members are searchable, and `codegraph_explore` can trace F# code.
+- A `.fs` file that reads as a GLSL shader or as Forth is left out, so those repositories index as before, and `"extensions": { ".fs": "fsharp" }` in `codegraph.json` treats every `.fs` file as F#.
+- In F#, calls through pipes, operators and qualified names, `inherit`, `interface ... with`, `open` and `#load` now link, so callers, impact and `codegraph_explore` follow F# code across files.
+- In F#, a name now links to what the F# compiler binds it to, following `open`s, the `.fsproj` compile order and `.fsi` signatures, so a same-named function elsewhere no longer draws its calls.
+- In a solution that mixes C# or Razor with F#, a name written in C# or Razor now reaches the F# module, type or member it means, so `codegraph callers` on F# code lists its C# and Razor callers too.
 - The Claude Code prompt hook now gets its context from the CodeGraph server already running for your project instead of loading the index again on every prompt, so structural prompts are answered sooner, most of all in large projects; with no server running, one that is busy, or one that can't prove it runs as you, the hook works it out itself as before. Thanks @aidenpan0x for the report, the measurements and the pull request. (#3284)
 - Elysia (Bun) backends now have their HTTP routes in the graph, named by the full path a request takes, with the prefixes of `new Elysia({ prefix })`, `.group()` and a `.use()` in another file included, and linked to their handlers, so `codegraph_explore` can follow a request from its route into your code. Thanks @ChampPABA for the report. (#3255)
 
