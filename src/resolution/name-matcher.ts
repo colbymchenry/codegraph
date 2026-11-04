@@ -14,6 +14,7 @@ import { isJsSuperCallSite } from './js-super-calls';
 import { JS_ARRAY_METHODS, JS_BROWSER_HOST_GLOBALS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, dartPrivateVisible, inSameDartLibrary } from './dart-libraries';
+import { SWIFT_STD_METHODS, isSwiftStdMethodName } from './swift-builtins';
 import { isDartLocallyBound } from './dart-local-scope';
 import { breakVbTie, isVbMemberInScope, isVbNestedTypeInScope, isVbTypeQualifiedBy, matchVbTypedCall, preferVbProject, sameVbProject } from './vbnet-receivers';
 import { cppAliasedClass, cppAliasedTypeName, cppAliasedTypeWritten, cppDeclaresLocalAlias, cppParentScope, cppScopesWithin, cppTemplateArguments, cppTemplateParameters, cppTypeNamesDeclared, cppTypeSegments, isCppPointerType, resolveCppAliasedType, stripCppTemplateArguments, type CppAliasedType } from './cpp-type-aliases';
@@ -6826,6 +6827,7 @@ function stdMethodNames(language: string): ReadonlySet<string> | null {
     case 'scala': return SCALA_STD_METHODS;
     case 'java': return JAVA_STD_METHODS;
     case 'ruby': return RUBY_STD_METHODS;
+    case 'swift': return SWIFT_STD_METHODS;
     default: return null;
   }
 }
@@ -7531,23 +7533,6 @@ function nearestSwiftMembers(candidates: Node[], ref: UnresolvedRef, context: Re
 }
 
 /**
- * Methods of Swift's standard collections, strings and optionals and of
- * Foundation / UIKit views — names a project type rarely carries itself.
- * Ones it often does (`cancel`, `resume`, `store`, `validate`, `load`) are
- * left out: Alamofire's `request.resume()`, Kingfisher's `cache.store(…)`.
- */
-const SWIFT_STD_METHODS: ReadonlySet<string> = new Set([
-  'append', 'insert', 'remove', 'removeAll', 'removeFirst', 'removeLast', 'removeValue', 'contains', 'map',
-  'compactMap', 'flatMap', 'filter', 'reduce', 'forEach', 'sorted', 'sort', 'first', 'last', 'min', 'max',
-  'firstIndex', 'lastIndex', 'index', 'enumerated', 'reversed', 'joined', 'split', 'prefix', 'suffix',
-  'dropFirst', 'dropLast', 'allSatisfy', 'randomElement', 'shuffled', 'popLast', 'replaceSubrange',
-  'replacingOccurrences', 'components', 'trimmingCharacters', 'hasPrefix', 'hasSuffix', 'lowercased',
-  'uppercased', 'appending', 'updateValue', 'merge', 'merging', 'union', 'intersection', 'subtracting',
-  'formUnion', 'isEqual', 'addSubview', 'removeFromSuperview', 'setNeedsDisplay', 'setNeedsLayout',
-  'layoutIfNeeded', 'addGestureRecognizer', 'addTarget', 'addObserver', 'removeObserver', 'eraseToAnyPublisher',
-]);
-
-/**
  * Whether a Swift file's declarations are visible from another file as far as
  * separate modules go: one under a `…Tests` directory (SwiftPM's
  * `Tests/VaporTests`, Xcode's `KingfisherTests`) or in a playground only from
@@ -7569,8 +7554,11 @@ function isSwiftTargetVisible(declFile: string, fromFile: string): boolean {
  * field, `super.init(…)` to an Objective-C demo's `init` 170 times. A member
  * reached down a longer chain keeps its match unless its name is one the
  * standard types all carry: `axis.entries.removeAll()` is the array's, not
- * a chart data class's (unless the receiver names the owner, or the owner
- * is an outside type the project only extends).
+ * a chart data class's — unless the receiver names the owner, the owner is
+ * an outside type the project only extends, or the call gives a label that
+ * member declares. A chain whose receiver reads as empty (a trailing
+ * closure ends it: `values.map { … }.sorted()`) has nothing to name the
+ * owner, so only the last two keep it.
  */
 function isSwiftCallTarget(n: Node, shape: SwiftCallShape | null, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (!shape) return true;
@@ -7599,12 +7587,38 @@ function isSwiftCallTarget(n: Node, shape: SwiftCallShape | null, ref: Unresolve
     // ImageCache's, not a test subclass's override.
     const typed = /^(?:self\.)?[A-Za-z_]\w*$/.test(shape.receiver) ? inferMemberReceiverType(shape.receiver, ref, context) : null;
     if (typed && /^[A-Z]/.test(typed)) return swiftTypeClosure(typed, context).has(owner);
-    if (shape.receiver === '' || !SWIFT_STD_METHODS.has(n.name)) return true;
-    return sharesReceiverWord(shape.receiver.split('.').pop()!, n) || !swiftDeclOf(owner, context).projectType ||
-      swiftDeclaresLabel(n, shape.label, context);
+    if (!isSwiftStdMethodName(n.name)) return true;
+    return (shape.receiver !== '' && sharesReceiverWord(shape.receiver.split('.').pop()!, n)) ||
+      !swiftDeclOf(owner, context).projectType || swiftDeclaresLabel(n, shape.label, context);
   }
   const depth = swiftHierarchyAt(ref, context).get(owner);
   return depth !== undefined && (shape.shape !== 'super' || depth > 0);
+}
+
+/**
+ * Whether a Swift member called by a standard-library name on an untyped
+ * receiver that does not name its owner (`xs.sorted(limit: 1)` on an `[Int]`)
+ * is kept. It takes the outside-type ground `isSwiftCallTarget` keeps a chained
+ * call on (its owner an outside type the project only extends:
+ * `extension Array { func sorted(limit:) }`), and adds that the call's argument
+ * labels fit the member's parameters; that test does not check them. It does
+ * not take that test's declared-label ground: without the receiver's type a
+ * label cannot tell a project namesake from an SDK method
+ * (`u.appending(queryItems: [])` on a `URL`). `xs.sorted()` does not fit
+ * `sorted(limit:)`, and unreadable argument or parameter lists keep nothing.
+ * The argument list must be this call's own: a trailing-closure call does not
+ * take a later call's labels.
+ */
+function isSwiftStdNameKept(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (n.language !== 'swift') return false;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  const owner = cut > 0 ? n.qualifiedName.slice(0, cut).split(/::|\./).pop()! : null;
+  if (owner === null || swiftDeclOf(owner, context).projectType) return false;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const text = lines.slice(ref.line - 1, ref.line + 11).join('\n').slice(Math.max(0, ref.column));
+  const access = new RegExp(`\\.\\s*${escapeRegExp(n.name)}(?![\\w$])`).exec(text);
+  if (!access || !/^\s*\(/.test(text.slice(access.index + access[0].length))) return false;
+  return swiftCallFitsLabels(ref, n, context) === true;
 }
 
 /**
@@ -25257,12 +25271,15 @@ export function matchMethodCall(
         // `json` of its `MockedResponse`.
         !isUnnamedTestDouble(targetMethods[0]!, objectOrClass!, ref, context) &&
         !((ref.language === 'lua' || ref.language === 'luau') && isLuaLibraryCall(objectOrClass!, methodName!, ref, targetMethods[0]!)) &&
-        // Rust / Go / Kotlin / C# / VB.NET / Python / Scala / Java: a
-        // standard-library method name on an untyped receiver (`sym.map(…)`,
-        // `w.Header().Get(…)`, `reader.Value.ToString()`,
-        // `options.setdefault(…)`) is the library type's.
+        // Go / Rust / Kotlin / C# / VB.NET / Dart / Python / Scala / Java /
+        // Ruby / Swift: a standard-library method name on an untyped receiver
+        // (`sym.map(…)`, `w.Header().Get(…)`, `reader.Value.ToString()`,
+        // `options.setdefault(…)`, `arr.sorted()`) is treated as the library type's —
+        // unless, in Swift, the member extends an outside type and the call's
+        // argument labels fit it (`xs.sorted(limit: 1)`).
         !(isStdMethodName(ref.language, methodName!) &&
-          !/^(?:self|Self|this|base)$/.test(objectOrClass!) && !receiverNamesOwner(receiverLink(objectOrClass!), targetMethods[0]!, context)) &&
+          !/^(?:self|Self|this|base)$/.test(objectOrClass!) && !receiverNamesOwner(receiverLink(objectOrClass!), targetMethods[0]!, context) &&
+          !isSwiftStdNameKept(targetMethods[0]!, ref, context)) &&
         !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
@@ -32259,7 +32276,7 @@ export function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, co
   // `self.tableView(tableView, numberOfRowsInSection: section)` inside
   // `tableView(_:titleForHeaderInSection:)` is the other `tableView`.
   if (ref.language === 'swift') {
-    const labels = args.trim() === '' ? [] : splitCppTopLevel(args).map((a) => /^\s*([A-Za-z_]\w*)\s*:(?!:)/.exec(a)?.[1] ?? '_');
+    const labels = swiftArgumentLabels(args);
     const fitsLabels = (id: string): boolean | null => {
       const decl = context.getNodeById?.(id);
       const list = decl ? cppParenListAfter(decl.filePath, decl.startLine, 0, set!.name, context) : null;
@@ -32273,6 +32290,25 @@ export function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, co
   if (argc >= set.own.min && argc <= set.own.max) return result;
   const fits = set.siblings.filter((s) => s.arity !== null && argc >= s.arity.min && argc <= s.arity.max);
   return fits.length === 1 ? { ...result, targetNodeId: fits[0]!.id } : result;
+}
+
+/** A Swift call's argument labels from its argument list, `_` for an unlabelled argument. */
+function swiftArgumentLabels(args: string): string[] {
+  return args.trim() === '' ? [] : splitCppTopLevel(args).map((a) => /^\s*([A-Za-z_]\w*)\s*:(?!:)/.exec(a)?.[1] ?? '_');
+}
+
+/**
+ * Whether a Swift `Type.member(…)` or `value.member(…)` call's argument labels
+ * fit `decl`'s parameter list (swiftLabelsFit); null when either balanced
+ * parenthesised list cannot be found within the source scan. A backtick after
+ * the member name prevents the scanner from matching its opening parenthesis.
+ */
+function swiftCallFitsLabels(ref: UnresolvedRef, decl: Node, context: ResolutionContext): boolean | null {
+  const member = ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1);
+  const args = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), member, context);
+  if (args === null) return null;
+  const params = cppParenListAfter(decl.filePath, decl.startLine, 0, decl.name, context);
+  return params === null ? null : swiftLabelsFit(swiftArgumentLabels(args), params);
 }
 
 /** Whether a Swift parameter (`_ body: @escaping (Int) -> Void`) takes a function: its type has a `->` outside any brackets of the type's own. */
