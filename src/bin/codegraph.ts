@@ -20,6 +20,8 @@
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph implementations <symbol>  List the types that implement or extend a trait, interface or class
+ *   codegraph suspects          Audit questionable call edges
+ *   codegraph grep <pattern>    Search indexed contents by enclosing symbol
  *   codegraph affected [files]   Find test files affected by changes
  *   codegraph cycles [path]      List circular imports between files
  *   codegraph ui [path]          Open the browser viewer (alias: web; not released yet — needs CODEGRAPH_UI=1)
@@ -2893,6 +2895,66 @@ program
     } catch (err) {
       error(`implementations failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
+    }
+  });
+
+/** Search indexed content without letting unindexed paths enter the result. */
+program
+  .command('grep <pattern>')
+  .description('Search indexed files, group hits by symbol and rank by incoming edges')
+  .option('-p, --path <path>', 'Project path')
+  .option('--in <prefix>', 'Repo-relative indexed path prefix')
+  .option('--fixed', 'Treat the pattern as a literal string')
+  .option('-i, --ignore-case', 'Case-insensitive match')
+  .option('--strict', 'Exclude questionable calls from incoming-edge counts')
+  .option('--json', 'Output the structured search result as JSON')
+  .action(async (pattern: string, options: { path?: string; in?: string; fixed?: boolean; ignoreCase?: boolean; strict?: boolean; json?: boolean }) => {
+    try {
+      const projectPath = resolveProjectPath(options.path);
+      if (!isInitialized(projectPath)) throw new Error(`CodeGraph not initialized in ${projectPath}`);
+      const cg = await openIndexToRead(projectPath);
+      try {
+        const { grepIndex } = await import('../search/grep');
+        const { formatGrepResult, zeroHitNote } = await import('../search/grep-format');
+        const result = await grepIndex(cg.getProjectRoot(), pattern, options);
+        if (options.json) console.log(JSON.stringify(result, null, 2));
+        else if (result.totalHits === 0) console.error(zeroHitNote(result));
+        else process.stdout.write(formatGrepResult(result));
+      } finally { cg.destroy(); }
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    }
+  });
+
+/** Read-only audit of name-only and low-confidence resolver bindings. */
+program
+  .command('suspects')
+  .description('Audit name-only and low-confidence call edges, ranked for review')
+  .option('-p, --path <path>', 'Project path')
+  .option('--json', 'Output { version: 1, suspects } as JSON')
+  .option('-l, --limit <n|all>', 'Maximum targets, or all', '50')
+  .option('-e, --edges <n>', 'Sample edges per target', '5')
+  .action(async (options: { path?: string; json?: boolean; limit: string; edges: string }) => {
+    try {
+      const { parseSuspectCount } = await import('../graph/suspects-options');
+      let limit: number | undefined;
+      let edges: number | undefined;
+      try { limit = parseSuspectCount(options.limit, true, 1); }
+      catch { throw new Error('--limit must be a positive integer or "all".'); }
+      try { edges = parseSuspectCount(options.edges, false, 0); }
+      catch { throw new Error('--edges must be a non-negative integer.'); }
+      const projectPath = resolveProjectPath(options.path);
+      if (!isInitialized(projectPath)) throw new Error(`CodeGraph not initialized in ${projectPath}`);
+      const cg = await openIndexToRead(projectPath);
+      try {
+        const { findSuspects, formatSuspects, suspectsToJson } = await import('../graph/suspects');
+        const list = findSuspects(cg.getProjectRoot(), { limit, maxEdgesPerTarget: edges });
+        console.log(options.json ? JSON.stringify(suspectsToJson(list), null, 2) : formatSuspects(list));
+      } finally { cg.destroy(); }
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
     }
   });
 
