@@ -9,11 +9,11 @@ Get up and running with CodeGraph in seconds.
 
 No Node.js required — one command grabs the right build for your OS:
 
-```bash
-# macOS / Linux
+```bash title="macOS / Linux"
 curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
+```
 
-# Windows (PowerShell)
+```powershell title="Windows (PowerShell)"
 irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex
 ```
 
