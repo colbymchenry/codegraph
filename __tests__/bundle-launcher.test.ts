@@ -136,7 +136,8 @@ describe('bundled Node runtime (#2617)', () => {
     const pin = /^NODE_VERSION="\$\{2:-v(\d+)\.(\d+)\.(\d+)\}"\r?$/m.exec(recipe);
     expect(pin, 'default NODE_VERSION in scripts/build-bundle.sh').not.toBeNull();
     const [major, minor] = pin!.slice(1, 3).map(Number);
-    // The CLI refuses to run on Node 25 and later.
+    // Releases keep bundling Node 24. The CLI hard-blocks Node 25 only;
+    // Node 26+ runs on the same --liftoff-only path as Node 22 and 24.
     expect(major).toBe(24);
     // Node 24 before 24.20.0 can abort on Windows as the process exits, after
     // the command's work is done (0xC0000409, nodejs/node#56645).

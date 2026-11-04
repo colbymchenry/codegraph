@@ -30,15 +30,15 @@ export default defineConfig({
     /**
      * Several MCP integration tests (mcp-daemon, mcp-initialize, mcp-ppid-watchdog,
      * mcp-roots) spawn `dist/bin/codegraph.js serve --mcp` with `process.execPath`
-     * and rely on the child inheriting `process.env`. On a Node >= 25 dev machine
+     * and rely on the child inheriting `process.env`. On a Node 25 dev machine
      * the CLI's hard-block (src/bin/codegraph.ts) would otherwise exit the child
      * before it ever responds, so every spawn-based test times out — see #478.
+     * Node 26+ is allowed and does not need the override for the version check.
      *
      * Setting the override here keeps the CLI's runtime guard intact for end
      * users (it's still enforced when `codegraph` is invoked directly) while
-     * letting the test suite run on whatever Node the contributor happens to
-     * have installed. CI on Node 22/23 is unaffected — the guard doesn't fire
-     * there, so the variable is a no-op.
+     * letting the test suite run on Node 25. CI on Node 22/24 is unaffected —
+     * the guard doesn't fire there, so the variable is a no-op.
      */
     env: {
       CODEGRAPH_ALLOW_UNSAFE_NODE: '1',

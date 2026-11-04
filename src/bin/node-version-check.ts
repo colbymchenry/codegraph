@@ -3,14 +3,16 @@
  *
  * Node 25.x has a V8 turboshaft WASM JIT Zone allocator bug that
  * reliably crashes CodeGraph with `Fatal process out of memory: Zone`
- * during tree-sitter grammar compilation. This module owns the
- * user-facing banner shown before exit. Kept side-effect-free so it's
- * safe to import from tests without triggering CLI bootstrap.
+ * during tree-sitter grammar compilation, and `--liftoff-only` does not
+ * contain that variant. Node 26 and newer are not part of that block;
+ * they use the same Liftoff launch path as Node 22 and 24. This module
+ * owns the user-facing banner shown before exit. Kept side-effect-free
+ * so it's safe to import from tests without triggering CLI bootstrap.
  */
 
 /**
  * Build the bordered banner shown when CodeGraph detects an
- * unsupported Node.js major version (currently 25+). Pinned via unit
+ * unsupported Node.js major version (currently 25.x only). Pinned via unit
  * test so the recovery commands and override instructions can't be
  * silently stripped by future edits.
  *
@@ -46,6 +48,14 @@ export function buildNode25BlockBanner(nodeVersion: string): string {
  * also hard-blocks here to actually enforce the floor.
  */
 export const MIN_NODE_MAJOR = 20;
+
+/**
+ * The only major that hard-exits before the Liftoff relaunch. Node 25's
+ * turboshaft Zone crash is not fixed by `--liftoff-only`; Node 26+ is.
+ */
+export function isHardBlockedNodeMajor(major: number): boolean {
+  return major === 25;
+}
 
 /**
  * Build the bordered banner shown when CodeGraph detects a Node.js major below
