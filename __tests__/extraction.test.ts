@@ -14606,3 +14606,142 @@ describe('C++ COM interface declarations (#1519)', () => {
     expect(Buffer.byteLength(expected)).toBe(Buffer.byteLength(source));
   });
 });
+
+// =============================================================================
+// SQL (plain `.sql`, DerekStride/tree-sitter-sql v0.3.11, vendored wasm)
+// =============================================================================
+
+describe('SQL Extraction', () => {
+  const refsFrom = (result: ReturnType<typeof extractFromSource>, fromName: string, kind: string) => {
+    const from = result.nodes.find((n) => n.name === fromName);
+    return result.unresolvedReferences
+      .filter((r) => r.fromNodeId === from?.id && r.referenceKind === kind)
+      .map((r) => r.referenceName);
+  };
+
+  it('routes only .sql to the SQL grammar', () => {
+    expect(detectLanguage('db/schema.sql')).toBe('sql');
+    expect(detectLanguage('models/orders.sqlx')).not.toBe('sql'); // Dataform
+    expect(detectLanguage('schema.ddl')).not.toBe('sql');
+    expect(isLanguageSupported('sql')).toBe(true);
+  });
+
+  it('extracts tables and views as struct nodes, never class', () => {
+    const result = extractFromSource(
+      'schema.sql',
+      `CREATE TABLE public.users (id INTEGER PRIMARY KEY);
+       CREATE VIEW active_users AS SELECT id FROM users;
+       CREATE MATERIALIZED VIEW order_totals AS SELECT user_id FROM orders;`
+    );
+    const objects = result.nodes.filter((n) => n.kind !== 'file');
+    expect(objects.map((n) => [n.kind, n.name])).toEqual([
+      ['struct', 'users'],
+      ['struct', 'active_users'],
+      ['struct', 'order_totals'],
+    ]);
+    expect(objects[0]!.signature).toBe('CREATE TABLE public.users');
+    expect(result.nodes.some((n) => n.kind === 'class')).toBe(false);
+  });
+
+  it('extracts a function and attributes its body to it', () => {
+    const result = extractFromSource(
+      'fn.sql',
+      `CREATE FUNCTION total_for_user(uid INTEGER) RETURNS DECIMAL AS $$
+         SELECT SUM(total) FROM orders WHERE user_id = uid;
+       $$ LANGUAGE SQL;`
+    );
+    const fn = result.nodes.find((n) => n.kind === 'function');
+    expect(fn?.name).toBe('total_for_user');
+    expect(refsFrom(result, 'total_for_user', 'references')).toEqual(['orders']);
+    expect(refsFrom(result, 'total_for_user', 'calls')).toEqual(['SUM']);
+  });
+
+  it('links a view to every table it joins, and a table to its foreign-key targets', () => {
+    const result = extractFromSource(
+      'schema.sql',
+      `CREATE TABLE orders (id INT, user_id INT REFERENCES public.users (id));
+       CREATE VIEW v AS SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id;`
+    );
+    expect(refsFrom(result, 'orders', 'references')).toEqual(['users']);
+    expect(refsFrom(result, 'v', 'references')).toEqual(['users', 'orders']);
+  });
+
+  it('attributes top-level DML to the file and skips column qualifiers', () => {
+    const result = extractFromSource(
+      'dml.sql',
+      `INSERT INTO users (id) VALUES (1);
+       UPDATE orders SET total = 0 WHERE id = 1;
+       DELETE FROM sessions WHERE id = 1;
+       SELECT u.name FROM users u;`
+    );
+    const file = result.nodes.find((n) => n.kind === 'file')!;
+    const refs = result.unresolvedReferences.filter((r) => r.fromNodeId === file.id).map((r) => r.referenceName);
+    // `u` in `u.name` is an alias qualifier, not a table.
+    expect(refs).toEqual(['users', 'orders', 'sessions', 'users']);
+  });
+
+  it('does not reference a CTE as if it were a table', () => {
+    const result = extractFromSource(
+      'cte.sql',
+      `CREATE VIEW v AS WITH recent AS (SELECT id FROM orders) SELECT id FROM recent;`
+    );
+    expect(refsFrom(result, 'v', 'references')).toEqual(['orders']);
+  });
+
+  it('reads quoted identifiers by their bare name', () => {
+    const result = extractFromSource('q.sql', 'CREATE TABLE "Users" (id INT); CREATE VIEW v AS SELECT 1 FROM "Users";');
+    expect(result.nodes.find((n) => n.kind === 'struct' && n.name === 'Users')).toBeDefined();
+    expect(refsFrom(result, 'v', 'references')).toEqual(['Users']);
+  });
+
+  it('invents nothing for CREATE PROCEDURE, which the grammar does not parse', () => {
+    const result = extractFromSource(
+      'proc.sql',
+      `CREATE PROCEDURE archive_user(uid INTEGER) LANGUAGE plpgsql AS $$ BEGIN DELETE FROM orders; END; $$;`
+    );
+    expect(result.nodes.some((n) => n.name === 'archive_user')).toBe(false);
+  });
+
+  describe('resolution', () => {
+    let dir: string;
+    beforeEach(() => { dir = createTempDir(); });
+    afterEach(() => cleanupTempDir(dir));
+
+    it('links SQL to SQL, and never to or from same-named code', async () => {
+      fs.writeFileSync(
+        path.join(dir, 'schema.sql'),
+        `CREATE TABLE users (id INTEGER PRIMARY KEY);
+         CREATE VIEW active_users AS SELECT id FROM users;
+         CREATE VIEW billing AS SELECT id FROM invoice;
+         CREATE FUNCTION audit_trail() RETURNS INTEGER AS $$ SELECT 1 $$ LANGUAGE SQL;`
+      );
+      // Names that exist on one side of the SQL boundary only: `invoice` is a
+      // class, `audit_trail` a SQL function the TypeScript below calls.
+      fs.writeFileSync(
+        path.join(dir, 'models.ts'),
+        `export class invoice { id = 0; }
+         export function audit_trail_report() { return audit_trail(); }`
+      );
+      const cg = CodeGraph.initSync(dir);
+      await cg.indexAll();
+      try {
+        const structs = cg.getNodesByKind('struct');
+        const table = structs.find((n) => n.name === 'users')!;
+        const view = structs.find((n) => n.name === 'active_users')!;
+        const billing = structs.find((n) => n.name === 'billing')!;
+        const klass = cg.getNodesByKind('class').find((n) => n.name === 'invoice')!;
+        const sqlFn = cg.getNodesByKind('function').find((n) => n.name === 'audit_trail')!;
+        const targets = (id: string) => cg.getOutgoingEdges(id).filter((e) => e.kind === 'references').map((e) => e.target);
+
+        // SQL → SQL resolves …
+        expect(targets(view.id)).toEqual([table.id]);
+        // … SQL never reaches a same-named class …
+        expect(targets(billing.id)).not.toContain(klass.id);
+        // … and code never reaches a same-named SQL function.
+        expect(cg.getIncomingEdges(sqlFn.id).filter((e) => e.kind === 'calls')).toEqual([]);
+      } finally {
+        cg.close();
+      }
+    });
+  });
+});

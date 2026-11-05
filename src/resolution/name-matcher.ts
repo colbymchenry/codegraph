@@ -197,6 +197,10 @@ const CODE_FAMILY: Record<string, string> = {
   python: 'python', go: 'go', rust: 'rust', php: 'php', ruby: 'ruby', dart: 'dart',
   lua: 'lua', luau: 'lua', r: 'r', erlang: 'erlang', pascal: 'pascal', solidity: 'solidity',
   nix: 'nix', cobol: 'cobol',
+  // SQL objects (tables, views, functions) share names with code symbols
+  // (`users`, `orders`); without a family of its own a bare-name match would
+  // link a query to a same-named class, and an ORM model to a table.
+  sql: 'sql',
 };
 
 export function crossesCodeBoundary(a: string, b: string): boolean {
