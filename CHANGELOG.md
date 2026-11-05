@@ -17,6 +17,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Python, `import time` no longer links the importing file to a project function that happens to be named `time`, so such a function stops listing every file that imports the standard library module among its callers and in its impact. The same goes for `json`, `copy`, `random`, `logging` and any other module, and for a fallback variable like `brotli = None` beside a guarded `import brotli`. Thanks @inth3shadows for the report. (#3239)
 - In Rust, a call through a module that a glob `use` brings in, like `gzip::write()` in a test module with `use super::*`, or that a `use` inside the function names, now links to that module's function again. Thanks @Egrn for the report and @mohitdixit02. (#3253)
 - CodeGraph no longer takes git's index lock while it checks your repository for changes, so a `git add` in a pre-commit hook, a commit or a checkout that runs while CodeGraph syncs no longer fails with "index.lock: File exists". Thanks @iamclaudia-ai for the report. (#3295)
+- `codegraph impact` and `codegraph_impact` are as fast as they were in 1.6.2 again, with the same results: 1.6.3 read each symbol's dependents in a way that slowed down every step of the walk. Thanks @inth3shadows for the report and the fix, and @Marcos-199-GitHub for #3285. (#3248)
 
 ## [1.6.3] - 2026-11-17
 
