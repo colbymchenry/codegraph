@@ -4,7 +4,7 @@
  * BFS and DFS traversal for the code knowledge graph.
  */
 
-import { Node, Edge, Subgraph, TraversalOptions, EdgeKind, ImpactOptions, EDGE_KINDS } from '../types';
+import { Node, Edge, Subgraph, TraversalOptions, EdgeKind, ImpactOptions } from '../types';
 import { QueryBuilder } from '../db/queries';
 
 /**
@@ -21,7 +21,6 @@ const DEFAULT_OPTIONS: Required<TraversalOptions> = {
 
 export const DEFAULT_IMPACT_MAX_NODES = 10_000;
 export const DEFAULT_IMPACT_MAX_EDGES = 50_000;
-const IMPACT_INCOMING_KINDS = EDGE_KINDS.filter((kind) => kind !== 'contains');
 
 /**
  * Result of a single traversal step
@@ -663,7 +662,8 @@ export class GraphTraverser {
       const containerKinds = new Set(['class', 'interface', 'struct', 'union', 'trait', 'protocol', 'module', 'enum']);
       if (containerKinds.has(focalNode.kind)) {
         const remaining = budget.maxEdges - edges.length;
-        const fetched = this.queries.getOutgoingEdges(nodeId, ['contains'], undefined, remaining + 1);
+        // No SQL LIMIT here either: the slice applies the budget (#3248).
+        const fetched = this.queries.getOutgoingEdges(nodeId, ['contains']);
         if (fetched.length > remaining) budget.truncated = true;
         const containsEdges = fetched.slice(0, remaining);
         if (containsEdges.length > 0) {
@@ -692,9 +692,9 @@ export class GraphTraverser {
     // them, so following it upward would climb to the parent class and then
     // re-expand every sibling member — exploding impact for a leaf symbol. (#536)
     const remaining = budget.maxEdges - edges.length;
-    // Fetch one extra row so hitting the SQL LIMIT is distinguishable from an
-    // exact-size result and can be surfaced as explicit truncation.
-    const fetched = this.queries.getIncomingEdges(nodeId, IMPACT_INCOMING_KINDS, remaining + 1);
+    // The whole list, then the slice applies the budget: a SQL LIMIT made this
+    // per-node read markedly slower (#3248).
+    const fetched = this.queries.getIncomingEdgesExceptContains(nodeId);
     if (fetched.length > remaining) budget.truncated = true;
     const incomingEdges = fetched.slice(0, remaining);
     if (incomingEdges.length === 0) return;
