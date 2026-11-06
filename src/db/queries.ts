@@ -483,6 +483,7 @@ export class QueryBuilder {
     deleteEdgesByTarget?: SqliteStatement;
     getEdgesBySource?: SqliteStatement;
     getEdgesByTarget?: SqliteStatement;
+    getDependentEdgesByTarget?: SqliteStatement;
     getUnresolvedFromNode?: SqliteStatement;
     getUnresolvedInFile?: SqliteStatement;
     insertFile?: SqliteStatement;
@@ -2765,6 +2766,24 @@ export class QueryBuilder {
       this.stmts.getEdgesBySource = this.db.prepare('SELECT * FROM edges WHERE source = ? ORDER BY kind, target, line, col');
     }
     const rows = this.stmts.getEdgesBySource.all(sourceId) as EdgeRow[];
+    return rows.map(rowToEdge);
+  }
+
+  /**
+   * Incoming edges to a node except `contains`: the edges that make their
+   * source depend on the target, in {@link getIncomingEdges} order.
+   *
+   * Impact traversal runs this once per visited node, so it stays one index
+   * search with no LIMIT. A kind list searches the index once per kind, and a
+   * LIMIT under this ORDER BY made each read markedly slower (#3248).
+   */
+  getIncomingEdgesExceptContains(targetId: string): Edge[] {
+    if (!this.stmts.getDependentEdgesByTarget) {
+      this.stmts.getDependentEdgesByTarget = this.db.prepare(
+        "SELECT * FROM edges WHERE target = ? AND kind != 'contains' ORDER BY kind, source, line, col"
+      );
+    }
+    const rows = this.stmts.getDependentEdgesByTarget.all(targetId) as EdgeRow[];
     return rows.map(rowToEdge);
   }
 
