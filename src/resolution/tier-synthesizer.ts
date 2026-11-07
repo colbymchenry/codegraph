@@ -460,6 +460,16 @@ function matchHttp(site: HttpSite, routes: readonly HttpRoute[]): HttpRoute | nu
   return tied ? null : best;
 }
 
+/** Hostnames that are unambiguously this machine — a dev server's own home. */
+const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(['localhost', '127.0.0.1', '::1']);
+
+/** The lowercased hostname of an absolute URL string (`http://Host:3000/x` → `host`); null when not absolute. */
+function hostnameOf(s: string): string | null {
+  const m = /^(?:[a-z][a-z0-9+.-]*:)?\/\/([^/]*)/i.exec(s);
+  if (!m) return null;
+  return m[1]!.replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase();
+}
+
 /**
  * The path a client call names, as segments, with `${…}` as `*`; `suffix`
  * when a base URL came first. Null when the path is not literal enough: a
@@ -470,9 +480,23 @@ function clientPath(raw: string, baseURL: string | null): { segs: string[]; suff
   const cut = p.search(/[?#]/);
   if (cut >= 0) p = p.slice(0, cut);
   let suffix = false;
-  const absolute = /^(?:[a-z][a-z0-9+.-]*:)?\/\/[^/]*(\/.*)?$/i.exec(p);
-  if (absolute) p = absolute[1] ?? '/';
-  else if (!p.startsWith('/')) {
+  // An absolute URL (`https://host/…`, `//host/…`) names a specific host. It
+  // reaches this project's own routes only when that host is the project's own:
+  // loopback (localhost / 127.0.0.1 / [::1]), or the host this file's configured
+  // client baseURL points at (the backend the client is wired to talk to). Any
+  // other host — a third party — can never be an own route, so it yields nothing
+  // (round 1). A same-host absolute URL path-matches exactly as a relative one.
+  const abs = /^(?:([a-z][a-z0-9+.-]*:)?\/\/([^/]*)(\/.*)?)$/i.exec(p);
+  if (abs) {
+    const host = abs[2]!.replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase();
+    const loopback = LOOPBACK_HOSTNAMES.has(host);
+    const sameAsBase = baseURL !== null && hostnameOf(baseURL) === host;
+    if (!loopback && !sameAsBase) return null;
+    p = abs[3] ?? '/';
+    // A same-host absolute URL is self-contained: the path after the host is
+    // complete, so do not also join the configured baseURL onto it.
+    baseURL = null;
+  } else if (!p.startsWith('/')) {
     if (p.startsWith(HOLE)) {
       const rest = p.slice(1);
       if (!rest.startsWith('/')) return null;
