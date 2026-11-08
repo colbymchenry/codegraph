@@ -32272,7 +32272,16 @@ export function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, co
   const argc = args.trim() === '' ? 0 : splitCppTopLevel(args).length;
   if (argc >= set.own.min && argc <= set.own.max) return result;
   const fits = set.siblings.filter((s) => s.arity !== null && argc >= s.arity.min && argc <= s.arity.max);
-  return fits.length === 1 ? { ...result, targetNodeId: fits[0]!.id } : result;
+  if (fits.length === 0) return result;
+  // Several fit when overloads differ only in parameter types: C#'s
+  // `Read(value, null)` inside `Read(string value)` among `Read(string, string)`
+  // and `Read(string, int)`, or Kotlin's `KUtil.load(f, c, b, p)` among two
+  // four-parameter `load`s. Types aren't compared here, so the first declared
+  // of them, never the target the argument count rules out. Java's types are
+  // weighed above, so Java only lands here when javaOverloadsFitting can't say.
+  const line = (id: string) => context.getNodeById?.(id)?.startLine ?? Infinity;
+  const first = fits.reduce((a, b) => (line(b.id) < line(a.id) ? b : a));
+  return { ...result, targetNodeId: first.id };
 }
 
 /** Whether a Swift parameter (`_ body: @escaping (Int) -> Void`) takes a function: its type has a `->` outside any brackets of the type's own. */
