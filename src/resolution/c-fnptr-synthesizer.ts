@@ -1327,10 +1327,21 @@ export async function cFnPointerDispatchEdges(
   if (reg.size === 0 && arrayReg.size === 0) return [];
 
   // ---- Stage E: dispatch sites → edges ----
-  // Filter: a file matters only if some dispatch field is a known fn-pointer
-  // field, or some subscripted name is a registered fn-pointer array — the loop
-  // body's own first gates (`owners` / `entries`), which a skipped file's
-  // matches would all fail before touching `seen`/`added`/`edges`.
+  // Filter: a dispatch can only produce an edge through a `struct.field` key
+  // that `reg` holds a handler for (the `targets` lookup below), so the only
+  // field names that matter are the ones some non-empty `reg` key ends in —
+  // registrations AND propagation targets, which is why this is read after
+  // stage D. A file whose dispatch fields are all unregistered, and a match on
+  // such a field, would fail that lookup before touching `seen`/`added`/`edges`;
+  // skipping them cannot change the output. Most fn-pointer fields in a large
+  // C++ tree (`callback`, `data`, `func`, ...) are declared but never registered
+  // in a table, and resolving each match's receiver type costs a body-wide regex.
+  // A field name is `\w+` (it never contains `.`), so it is the key's last segment.
+  // Array dispatch keeps its own gate (`arrayReg`).
+  const regFields = new Set<string>();
+  for (const [key, ids] of reg) {
+    if (ids.size > 0) regFields.add(key.slice(key.lastIndexOf('.') + 1));
+  }
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const file of files) {
@@ -1338,7 +1349,7 @@ export async function cFnPointerDispatchEdges(
     const facts = factsByFile.get(file);
     if (!facts) continue;
     const eSurvives =
-      (facts.dispatchFields?.some((f) => fieldToStructs.has(f)) ?? false) ||
+      (facts.dispatchFields?.some((f) => regFields.has(f)) ?? false) ||
       (arrayReg.size > 0 && (facts.arrayDispatchNames?.some((n) => arrayReg.has(n)) ?? false));
     if (!eSurvives) continue;
     const s = src(file);
@@ -1366,6 +1377,7 @@ export async function cFnPointerDispatchEdges(
     while ((m = DISPATCH_RE.exec(body)) && added < FANOUT_CAP) {
       const baseChain = m[1]!.replace(/\s*(?:->|\.)\s*$/, '').trim(); // receiver, minus the trailing arrow
       const field = m[2]!;
+      if (!regFields.has(field)) continue; // nothing is registered under this field name: no edge, skip the type regexes
       const owners = fieldToStructs.get(field);
       if (!owners || owners.size === 0) continue;
       // 1) resolve the receiver chain's struct type precisely (handles c->cmd->proc);

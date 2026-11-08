@@ -2976,6 +2976,9 @@ const RN_SWIFT_SEND_CONST_RE = /\bsendEvent\s*\(\s*withName\s*:\s*([A-Za-z_][\w.
 const RN_JVM_EMIT_CONST_RE = /\.emit\s*\(\s*([A-Za-z_][\w.]*)\s*,/g;
 const RN_NATIVE_SENDEVENT_CONST_RE = /\bsendEvent\s*\(\s*[A-Za-z_][\w.]*\s*,\s*([A-Za-z_][\w.]*)\s*,/g;
 const RN_JS_LISTEN_CONST_RE = /\.(?:on|once|addListener)\(\s*((?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*)\s*,\s*([A-Za-z_$][\w$.]*|(?:async\s*)?(?:\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>|function\s*\())/g;
+// The only extensions rnEventEdges reads: ObjC (.m/.mm), Swift, JVM (.java/.kt)
+// and JS-family subscribers — the union of its per-file branches.
+const RN_EVENT_FILE_RE = /\.(?:mm?|swift|java|kt|jsx?|tsx?|mjs|cjs)$/;
 
 const CONSTANT_KINDS = new Set<NodeKind>(['constant', 'variable', 'field', 'property', 'enum_member']);
 
@@ -3049,6 +3052,10 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
 
   for (const file of ctx.getAllFiles()) {
     if ((++scannedFiles & 15) === 0) await onYield();
+    // Every branch below is keyed on the file's extension, so any other file
+    // (the bulk of a C++ tree) cannot add a dispatcher or a handler: skip its
+    // read and node lookup instead of paying them per refresh.
+    if (!RN_EVENT_FILE_RE.test(file)) continue;
     const content = ctx.readFile(file);
     if (!content) continue;
 
@@ -5611,8 +5618,6 @@ export async function synthesizeCallbackEdges(
   // main-thread retry keeps coverage. Skipping loses only that pass's
   // synthesized edges; the index still completes.
   const MAIN_RETRY_MAX_NODES = 1_500_000;
-  const graphNodes = queries.getNodeAndEdgeCount().nodes;
-
   // Files whose text could feed a pass (inputs that produce NO edges included,
   // e.g. an over-cap channel: deleting one may make the full pass viable). It
   // depends only on the files, so with a pool the main thread reads them while
@@ -5639,6 +5644,7 @@ export async function synthesizeCallbackEdges(
   let inputs: string[] | null = null;
 
   if (pool && gatedIn.length > 1) {
+    let graphNodes: number | undefined;
     const runPooled = async (i: number): Promise<void> => {
       const pass = SYNTH_PASSES[i]!;
       try {
@@ -5646,6 +5652,10 @@ export async function synthesizeCallbackEdges(
         passEdges[i] = out.edges;
         markPass(pass.name, out.ms);
       } catch (err) {
+        // Count on the first failed worker only, then reuse it: the query also
+        // scans edge metadata, work successful passes don't need. Nodes don't
+        // change while these passes run.
+        graphNodes ??= queries.getNodeAndEdgeCount().nodes;
         if (graphNodes > MAIN_RETRY_MAX_NODES) {
           // Worker died at a scale where the main-thread retry is a process
           // OOM risk: skip the pass, keep the index alive, and say so.

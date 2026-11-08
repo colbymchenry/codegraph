@@ -165,6 +165,37 @@ int only_reads(struct io *p) { return p->read(); }
     expect(has(edges, 'only_reads', 'do_write')).toBe(false);
   });
 
+  it('bridges the registered field of a function that also dispatches fields nothing registers', async () => {
+    write('events.c', `
+struct events { int (*on_event)(int); int (*on_error)(int); int (*on_close)(void); };
+static int handle_event(int x) { return x; }
+static struct events table = { .on_event = handle_event };
+
+int pump(struct events *e, int x) {
+    e->on_close();            /* declared, never registered */
+    if (e->on_error(x)) return 0;
+    return e->on_event(x);
+}
+`);
+    const edges = await load();
+    expect(edges.map((e) => `${e.src}>${e.tgt}@${e.via}`)).toEqual(['pump>handle_event@events.on_event']);
+  });
+
+  it('does not carry a registration across two structs that share a field name', async () => {
+    write('twins.c', `
+struct left { int (*cb)(void); };
+struct right { int (*cb)(void); };
+static int left_cb(void) { return 1; }
+static struct left l = { .cb = left_cb };
+
+int run_left(struct left *p) { return p->cb(); }
+int run_right(struct right *p) { return p->cb(); }  /* right.cb has no registration */
+`);
+    const edges = await load();
+    expect(has(edges, 'run_left', 'left_cb')).toBe(true);
+    expect(edges.some((e) => e.src === 'run_right')).toBe(false);
+  });
+
   it('does not bridge a plain data field, and no-ops on a struct with no dispatch', async () => {
     write('data.c', `
 struct box { int count; int (*fn)(void); };
