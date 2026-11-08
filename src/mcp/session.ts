@@ -141,6 +141,15 @@ export interface MCPSessionOptions {
    * where the project lives.
    */
   explicitProjectPath?: string | null;
+  /**
+   * Called the first time this session starts work that can block the main
+   * thread (#3250): the first `tools/call`, an `initialize` naming an
+   * indexed project, or a `tools/list` that ends up opening a default
+   * project. Direct mode passes the server's lazy watchdog arming; daemon
+   * and proxy sessions leave it unset (they arm their own watchdogs at
+   * startup). Optional — a session without it simply never arms one.
+   */
+  onWorkBegins?: () => void;
 }
 
 /**
@@ -154,6 +163,7 @@ export class MCPSession {
   private rootsAttempted = false;
   private resolvePromise: Promise<void> | null = null;
   private explicitProjectPath: string | null;
+  private onWorkBegins: (() => void) | null;
   /**
    * What `codegraph_explore` has already returned to THIS client, per project
    * (CG-17). Owned by the session, not the engine: the daemon shares one engine
@@ -172,6 +182,7 @@ export class MCPSession {
     opts: MCPSessionOptions = {},
   ) {
     this.explicitProjectPath = opts.explicitProjectPath ?? null;
+    this.onWorkBegins = opts.onWorkBegins ?? null;
   }
 
   /**
@@ -304,6 +315,11 @@ export class MCPSession {
     });
 
     if (explicitPath) {
+      // The client named a project and it resolves to an indexed root, so
+      // the background init below is real work that can block the main
+      // thread — arm the watchdog before it starts (#3250). A named but
+      // unindexed path starts nothing, so it stays unarmed.
+      if (indexed) this.onWorkBegins?.();
       // Kick off engine init in the background. If another session in the
       // same daemon already opened the project, `ensureInitialized` is a
       // ~free no-op — N concurrent clients pay exactly one open.
@@ -313,6 +329,11 @@ export class MCPSession {
 
   private async handleToolsList(request: JsonRpcRequest): Promise<void> {
     await this.retryInitIfNeeded();
+    // Discovery itself starts no watchdog — but if the retry above ended up
+    // opening a default project (e.g. an indexed cwd), work has begun and
+    // the watchdog arms now (#3250). With no project anywhere this stays
+    // unarmed, which is the whole point of the deferral.
+    if (this.engine.hasDefaultCodeGraph()) this.onWorkBegins?.();
     // Always expose the tools — even when the server root has no index. Gating
     // availability on whether `./` is indexed (the old behavior) breaks the
     // monorepo case where only sub-projects carry a `.codegraph/` (the agent
@@ -358,6 +379,9 @@ export class MCPSession {
     }
 
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} pre-init\n`);
+    // First real work of the session: hang protection must cover this
+    // operation, so arm the watchdog before any init or dispatch (#3250).
+    this.onWorkBegins?.();
     await this.retryInitIfNeeded();
 
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);

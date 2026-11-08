@@ -469,6 +469,8 @@ export class MCPServer {
   // Worker-thread liveness watchdog (#850). Long-lived modes only; SIGKILLs the
   // process if the main thread wedges in a non-yielding sync loop.
   private livenessWatchdog: WatchdogHandle | null = null;
+  /** Whether the liveness watchdog has been armed (attempted) — see armLivenessWatchdog. */
+  private watchdogArmed = false;
   // PPID watchdog baseline — from the CLI entry's earliest-possible capture
   // (early-ppid.ts). Capturing here (construction) already lost the race when
   // the launcher was killed during module loading (#1185).
@@ -584,6 +586,26 @@ export class MCPServer {
     process.exit(0);
   }
 
+  /**
+   * Arm the main-thread liveness watchdog (#3250). Idempotent: the first
+   * call installs it (or records that it is disabled / could not spawn);
+   * later calls are no-ops.
+   *
+   * A direct-mode session with no project known at startup leaves the
+   * watchdog unarmed until work begins — the session invokes this through
+   * `onWorkBegins` on the first `tools/call`, on an `initialize` naming an
+   * indexed project, or when a `tools/list` ends up opening a default
+   * project — so a discovery-only session never pays for a watchdog child
+   * it never uses. A session launched with `--path` arms it at startup
+   * instead (its engine init is already running). Daemon and proxy modes
+   * install their own watchdogs and never call this.
+   */
+  private armLivenessWatchdog(): void {
+    if (this.watchdogArmed) return;
+    this.watchdogArmed = true;
+    this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(resolveDaemonRoot(this.projectPath)));
+  }
+
   /** Single-process stdio MCP session — the pre-issue-#411 code path. */
   private async startDirect(reason: string): Promise<void> {
     if (reason && process.env.CODEGRAPH_MCP_DEBUG) {
@@ -608,6 +630,11 @@ export class MCPServer {
     const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
     this.session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.projectPath,
+      // #3250: defer the liveness watchdog until this session starts real
+      // work; the session calls this back on the first tools/call, on an
+      // initialize naming an indexed project, or when a tools/list opens a
+      // default project.
+      onWorkBegins: () => this.armLivenessWatchdog(),
     });
 
     if (this.projectPath) {
@@ -639,7 +666,12 @@ export class MCPServer {
     this.mode = 'direct';
     this.installSignalHandlers();
     this.installPpidWatchdog();
-    this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(resolveDaemonRoot(this.projectPath)));
+    // #3250: only arm the watchdog at startup when a project was given on
+    // the command line — its engine init is already running (kicked off
+    // above), so work has begun. Otherwise the session arms it lazily via
+    // onWorkBegins when the first real work arrives; a discovery-only
+    // session never starts a watchdog child at all.
+    if (this.projectPath) this.armLivenessWatchdog();
   }
 
   /**
