@@ -38,6 +38,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Pascal, a call to a routine with overloads in several units, like mORMot's `FormatUtf8`, now links to the overload its arguments fit, and a call from another unit no longer links to a routine that a unit declares only in its implementation section. (#3476)
 - In Pascal, an `inherited` call, like `inherited Create(AOwner)` or a bare `inherited;`, now links to the method of the nearest ancestor class that declares it, so a flow through an overriding method goes on into the method it overrides; re-index Pascal projects after upgrading. (#3477)
 - In Pascal, a routine whose `{$IFDEF}` branches each open a block for one shared `end`, like a `case` on one platform and a `begin` on another, or a Pascal body beside assembler versions, now ends at its own `end`, so the routines after it keep their own nodes and calls instead of being read as part of it; re-index Pascal projects after upgrading. (#3478)
+- In C#, Kotlin, Scala, Dart, VB.NET and Solidity, a call that fits several overloads by its number of arguments now links to one of those, like `KUtil.load(f, c, b, p)` between two four-parameter `load` overloads. Before, it went to the first overload declared even when that one takes a different number of parameters, and a method calling another overload of itself, like `Read(value, null)` inside `Read(string value)`, could link back to itself. Thanks @inth3shadows for the report. (#3040)
 
 ## [1.6.4] - 2026-11-20
 
