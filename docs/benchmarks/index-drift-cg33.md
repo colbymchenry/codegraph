@@ -91,9 +91,17 @@ largest residual class in the first measurement of this fix.
 
 Conservative by construction, because a wrong deletion is a permanent edge loss
 while a missed rebind is only residual drift: an edge with no `refName` stamp
-(synthesized, or built by an older engine) is never touched, edges whose source
-file the sync already re-extracted are skipped, and a per-name ceiling of 500
-edges declines the generic names.
+(synthesized, or built by an older engine) is never touched, and edges whose
+source file the sync already re-extracted are skipped. There is no per-name
+ceiling: a name that gained or lost a definition re-opens every edge that
+targets it (`reopenResolutionEdgesByTargetName`, read in keyset batches of 1,000
+inside one transaction, so memory is the batch and an interruption keeps the
+old answers), and the failed refs waiting for it
+(`reopenFailedReferencesByName`, a status update with nothing loaded). The
+resolver's own ambiguity ceilings then decide what each binds to, as in a
+rebuild. The earlier 500-edge ceiling declined a name the resolver would have
+bound: 501 unchanged callers of `push` stayed on the old definition while a
+rebuild moved all of them to an earlier-sorting new one.
 
 ### Result
 
@@ -116,17 +124,23 @@ composite `(name, file_path, start_line)` index would make the sort free, but it
 would widen every node index entry with a full path string on the write-heavy
 indexing path — not worth 43ms.
 
-### The residual, and why it is not chased
+### The residual, and what changed
 
-At 80 commits, 357 of the 361 remaining edges are a single pre-existing class:
-references to very generic names (`push` 260, `join` 97) that failed at index
-time and stay parked because `getRetryableFailedReferences` declines any name
-with more than 500 failed refs (1,412 for `push`, 2,346 for `join`). That
-ceiling is #1240/#999 policy, it is present on `main`, and what it declines to
-create is cross-language garbage: a TypeScript test file "calling" an R method
-named `push`, or a Rust method named `join`. **The full rebuild is the wrong one
-here** — converging would mean teaching sync to manufacture thousands of wrong
-edges. Left as is, deliberately.
+At 80 commits, 357 of the 361 remaining edges were a single class: references
+to very generic names (`push` 260, `join` 97) that failed at index time and
+stayed parked because `getRetryableFailedReferences` declines any name with
+more than 500 failed refs (1,412 for `push`, 2,346 for `join`). That ceiling
+is #1240/#999 policy and still bounds the retry of the changed files' own
+names. The rebind no longer applies it: when such a name gains or loses a
+definition, every failed ref under it is re-opened and the resolver decides,
+removing that source of drift. If those edges are
+cross-language garbage (a TypeScript test "calling" an R method named `push`),
+that is the resolver's output on a rebuild too, and is fixed there, not by
+letting sync disagree with it.
+
+Those are historical replay counts, not a replay of the complete-invalidation
+change. Its add/delete and failed-reference fixtures compare full edge sets
+against fresh indexes; they do not prove convergence for unrelated mechanisms.
 
 ### Navigation waits on a route, not a name (2026-10)
 

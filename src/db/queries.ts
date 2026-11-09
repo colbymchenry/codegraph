@@ -4,7 +4,7 @@
  * Prepared statements for CRUD operations on the knowledge graph.
  */
 
-import { SqliteDatabase, SqliteStatement } from './sqlite-adapter';
+import { createDatabase, SqliteDatabase, SqliteStatement } from './sqlite-adapter';
 import {
   Node,
   Edge,
@@ -23,6 +23,8 @@ import { parseQuery, boundedEditDistance, type ParsedQuery } from '../search/que
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
 import { isModuleKey, referenceNameTail, MEMBER_TAIL_SQL, MODULE_PARKED_SQL } from './reference-tail';
+import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
+import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
 import { ParameterFlowQueries } from './parameter-flow-queries';
 import { NAME_SUBSTRING_KINDS, buildNameSubstringIndex, searchNameSubstring, type NameSubstringIndex, type ScanOrder } from './name-substring-index';
 
@@ -46,6 +48,13 @@ function isLowValueFile(filePath: string, generated?: ReadonlySet<string>): bool
 }
 
 const SQLITE_PARAM_CHUNK_SIZE = 500;
+
+/**
+ * Edges read, rewritten and released at a time when a sync re-opens the
+ * resolutions of a name (`reopenResolutionEdgesByTargetName`): the working set
+ * is this many edges whatever the population, instead of every edge of the name.
+ */
+const RESOLUTION_EDGE_BATCH = 1000;
 
 /**
  * How an import names a folder only through where it is written: `.`, or a
@@ -4382,28 +4391,35 @@ export class QueryBuilder {
    */
   insertUnresolvedRefsBatch(refs: UnresolvedReference[]): void {
     if (refs.length === 0) return;
-    const insert = this.db.transaction(() => {
-      const rows: unknown[][] = [];
-      for (const ref of refs) {
-        rows.push([
-          ref.fromNodeId,
-          ref.referenceName,
-          ref.referenceKind,
-          ref.line,
-          ref.column,
-          ref.candidates ? JSON.stringify(ref.candidates) : null,
-          ref.filePath ?? '',
-          ref.language ?? 'unknown',
-        ]);
-      }
-      this.runBatched(
-        'insertUnresolvedRefs',
-        'INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ',
-        '(?,?,?,?,?,?,?,?)',
-        rows
-      );
-    });
-    insert();
+    this.db.transaction(() => this.insertUnresolvedRefRows(refs))();
+  }
+
+  /**
+   * The writes of {@link insertUnresolvedRefsBatch}, with no transaction of
+   * their own: for a caller that owns one it cannot nest in, such as the owned
+   * connection of {@link inOwnedTransaction}, whose `BEGIN` the adapter's
+   * `transaction()` cannot see.
+   */
+  private insertUnresolvedRefRows(refs: UnresolvedReference[]): void {
+    const rows: unknown[][] = [];
+    for (const ref of refs) {
+      rows.push([
+        ref.fromNodeId,
+        ref.referenceName,
+        ref.referenceKind,
+        ref.line,
+        ref.column,
+        ref.candidates ? JSON.stringify(ref.candidates) : null,
+        ref.filePath ?? '',
+        ref.language ?? 'unknown',
+      ]);
+    }
+    this.runBatched(
+      'insertUnresolvedRefs',
+      'INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ',
+      '(?,?,?,?,?,?,?,?)',
+      rows
+    );
   }
 
   /**
@@ -5168,98 +5184,213 @@ export class QueryBuilder {
     return changed;
   }
 
+  /**
+   * Run `body` in ONE transaction on a connection of its own, so `body` may
+   * await (yield to the event loop) between writes without leaving this
+   * connection inside a transaction other code on it could run into. Readers on
+   * this connection see the last commit until the body finishes: the graph
+   * keeps its old answers while the pass runs, and keeps them if it fails.
+   *
+   * The pattern of {@link SynthesisStage}: `BEGIN IMMEDIATE` explicitly,
+   * `wal_autocheckpoint = 0` so the stage never checkpoints (the owner's WAL
+   * valve does, outside any transaction), and the connection closed on every
+   * outcome. The body must write through unchecked primitives
+   * (`insertUnresolvedRefRows`, `replaceEdgesWithRefs`, plain statements): the
+   * adapter's `transaction()` does not know about an explicit `BEGIN`, and
+   * would try to open another. Nothing here waits on the owner's writer or a
+   * checkpoint; a caller that needs backpressure awaits it before and after.
+   * Must not be called inside a transaction of this connection: the write lock
+   * would be held against the stage until `busy_timeout` ran out.
+   */
+  private async inOwnedTransaction<T>(body: (stage: QueryBuilder) => Promise<T>): Promise<T> {
+    const callerTransaction = this.db.inTransaction;
+    if (callerTransaction === true) {
+      throw new Error('inOwnedTransaction: the connection is inside a transaction; its write lock would block the owned one');
+    }
+    if (callerTransaction === undefined) {
+      // Older node:sqlite has no isTransaction. A deferred BEGIN probes without
+      // reading or writing; inside a caller transaction SQLite rejects it.
+      this.db.exec('BEGIN');
+      this.db.exec('ROLLBACK');
+    }
+    const attached: Array<{ name: string; file: string }> = this.db.prepare('PRAGMA database_list').all();
+    const main = attached.find((row) => row.name === 'main');
+    if (!main?.file) throw new Error('inOwnedTransaction: the database is not a file, so a second connection cannot reach it');
+    const { db } = createDatabase(main.file);
+    try {
+      db.pragma('busy_timeout = 5000');
+      db.pragma('foreign_keys = ON');
+      db.pragma('synchronous = NORMAL');
+      db.pragma('wal_autocheckpoint = 0');
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const result = await body(new QueryBuilder(db));
+        db.exec('COMMIT');
+        return result;
+      } catch (error) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          /* the transaction already ended; the failure to report is the body's */
+        }
+        throw error;
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  /**
+   * Put EVERY failed reference a definition of one of `names` can answer back in
+   * the pending set — the complete form of
+   * `reopenFailedReferences(getRetryableFailedReferences(names))`, for a sync's
+   * rebind. The same four lookups (see {@link getRetryableFailedReferences}):
+   * the reference's own tail, a module-parked reference by its whole name, by
+   * its member, and by its receiver (`store.`). There is no per-name ceiling:
+   * a name that gained or lost a definition can answer a failure however many
+   * there are, and re-opening only some of them leaves the index unlike a fresh
+   * one. What a pass cannot resolve it parks as failed again. Returns the
+   * number re-opened.
+   *
+   * Cooperative: each lookup is a status update of at most `batchSize` rows
+   * (`id IN (SELECT id … LIMIT ?)` over the same partial indexes), repeated
+   * until a batch comes back short, since an updated row leaves the lookup's
+   * `status = 'failed'` and the next batch starts where the last stopped. The
+   * event loop is offered a turn between batches (`yieldToLoop`). All batches
+   * share one transaction on an owned connection ({@link inOwnedTransaction}),
+   * so an interruption re-opens none and nothing loads into memory.
+   *
+   * Cost: this call only flips each matching row's status, which is cheap per
+   * row. The re-opened refs are then re-resolved by the sync's sweep, which
+   * scales with the number re-opened and for a very common name can dominate
+   * the sync; that cost is not bounded here and has not been measured.
+   */
+  async reopenFailedReferencesByName(
+    names: readonly string[],
+    options: { batchSize?: number; yieldToLoop?: MaybeYield } = {}
+  ): Promise<number> {
+    const unique = [...new Set(names)];
+    if (unique.length === 0) return 0;
+    const batchSize = options.batchSize ?? RESOLUTION_EDGE_BATCH;
+    const yieldToLoop = options.yieldToLoop ?? createYielder();
+    return this.inOwnedTransaction(async (stage) => {
+      let changed = 0;
+      const reopen = async (where: string, params: readonly string[]): Promise<void> => {
+        const update = stage.db.prepare(
+          `UPDATE unresolved_refs SET status = 'pending' WHERE id IN (SELECT id FROM unresolved_refs WHERE ${where} LIMIT ?)`
+        );
+        for (;;) {
+          const batch = update.run(...params, batchSize).changes;
+          changed += batch;
+          const pause = yieldToLoop();
+          if (pause) await pause;
+          if (batch < batchSize) return;
+        }
+      };
+      for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+        const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+        const placeholders = chunk.map(() => '?').join(',');
+        await reopen(`status = 'failed' AND name_tail IN (${placeholders})`, chunk);
+        await reopen(`${MODULE_PARKED_SQL} AND reference_name IN (${placeholders})`, chunk);
+        await reopen(`${MODULE_PARKED_SQL} AND instr(reference_name, '.') > 0 AND ${MEMBER_TAIL_SQL} IN (${placeholders})`, chunk);
+      }
+      // By receiver: the range `store.` up to `store/` ('/' follows '.').
+      for (const name of unique) {
+        if (RECEIVER_NAME.test(name)) await reopen(`${MODULE_PARKED_SQL} AND reference_name >= ? AND reference_name < ?`, [`${name}.`, `${name}/`]);
+      }
+      return changed;
+    });
+  }
+
   /** The highest edge id so far: edges inserted later have higher ids (AUTOINCREMENT). */
   getMaxEdgeId(): number {
     return (this.db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM edges').get() as { id: number }).id;
   }
 
   /**
-   * Resolution edges whose TARGET symbol is named one of `names` — the edges a
-   * sync must re-resolve after `names` gained or lost a definition (CG-33).
+   * Re-open stamped resolution edges targeting names whose definitions changed.
+   * A name's nodes and each node/kind's edges are read in keyset batches, so
+   * memory is bounded independently of the number of callers or definitions.
+   * The resolver, not invalidation, owns ambiguity limits.
    *
-   * Resolution binds a reference to a node whose name matches the reference's
-   * tail, and it picks among ALL same-named definitions project-wide. So adding
-   * or removing one definition of `pct` changes the answer for every `pct(...)`
-   * reference in the repo — including references in files this sync never
-   * touches, whose edges nothing else revisits. Those edges' current target is,
-   * by that same rule, a node named `pct`, which is why the target's name is a
-   * sufficient (and index-backed, via idx_nodes_name) way to find them without
-   * a schema change or a scan of edge metadata.
+   * Preserve generated/unstamped edges and edges from re-extracted files,
+   * matching the existing reconstruction contract. Include retry-created edges:
+   * their answers can depend on prerequisite edges this pass will invalidate.
+   * Each deletion inserts its original reference as pending in the same
+   * transaction; any failed batch rolls back the entire pass.
    *
-   * Returns the source file/language alongside each edge so the caller can
-   * resurrect it as its original reference. Excludes `provenance='heuristic'`
-   * (synthesized dispatch edges are not resolution output and carry no refName
-   * stamp to resurrect from — deleting one would be a permanent loss).
-   *
-   * Names matching more than `perNameCeiling` edges are skipped entirely, same
-   * rationale and same default as {@link getRetryableFailedReferences}: at that
-   * population the name is generic (`get`, `clear`, …), one definition changing
-   * won't flip most of them, and rebinding an arbitrary subset is both wasted
-   * work and incoherent coverage.
-   *
-   * With `countedUpToEdgeId`, only edges up to that id count toward the
-   * ceiling: the ones a sync's failed-ref retry made just now were resolved
-   * against the graph this sync built, and relinking every `from django.urls
-   * import path` must not push `path` over the ceiling and leave the edges the
-   * new definitions moved unrebound. They are still returned under a name
-   * that stays below it.
+   * The pass uses one owned transaction and offers an event-loop turn between
+   * batches (the default yielder has a 250 ms budget). Other readers retain the
+   * old graph until commit. Any rejected yield or failed batch rolls back all
+   * preceding batches; each individual SQLite statement still runs synchronously.
    */
-  getResolutionEdgesByTargetName(
-    names: string[],
-    perNameCeiling: number = 500,
-    countedUpToEdgeId?: number
-  ): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> {
-    if (names.length === 0) return [];
-
-    // Pass 1: per-name edge counts, chunked under the SQLite parameter limit.
-    const keep: string[] = [];
-    const counted = countedUpToEdgeId === undefined ? '' : 'AND e.id <= ?';
-    for (let i = 0; i < names.length; i += SQLITE_PARAM_CHUNK_SIZE) {
-      const chunk = names.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
-      const placeholders = chunk.map(() => '?').join(',');
-      const counts = this.db
-        .prepare(
-          `SELECT tgt.name AS name, COUNT(*) AS count
-             FROM edges e
-             JOIN nodes tgt ON tgt.id = e.target
-            WHERE tgt.name IN (${placeholders})
-              AND (e.provenance IS NULL OR e.provenance != 'heuristic')
-              ${counted}
-            GROUP BY tgt.name`
-        )
-        .all(...chunk, ...(countedUpToEdgeId === undefined ? [] : [countedUpToEdgeId])) as Array<{ name: string; count: number }>;
-      for (const row of counts) {
-        if (row.count <= perNameCeiling) keep.push(row.name);
+  async reopenResolutionEdgesByTargetName(
+    names: readonly string[],
+    freshSourceFiles: ReadonlySet<string>,
+    options: { batchSize?: number; yieldToLoop?: MaybeYield } = {}
+  ): Promise<number> {
+    const unique = [...new Set(names)];
+    if (unique.length === 0) return 0;
+    const batchSize = options.batchSize ?? RESOLUTION_EDGE_BATCH;
+    const yieldToLoop = options.yieldToLoop ?? createYielder();
+    return this.inOwnedTransaction(async (stage) => {
+      const nodesNamed = stage.db.prepare(`SELECT rowid AS rid, id FROM nodes WHERE name = ? AND rowid > ? ORDER BY rowid LIMIT ?`);
+      const kindsOf = stage.db.prepare(`SELECT DISTINCT kind FROM edges WHERE target = ? AND kind != 'contains'`);
+      const page = stage.db.prepare(
+        `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
+           FROM edges e
+           JOIN nodes src ON src.id = e.source
+          WHERE e.target = ? AND e.kind = ? AND e.id > ?
+            AND (e.provenance IS NULL OR e.provenance != 'heuristic')
+          ORDER BY e.id
+          LIMIT ?`
+      );
+      const reopenEdgesOf = async (target: string): Promise<number> => {
+        let reopened = 0;
+        for (const { kind } of kindsOf.all(target) as Array<{ kind: string }>) {
+          let after = 0;
+          for (;;) {
+            const rows = page.all(target, kind, after, batchSize) as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
+            if (rows.length === 0) break;
+            after = rows[rows.length - 1]!.id;
+            const edgeIds: number[] = [];
+            const refs: UnresolvedReference[] = [];
+            for (const row of rows) {
+              if (freshSourceFiles.has(row.source_file_path)) continue;
+              const ref = resurrectRefFromDroppedEdge({
+                ...rowToEdge(row),
+                sourceFilePath: row.source_file_path,
+                sourceLanguage: row.source_language,
+              });
+              if (!ref) continue; // no stamp: never delete what cannot be restored
+              edgeIds.push(row.id);
+              refs.push(ref);
+            }
+            if (refs.length > 0) {
+              stage.replaceEdgesWithRefs(edgeIds, refs);
+              reopened += refs.length;
+            }
+            const pause = yieldToLoop();
+            if (pause) await pause;
+            if (rows.length < batchSize) break;
+          }
+        }
+        return reopened;
+      };
+      let reopened = 0;
+      for (const name of unique) {
+        let afterNode = 0;
+        for (;;) {
+          const targets = nodesNamed.all(name, afterNode, batchSize) as Array<{ rid: number; id: string }>;
+          for (const { id } of targets) reopened += await reopenEdgesOf(id);
+          const pause = yieldToLoop();
+          if (pause) await pause;
+          if (targets.length < batchSize) break;
+          afterNode = targets[targets.length - 1]!.rid;
+        }
       }
-    }
-    if (keep.length === 0) return [];
-
-    // Pass 2: load the surviving edges with the source file context a
-    // resurrection needs.
-    const out: Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> = [];
-    for (let i = 0; i < keep.length; i += SQLITE_PARAM_CHUNK_SIZE) {
-      const chunk = keep.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
-      const placeholders = chunk.map(() => '?').join(',');
-      const rows = this.db
-        .prepare(
-          `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
-             FROM edges e
-             JOIN nodes tgt ON tgt.id = e.target
-             JOIN nodes src ON src.id = e.source
-            WHERE tgt.name IN (${placeholders})
-              AND (e.provenance IS NULL OR e.provenance != 'heuristic')`
-        )
-        .all(...chunk) as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
-      for (const row of rows) {
-        out.push({
-          ...rowToEdge(row),
-          edgeId: row.id,
-          sourceFilePath: row.source_file_path,
-          sourceLanguage: row.source_language,
-        });
-      }
-    }
-    return out;
+      return reopened;
+    });
   }
 
   /**
@@ -5306,7 +5437,7 @@ export class QueryBuilder {
    * Every resolution edge leaving a node of `language` — the re-resolution set
    * when a project-wide input to that language's import resolution changes
    * (Python package roots). Same exclusion as
-   * {@link getResolutionEdgesByTargetName}: synthesized edges carry no refName
+   * {@link reopenResolutionEdgesByTargetName}: synthesized edges carry no refName
    * stamp and are left alone.
    */
   getResolutionEdgesBySourceLanguage(
@@ -5510,14 +5641,17 @@ export class QueryBuilder {
   /** Delete edges by primary key — the rebind pass's half of a re-resolution. */
   deleteEdgesByIds(edgeIds: number[]): number {
     if (edgeIds.length === 0) return 0;
+    return this.db.transaction(() => this.deleteEdgeRows(edgeIds))();
+  }
+
+  /** The deletes of {@link deleteEdgesByIds}, with no transaction of their own. */
+  private deleteEdgeRows(edgeIds: number[]): number {
     let changed = 0;
-    this.db.transaction(() => {
-      for (let i = 0; i < edgeIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
-        const chunk = edgeIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
-        const placeholders = chunk.map(() => '?').join(',');
-        changed += this.db.prepare(`DELETE FROM edges WHERE id IN (${placeholders})`).run(...chunk).changes;
-      }
-    })();
+    for (let i = 0; i < edgeIds.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = edgeIds.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      changed += this.db.prepare(`DELETE FROM edges WHERE id IN (${placeholders})`).run(...chunk).changes;
+    }
     return changed;
   }
 
@@ -5657,11 +5791,17 @@ export class QueryBuilder {
     edgeIds: number[],
     refs: UnresolvedReference[]
   ): number {
-    return this.db.transaction(() => {
-      const changed = this.deleteEdgesByIds(edgeIds);
-      this.insertUnresolvedRefsBatch(refs);
-      return changed;
-    })();
+    return this.db.transaction(() => this.replaceEdgesWithRefs(edgeIds, refs))();
+  }
+
+  /**
+   * {@link replaceResolutionEdgesWithUnresolvedRefs} with no transaction of its
+   * own: the caller's holds both writes, so a failure in either undoes both.
+   */
+  private replaceEdgesWithRefs(edgeIds: number[], refs: UnresolvedReference[]): number {
+    const changed = this.deleteEdgeRows(edgeIds);
+    if (refs.length > 0) this.insertUnresolvedRefRows(refs);
+    return changed;
   }
 
   /**

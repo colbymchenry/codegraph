@@ -402,68 +402,115 @@ describe('Incremental sync converges to a full rebuild (CG-33)', INDEXING_TIMEOU
   });
 
   /**
-   * The per-name ceiling in `getResolutionEdgesByTargetName` (500 by default).
-   * Above it a name is generic — `push`, `get`, `join` — one new definition
-   * won't flip most of its references, and rebinding an arbitrary subset would
-   * manufacture wrong edges while costing the most work. It must DECLINE the
-   * name outright, and declining must be lossless.
+   * A name with more references than the old per-name ceiling (500) is the
+   * name most likely to be shared by two definitions (`push`, `get`, `join`),
+   * and the one whose answer a new definition moves for the most callers. The
+   * rebind used to decline such a name outright, so an index that took the
+   * sync kept every caller on the old definition while a rebuild of the same
+   * tree bound them all to the earlier-sorting new one: 501 edges wrong in
+   * each direction, with the total the same.
    *
-   * The rare name in the same sync is the control: it proves the pass ran and
-   * that the ceiling is what spared the generic one, not a dead rebind pass.
+   * 501 callers sit one past the old ceiling, in files the sync never touches.
+   * The rare name in the same tree is the control. The whole edge set is
+   * compared, never a count.
    */
-  it('declines a name over the per-name ceiling instead of rebinding an arbitrary subset', async () => {
-    // Must exceed the 500 default in getResolutionEdgesByTargetName.
-    const OVER_CEILING = 501;
-    const callers = Array.from(
-      { length: OVER_CEILING },
-      (_, i) => `export function hot${i}(): number {\n  return push(${i});\n}\n`
-    ).join('');
-    write('src/hot.ts', callers);
+  const OVER_CEILING = 501;
+  const writeCallers = () => {
+    write(
+      'src/hot.ts',
+      Array.from({ length: OVER_CEILING }, (_, i) => `export function hot${i}(): number {\n  return push(${i});\n}\n`).join('')
+    );
     write('src/rare.ts', `export function rare(): number {\n  return tug(1);\n}\n`);
     write(
       'src/zzz_defs.ts',
       `export function push(n: number): number {\n  return n;\n}\nexport function tug(n: number): number {\n  return n;\n}\n`
     );
-    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
-    await cg.indexAll();
-
-    const targetsOf = (name: string): string[] =>
-      withDb((db) =>
-        (
-          db
-            .prepare(
-              `SELECT t.file_path AS file FROM edges e
-               JOIN nodes t ON t.id = e.target
-               JOIN nodes s ON s.id = e.source
-               WHERE t.name = ? AND e.kind = 'calls'`
-            )
-            .all(name) as Array<{ file: string }>
-        ).map((r) => r.file)
-      );
-
-    expect(targetsOf('push')).toHaveLength(OVER_CEILING);
-    expect(new Set(targetsOf('push'))).toEqual(new Set(['src/zzz_defs.ts']));
-    expect(targetsOf('tug')).toEqual(['src/zzz_defs.ts']);
-
-    // One sync adds a competing definition of BOTH names, in a file that sorts
-    // first and is therefore the rebuild's answer for each.
+  };
+  const writeCompetingDefinitions = () =>
     write(
       'src/aaa.ts',
       `export function push(n: number): number {\n  return n * 2;\n}\nexport function tug(n: number): number {\n  return n * 2;\n}\n`
     );
+  const callTargets = (name: string): string[] =>
+    withDb((db) =>
+      (
+        db
+          .prepare(
+            `SELECT t.file_path AS file FROM edges e
+             JOIN nodes t ON t.id = e.target
+             WHERE t.name = ? AND e.kind = 'calls'`
+          )
+          .all(name) as Array<{ file: string }>
+      ).map((r) => r.file)
+    );
+
+  it('rebinds every caller of a name past the former ceiling when a sync adds a competing definition', async () => {
+    writeCallers();
+    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+    expect(callTargets('push')).toHaveLength(OVER_CEILING);
+    expect(new Set(callTargets('push'))).toEqual(new Set(['src/zzz_defs.ts']));
+
+    writeCompetingDefinitions();
     const result = await cg.sync();
     expect(result.definitionDelta).toContain('push');
     expect(result.definitionDelta).toContain('tug');
 
-    // `push` is untouched — every edge still there, still on the old target.
-    // This is knowingly divergent from a rebuild; see "Don't chase the
-    // residual" in docs/benchmarks/index-drift-cg33.md.
-    const pushTargets = targetsOf('push');
-    expect(pushTargets).toHaveLength(OVER_CEILING);
-    expect(new Set(pushTargets)).toEqual(new Set(['src/zzz_defs.ts']));
+    // The control moved, and so did every caller of the common name.
+    expect(callTargets('tug')).toEqual(['src/aaa.ts']);
+    expect(callTargets('push')).toHaveLength(OVER_CEILING);
+    expect(new Set(callTargets('push'))).toEqual(new Set(['src/aaa.ts']));
 
-    // `tug` — the control — rebound.
-    expect(targetsOf('tug')).toEqual(['src/aaa.ts']);
+    const synced = edgeSet();
+    const rebuilt = await rebuildEdgeSet();
+    expect(describeDiff(synced, rebuilt)).toBe('missing from synced: 0, stale in synced: 0');
+  });
+
+  it('rebinds every caller of a name past the former ceiling when a sync deletes the winning definition', async () => {
+    writeCallers();
+    writeCompetingDefinitions();
+    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+    expect(new Set(callTargets('push'))).toEqual(new Set(['src/aaa.ts']));
+
+    fs.rmSync(path.join(testDir, 'src', 'aaa.ts'));
+    const result = await cg.sync();
+    expect(result.filesRemoved).toBe(1);
+    expect(result.definitionDelta).toContain('push');
+
+    expect(callTargets('tug')).toEqual(['src/zzz_defs.ts']);
+    expect(callTargets('push')).toHaveLength(OVER_CEILING);
+    expect(new Set(callTargets('push'))).toEqual(new Set(['src/zzz_defs.ts']));
+
+    const synced = edgeSet();
+    const rebuilt = await rebuildEdgeSet();
+    expect(describeDiff(synced, rebuilt)).toBe('missing from synced: 0, stale in synced: 0');
+  });
+
+  /**
+   * The same population as FAILED references. 501 callers of a name nothing
+   * defines are parked as failed; their definition arrives in one file. The
+   * failed-ref retry used to skip a name with more than 500 of them, and the
+   * rebind's re-open of failed refs had the same ceiling, so they stayed
+   * unresolved while a rebuild links every one.
+   */
+  it('resolves more failed callers than the former ceiling when their definition appears', async () => {
+    write(
+      'src/hot.ts',
+      Array.from({ length: OVER_CEILING }, (_, i) => `export function hot${i}(): number {\n  return push(${i});\n}\n`).join('')
+    );
+    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+    expect(callTargets('push')).toHaveLength(0);
+
+    write('src/defs.ts', `export function push(n: number): number {\n  return n;\n}\n`);
+    const result = await cg.sync();
+    expect(result.definitionDelta).toContain('push');
+    expect(callTargets('push')).toHaveLength(OVER_CEILING);
+
+    const synced = edgeSet();
+    const rebuilt = await rebuildEdgeSet();
+    expect(describeDiff(synced, rebuilt)).toBe('missing from synced: 0, stale in synced: 0');
   });
 
   /**

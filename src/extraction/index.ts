@@ -3613,42 +3613,26 @@ export class ExtractionOrchestrator {
    * resolution sweep to bind against the post-sync graph — the same input a
    * full rebuild resolves from, which is what makes the two converge.
    *
-   * Deliberately conservative in three ways, because a wrong deletion is a
+   * Deliberately conservative in two ways, because a wrong deletion is a
    * permanent edge loss while a missed rebind is only residual drift:
    * - an edge with no refName stamp (synthesized, or built by an engine older
    *   than the stamp) is left ALONE rather than reconstructed from the target's
    *   plain name, same rule as `resurrectRefFromDroppedEdge`;
    * - edges whose source is in a file this sync already re-extracted are
    *   skipped — their references were re-resolved from scratch moments ago;
-   * - very common names are skipped by the per-name ceiling in
-   *   `getResolutionEdgesByTargetName`, counted over the edges up to
-   *   `countedUpToEdgeId` when given (those before the sync's failed-ref retry).
    *
-   * Returns the number of references resurrected.
+   * Nothing is skipped for being common: every stamped edge to a name that
+   * gained or lost a definition is re-opened, read in bounded batches by
+   * `reopenResolutionEdgesByTargetName`, and the resolver (with its own
+   * ambiguity ceilings) decides what each now binds to. The pass is one
+   * transaction that yields to the event loop between batches, so a caller must
+   * await it, and must not hold a transaction of its own on the connection.
+   *
+   * Resolves to the number of references resurrected.
    */
-  resurrectStaleResolutionEdges(definitionDelta: string[], changedFilePaths: string[], countedUpToEdgeId?: number): number {
+  async resurrectStaleResolutionEdges(definitionDelta: string[], changedFilePaths: string[]): Promise<number> {
     if (definitionDelta.length === 0) return 0;
-    const alreadyFresh = new Set(changedFilePaths);
-    const candidates = this.queries.getResolutionEdgesByTargetName(definitionDelta, undefined, countedUpToEdgeId);
-
-    const edgeIds: number[] = [];
-    const refs: UnresolvedReference[] = [];
-    for (const e of candidates) {
-      if (alreadyFresh.has(e.sourceFilePath)) continue;
-      const ref = resurrectRefFromDroppedEdge(e);
-      if (!ref) continue; // no stamp — never delete what we cannot restore
-      edgeIds.push(e.edgeId);
-      refs.push(ref);
-    }
-    if (refs.length === 0) return 0;
-
-    // Delete first. The sweep re-inserts whichever edge resolution now picks,
-    // and `insertEdges` is INSERT OR IGNORE against idx_edges_identity — so a
-    // rebind to the same target is a clean no-op, but leaving the old row in
-    // place for a rebind ELSEWHERE would keep both, turning drift into
-    // duplication.
-    this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
-    return refs.length;
+    return this.queries.reopenResolutionEdgesByTargetName(definitionDelta, new Set(changedFilePaths));
   }
 
   /**
