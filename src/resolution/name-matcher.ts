@@ -10372,8 +10372,8 @@ function rustLibModule(crateDir: string, context: ResolutionContext): RustModule
  * `unix/mod.rs` or `windows.rs`) are all of them (rustCfgChoiceItems); null
  * when a `cfg_attr` sets the path, as for one with no file.
  */
-function rustSubmodule(m: RustModule, name: string, context: ResolutionContext, depth = 0): RustModule | null {
-  if (m.choices) return rustCfgChoice(m.choices.map((c) => rustSubmodule(c, name, context, depth)).filter((c) => c !== null));
+function rustSubmodule(m: RustModule, name: string, context: ResolutionContext, depth = 0, seen?: Set<string>): RustModule | null {
+  if (m.choices) return rustCfgChoice(m.choices.map((c) => rustSubmodule(c, name, context, depth, seen)).filter((c) => c !== null));
   const dir = rustJoin(m.dir, name);
   const layout = rustUsesOf(m.file, context);
   if (layout.pathMods.has(name)) {
@@ -10395,6 +10395,23 @@ function rustSubmodule(m: RustModule, name: string, context: ResolutionContext, 
     if (p.scope || rustBlockAt(layout.blocks, p.at) !== m.block) continue;
     const passed = rustWalkModules(p.segs, m, context, depth + 1);
     if (passed !== null && passed !== 'outside') return passed;
+  }
+  const key = `${m.file}\0${m.block?.open ?? -1}\0${name}`;
+  if (seen?.has(key)) return null;
+  const nextSeen = seen ?? new Set<string>();
+  nextSeen.add(key);
+  try {
+    for (const g of layout.globPaths) {
+      if (g.scope || rustBlockAt(layout.blocks, g.at) !== m.block) continue;
+      const passed = rustWalkModules(g.segs, m, context, depth + 1);
+      if (passed !== null && passed !== 'outside') {
+        const sub = rustSubmodule(passed, name, context, depth + 1, nextSeen);
+        if (sub !== null) return sub;
+      }
+    }
+  } finally {
+    if (!seen) nextSeen.clear();
+    else nextSeen.delete(key);
   }
   return null;
 }
