@@ -421,20 +421,4 @@ describe('the retry ceiling', () => {
     // The module ceiling still bounds the work.
     expect(queries.getRetryableFailedReferences(['module:fastapi'], 500, 599)).toHaveLength(0);
   });
-
-  it("leaves the edges a sync's retry just made out of the rebind's count, not out of the rebind", () => {
-    // Django: relinking every `from django.urls import path` must not stop a
-    // new definition of `path` from rebinding the calls it may now answer.
-    const queries = fixture();
-    queries.insertNode({ id: 'p', kind: 'variable', name: 'path', qualifiedName: 'path', filePath: 'conf.py',
-      language: 'python', startLine: 1, endLine: 1, startColumn: 0, endColumn: 0, updatedAt: 0 });
-    const edge = (line: number) => ({ source: 'f', target: 'p', kind: 'calls' as const, line, column: 0,
-      metadata: { refName: 'path', resolvedBy: 'exact-match', confidence: 0.7 } });
-    queries.insertEdges([edge(1)]);
-    const beforeRetry = queries.getMaxEdgeId();
-    queries.insertEdges(Array.from({ length: 600 }, (_, i) => edge(i + 2)));
-
-    expect(queries.getResolutionEdgesByTargetName(['path'])).toHaveLength(0);
-    expect(queries.getResolutionEdgesByTargetName(['path'], 500, beforeRetry)).toHaveLength(601);
-  });
 });

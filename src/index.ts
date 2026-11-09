@@ -1358,12 +1358,8 @@ export class CodeGraph {
 
         // Resolve references if files were updated
         const filesChanged = result.filesAdded > 0 || result.filesModified > 0;
-        // The last edge before the failed-ref retry below: the rebind's
-        // per-name ceiling counts only edges up to it (see
-        // resurrectStaleResolutionEdges).
-        let edgesBeforeRetry: number | undefined;
-        // And the last edge before this sync resolved anything: an importer's
-        // edge up to it was bound before a module this sync adds was there.
+        // Importer edges up to this id were bound before this sync resolved
+        // anything against the newly extracted graph.
         const edgesBeforeResolution = this.queries.getMaxEdgeId();
         if (filesChanged) {
           if (result.changedFilePaths) {
@@ -1408,7 +1404,6 @@ export class CodeGraph {
             // well as an added file. On a sync where no failed ref matches,
             // this is a few indexed lookups.
             const tRetry = Date.now();
-            edgesBeforeRetry = this.queries.getMaxEdgeId();
             const retryable = this.queries.getRetryableFailedReferences([...new Set([
               ...this.queries.getNodeNamesByFiles(result.changedFilePaths),
               ...result.changedFilePaths.flatMap(moduleReferenceKeys),
@@ -1623,10 +1618,9 @@ export class CodeGraph {
         // the failed-ref re-open that follows the rebind with it.
         if (result.definitionDelta && process.env.CODEGRAPH_NO_REBIND !== '1') {
           const tRebind = Date.now();
-          const rebound = this.orchestrator.resurrectStaleResolutionEdges(
+          const rebound = await this.orchestrator.resurrectStaleResolutionEdges(
             result.definitionDelta,
-            result.changedFilePaths ?? [],
-            edgesBeforeRetry
+            result.changedFilePaths ?? []
           );
           // And the failed refs under those names: a call that failed only
           // because two definitions shared its name (`x.go()` with `go` in two
@@ -1635,9 +1629,8 @@ export class CodeGraph {
           // deleted file or a name renamed away no longer has, and a sync that
           // only deletes files skips it. The sweep below resolves what this
           // re-opens.
-          const reopenedFailed = this.queries.reopenFailedReferences(
-            this.queries.getRetryableFailedReferences(result.definitionDelta).flatMap((ref) => (ref.rowId === undefined ? [] : [ref.rowId]))
-          );
+          const reopenedFailed = await this.queries.reopenFailedReferencesByName(result.definitionDelta);
+          await backpressure?.();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(
               `[phase-timing] sync-rebind: ${Date.now() - tRebind}ms (${result.definitionDelta.length} changed names, ${rebound} edges and ${reopenedFailed} failed refs re-opened)`
