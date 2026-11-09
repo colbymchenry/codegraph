@@ -123,6 +123,9 @@ const DEFAULT_CLIENT_SWEEP_MS = 30_000;
 /** How often the daemon checks that the install it runs from is still in place (#2335). */
 const DEFAULT_INSTALL_CHECK_MS = 30_000;
 
+/** How often the daemon checks that its project root is still present (#3245). */
+const DEFAULT_ROOT_CHECK_MS = 5_000;
+
 /**
  * Why the install this daemon was started from no longer matches it, or null
  * while it still does. An upgrade replaces or deletes the package directory
@@ -218,6 +221,7 @@ export class Daemon {
   private maxIdleTimer: NodeJS.Timeout | null = null;
   private clientSweepTimer: NodeJS.Timeout | null = null;
   private installCheckTimer: NodeJS.Timeout | null = null;
+  private rootCheckTimer: NodeJS.Timeout | null = null;
   private engine: MCPEngine;
   private stopping = false;
   private socketPath: string;
@@ -409,6 +413,10 @@ export class Daemon {
       clearInterval(this.installCheckTimer);
       this.installCheckTimer = null;
     }
+    if (this.rootCheckTimer) {
+      clearInterval(this.rootCheckTimer);
+      this.rootCheckTimer = null;
+    }
     process.stderr.write(`[CodeGraph daemon] Shutting down (${reason}; clients=${this.clients.size}).\n`);
     for (const session of [...this.clients]) {
       try { session.stop(); } catch { /* best-effort */ }
@@ -420,9 +428,12 @@ export class Daemon {
       await new Promise<void>((resolve) => this.server!.close(() => resolve()));
       this.server = null;
     }
-    await this.engine.stop();
-    this.cleanupLockfile();
-    deregisterDaemon(this.projectRoot);
+    try {
+      await this.engine.stop();
+    } finally {
+      this.cleanupLockfile();
+      deregisterDaemon(this.projectRoot);
+    }
     if (process.platform !== 'win32') {
       try { fs.unlinkSync(this.socketPath); } catch { /* may already be gone */ }
     }
@@ -535,6 +546,12 @@ export class Daemon {
       this.installCheckTimer = setInterval(() => { this.checkInstall(); }, installMs);
       this.installCheckTimer.unref?.();
     }
+    // Check that the project root is still present; exit if it disappeared.
+    const rootMs = resolveRootCheckMs();
+    if (rootMs > 0) {
+      this.rootCheckTimer = setInterval(() => { this.checkProjectRoot(); }, rootMs);
+      this.rootCheckTimer.unref?.();
+    }
   }
 
   /**
@@ -584,6 +601,21 @@ export class Daemon {
       return peers != null && peers.pid !== null && !peerIsDead(peers, isAlive);
     });
     return !anyProvablyAlive;
+  }
+
+  /**
+   * Public method to check if the project root exists. Exposed for testing; the
+   * timer passes the real check function.
+   */
+  checkProjectRoot(exists?: () => boolean): boolean {
+    if (this.stopping) return false;
+    const check = exists ?? (() => fs.existsSync(this.projectRoot) && fs.existsSync(path.join(this.projectRoot, '.codegraph')));
+    if (!check()) {
+      process.stderr.write(`[CodeGraph daemon] Project root deleted; stopping.\n`);
+      void this.stop('project root deleted');
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -932,6 +964,14 @@ function resolveInstallCheckMs(): number {
   if (raw === undefined || raw === '') return DEFAULT_INSTALL_CHECK_MS;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_INSTALL_CHECK_MS;
+  return Math.floor(parsed); // 0 disables the check
+}
+
+function resolveRootCheckMs(): number {
+  const raw = process.env.CODEGRAPH_DAEMON_ROOT_CHECK_MS;
+  if (raw === undefined || raw === '') return DEFAULT_ROOT_CHECK_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_ROOT_CHECK_MS;
   return Math.floor(parsed); // 0 disables the check
 }
 
