@@ -3090,6 +3090,310 @@ program
     }
   });
 
+const CLI_DIFF_ROWS_SHOWN = 15;
+
+/**
+ * codegraph diff <refA> <refB>
+ *
+ * Compare what two refs change relative to their merge-base, in graph terms,
+ * and list the places where merging them would leave the program broken even
+ * when git's textual merge is clean. Neither ref needs to be checked out.
+ * Exits 1 when there are semantic conflicts, so it works as a CI check.
+ */
+program
+  .command('diff [refA] [refB]')
+  .description('Compare two git refs as code graphs and find semantic merge conflicts (exits 1 when there are any)')
+  .option('-p, --path <path>', 'Project path (default: current directory)')
+  .option('-b, --base <ref>', 'Base to compare both refs against (default: their merge-base)')
+  .option('-s, --sweep <target>', 'Instead of two refs, check every local branch against <target> and rank them')
+  .option('--branches <glob>', 'With --sweep: only branches matching this glob (e.g. "feature/*")')
+  .option('--limit <n>', 'With --sweep: most branches to analyse, newest first (default 20)')
+  .option('-c, --cherry-pick <commit>', 'Check whether <commit> would still make sense applied to --onto')
+  .option('-r, --rebase <branch>', 'Replay <branch>\'s commits onto --onto and name the first one that would break')
+  .option('--onto <ref>', 'With --cherry-pick or --rebase: the branch or commit to apply to')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (
+    refA: string | undefined,
+    refB: string | undefined,
+    options: {
+      path?: string; base?: string; sweep?: string; branches?: string; limit?: string;
+      cherryPick?: string; rebase?: string; onto?: string; json?: boolean;
+    },
+  ) => {
+    const projectPath = resolveProjectPath(options.path);
+    try {
+      if (options.rebase) {
+        if (!options.onto) {
+          error('--rebase needs --onto <ref>');
+          process.exit(1);
+        }
+        const limit = options.limit === undefined ? undefined : Number.parseInt(options.limit, 10);
+        if (limit !== undefined && (!Number.isFinite(limit) || limit < 1)) {
+          error('--limit must be a positive number');
+          process.exit(1);
+        }
+        const { gitWorktreeRoot } = await import('../sync/worktree');
+        const { runRebase } = await import('../graph/rebase-run');
+        const { describeKey } = await import('../graph/graph-diff');
+        const repoRoot = gitWorktreeRoot(projectPath);
+        if (!repoRoot) {
+          error(`${projectPath} is not inside a git repository`);
+          process.exit(1);
+        }
+        const r = await runRebase(repoRoot, options.rebase, options.onto, {
+          limit,
+          onProgress: options.json ? undefined : (m) => console.error(chalk.dim(`  ${m}`)),
+        });
+        const broken = r.result?.firstBreaking ?? null;
+        const stepJson = (s: NonNullable<typeof r.result>['steps'][number]) => ({
+          commit: s.sha, subject: s.subject, verdict: s.verdict,
+          missing: s.analysis.missing.map((m) => ({ kind: m.kind, symbol: describeKey(m.key) })),
+          conflicts: s.analysis.conflicts.map((c) => ({ kind: c.kind, message: c.message })),
+        });
+        if (options.json) {
+          console.log(JSON.stringify({
+            branch: r.branch, onto: r.onto, base: r.baseSha, status: r.status,
+            textualConflict: r.textualConflict, replayed: r.replayed, notReplayed: r.notReplayed,
+            firstBreaking: broken ? broken.sha : null,
+            endConflicts: (r.result?.endConflicts ?? []).map((c) => ({ kind: c.kind, message: c.message })),
+            commits: (r.result?.steps ?? []).map(stepJson),
+          }, null, 2));
+        } else if (r.status === 'no-common-history') {
+          error(`${r.branch} and ${r.onto} share no history`);
+        } else if (r.status === 'nothing-to-rebase') {
+          console.log(`${r.branch} has nothing that ${r.onto} lacks`);
+        } else if (r.status === 'fast-forward') {
+          success(`${r.branch} already sits on ${r.onto}: the rebase moves nothing`);
+        } else {
+          console.log(chalk.bold(`\nRebasing ${r.branch} onto ${r.onto}: ${r.replayed} commit${r.replayed === 1 ? '' : 's'}\n`));
+          console.log(
+            `  Textual merge: ${r.textualConflict === null ? 'unknown (needs git 2.38+)' : r.textualConflict ? chalk.yellow('conflicts') : chalk.green('clean')}\n`,
+          );
+          for (const s of r.result!.steps) {
+            const mark = s.verdict === 'safe' ? chalk.green('ok   ') : chalk.red('FAILS');
+            console.log(`${mark} ${s.sha.slice(0, 8)} ${s.subject}`);
+            for (const m of s.analysis.missing.slice(0, 3)) console.log(chalk.dim(`        ${m.kind}: ${describeKey(m.key)}`));
+            for (const c of s.analysis.conflicts.slice(0, 3)) console.log(chalk.dim(`        ${c.kind}: ${c.message}`));
+          }
+          if (r.notReplayed > 0) console.log(chalk.dim(`\n${r.notReplayed} later commit(s) not replayed (raise --limit)`));
+          if (broken) {
+            console.log(chalk.bold(`\nFirst commit to break: ${broken.sha.slice(0, 8)} ${broken.subject}`));
+            console.log(
+              r.result!.endConflicts.length === 0
+                ? chalk.dim('The finished rebase has no conflicts, so a later commit repairs it: squash or reorder to avoid the broken step.')
+                : chalk.dim(`The finished rebase still has ${r.result!.endConflicts.length} conflict(s).`),
+            );
+          } else {
+            success('\nEvery commit replays cleanly');
+          }
+        }
+        if (r.status === 'breaks-at-commit' || r.status === 'no-common-history') process.exitCode = 1;
+        return;
+      }
+      if (options.cherryPick) {
+        if (!options.onto) {
+          error('--cherry-pick needs --onto <ref>');
+          process.exit(1);
+        }
+        const { gitWorktreeRoot } = await import('../sync/worktree');
+        const { runCherryPick } = await import('../graph/cherry-pick-run');
+        const { describeKey } = await import('../graph/graph-diff');
+        const repoRoot = gitWorktreeRoot(projectPath);
+        if (!repoRoot) {
+          error(`${projectPath} is not inside a git repository`);
+          process.exit(1);
+        }
+        const r = await runCherryPick(
+          repoRoot, options.cherryPick, options.onto,
+          options.json ? undefined : (m) => console.error(chalk.dim(`  ${m}`)),
+        );
+        const a = r.analysis;
+        if (options.json) {
+          console.log(JSON.stringify({
+            commit: r.commitSha, onto: r.ontoSha, verdict: r.verdict, textualConflict: r.textualConflict,
+            mergeCommit: r.mergeCommit,
+            change: {
+              added: a.change.added.length, removed: a.change.removed.length, changed: a.change.changed.length,
+            },
+            missing: a.missing.map((m) => ({ kind: m.kind, symbol: describeKey(m.key), usedBy: m.usedBy.map(describeKey) })),
+            prerequisites: r.prerequisites.map((p) => ({ symbol: describeKey(p.key), commits: p.commits })),
+            conflicts: a.conflicts.map((c) => ({ kind: c.kind, symbol: describeKey(c.key), message: c.message })),
+          }, null, 2));
+        } else {
+          console.log(chalk.bold(`\nCherry-picking ${r.commitSha.slice(0, 8)} onto ${r.onto} (${r.ontoSha.slice(0, 8)})\n`));
+          if (r.mergeCommit) console.log(chalk.yellow('  Merge commit: compared with its first parent'));
+          console.log(
+            `  The commit adds ${a.change.added.length}, removes ${a.change.removed.length}, changes ${a.change.changed.length} symbols`,
+          );
+          console.log(
+            `  Textual apply: ${r.textualConflict === null ? 'unknown (needs git 2.38+)' : r.textualConflict ? chalk.yellow('conflicts') : chalk.green('clean')}`,
+          );
+          if (a.missing.length > 0) {
+            console.log(chalk.bold(`\nMissing on ${r.onto}: ${a.missing.length}\n`));
+            for (const m of a.missing.slice(0, CLI_DIFF_ROWS_SHOWN)) {
+              const what = m.kind === 'absent' ? 'does not exist' : m.kind === 'contract-changed' ? 'has a different signature' : 'is edited by the commit but does not exist';
+              console.log(`${chalk.yellow(m.kind)}  ${describeKey(m.key)} ${what}`);
+              for (const u of m.usedBy.slice(0, 5)) console.log(chalk.dim(`    used by ${describeKey(u)}`));
+            }
+            for (const p of r.prerequisites.filter((p) => p.commits.length > 0)) {
+              console.log(chalk.bold(`\nTo bring in ${describeKey(p.key)}, pick first:`));
+              for (const c of p.commits.slice(0, 5)) console.log(`  ${c.sha.slice(0, 8)} ${c.subject}`);
+            }
+          }
+          for (const c of a.conflicts.slice(0, CLI_DIFF_ROWS_SHOWN)) console.log(`${chalk.yellow(c.kind)}  ${c.message}`);
+          if (r.verdict === 'safe') success('\nLooks safe to cherry-pick');
+        }
+        if (r.verdict !== 'safe') process.exitCode = 1;
+        return;
+      }
+      if (options.sweep) {
+        const { gitWorktreeRoot } = await import('../sync/worktree');
+        const { sweepBranches, summarizeConflict } = await import('../graph/sweep');
+        const repoRoot = gitWorktreeRoot(projectPath);
+        if (!repoRoot) {
+          error(`${projectPath} is not inside a git repository`);
+          process.exit(1);
+        }
+        const limit = options.limit === undefined ? undefined : Number.parseInt(options.limit, 10);
+        if (limit !== undefined && (!Number.isFinite(limit) || limit < 1)) {
+          error('--limit must be a positive number');
+          process.exit(1);
+        }
+        const result = await sweepBranches(repoRoot, options.sweep, {
+          branches: options.branches,
+          limit,
+          onProgress: options.json ? undefined : (m) => console.error(chalk.dim(`  ${m}`)),
+        });
+        const blocked = result.entries.filter((e) => e.status === 'semantic-conflict' || e.status === 'textual-conflict');
+        if (options.json) {
+          console.log(JSON.stringify({
+            target: result.target,
+            targetSha: result.targetSha,
+            skipped: result.skipped,
+            branches: result.entries.map((e) => ({
+              branch: e.branch, status: e.status, textualConflict: e.textualConflict,
+              added: e.added, removed: e.removed, changed: e.changed,
+              conflicts: e.conflicts.map(summarizeConflict),
+            })),
+          }, null, 2));
+        } else if (result.entries.length === 0) {
+          console.log(`No other branches to compare with ${result.target}`);
+        } else {
+          console.log(chalk.bold(`\nBranches vs ${result.target} (${result.targetSha.slice(0, 8)})\n`));
+          const paint: Record<string, (s: string) => string> = {
+            'semantic-conflict': chalk.red, 'textual-conflict': chalk.yellow,
+            'no-common-history': chalk.yellow, clean: chalk.green, 'up-to-date': chalk.dim,
+          };
+          for (const e of result.entries) {
+            console.log(
+              `${(paint[e.status] ?? ((s: string) => s))(e.status.padEnd(18))} ${e.branch}` +
+                chalk.dim(`  +${e.added} -${e.removed} ~${e.changed}`),
+            );
+            for (const c of e.conflicts.slice(0, 3)) console.log(chalk.dim(`    ${summarizeConflict(c)}`));
+            if (e.conflicts.length > 3) console.log(chalk.dim(`    ... and ${e.conflicts.length - 3} more`));
+          }
+          if (result.skipped.length > 0) {
+            console.log(chalk.dim(`\n${result.skipped.length} older branch(es) not analysed (raise --limit)`));
+          }
+        }
+        if (blocked.length > 0) process.exitCode = 1;
+        return;
+      }
+      if (!refA || !refB) {
+        error('Give two refs (codegraph diff <refA> <refB>) or use --sweep <target>');
+        process.exit(1);
+      }
+      const { gitWorktreeRoot } = await import('../sync/worktree');
+      const { resolveRef, mergeBase, isShallowRepo, textualMergeConflicts } = await import('../sync/git-refs');
+      const { snapshotOfCommit } = await import('../graph/ref-graph');
+      const { analyzeMerge } = await import('../graph/merge-conflicts');
+      const { describeKey } = await import('../graph/graph-diff');
+
+      const repoRoot = gitWorktreeRoot(projectPath);
+      if (!repoRoot) {
+        error(`${projectPath} is not inside a git repository`);
+        process.exit(1);
+      }
+      const shaA = resolveRef(repoRoot, refA);
+      const shaB = resolveRef(repoRoot, refB);
+      if (!shaA || !shaB) {
+        error(`Cannot resolve ${!shaA ? refA : refB} to a commit${isShallowRepo(repoRoot) ? ' (shallow clone: try `git fetch --unshallow`)' : ''}`);
+        process.exit(1);
+      }
+      const shaBase = options.base ? resolveRef(repoRoot, options.base) : mergeBase(repoRoot, shaA, shaB);
+      if (!shaBase) {
+        error(
+          options.base
+            ? `Cannot resolve base ${options.base} to a commit`
+            : `${refA} and ${refB} share no history${isShallowRepo(repoRoot) ? ' in this shallow clone (try `git fetch --unshallow`)' : ''}; pass --base <ref>`,
+        );
+        process.exit(1);
+      }
+
+      const progress = options.json ? undefined : (m: string) => console.error(chalk.dim(`  ${m}`));
+      const base = await snapshotOfCommit(repoRoot, shaBase, progress);
+      const a = await snapshotOfCommit(repoRoot, shaA, progress);
+      const b = await snapshotOfCommit(repoRoot, shaB, progress);
+      const analysis = analyzeMerge(base, a, b);
+      const textual = textualMergeConflicts(repoRoot, shaA, shaB);
+
+      if (options.json) {
+        const sideJson = (d: typeof analysis.a) => ({
+          added: d.added.map((n) => describeKey(n.key)),
+          removed: d.removed.map((n) => describeKey(n.key)),
+          changed: d.changed.map((c) => ({ symbol: describeKey(c.key), fields: c.fields })),
+          moved: d.movedCount,
+          edgesAdded: d.edgesAdded.length,
+          edgesRemoved: d.edgesRemoved.length,
+        });
+        console.log(
+          JSON.stringify(
+            {
+              refA, refB, base: shaBase, textualConflict: textual,
+              a: sideJson(analysis.a),
+              b: sideJson(analysis.b),
+              conflicts: analysis.conflicts.map((c) => ({
+                kind: c.kind, symbol: describeKey(c.key), side: c.side, message: c.message,
+                dependents: c.dependents.map(describeKey),
+              })),
+            },
+            null,
+            2,
+          ),
+        );
+      } else {
+        const side = (label: string, d: typeof analysis.a) =>
+          console.log(
+            `  ${chalk.cyan(label)}: ${d.added.length} added, ${d.removed.length} removed, ` +
+              `${d.changed.length} changed, ${d.movedCount} moved, ${d.edgesAdded.length}+/${d.edgesRemoved.length}- dependencies`,
+          );
+        console.log(chalk.bold(`\nComparing ${refA} and ${refB} against ${shaBase.slice(0, 8)}\n`));
+        side(refA, analysis.a);
+        side(refB, analysis.b);
+        console.log(
+          `  Textual merge: ${textual === null ? 'unknown (needs git 2.38+)' : textual ? chalk.yellow('conflicts') : chalk.green('clean')}`,
+        );
+        if (analysis.conflicts.length === 0) {
+          success('\nNo semantic conflicts found');
+        } else {
+          console.log(chalk.bold(`\nSemantic conflicts: ${analysis.conflicts.length}\n`));
+          for (const c of analysis.conflicts.slice(0, CLI_DIFF_ROWS_SHOWN)) {
+            console.log(`${chalk.yellow(c.kind)}  ${c.message}`);
+            for (const dep of c.dependents.slice(0, 5)) console.log(chalk.dim(`    used by ${describeKey(dep)}`));
+          }
+          if (analysis.conflicts.length > CLI_DIFF_ROWS_SHOWN) {
+            console.log(chalk.dim(`... and ${analysis.conflicts.length - CLI_DIFF_ROWS_SHOWN} more (--json lists them all)`));
+          }
+        }
+      }
+      // exitCode, not exit(): a piped --json has to reach its reader whole.
+      if (analysis.conflicts.length > 0) process.exitCode = 1;
+    } catch (err) {
+      error(`diff failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
 /**
  * codegraph install
  */
