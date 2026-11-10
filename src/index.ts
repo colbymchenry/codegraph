@@ -3177,6 +3177,25 @@ export class CodeGraph {
   }
 
   /**
+   * Every node and the edges between them, for comparing this graph with
+   * another (`codegraph diff`). Read-only; large on a big project.
+   */
+  getGraphContents(): { nodes: Node[]; edges: Edge[] } {
+    // By file, not `getAllNodes()`: that streams with `iterate()`, which
+    // node:sqlite only has from Node 22.13, and a compare must run on 22.5+.
+    const nodes: Node[] = [];
+    const files = this.queries.getAllFiles().map((f) => f.path);
+    for (let i = 0; i < files.length; i += 200) nodes.push(...this.queries.getNodesByFiles(files.slice(i, i + 200)));
+    const edges: Edge[] = [];
+    const CHUNK = 400;
+    for (let i = 0; i < nodes.length; i += CHUNK) {
+      const ids = nodes.slice(i, i + CHUNK).map((n) => n.id);
+      edges.push(...this.queries.getOutgoingEdgesFrom(ids));
+    }
+    return { nodes, edges };
+  }
+
+  /**
    * Find unreferenced symbols — the RAW candidate set.
    *
    * Non-exported symbols of the given kinds with no incoming edge but
