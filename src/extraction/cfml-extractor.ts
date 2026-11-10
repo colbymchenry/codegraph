@@ -434,6 +434,9 @@ export class CfmlExtractor {
           const condition = this.tagAttrValueNode(this.cfStartTag(node) ?? node, 'condition');
           if (condition) this.addTagExpression(condition, containerId);
         }
+        // `<cfinvoke component="a.b.Svc" method="run">`. Its attributes are
+        // still walked below for `#hash#` expressions, and its body for nested tags.
+        if (name === 'invoke') this.extractInvokeTag(node, containerId);
         break;
       }
       default:
@@ -758,6 +761,70 @@ export class CfmlExtractor {
       this.unresolvedReferences.push(ref);
     }
     this.addBlockErrors(result.errors, queryTag, 'cfquery', startLine);
+  }
+
+  /**
+   * `<cfinvoke component="a.b.Svc" method="run">` calls `run` on a fresh
+   * instance of the component, as `createObject("component", "a.b.Svc").run()`
+   * does, so it is encoded the same way: `a.b.Svc().run`, which the resolver
+   * links to that component's method or one it inherits, and to nothing else.
+   * Without `component`, `<cfinvoke method="run">` calls the component's own
+   * `run`, as a bare `run()` does.
+   *
+   * A component path that starts with a runtime prefix and ends in a literal
+   * one, `component="#application.cfcRoot#.translations"` — the usual way an
+   * app finds its components under a mapping it reads at startup — is the
+   * component the literal part names (`translations`), found as a bare name
+   * is. A component that is a variable (`component="#oSvc#"`), a method name
+   * built at runtime, or a web service call names nothing the index can link.
+   */
+  private extractInvokeTag(tag: SyntaxNode, scopeId: string): void {
+    const start = this.cfStartTag(tag) ?? tag;
+    if (this.tagAttrValueNode(start, 'webservice') !== undefined) return;
+    const methodNode = this.tagAttrValueNode(start, 'method', true);
+    const method = methodNode ? this.source.substring(methodNode.startIndex, methodNode.endIndex).trim() : '';
+    if (!/^[A-Za-z_$][\w$]*$/.test(method)) return;
+
+    let referenceName = method;
+    if (this.tagAttrValueNode(start, 'component') !== undefined) {
+      const component = this.invokeComponentPath(start);
+      if (!component) return;
+      referenceName = `${component}().${method}`;
+    }
+    this.unresolvedReferences.push({
+      fromNodeId: scopeId,
+      referenceName,
+      referenceKind: 'calls',
+      filePath: this.filePath,
+      line: tag.startPosition.row + 1,
+      column: tag.startPosition.column,
+      language: this.language,
+    });
+  }
+
+  /**
+   * The component path a `<cfinvoke component="…">` names: the whole value when
+   * it is plain text (`a.b.Svc`), or the literal part after a runtime prefix
+   * (`#root#.a.Svc` → `a.Svc`). Undefined for anything else.
+   */
+  private invokeComponentPath(start: SyntaxNode): string | undefined {
+    const whole = this.tagAttrValueNode(start, 'component', true);
+    let path: string;
+    if (whole) {
+      path = this.source.substring(whole.startIndex, whole.endIndex).trim();
+    } else {
+      // `#prefix#.a.Svc`: one or more `#hash#` parts, then one literal part that starts with a dot.
+      const parts = this.tagAttrValueNode(start, 'component')?.parent?.namedChildren ?? [];
+      const last = parts[parts.length - 1];
+      if (
+        !last || last.type !== 'attribute_value' || parts.length < 2 ||
+        !parts.slice(0, -1).every((p: SyntaxNode) => p.type === 'hash_expression')
+      ) return undefined;
+      const tail = this.source.substring(last.startIndex, last.endIndex).trim();
+      if (!tail.startsWith('.')) return undefined;
+      path = tail.slice(1);
+    }
+    return /^[A-Za-z_$][\w$-]*(?:\.[A-Za-z_$][\w$-]*)*$/.test(path) ? path : undefined;
   }
 
   /** Read a `cf_attribute`'s value by name from a tag node's direct `cf_attribute`/`cf_tag_attributes` children. */
