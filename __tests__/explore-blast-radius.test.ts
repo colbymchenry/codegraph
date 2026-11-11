@@ -155,3 +155,85 @@ describe('codegraph_explore — views in the blast radius', () => {
     expect(res.content[0]!.text).toMatch(/1 caller in 1 view: `Views\/Solo\.cshtml`/);
   });
 });
+
+describe('codegraph_explore — Rust unit tests in the blast radius (#3265)', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-blast-rust-'));
+    const src = path.join(testDir, 'src');
+    fs.mkdirSync(path.join(src, 'store'), { recursive: true });
+    fs.writeFileSync(path.join(testDir, 'Cargo.toml'), '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n');
+    fs.writeFileSync(path.join(src, 'lib.rs'), 'pub mod store;\npub mod api;\n');
+    fs.writeFileSync(
+      path.join(src, 'store.rs'),
+      'pub fn create_note() -> u32 { 1 }\n' +
+      'pub fn inline_target() -> u32 { 2 }\n' +
+      'pub fn prod_only_target() -> u32 { 3 }\n' +
+      'pub fn not_test_target() -> u32 { 4 }\n' +
+      '\n' +
+      '#[cfg(test)]\n' +
+      'mod tests;\n' +
+      '\n' +
+      '#[cfg(test)]\n' +
+      'mod inline_tests {\n' +
+      '    use super::*;\n' +
+      '    #[test]\n' +
+      '    fn checks_inline() { let n = inline_target(); assert_eq!(n, 2); }\n' +
+      '}\n' +
+      '\n' +
+      '#[cfg(not(test))]\n' +
+      'mod real {\n' +
+      '    use super::*;\n' +
+      '    pub fn uses_not_test() -> u32 { not_test_target() }\n' +
+      '}\n',
+    );
+    // The out-of-line layout: `src/store/tests.rs`, declared by `#[cfg(test)] mod tests;`.
+    fs.writeFileSync(
+      path.join(src, 'store', 'tests.rs'),
+      'use super::*;\n' +
+      '#[test]\n' +
+      'fn checks_create_note() { let n = create_note(); assert_eq!(n, 1); }\n',
+    );
+    fs.writeFileSync(
+      path.join(src, 'api.rs'),
+      'use crate::store::{create_note, prod_only_target};\n' +
+      'pub fn handler() -> u32 { create_note() + prod_only_target() }\n',
+    );
+    cg = CodeGraph.initSync(testDir);
+    await cg.indexAll();
+  });
+
+  afterEach(() => {
+    if (cg) cg.destroy();
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  const lineFor = async (name: string): Promise<string> => {
+    const res = await new ToolHandler(cg).execute('codegraph_explore', { query: name });
+    const text = res.content[0]!.text as string;
+    return text.split('\n').find((l) => l.startsWith(`- \`${name}\``)) ?? '';
+  };
+
+  it('counts a tests.rs file a #[cfg(test)] mod declares as a test', async () => {
+    const line = await lineFor('create_note');
+    expect(line).toMatch(/in `src\/api\.rs`/);
+    expect(line).toMatch(/tests: `src\/store\/tests\.rs`/);
+  });
+
+  it('counts a caller inside an inline #[cfg(test)] module as a test', async () => {
+    const line = await lineFor('inline_target');
+    expect(line).toMatch(/tests: `src\/store\.rs`/);
+    expect(line).not.toMatch(/no tests found/);
+  });
+
+  it('keeps production callers and #[cfg(not(test))] modules out of the tests', async () => {
+    const prod = await lineFor('prod_only_target');
+    expect(prod).toMatch(/in `src\/api\.rs`/);
+    expect(prod).not.toMatch(/tests:/);
+    const notTest = await lineFor('not_test_target');
+    expect(notTest).toMatch(/in `src\/store\.rs`/);
+    expect(notTest).not.toMatch(/tests:/);
+  });
+});
