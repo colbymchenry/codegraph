@@ -56,6 +56,7 @@ import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, C
 import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
+import { isTestCode, type SourceReader } from '../graph/test-code';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
 import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
 import { DEFAULT_IMPACT_MAX_EDGES, DEFAULT_IMPACT_MAX_NODES, type CallSiteRow } from '../graph/traversal';
@@ -4161,6 +4162,33 @@ export class ToolHandler {
   }
 
   /**
+   * Whether a caller is test code, for one blast-radius section. A Rust unit
+   * test is told by its file's source (an inline `#[cfg(test)]` module, or the
+   * parent's `#[cfg(test)] mod tests;`), so each file is read once.
+   */
+  private testCodeReading(cg: CodeGraph): (node: Node) => boolean {
+    const root = cg.getProjectRoot();
+    const sources = new Map<string, string | undefined>();
+    const readSource: SourceReader = (filePath) => {
+      if (!sources.has(filePath)) {
+        let text: string | undefined;
+        try {
+          const abs = validatePathWithinRoot(root, filePath);
+          text = abs === null ? undefined : readFileSync(abs, 'utf-8');
+        } catch { /* unreadable → not known to be test code */ }
+        sources.set(filePath, text);
+      }
+      return sources.get(filePath);
+    };
+    const verdicts = new Map<string, boolean>();
+    return (node) => {
+      let v = verdicts.get(node.id);
+      if (v === undefined) verdicts.set(node.id, (v = isTestCode(node, readSource)));
+      return v;
+    };
+  }
+
+  /**
    * Compact "blast radius" for the entry symbols of an explore result: who
    * depends on each (callers) and which test files cover it — LOCATIONS ONLY,
    * no source, so the agent knows what to update / re-verify before editing
@@ -4187,6 +4215,7 @@ export class ToolHandler {
       'enum', 'type_alias', 'component', 'constant', 'variable', 'property', 'field',
     ]);
     const rel = (p: string) => p.replace(/\\/g, '/');
+    const isTest = this.testCodeReading(cg);
 
     const roots = [...new Set([...leadingIds, ...subgraph.roots])]
       .map((id) => subgraph.nodes.get(id))
@@ -4206,9 +4235,10 @@ export class ToolHandler {
       }
       if (uniq.length === 0) continue; // no blast radius → nothing to flag
 
-      const callerFiles = [...new Set(uniq.map((n) => rel(n.filePath)))];
-      const testFiles = callerFiles.filter((f) => isTestFile(f));
-      const nonTest = callerFiles.filter((f) => !isTestFile(f));
+      // By caller, not by file: a Rust file holds its `#[cfg(test)] mod tests`
+      // next to the production code it tests.
+      const testFiles = [...new Set(uniq.filter(isTest).map((n) => rel(n.filePath)))];
+      const nonTest = [...new Set(uniq.filter((n) => !isTest(n)).map((n) => rel(n.filePath)))];
 
       // A view depends on a helper across a layer, and is easily outnumbered by
       // same-language callers: one flat cap showed none of a helper's 22 views
@@ -4223,7 +4253,7 @@ export class ToolHandler {
       const where = (codeFiles.length > 0 ? ` in ${shown}${more}` : '') + views;
       const tests = testFiles.length > 0
         ? `; tests: ${testFiles.slice(0, FILE_CAP).map((f) => `\`${f}\``).join(', ')}${testFiles.length > FILE_CAP ? ` +${testFiles.length - FILE_CAP}` : ''}`
-        : this.indirectTestNote(cg, uniq, rel);
+        : this.indirectTestNote(cg, uniq, rel, isTest);
 
       entries.push(
         `- \`${root.name}\` (${rel(root.filePath)}:${root.startLine}) — ${uniq.length} caller${uniq.length === 1 ? '' : 's'}${where}${tests}`,
@@ -4286,7 +4316,7 @@ export class ToolHandler {
    * symbols had a test within 2-3 hops), so walk up to 2 more hops before
    * claiming anything — and even then claim only what was measured.
    */
-  private indirectTestNote(cg: CodeGraph, directCallers: Node[], rel: (p: string) => string): string {
+  private indirectTestNote(cg: CodeGraph, directCallers: Node[], rel: (p: string) => string, isTest: (n: Node) => boolean): string {
     const MAX_HOPS = 3; // direct callers are hop 1
     const BUDGET = 64;  // getCallers lookups per entry — bounds god-fan-in symbols
     const FILE_CAP = 2;
@@ -4304,8 +4334,7 @@ export class ToolHandler {
           const n = c?.node;
           if (!n || visited.has(n.id)) continue;
           visited.add(n.id);
-          const f = rel(n.filePath);
-          if (isTestFile(f)) found.add(f);
+          if (isTest(n)) found.add(rel(n.filePath));
           else next.push(n);
         }
       }

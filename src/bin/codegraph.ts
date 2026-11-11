@@ -2850,7 +2850,7 @@ program
             relation: e.relation,
             depth: e.depth,
             via: e.depth > 1 ? nameOf.get(e.parentId) : undefined,
-            test: isTestCode(e.node, e.node.language === 'rust' ? sourceOf(e.node.filePath) : undefined),
+            test: isTestCode(e.node, sourceOf),
             synthesized: e.synthesized,
           }));
           return { group, implementations, directSubtypes: hierarchy?.directSubtypes ?? 0, bounded: hierarchy?.bounded ?? false };
