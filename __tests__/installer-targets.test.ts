@@ -2187,6 +2187,48 @@ describe('Installer — refreshTargets sweep (codegraph install --refresh)', () 
       expect(r.changedPaths).toEqual([]);
     }
   });
+
+  // `codegraph upgrade` runs the sweep in the terminal's directory, which in
+  // a fresh terminal is the home directory. There a target's project-local
+  // file is its user-wide one, so the local sweep took each global install
+  // for a local one and rewrote it as a project's.
+  it('a local sweep from the home directory leaves every global install as it was (#3234)', () => {
+    for (const t of ALL_TARGETS) {
+      if (t.supportsLocation('global')) t.install('global', { autoAllow: true });
+    }
+    const readTree = (dir: string): Record<string, string> => {
+      const files: Record<string, string> = {};
+      for (const entry of fs.readdirSync(dir, { recursive: true, withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        const full = path.join(entry.parentPath, entry.name);
+        files[path.relative(dir, full)] = fs.readFileSync(full, 'utf-8');
+      }
+      return files;
+    };
+    const before = readTree(tmpHome);
+    process.chdir(tmpHome);
+
+    for (const r of refreshTargets(ALL_TARGETS, 'local')) {
+      expect(['not-configured', 'unsupported']).toContain(r.status);
+      expect(r.changedPaths).toEqual([]);
+    }
+    expect(readTree(tmpHome)).toEqual(before);
+    expect(fs.existsSync(path.join(tmpHome, 'AGENTS.md'))).toBe(false);
+    const cursor = JSON.parse(fs.readFileSync(path.join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursor.mcpServers.codegraph.args).toEqual(['serve', '--mcp', '--path', '${workspaceFolder}']);
+  });
+
+  it('a local sweep in a project still refreshes what a local install wrote', () => {
+    const codex = getTarget('codex')!;
+    codex.install('local', { autoAllow: false });
+    const agentsMd = path.join(process.cwd(), 'AGENTS.md');
+    fs.writeFileSync(agentsMd, LEGACY_BLOCK + '\n');
+
+    const report = refreshTargets([codex], 'local')[0]!;
+    expect(report.status).toBe('refreshed');
+    expect(report.changedPaths).toContain(agentsMd);
+    expect(fs.readFileSync(agentsMd, 'utf-8')).not.toContain('codegraph_search');
+  });
 });
 
 // ---------------------------------------------------------------------------
