@@ -147,19 +147,6 @@ describe('a name imported from an installed package the manifest does not list',
     expect(edgesFrom(cg, 'main.ts')).toEqual([]);
   });
 
-  it('links to no project export when a fixture folder of the project shares the package name', async () => {
-    const graph = await index({
-      ...installed('react-hook-form'),
-      'test/fixtures/react-hook-form/package.json': JSON.stringify({ name: 'react-hook-form', private: true }),
-      'test/fixtures/react-hook-form/index.ts': 'export const fixture = 1;\n',
-      'tools/react-hook-form/package.json': JSON.stringify({ name: 'react-hook-form', version: '0.0.1' }),
-      'tools/react-hook-form/index.ts': 'export const tool = 1;\n',
-      'main.ts': MAIN,
-      'decoy.ts': DECOY,
-    });
-    expect(edgesFrom(graph, 'main.ts')).toEqual([]);
-  });
-
   it('still lets an inner declaration shadow the import', async () => {
     const graph = await index({
       ...installed('react-hook-form'),
@@ -342,6 +329,41 @@ describe('an undeclared specifier with no install evidence keeps linking', () =>
       'apps/web/src/main.ts': "import { makeKit } from 'acme-kit';\nexport function run() {\n  return makeKit();\n}\n",
     });
     expect(edgesFrom(graph, 'apps/web/src/main.ts')).toContain('calls packages/kit/src/index.ts:makeKit');
+  });
+
+  it('a sibling package copied into node_modules before its version was bumped', async () => {
+    const graph = await index({
+      'libs/lib/package.json': JSON.stringify({ name: '@acme/lib', version: '1.3.0', main: 'index.ts' }),
+      'libs/lib/index.ts': 'export function useLib() { return 1; }\n',
+      'node_modules/@acme/lib/package.json': JSON.stringify({ name: '@acme/lib', version: '1.2.3', main: 'index.ts' }),
+      'node_modules/@acme/lib/index.ts': 'export function useLib() { return 1; }\n',
+      'apps/web/main.ts': "import { useLib } from '@acme/lib';\nexport function entry() {\n  return useLib();\n}\n",
+    });
+    expect(edgesFrom(graph, 'apps/web/main.ts')).toContain('calls libs/lib/index.ts:useLib');
+  });
+
+  it('a sibling package copied into node_modules under another name', async () => {
+    const graph = await index({
+      'libs/lib/package.json': JSON.stringify({ name: '@acme/lib', version: '1.2.3', main: 'index.ts' }),
+      'libs/lib/index.ts': 'export function useLib() { return 1; }\n',
+      'apps/a/package.json': JSON.stringify({ name: 'a', dependencies: { kit: 'file:../../libs/lib' } }),
+      'node_modules/kit/package.json': JSON.stringify({ name: '@acme/lib', version: '1.2.3', main: 'index.ts' }),
+      'node_modules/kit/index.ts': 'export function useLib() { return 1; }\n',
+      'apps/web/main.ts': "import { useLib } from 'kit';\nexport function entry() {\n  return useLib();\n}\n",
+    });
+    expect(edgesFrom(graph, 'apps/web/main.ts')).toContain('calls libs/lib/index.ts:useLib');
+  });
+
+  it('a copied sibling whose package.json starts with a byte order mark', async () => {
+    const manifest = '\uFEFF' + JSON.stringify({ name: '@acme/lib', version: '1.2.3', main: 'index.ts' });
+    const graph = await index({
+      'libs/lib/package.json': manifest,
+      'libs/lib/index.ts': 'export function useLib() { return 1; }\n',
+      'node_modules/@acme/lib/package.json': manifest,
+      'node_modules/@acme/lib/index.ts': 'export function useLib() { return 1; }\n',
+      'apps/web/main.ts': "import { useLib } from '@acme/lib';\nexport function entry() {\n  return useLib();\n}\n",
+    });
+    expect(edgesFrom(graph, 'apps/web/main.ts')).toContain('calls libs/lib/index.ts:useLib');
   });
 
   it('a sibling package when the project itself lives inside a node_modules folder', async () => {

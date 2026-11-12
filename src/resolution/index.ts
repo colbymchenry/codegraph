@@ -320,6 +320,16 @@ function moduleConfigDigest(abs: string, projectRoot: string): string {
   return createHash('sha256').update(read).digest('hex').slice(0, 16);
 }
 
+/** The `name` a package.json gives, read past a byte order mark; null when it gives none or can't be read. */
+function readPackageName(abs: string): string | null {
+  try {
+    const json = JSON.parse(fs.readFileSync(abs, 'utf-8').replace(/^\uFEFF/, '')) as { name?: unknown } | null;
+    return json && typeof json === 'object' && typeof json.name === 'string' ? json.name : null;
+  } catch {
+    return null;
+  }
+}
+
 function cargoManifestDigestText(abs: string): string {
   try {
     return cargoManifestFields(fs.readFileSync(abs, 'utf-8'));
@@ -749,8 +759,8 @@ export class ReferenceResolver {
     this.directoryListings.clear();
     this.searchedModules.clear();
     this.realModulesDirs.clear();
-    this.ownPackageVersions = null;
-    this.projectPackageCopies.clear();
+    this.ownPackageNames = null;
+    this.installedNames.clear();
     this.knownNames = null;
     this.knownLowerNames = null;
     this.knownFiles = null;
@@ -4678,10 +4688,10 @@ export class ReferenceResolver {
   private searchedModules = new Map<string, string[]>();
   /** Per `node_modules` folder: its real path. */
   private realModulesDirs = new Map<string, string>();
-  /** Per package name: the versions the project's own manifests give it (see isProjectPackageCopy). */
-  private ownPackageVersions: Map<string, Set<string>> | null = null;
-  /** isProjectPackageCopy's answers, by `node_modules` folder and package name. */
-  private projectPackageCopies = new Map<string, boolean>();
+  /** The package names the project's own manifests give (see projectPackageNames). */
+  private ownPackageNames: Set<string> | null = null;
+  /** The name an installed package's own package.json gives, by `node_modules` folder and import name ('' for none). */
+  private installedNames = new Map<string, string>();
 
   /**
    * Is `source` a package from outside the repository? Only when the importing
@@ -4712,7 +4722,7 @@ export class ReferenceResolver {
    * doesn't read (a bundler's `ui`, an import map's `helpers`) has no such
    * folder, so it keeps the project's. So does a package of the project's
    * own: one a `node_modules` entry links to (see isRegistryCopy), or a copy
-   * of one (see isProjectPackageCopy). Only a valid npm package name
+   * of one (see projectPackageNames). Only a valid npm package name
    * qualifies, so `$lib/…`, `~/…`, `@/…` and `#…` keep the project's.
    */
   private isInstalledPackage(source: string, fromFile: string): boolean {
@@ -4726,6 +4736,7 @@ export class ReferenceResolver {
     const scope = this.manifestScope(fromDir);
     if (scope.own.has(name) || this.context.getWorkspacePackages?.()?.byName.has(name)) return false;
     for (const modules of this.modulesSearchedFrom(fromDir)) {
+      // Not there at all: no answer to keep for it.
       if (this.listing(modules) === null) continue;
       const copy = this.isRegistryCopy(modules, name);
       if (copy !== undefined) return copy && !this.isProjectPackageCopy(modules, name);
@@ -4734,50 +4745,65 @@ export class ReferenceResolver {
   }
 
   /**
+   * The names of the project's own packages: the `name` of every package.json
+   * at or above a directory the index holds files in, and every dependency
+   * one of them takes from the project (`workspace:`, `file:`, `link:`,
+   * `portal:`, which can install it under another name). An installed copy of
+   * one stays the project's: an install that copies a sibling instead of
+   * linking it (yarn's `file:`, npm's install-links), or a project that lives
+   * inside a `node_modules` folder. Read only when a name would otherwise
+   * count as installed.
+   */
+  /**
    * Is the package `name` installed in `modules` a copy of one of the
-   * project's own packages? It is when a package.json of the project, at or
-   * above a directory the index holds files in, gives the same name and
-   * version: an install that copies a sibling instead of linking it (yarn's
-   * `file:`, npm's install-links), or a project that lives inside a
-   * `node_modules` folder. A fixture or tool folder that only shares the name
-   * gives a different version, or none, so the registry copy stays the
-   * package's.
+   * project's own packages? It is when a project manifest names it (see
+   * projectPackageNames), under the name it is imported by or under the name
+   * its own package.json gives, which differs when an install put it under
+   * another name (`"kit": "file:../libs/lib"`).
    */
   private isProjectPackageCopy(modules: string, name: string): boolean {
+    const own = this.projectPackageNames();
+    if (own.has(name)) return true;
     const key = modules + '\0' + name;
-    const memo = this.projectPackageCopies.get(key);
-    if (memo !== undefined) return memo;
-    let version = '';
-    try {
-      const json = JSON.parse(fs.readFileSync(path.join(modules, name, 'package.json'), 'utf-8')) as { version?: unknown } | null;
-      if (json && typeof json.version === 'string') version = json.version;
-    } catch { /* no readable package.json: compared as having no version */ }
-    if (!this.ownPackageVersions) {
-      // Read only when a name would otherwise count as installed.
-      const versions = new Map<string, Set<string>>();
-      const dirs = new Set<string>();
-      for (const file of this.knownFiles ?? this.queries.getAllFilePaths()) {
-        let dir = file.replace(/\\/g, '/');
-        do {
-          dir = dir.includes('/') ? dir.slice(0, dir.lastIndexOf('/')) : '';
-          if (dirs.has(dir)) break;
-          dirs.add(dir);
-        } while (dir !== '');
-      }
-      for (const dir of dirs) {
-        try {
-          const json = JSON.parse(this.context.readFile(dir ? `${dir}/package.json` : 'package.json') ?? 'null') as { name?: unknown; version?: unknown } | null;
-          if (!json || typeof json !== 'object' || typeof json.name !== 'string') continue;
-          const own = versions.get(json.name) ?? new Set<string>();
-          own.add(typeof json.version === 'string' ? json.version : '');
-          versions.set(json.name, own);
-        } catch { /* no or unreadable package.json */ }
-      }
-      this.ownPackageVersions = versions;
+    let installedAs = this.installedNames.get(key);
+    if (installedAs === undefined) {
+      installedAs = readPackageName(path.join(modules, name, 'package.json')) ?? '';
+      this.installedNames.set(key, installedAs);
     }
-    const copy = this.ownPackageVersions.get(name)?.has(version) === true;
-    this.projectPackageCopies.set(key, copy);
-    return copy;
+    return installedAs !== '' && own.has(installedAs);
+  }
+
+  private projectPackageNames(): Set<string> {
+    if (this.ownPackageNames) return this.ownPackageNames;
+    const names = new Set<string>();
+    const dirs = new Set<string>();
+    for (const file of this.knownFiles ?? this.queries.getAllFilePaths()) {
+      let dir = file.replace(/\\/g, '/');
+      do {
+        dir = dir.includes('/') ? dir.slice(0, dir.lastIndexOf('/')) : '';
+        if (dirs.has(dir)) break;
+        dirs.add(dir);
+      } while (dir !== '');
+    }
+    for (const dir of dirs) {
+      let json: Record<string, unknown> | null = null;
+      try {
+        // Read directly: a sweep of every directory would push source text out of the read cache.
+        const raw = fs.readFileSync(path.join(this.projectRoot, dir, 'package.json'), 'utf-8');
+        json = JSON.parse(raw.replace(/^\uFEFF/, '')) as Record<string, unknown> | null;
+      } catch { /* no or unreadable package.json */ }
+      if (!json || typeof json !== 'object') continue;
+      if (typeof json.name === 'string') names.add(json.name);
+      for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+        const deps = json[field];
+        if (!deps || typeof deps !== 'object') continue;
+        for (const [dep, version] of Object.entries(deps)) {
+          if (typeof version === 'string' && /^(?:workspace|file|link|portal):/.test(version)) names.add(dep);
+        }
+      }
+    }
+    this.ownPackageNames = names;
+    return names;
   }
 
   /**
