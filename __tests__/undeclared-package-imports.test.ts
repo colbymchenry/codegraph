@@ -147,6 +147,19 @@ describe('a name imported from an installed package the manifest does not list',
     expect(edgesFrom(cg, 'main.ts')).toEqual([]);
   });
 
+  it('links to no project export when a fixture folder of the project shares the package name', async () => {
+    const graph = await index({
+      ...installed('react-hook-form'),
+      'test/fixtures/react-hook-form/package.json': JSON.stringify({ name: 'react-hook-form', private: true }),
+      'test/fixtures/react-hook-form/index.ts': 'export const fixture = 1;\n',
+      'tools/react-hook-form/package.json': JSON.stringify({ name: 'react-hook-form', version: '0.0.1' }),
+      'tools/react-hook-form/index.ts': 'export const tool = 1;\n',
+      'main.ts': MAIN,
+      'decoy.ts': DECOY,
+    });
+    expect(edgesFrom(graph, 'main.ts')).toEqual([]);
+  });
+
   it('still lets an inner declaration shadow the import', async () => {
     const graph = await index({
       ...installed('react-hook-form'),
@@ -321,11 +334,10 @@ describe('an undeclared specifier with no install evidence keeps linking', () =>
   it('a sibling package an install copied into node_modules', async () => {
     // yarn v1's `file:` and npm's install-links copy the folder instead of linking it.
     const graph = await index({
-      'packages/kit/package.json': JSON.stringify({ name: 'acme-kit', main: 'src/index.ts' }),
+      'packages/kit/package.json': JSON.stringify({ name: 'acme-kit', version: '1.2.0', main: 'src/index.ts' }),
       'packages/kit/src/index.ts': 'export function makeKit() { return 1; }\n',
-      'node_modules/acme-kit/package.json': JSON.stringify({ name: 'acme-kit', main: 'src/index.ts' }),
+      'node_modules/acme-kit/package.json': JSON.stringify({ name: 'acme-kit', version: '1.2.0', main: 'src/index.ts' }),
       'node_modules/acme-kit/src/index.ts': 'export function makeKit() { return 1; }\n',
-      'apps/api/package.json': JSON.stringify({ name: 'api', dependencies: { 'acme-kit': 'file:../../packages/kit' } }),
       'apps/web/package.json': JSON.stringify({ name: 'web' }),
       'apps/web/src/main.ts': "import { makeKit } from 'acme-kit';\nexport function run() {\n  return makeKit();\n}\n",
     });
