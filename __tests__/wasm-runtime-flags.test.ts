@@ -139,3 +139,57 @@ describe('buildRelaunchArgv', () => {
     }
   });
 });
+
+describe('relaunchWithWasmRuntimeFlagsIfNeeded', () => {
+  // The relaunch helper re-execs node with the WASM flags, then exits with the
+  // child's status. When the relaunched indexer is killed by a signal (an
+  // out-of-memory kill), the old behavior exited 1 silently — scripts and CI
+  // couldn't tell a kill from a failure. These spawn a harness that goes
+  // through the real relaunch and makes the child kill itself, then assert the
+  // parent reports the signal on stderr and exits 128+signo, as a shell would.
+
+  const moduleUnderTest = path.resolve(__dirname, '..', 'dist', 'extraction', 'wasm-runtime-flags.js');
+
+  const runHarness = (dir: string, signal: string): { status: number | null; stderr: string } => {
+    const harness = path.join(dir, 'relaunch-harness.cjs');
+    fs.writeFileSync(harness, [
+      'const { relaunchWithWasmRuntimeFlagsIfNeeded } = require(process.env.CODEGRAPH_HARNESS_MODULE);',
+      "if (process.env.CODEGRAPH_WASM_RELAUNCHED) process.kill(process.pid, process.env.CODEGRAPH_KILL_SIGNAL || 'SIGTERM');",
+      'relaunchWithWasmRuntimeFlagsIfNeeded(__filename);',
+      '',
+    ].join('\n'));
+    return spawnSync(process.execPath, [harness], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        CODEGRAPH_HARNESS_MODULE: moduleUnderTest,
+        CODEGRAPH_KILL_SIGNAL: signal,
+        CODEGRAPH_WASM_RELAUNCHED: '',
+        CODEGRAPH_NO_RELAUNCH: '',
+      },
+    });
+  };
+
+  it('reports a signal-killed relaunched child on stderr and exits 128+signo', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-relaunch-signal-'));
+    try {
+      const res = runHarness(dir, 'SIGTERM');
+      expect(res.status).toBe(143);
+      expect(res.stderr).toMatch(/killed by SIGTERM/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('names SIGKILL as a likely out-of-memory kill', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-relaunch-signal-'));
+    try {
+      const res = runHarness(dir, 'SIGKILL');
+      expect(res.status).toBe(137);
+      expect(res.stderr).toMatch(/killed by SIGKILL/);
+      expect(res.stderr).toMatch(/out of memory/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
