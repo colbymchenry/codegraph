@@ -320,6 +320,25 @@ function moduleConfigDigest(abs: string, projectRoot: string): string {
   return createHash('sha256').update(read).digest('hex').slice(0, 16);
 }
 
+/**
+ * A package.json as an object, read past a byte order mark; null when it is
+ * missing, not a regular file (a FIFO or a device would block or flood the
+ * read), over the source size limit, or not a JSON object.
+ */
+function readPackageJson(abs: string): Record<string, unknown> | null {
+  try {
+    const text = readSourceText(abs);
+    if (text === null) return null;
+    const json = JSON.parse(text.replace(/^\uFEFF/, '')) as unknown;
+    return json && typeof json === 'object' && !Array.isArray(json) ? json as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A dependency spec that takes the package from the project: a protocol, or npm's bare local path. */
+const LOCAL_DEPENDENCY_SPEC = /^(?:(?:workspace|file|link|portal):|\.{1,2}\/|~\/|\/)/;
+
 function cargoManifestDigestText(abs: string): string {
   try {
     return cargoManifestFields(fs.readFileSync(abs, 'utf-8'));
@@ -745,6 +764,12 @@ export class ReferenceResolver {
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
     this.manifestScopes.clear();
+    this.installedPackages.clear();
+    this.directoryListings.clear();
+    this.searchedModules.clear();
+    this.realModulesDirs.clear();
+    this.ownPackageNames = null;
+    this.installedNames.clear();
     this.knownNames = null;
     this.knownLowerNames = null;
     this.knownFiles = null;
@@ -880,7 +905,8 @@ export class ReferenceResolver {
         if (!isExternalImport(source, language, this.context, { aliasPrefixes: false, fromFile })) return false;
         const resolved = resolveImportPath(source, fromFile, language, this.context);
         if (resolved !== null && this.isIndexedFile(resolved)) return false;
-        return this.isDeclaredOutsidePackage(source, fromFile);
+        return this.isDeclaredOutsidePackage(source, fromFile) ||
+          (ESM_IMPORT_LANGUAGES.has(language) && this.isInstalledPackage(source, fromFile));
       },
       resolveModuleFile: (source, fromFile, language) =>
         resolveImportPath(source, fromFile, language, this.context),
@@ -4663,6 +4689,18 @@ export class ReferenceResolver {
   /** The repository's own package name, from its root package.json; null without one. */
   /** Per directory: the package names its package.json and every enclosing one own and depend on. */
   private manifestScopes = new Map<string, { own: Set<string>; deps: Set<string> }>();
+  /** isRegistryCopy's answers, by `node_modules` folder and package name; undefined: not there. */
+  private installedPackages = new Map<string, boolean | undefined>();
+  /** Per absolute directory: the names of what it holds, exactly as spelled; null when it can't be listed. */
+  private directoryListings = new Map<string, Set<string> | null>();
+  /** Per importing directory: the `node_modules` folders Node searches from it, nearest first. */
+  private searchedModules = new Map<string, string[]>();
+  /** Per `node_modules` folder: its real path. */
+  private realModulesDirs = new Map<string, string>();
+  /** The package names the project's own manifests give (see projectPackageNames). */
+  private ownPackageNames: Set<string> | null = null;
+  /** The name an installed package's own package.json gives, by `node_modules` folder and import name ('' for none). */
+  private installedNames = new Map<string, string>();
 
   /**
    * Is `source` a package from outside the repository? Only when the importing
@@ -4683,6 +4721,156 @@ export class ReferenceResolver {
     // unless this repository is that framework.
     const provider = source.startsWith('astro:') ? 'astro' : /^\$(?:app|env|service-worker)(?:\/|$)/.test(source) ? '@sveltejs/kit' : null;
     return provider !== null && !scope.own.has(provider) && !this.context.getWorkspacePackages?.()?.byName.has(provider);
+  }
+
+  /**
+   * Is `source`, a package name no manifest declares, one the project has
+   * installed? A dependency the manifest doesn't list is still a package when
+   * it sits in a `node_modules` folder the import would search: hoisted in a
+   * monorepo, or pulled in by another package (#3271). An alias this resolver
+   * doesn't read (a bundler's `ui`, an import map's `helpers`) has no such
+   * folder, so it keeps the project's. So does a package of the project's
+   * own: one a `node_modules` entry links to (see isRegistryCopy), or a copy
+   * of one (see projectPackageNames). Only a valid npm package name
+   * qualifies, so `$lib/…`, `~/…`, `@/…` and `#…` keep the project's.
+   */
+  private isInstalledPackage(source: string, fromFile: string): boolean {
+    const segments = source.split('/');
+    const name = source.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0]!;
+    // Capitals only in a name npm accepted before it stopped, like `JSONStream`:
+    // the folder listing below matches the spelling exactly.
+    if (!/^(?:@[A-Za-z0-9][\w.~-]*\/)?[A-Za-z0-9][\w.~-]*$/.test(name)) return false;
+    const normalized = fromFile.replace(/\\/g, '/');
+    const fromDir = normalized.includes('/') ? normalized.slice(0, normalized.lastIndexOf('/')) : '';
+    const scope = this.manifestScope(fromDir);
+    if (scope.own.has(name) || this.context.getWorkspacePackages?.()?.byName.has(name)) return false;
+    for (const modules of this.modulesSearchedFrom(fromDir)) {
+      // Not there at all: no answer to keep for it.
+      if (this.listing(modules) === null) continue;
+      const copy = this.isRegistryCopy(modules, name);
+      if (copy !== undefined) return copy && !this.isProjectPackageCopy(modules, name);
+    }
+    return false;
+  }
+
+  /**
+   * Is the package `name` installed in `modules` a copy of one of the
+   * project's own packages? It is when a project manifest names it (see
+   * projectPackageNames), under the name it is imported by or under the name
+   * its own package.json gives, which differs when an install put it under
+   * another name (`"kit": "file:../libs/lib"`).
+   */
+  private isProjectPackageCopy(modules: string, name: string): boolean {
+    const own = this.projectPackageNames();
+    if (own.has(name)) return true;
+    const key = modules + '\0' + name;
+    let installedAs = this.installedNames.get(key);
+    if (installedAs === undefined) {
+      const json = readPackageJson(path.join(modules, name, 'package.json'));
+      installedAs = typeof json?.name === 'string' ? json.name : '';
+      this.installedNames.set(key, installedAs);
+    }
+    return installedAs !== '' && own.has(installedAs);
+  }
+
+  /**
+   * The names of the project's own packages: the `name` of every package.json
+   * at or above a directory the index holds files in, and every dependency
+   * one of them takes from the project (`workspace:`, `file:`, `link:`,
+   * `portal:`, which can install it under another name). An installed copy of
+   * one stays the project's: an install that copies a sibling instead of
+   * linking it (yarn's `file:`, npm's install-links), or a project that lives
+   * inside a `node_modules` folder. Read only when a name would otherwise
+   * count as installed.
+   */
+  private projectPackageNames(): Set<string> {
+    if (this.ownPackageNames) return this.ownPackageNames;
+    const names = new Set<string>();
+    const dirs = new Set<string>();
+    for (const file of this.knownFiles ?? this.queries.getAllFilePaths()) {
+      let dir = file.replace(/\\/g, '/');
+      do {
+        dir = dir.includes('/') ? dir.slice(0, dir.lastIndexOf('/')) : '';
+        if (dirs.has(dir)) break;
+        dirs.add(dir);
+      } while (dir !== '');
+    }
+    for (const dir of dirs) {
+      // Read directly: a sweep of every directory would push source text out of the read cache.
+      const json = readPackageJson(path.join(this.projectRoot, dir, 'package.json'));
+      if (!json) continue;
+      if (typeof json.name === 'string') names.add(json.name);
+      for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+        const deps = json[field];
+        if (!deps || typeof deps !== 'object') continue;
+        for (const [dep, version] of Object.entries(deps)) {
+          if (typeof version === 'string' && LOCAL_DEPENDENCY_SPEC.test(version)) names.add(dep);
+        }
+      }
+    }
+    this.ownPackageNames = names;
+    return names;
+  }
+
+  /**
+   * The `node_modules` folders Node would search from project directory
+   * `dir`, nearest first: one in every directory at or above where `dir`
+   * really is, past the project root too (a subdirectory indexed on its own
+   * installs into its parent). Paths only; the caller lists each one as it
+   * gets to it, so a nearer answer leaves the rest unread.
+   */
+  private modulesSearchedFrom(dir: string): string[] {
+    const memo = this.searchedModules.get(dir);
+    if (memo) return memo;
+    let real = path.resolve(this.projectRoot, dir);
+    try { real = fs.realpathSync(real); } catch { /* searched where it is written */ }
+    const found: string[] = [];
+    for (let at = real; ; at = path.dirname(at)) {
+      if (path.basename(at) !== 'node_modules') found.push(path.join(at, 'node_modules'));
+      if (path.dirname(at) === at) break;
+    }
+    this.searchedModules.set(dir, found);
+    return found;
+  }
+
+  /**
+   * Is the package `name` in the `modules` folder a copy from a registry?
+   * True for a folder there, or a link into a `node_modules` folder (pnpm's
+   * `.pnpm` store); false for a link to any other folder, which is a sibling
+   * package wherever the project's real path puts it (a package linked in
+   * from a checkout elsewhere, as `npm link` does, counts as one too, and so
+   * keeps today's behaviour); undefined when `modules` doesn't hold it, or
+   * holds a broken link, so Node looks further up.
+   */
+  private isRegistryCopy(modules: string, name: string): boolean | undefined {
+    const key = modules + '\0' + name;
+    if (this.installedPackages.has(key)) return this.installedPackages.get(key);
+    let answer: boolean | undefined;
+    const scope = name.startsWith('@') ? name.slice(0, name.indexOf('/')) : null;
+    const listed = scope
+      ? this.listing(modules)?.has(scope) && this.listing(path.join(modules, scope))?.has(name.slice(scope.length + 1))
+      : this.listing(modules)?.has(name);
+    if (listed) {
+      try {
+        let realModules = this.realModulesDirs.get(modules);
+        if (realModules === undefined) {
+          realModules = fs.realpathSync(modules);
+          this.realModulesDirs.set(modules, realModules);
+        }
+        const rel = path.relative(path.dirname(realModules), fs.realpathSync(path.join(modules, name)));
+        answer = rel.split(path.sep).includes('node_modules');
+      } catch { /* a broken link */ }
+    }
+    this.installedPackages.set(key, answer);
+    return answer;
+  }
+
+  private listing(dir: string): Set<string> | null {
+    if (this.directoryListings.has(dir)) return this.directoryListings.get(dir)!;
+    let names: Set<string> | null = null;
+    try { names = new Set(fs.readdirSync(dir)); } catch { /* not a readable directory */ }
+    this.directoryListings.set(dir, names);
+    return names;
   }
 
   private manifestScope(dir: string): { own: Set<string>; deps: Set<string> } {

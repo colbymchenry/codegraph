@@ -2080,7 +2080,8 @@ function importedFrom(ctx: ResolutionContext, file: string, language: Language):
 /**
  * Does `file` import `name` from a package outside the repository (`import {
  * Button } from 'antd'`)? A package means one the file's package.json, or an
- * enclosing one, declares, under a specifier no project file answers. That is
+ * enclosing one, declares, or one installed in a `node_modules` folder the
+ * import would search, under a specifier no project file answers. That is
  * the test the name matcher applies to calls and values. What such a name
  * renders is the package's, never a project symbol that shares the name.
  */
