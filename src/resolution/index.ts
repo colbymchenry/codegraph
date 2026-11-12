@@ -748,6 +748,8 @@ export class ReferenceResolver {
     this.installedPackages.clear();
     this.directoryListings.clear();
     this.searchedModules.clear();
+    this.realModulesDirs.clear();
+    this.ownPackageNames = null;
     this.knownNames = null;
     this.knownLowerNames = null;
     this.knownFiles = null;
@@ -4673,6 +4675,10 @@ export class ReferenceResolver {
   private directoryListings = new Map<string, Set<string> | null>();
   /** Per importing directory: the `node_modules` folders Node searches from it, nearest first. */
   private searchedModules = new Map<string, string[]>();
+  /** Per `node_modules` folder: its real path. */
+  private realModulesDirs = new Map<string, string>();
+  /** The package names the manifests of the indexed directories own (see projectPackageNames). */
+  private ownPackageNames: Set<string> | null = null;
 
   /**
    * Is `source` a package from outside the repository? Only when the importing
@@ -4701,10 +4707,11 @@ export class ReferenceResolver {
    * it sits in a `node_modules` folder the import would search: hoisted in a
    * monorepo, or pulled in by another package (#3271). An alias this resolver
    * doesn't read (a bundler's `ui`, an import map's `helpers`) has no such
-   * folder, so it keeps the project's, as does a `node_modules` entry that
-   * links to a folder of its own, which is a sibling package. Only a valid
-   * npm package name qualifies, so `$lib/…`, `~/…`, `@/…` and `#…` keep the
-   * project's.
+   * folder, so it keeps the project's. So does a package of the project's
+   * own: one a `node_modules` entry links to (see isRegistryCopy), or one a
+   * manifest in the project names, even when an install copied it into
+   * `node_modules` (yarn's `file:`). Only a valid npm package name qualifies,
+   * so `$lib/…`, `~/…`, `@/…` and `#…` keep the project's.
    */
   private isInstalledPackage(source: string, fromFile: string): boolean {
     const segments = source.split('/');
@@ -4718,9 +4725,27 @@ export class ReferenceResolver {
     if (scope.own.has(name) || this.context.getWorkspacePackages?.()?.byName.has(name)) return false;
     for (const modules of this.modulesSearchedFrom(fromDir)) {
       const copy = this.isRegistryCopy(modules, name);
-      if (copy !== undefined) return copy;
+      if (copy !== undefined) return copy && !this.projectPackageNames().has(name);
     }
     return false;
+  }
+
+  /**
+   * Every package name a manifest of the project owns: the package.json at or
+   * above each directory the index holds files in. Read only when a name
+   * would otherwise count as installed.
+   */
+  private projectPackageNames(): Set<string> {
+    if (this.ownPackageNames) return this.ownPackageNames;
+    const names = new Set<string>();
+    const dirs = new Set<string>(['']);
+    for (const file of this.knownFiles ?? this.queries.getAllFilePaths()) {
+      const normalized = file.replace(/\\/g, '/');
+      dirs.add(normalized.includes('/') ? normalized.slice(0, normalized.lastIndexOf('/')) : '');
+    }
+    for (const dir of dirs) for (const name of this.manifestScope(dir).own) names.add(name);
+    this.ownPackageNames = names;
+    return names;
   }
 
   /**
@@ -4763,7 +4788,11 @@ export class ReferenceResolver {
       : this.listing(modules)?.has(name);
     if (listed) {
       try {
-        const realModules = fs.realpathSync(modules);
+        let realModules = this.realModulesDirs.get(modules);
+        if (realModules === undefined) {
+          realModules = fs.realpathSync(modules);
+          this.realModulesDirs.set(modules, realModules);
+        }
         const rel = path.relative(path.dirname(realModules), fs.realpathSync(path.join(modules, name)));
         answer = rel.split(path.sep).includes('node_modules');
       } catch { /* a broken link */ }
