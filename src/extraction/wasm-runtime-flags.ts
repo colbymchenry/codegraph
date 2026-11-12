@@ -31,6 +31,7 @@
  * too.
  */
 import { spawnSync } from 'child_process';
+import * as os from 'os';
 
 /**
  * The V8 flag(s) that keep tree-sitter grammar compilation off the turboshaft
@@ -139,5 +140,15 @@ export function relaunchWithWasmRuntimeFlagsIfNeeded(scriptPath: string): void {
     // this process. Degraded (may OOM on huge repos) but not broken.
     return;
   }
-  process.exit(result.status ?? (result.signal ? 1 : 0));
+  if (result.signal) {
+    // The relaunched indexer was killed by a signal — most often an
+    // out-of-memory kill (SIGKILL). Name it and exit as a shell would (128 +
+    // signal number), so scripts and CI can tell a kill from an ordinary
+    // failure instead of a silent exit 1.
+    const hint = result.signal === 'SIGKILL' ? ' (out of memory?)' : '';
+    process.stderr.write(`codegraph: the indexer was killed by ${result.signal}${hint}\n`);
+    const signo = (os.constants.signals as Record<string, number | undefined>)[result.signal];
+    process.exit(signo ? 128 + signo : 1);
+  }
+  process.exit(result.status ?? 0);
 }
