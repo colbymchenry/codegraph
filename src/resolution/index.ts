@@ -320,15 +320,24 @@ function moduleConfigDigest(abs: string, projectRoot: string): string {
   return createHash('sha256').update(read).digest('hex').slice(0, 16);
 }
 
-/** The `name` a package.json gives, read past a byte order mark; null when it gives none or can't be read. */
-function readPackageName(abs: string): string | null {
+/**
+ * A package.json as an object, read past a byte order mark; null when it is
+ * missing, not a regular file (a FIFO or a device would block or flood the
+ * read), over the source size limit, or not a JSON object.
+ */
+function readPackageJson(abs: string): Record<string, unknown> | null {
   try {
-    const json = JSON.parse(fs.readFileSync(abs, 'utf-8').replace(/^\uFEFF/, '')) as { name?: unknown } | null;
-    return json && typeof json === 'object' && typeof json.name === 'string' ? json.name : null;
+    const text = readSourceText(abs);
+    if (text === null) return null;
+    const json = JSON.parse(text.replace(/^\uFEFF/, '')) as unknown;
+    return json && typeof json === 'object' && !Array.isArray(json) ? json as Record<string, unknown> : null;
   } catch {
     return null;
   }
 }
+
+/** A dependency spec that takes the package from the project: a protocol, or npm's bare local path. */
+const LOCAL_DEPENDENCY_SPEC = /^(?:(?:workspace|file|link|portal):|\.{1,2}\/|~\/|\/)/;
 
 function cargoManifestDigestText(abs: string): string {
   try {
@@ -4745,16 +4754,6 @@ export class ReferenceResolver {
   }
 
   /**
-   * The names of the project's own packages: the `name` of every package.json
-   * at or above a directory the index holds files in, and every dependency
-   * one of them takes from the project (`workspace:`, `file:`, `link:`,
-   * `portal:`, which can install it under another name). An installed copy of
-   * one stays the project's: an install that copies a sibling instead of
-   * linking it (yarn's `file:`, npm's install-links), or a project that lives
-   * inside a `node_modules` folder. Read only when a name would otherwise
-   * count as installed.
-   */
-  /**
    * Is the package `name` installed in `modules` a copy of one of the
    * project's own packages? It is when a project manifest names it (see
    * projectPackageNames), under the name it is imported by or under the name
@@ -4767,12 +4766,23 @@ export class ReferenceResolver {
     const key = modules + '\0' + name;
     let installedAs = this.installedNames.get(key);
     if (installedAs === undefined) {
-      installedAs = readPackageName(path.join(modules, name, 'package.json')) ?? '';
+      const json = readPackageJson(path.join(modules, name, 'package.json'));
+      installedAs = typeof json?.name === 'string' ? json.name : '';
       this.installedNames.set(key, installedAs);
     }
     return installedAs !== '' && own.has(installedAs);
   }
 
+  /**
+   * The names of the project's own packages: the `name` of every package.json
+   * at or above a directory the index holds files in, and every dependency
+   * one of them takes from the project (`workspace:`, `file:`, `link:`,
+   * `portal:`, which can install it under another name). An installed copy of
+   * one stays the project's: an install that copies a sibling instead of
+   * linking it (yarn's `file:`, npm's install-links), or a project that lives
+   * inside a `node_modules` folder. Read only when a name would otherwise
+   * count as installed.
+   */
   private projectPackageNames(): Set<string> {
     if (this.ownPackageNames) return this.ownPackageNames;
     const names = new Set<string>();
@@ -4786,19 +4796,15 @@ export class ReferenceResolver {
       } while (dir !== '');
     }
     for (const dir of dirs) {
-      let json: Record<string, unknown> | null = null;
-      try {
-        // Read directly: a sweep of every directory would push source text out of the read cache.
-        const raw = fs.readFileSync(path.join(this.projectRoot, dir, 'package.json'), 'utf-8');
-        json = JSON.parse(raw.replace(/^\uFEFF/, '')) as Record<string, unknown> | null;
-      } catch { /* no or unreadable package.json */ }
-      if (!json || typeof json !== 'object') continue;
+      // Read directly: a sweep of every directory would push source text out of the read cache.
+      const json = readPackageJson(path.join(this.projectRoot, dir, 'package.json'));
+      if (!json) continue;
       if (typeof json.name === 'string') names.add(json.name);
       for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
         const deps = json[field];
         if (!deps || typeof deps !== 'object') continue;
         for (const [dep, version] of Object.entries(deps)) {
-          if (typeof version === 'string' && /^(?:workspace|file|link|portal):/.test(version)) names.add(dep);
+          if (typeof version === 'string' && LOCAL_DEPENDENCY_SPEC.test(version)) names.add(dep);
         }
       }
     }

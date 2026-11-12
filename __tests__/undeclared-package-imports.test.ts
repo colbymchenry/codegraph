@@ -12,6 +12,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { execFileSync } from 'child_process';
 import CodeGraph from '../src/index';
 
 let tempDir: string;
@@ -146,6 +147,15 @@ describe('a name imported from an installed package the manifest does not list',
     cg = await CodeGraph.init(path.join(tempDir, 'app'), { index: true });
     expect(edgesFrom(cg, 'main.ts')).toEqual([]);
   });
+
+  it.runIf(process.platform !== 'win32')('finishes indexing when an installed package.json is a FIFO', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-undeclared-pkg-'));
+    write(tempDir, { 'main.ts': MAIN, 'decoy.ts': DECOY });
+    fs.mkdirSync(path.join(tempDir, 'node_modules/react-hook-form'), { recursive: true });
+    execFileSync('mkfifo', [path.join(tempDir, 'node_modules/react-hook-form/package.json')]);
+    cg = await CodeGraph.init(tempDir, { index: true });
+    expect(edgesFrom(cg, 'main.ts')).toEqual([]);
+  }, 30_000);
 
   it('still lets an inner declaration shadow the import', async () => {
     const graph = await index({
@@ -343,10 +353,10 @@ describe('an undeclared specifier with no install evidence keeps linking', () =>
   });
 
   it('a sibling package copied into node_modules under another name', async () => {
+    // Nothing indexed declares `kit`: the copy's own package.json names the sibling.
     const graph = await index({
       'libs/lib/package.json': JSON.stringify({ name: '@acme/lib', version: '1.2.3', main: 'index.ts' }),
       'libs/lib/index.ts': 'export function useLib() { return 1; }\n',
-      'apps/a/package.json': JSON.stringify({ name: 'a', dependencies: { kit: 'file:../../libs/lib' } }),
       'node_modules/kit/package.json': JSON.stringify({ name: '@acme/lib', version: '1.2.3', main: 'index.ts' }),
       'node_modules/kit/index.ts': 'export function useLib() { return 1; }\n',
       'apps/web/main.ts': "import { useLib } from 'kit';\nexport function entry() {\n  return useLib();\n}\n",
@@ -362,6 +372,30 @@ describe('an undeclared specifier with no install evidence keeps linking', () =>
       'node_modules/@acme/lib/package.json': manifest,
       'node_modules/@acme/lib/index.ts': 'export function useLib() { return 1; }\n',
       'apps/web/main.ts': "import { useLib } from '@acme/lib';\nexport function entry() {\n  return useLib();\n}\n",
+    });
+    expect(edgesFrom(graph, 'apps/web/main.ts')).toContain('calls libs/lib/index.ts:useLib');
+  });
+
+  it('a copy under another name whose package.json starts with a byte order mark', async () => {
+    const graph = await index({
+      'libs/lib/package.json': JSON.stringify({ name: '@acme/lib', main: 'index.ts' }),
+      'libs/lib/index.ts': 'export function useLib() { return 1; }\n',
+      'node_modules/kit/package.json': '\uFEFF' + JSON.stringify({ name: '@acme/lib', main: 'index.ts' }),
+      'node_modules/kit/index.ts': 'export function useLib() { return 1; }\n',
+      'apps/web/main.ts': "import { useLib } from 'kit';\nexport function entry() {\n  return useLib();\n}\n",
+    });
+    expect(edgesFrom(graph, 'apps/web/main.ts')).toContain('calls libs/lib/index.ts:useLib');
+  });
+
+  it('a nameless sibling a package takes by a bare local path', async () => {
+    const graph = await index({
+      'libs/lib/package.json': JSON.stringify({ version: '1.0.0', main: 'index.ts' }),
+      'libs/lib/index.ts': 'export function useLib() { return 1; }\n',
+      'apps/api/package.json': JSON.stringify({ name: 'api', dependencies: { lib: '../../libs/lib' } }),
+      'apps/api/index.ts': 'export const api = 1;\n',
+      'node_modules/lib/package.json': JSON.stringify({ version: '1.0.0', main: 'index.ts' }),
+      'node_modules/lib/index.ts': 'export function useLib() { return 1; }\n',
+      'apps/web/main.ts': "import { useLib } from 'lib';\nexport function entry() {\n  return useLib();\n}\n",
     });
     expect(edgesFrom(graph, 'apps/web/main.ts')).toContain('calls libs/lib/index.ts:useLib');
   });
