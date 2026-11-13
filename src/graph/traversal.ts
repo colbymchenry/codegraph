@@ -4,7 +4,7 @@
  * BFS and DFS traversal for the code knowledge graph.
  */
 
-import { Node, Edge, Subgraph, TraversalOptions, EdgeKind, ImpactOptions, EDGE_KINDS } from '../types';
+import { Node, Edge, Subgraph, TraversalOptions, EdgeKind, ImpactOptions } from '../types';
 import { QueryBuilder } from '../db/queries';
 
 /**
@@ -21,7 +21,17 @@ const DEFAULT_OPTIONS: Required<TraversalOptions> = {
 
 export const DEFAULT_IMPACT_MAX_NODES = 10_000;
 export const DEFAULT_IMPACT_MAX_EDGES = 50_000;
-const IMPACT_INCOMING_KINDS = EDGE_KINDS.filter((kind) => kind !== 'contains');
+
+/**
+ * What one node's expansion read: the edges that depend on it, and the ones
+ * it contains. Both are kept for the length of the walk, so a node reached
+ * again from a nearer depth asks the database for nothing the second time
+ * (#3248).
+ */
+interface ImpactRead {
+  dependents?: Edge[];
+  members?: Edge[];
+}
 
 /**
  * Result of a single traversal step
@@ -623,7 +633,7 @@ export class GraphTraverser {
     nodes.set(focalNode.id, focalNode);
 
     // Traverse incoming edges to find all dependents
-    this.getImpactRecursive(nodeId, maxDepth, 0, nodes, edges, visited, new Set(), budget);
+    this.getImpactRecursive(nodeId, maxDepth, 0, nodes, edges, visited, new Map(), budget);
 
     return {
       nodes,
@@ -640,7 +650,7 @@ export class GraphTraverser {
     nodes: Map<string, Node>,
     edges: Edge[],
     visited: Map<string, number>,
-    expanded: Set<string>,
+    reads: Map<string, ImpactRead>,
     budget: { maxNodes: number; maxEdges: number; truncated: boolean }
   ): void {
     // Mark visited before the depth check so a node collected at the depth
@@ -651,10 +661,13 @@ export class GraphTraverser {
     if (currentDepth >= maxDepth) {
       return;
     }
-    // A node re-expanded from a nearer depth re-reads the same edges; record
-    // them on its first expansion only.
-    const firstExpansion = !expanded.has(nodeId);
-    expanded.add(nodeId);
+    // A node re-expanded from a nearer depth reads the same edges again;
+    // record them on its first expansion only. What it read the first time is
+    // kept, so the second expansion asks the database for nothing (#3248).
+    const read = reads.get(nodeId);
+    const firstExpansion = read === undefined;
+    const expansion: ImpactRead = read ?? { dependents: undefined, members: undefined };
+    reads.set(nodeId, expansion);
 
     // For container nodes (classes, interfaces, structs, etc.), also traverse
     // into their children so that callers of contained methods appear in impact
@@ -663,24 +676,33 @@ export class GraphTraverser {
       const containerKinds = new Set(['class', 'interface', 'struct', 'union', 'trait', 'protocol', 'module', 'enum']);
       if (containerKinds.has(focalNode.kind)) {
         const remaining = budget.maxEdges - edges.length;
-        const fetched = this.queries.getOutgoingEdges(nodeId, ['contains'], undefined, remaining + 1);
-        if (fetched.length > remaining) budget.truncated = true;
-        const containsEdges = fetched.slice(0, remaining);
-        if (containsEdges.length > 0) {
-          const children = this.queries.getNodesByIds(containsEdges.map((e) => e.target));
-          for (const edge of containsEdges) {
-            const childNode = children.get(edge.target);
-            if (childNode && this.nearerThanBefore(visited, childNode.id, currentDepth)) {
-              if (!nodes.has(childNode.id)) {
-                if (nodes.size >= budget.maxNodes || edges.length >= budget.maxEdges) {
-                  budget.truncated = true;
-                  continue;
+        if (remaining <= 0) {
+          // The budget is spent, so no member can be kept. What is left to
+          // answer is whether the result has to say it was truncated, and one
+          // row says that — the container's members are not read (#3248).
+          if (this.queries.hasContainedMembers(nodeId)) budget.truncated = true;
+        } else {
+          // A container holds few members, so they are read whole and the
+          // slice applies the budget (#3248).
+          const fetched = this.readMembers(nodeId, expansion);
+          if (fetched.length > remaining) budget.truncated = true;
+          const containsEdges = fetched.slice(0, remaining);
+          if (containsEdges.length > 0) {
+            const children = this.queries.getNodesByIds(containsEdges.map((e) => e.target));
+            for (const edge of containsEdges) {
+              const childNode = children.get(edge.target);
+              if (childNode && this.nearerThanBefore(visited, childNode.id, currentDepth)) {
+                if (!nodes.has(childNode.id)) {
+                  if (nodes.size >= budget.maxNodes || edges.length >= budget.maxEdges) {
+                    budget.truncated = true;
+                    continue;
+                  }
+                  nodes.set(childNode.id, childNode);
+                  edges.push(edge);
                 }
-                nodes.set(childNode.id, childNode);
-                edges.push(edge);
+                // Recurse into children at the same depth (they're part of the same symbol)
+                this.getImpactRecursive(childNode.id, maxDepth, currentDepth, nodes, edges, visited, reads, budget);
               }
-              // Recurse into children at the same depth (they're part of the same symbol)
-              this.getImpactRecursive(childNode.id, maxDepth, currentDepth, nodes, edges, visited, expanded, budget);
             }
           }
         }
@@ -692,9 +714,18 @@ export class GraphTraverser {
     // them, so following it upward would climb to the parent class and then
     // re-expand every sibling member — exploding impact for a leaf symbol. (#536)
     const remaining = budget.maxEdges - edges.length;
-    // Fetch one extra row so hitting the SQL LIMIT is distinguishable from an
-    // exact-size result and can be surfaced as explicit truncation.
-    const fetched = this.queries.getIncomingEdges(nodeId, IMPACT_INCOMING_KINDS, remaining + 1);
+    if (remaining <= 0) {
+      // The budget is spent, so nothing this node offers can be kept. What is
+      // left to answer is whether the result has to say it was truncated, and
+      // one row says that — the node's incoming edges are not read (#3248).
+      if (this.queries.getFirstDependentEdge(nodeId)) budget.truncated = true;
+      return;
+    }
+    // The budget's share, one row more than it can keep: a read of every
+    // dependent the node has was what made the walk slow, and the index that
+    // carries the order makes the bounded read as cheap as the whole one
+    // (#3248).
+    const fetched = this.readDependents(nodeId, expansion, remaining + 1);
     if (fetched.length > remaining) budget.truncated = true;
     const incomingEdges = fetched.slice(0, remaining);
     if (incomingEdges.length === 0) return;
@@ -719,9 +750,32 @@ export class GraphTraverser {
       if (firstExpansion) edges.push(edge);
       if (this.nearerThanBefore(visited, sourceNode.id, currentDepth + 1)) {
         nodes.set(sourceNode.id, sourceNode);
-        this.getImpactRecursive(sourceNode.id, maxDepth, currentDepth + 1, nodes, edges, visited, expanded, budget);
+        this.getImpactRecursive(sourceNode.id, maxDepth, currentDepth + 1, nodes, edges, visited, reads, budget);
       }
     }
+  }
+
+  /**
+   * The edges that depend on a node, as many as the budget can keep. The
+   * read is kept for the length of the walk, so a node reached again from a
+   * nearer depth is not read twice (#3248).
+   */
+  private readDependents(nodeId: string, expansion: ImpactRead, limit: number): Edge[] {
+    if (!expansion.dependents) {
+      expansion.dependents = this.queries.getIncomingEdgesExceptContains(nodeId, limit);
+    }
+    return expansion.dependents;
+  }
+
+  /**
+   * The members a container holds: its `contains` edges. Kept for the length
+   * of the walk, like the dependents above (#3248).
+   */
+  private readMembers(nodeId: string, expansion: ImpactRead): Edge[] {
+    if (!expansion.members) {
+      expansion.members = this.queries.getOutgoingEdges(nodeId, ['contains']);
+    }
+    return expansion.members;
   }
 
   /**

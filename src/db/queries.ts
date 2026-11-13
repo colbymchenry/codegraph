@@ -16,6 +16,7 @@ import {
   GraphStats,
   SearchOptions,
   SearchResult,
+  EDGE_KINDS,
 } from '../types';
 import { safeJsonParse } from '../utils';
 import { isTestFile, kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
@@ -46,6 +47,22 @@ function isLowValueFile(filePath: string, generated?: ReadonlySet<string>): bool
 }
 
 const SQLITE_PARAM_CHUNK_SIZE = 500;
+
+/**
+ * The order incoming edges are read in, for every read of them. The kind
+ * comes first, then the source's place: file IDs sort before function IDs, so
+ * a source-first order lets imports displace actual calls in capped caller
+ * lists. Two reads that answer the same question must answer it in the same
+ * order, so they share this one definition (#3248).
+ */
+const INCOMING_EDGE_ORDER = 'kind, source, line, col';
+
+/**
+ * The edge kinds that make a source depend on a target: every kind the graph
+ * knows but `contains`, which says a container holds a member rather than
+ * that the member depends on it.
+ */
+const DEPENDENT_EDGE_KINDS = EDGE_KINDS.filter((kind) => kind !== 'contains');
 
 /**
  * How an import names a folder only through where it is written: `.`, or a
@@ -483,6 +500,9 @@ export class QueryBuilder {
     deleteEdgesByTarget?: SqliteStatement;
     getEdgesBySource?: SqliteStatement;
     getEdgesByTarget?: SqliteStatement;
+    getDependentEdgesByTarget?: SqliteStatement;
+    getFirstNonContainsEdgeByTarget?: SqliteStatement;
+    hasContainedMembers?: SqliteStatement;
     getUnresolvedFromNode?: SqliteStatement;
     getUnresolvedInFile?: SqliteStatement;
     insertFile?: SqliteStatement;
@@ -545,6 +565,14 @@ export class QueryBuilder {
   // and the member-lookup passes issue them per node, and preparing cost
   // about a third of the read.
   private edgeKindStmts: Map<string, SqliteStatement> = new Map();
+
+  /**
+   * Whether every edge in this index has a kind the graph knows, read once
+   * per connection. An index written by another version can hold a kind this
+   * one does not know, and that kind is not a dependency (#3248).
+   */
+  private onlyKnownEdgeKinds?: boolean;
+
   private static readonly BATCH_SIZES: readonly number[] = [128, 32, 8, 1];
 
   /**
@@ -605,6 +633,7 @@ export class QueryBuilder {
     this.stmts = {};
     this.batchStmts.clear();
     this.edgeKindStmts.clear();
+    this.onlyKnownEdgeKinds = undefined;
     this.flowQueries = undefined;
     // The change stamp is per connection, and fresh connections to two
     // different databases report the same one — the memo goes with the old
@@ -2737,8 +2766,8 @@ export class QueryBuilder {
    * Get outgoing edges from a node. Preserve the source/kind index order
    * (calls before imports/references), then break ties deterministically.
    */
-  getOutgoingEdges(sourceId: string, kinds?: EdgeKind[], provenance?: string, limit?: number): Edge[] {
-    if ((kinds && kinds.length > 0) || provenance || limit !== undefined) {
+  getOutgoingEdges(sourceId: string, kinds?: EdgeKind[], provenance?: string): Edge[] {
+    if ((kinds && kinds.length > 0) || provenance) {
       let sql = 'SELECT * FROM edges WHERE source = ?';
       const params: (string | number)[] = [sourceId];
 
@@ -2753,10 +2782,6 @@ export class QueryBuilder {
       }
 
       sql += ' ORDER BY kind, target, line, col';
-      if (limit !== undefined) {
-        sql += ' LIMIT ?';
-        params.push(Math.max(0, Math.floor(limit)));
-      }
       const rows = this.edgeKindStmt(sql).all(...params) as EdgeRow[];
       return rows.map(rowToEdge);
     }
@@ -2769,30 +2794,146 @@ export class QueryBuilder {
   }
 
   /**
+   * Incoming edges to a node except `contains`: the edges that make their
+   * source depend on the target, in {@link getIncomingEdges} order.
+   *
+   * Impact traversal runs this once per visited node, so it stays one index
+   * search. The index carries the order this read asks for, so it needs no
+   * sort, and the limit stops at the rows the budget can keep (#3248).
+   *
+   * The rows are the ones a kind list would return: `contains` never makes a
+   * source depend on a target, and a kind the graph does not know is not a
+   * dependency either. An index that holds only kinds the graph knows says so
+   * with one predicate — one index search. An index that holds a kind this
+   * version does not know falls back to the list, so the rows are the same
+   * either way.
+   *
+   * @param limit how many rows to read at most; the budget's own share.
+   */
+  getIncomingEdgesExceptContains(targetId: string, limit: number): Edge[] {
+    const rows = this.indexHoldsOnlyKnownKinds()
+      ? this.readDependentEdges(targetId, limit)
+      : this.readDependentEdgesOfKnownKinds(targetId, limit);
+    return rows.map(rowToEdge);
+  }
+
+  /**
+   * The dependent edges of a node, read with one predicate: every edge but a
+   * `contains` one.
+   */
+  private readDependentEdges(targetId: string, limit: number): EdgeRow[] {
+    if (!this.stmts.getDependentEdgesByTarget) {
+      this.stmts.getDependentEdgesByTarget = this.db.prepare(
+        `SELECT * FROM edges WHERE target = ? AND kind != 'contains' ORDER BY ${INCOMING_EDGE_ORDER} LIMIT ?`
+      );
+    }
+    return this.stmts.getDependentEdgesByTarget.all(targetId, this.readLimit(limit)) as EdgeRow[];
+  }
+
+  /**
+   * The dependent edges of a node, read with the list of kinds a dependency
+   * can have. Slower than one predicate — it searches the index once per kind
+   * — and only used for an index that holds a kind this version does not
+   * know, so that such a kind is not read as a dependency.
+   */
+  private readDependentEdgesOfKnownKinds(targetId: string, limit: number): EdgeRow[] {
+    const sql = `SELECT * FROM edges WHERE target = ? AND kind IN (${DEPENDENT_EDGE_KINDS.map(() => '?').join(',')}) ORDER BY ${INCOMING_EDGE_ORDER} LIMIT ?`;
+    return this.edgeKindStmt(sql).all(targetId, ...DEPENDENT_EDGE_KINDS, this.readLimit(limit)) as EdgeRow[];
+  }
+
+  /**
+   * Whether every edge in this index has a kind the graph knows. An index
+   * written by another version can hold a kind this one does not know, and
+   * that kind is not a dependency — the same rows a kind list would read.
+   */
+  private indexHoldsOnlyKnownKinds(): boolean {
+    if (this.onlyKnownEdgeKinds === undefined) {
+      const kinds = this.db.prepare('SELECT DISTINCT kind FROM edges').all() as Array<{ kind: string }>;
+      this.onlyKnownEdgeKinds = kinds.every((row) => (EDGE_KINDS as readonly string[]).includes(row.kind));
+    }
+    return this.onlyKnownEdgeKinds;
+  }
+
+  /**
+   * A limit of zero would read nothing, and the walk asks for one row more
+   * than it can keep to tell a full result from a cut one.
+   */
+  private readLimit(limit: number): number {
+    return Math.max(1, Math.floor(limit));
+  }
+
+  /**
+   * The first incoming edge to a node that a dependency can be made of, or
+   * undefined when the node has none. This answers "does anything depend on
+   * this?" without reading the node's whole incoming list: the walk asks it
+   * when its edge budget is already spent, where the answer decides whether
+   * the result says it was truncated (#3248).
+   */
+  getFirstDependentEdge(targetId: string): Edge | undefined {
+    const row = this.indexHoldsOnlyKnownKinds()
+      ? this.readFirstNonContainsEdge(targetId)
+      : this.readFirstKnownKindEdge(targetId);
+    return row ? rowToEdge(row) : undefined;
+  }
+
+  /**
+   * The first edge into a node that is not a `contains` one. No ORDER BY: the
+   * edge it returns is the one the index yields first, and the walk only
+   * asks whether a dependency exists.
+   */
+  private readFirstNonContainsEdge(targetId: string): EdgeRow | undefined {
+    if (!this.stmts.getFirstNonContainsEdgeByTarget) {
+      this.stmts.getFirstNonContainsEdgeByTarget = this.db.prepare(
+        "SELECT * FROM edges WHERE target = ? AND kind != 'contains' LIMIT 1"
+      );
+    }
+    return this.stmts.getFirstNonContainsEdgeByTarget.get(targetId) as EdgeRow | undefined;
+  }
+
+  /**
+   * The first edge into a node of a kind a dependency can be made of, for an
+   * index that holds a kind this version does not know.
+   */
+  private readFirstKnownKindEdge(targetId: string): EdgeRow | undefined {
+    const sql = `SELECT * FROM edges WHERE target = ? AND kind IN (${DEPENDENT_EDGE_KINDS.map(() => '?').join(',')}) LIMIT 1`;
+    return this.edgeKindStmt(sql).get(targetId, ...DEPENDENT_EDGE_KINDS) as EdgeRow | undefined;
+  }
+
+  /**
+   * Whether a node contains anything: one row of the `contains` edges, or
+   * none. The walk asks it when its edge budget is already spent, where the
+   * answer decides whether the result says it was truncated (#3248).
+   */
+  hasContainedMembers(sourceId: string): boolean {
+    if (!this.stmts.hasContainedMembers) {
+      this.stmts.hasContainedMembers = this.db.prepare(
+        "SELECT 1 FROM edges WHERE source = ? AND kind = 'contains' LIMIT 1"
+      );
+    }
+    return this.stmts.hasContainedMembers.get(sourceId) !== undefined;
+  }
+
+  /**
    * Get incoming edges to a node. Kind must precede opaque source IDs:
    * file IDs sort before function IDs, so source-first ordering lets imports
    * displace actual calls in capped caller lists. Keep deterministic ties
    * without changing the target/kind index's established kind precedence.
    */
-  getIncomingEdges(targetId: string, kinds?: EdgeKind[], limit?: number): Edge[] {
-    if ((kinds && kinds.length > 0) || limit !== undefined) {
+  getIncomingEdges(targetId: string, kinds?: EdgeKind[]): Edge[] {
+    if (kinds && kinds.length > 0) {
       let sql = 'SELECT * FROM edges WHERE target = ?';
       const params: (string | number)[] = [targetId];
-      if (kinds && kinds.length > 0) {
-        sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
-        params.push(...kinds);
-      }
-      sql += ' ORDER BY kind, source, line, col';
-      if (limit !== undefined) {
-        sql += ' LIMIT ?';
-        params.push(Math.max(0, Math.floor(limit)));
-      }
+      sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+      params.push(...kinds);
+      sql += ` ORDER BY ${INCOMING_EDGE_ORDER}`;
       const rows = this.edgeKindStmt(sql).all(...params) as EdgeRow[];
       return rows.map(rowToEdge);
     }
 
     if (!this.stmts.getEdgesByTarget) {
-      this.stmts.getEdgesByTarget = this.db.prepare('SELECT * FROM edges WHERE target = ? ORDER BY kind, source, line, col');
+      this.stmts.getEdgesByTarget = this.db.prepare(
+        `SELECT * FROM edges WHERE target = ? ORDER BY ${INCOMING_EDGE_ORDER}`
+      );
     }
     const rows = this.stmts.getEdgesByTarget.all(targetId) as EdgeRow[];
     return rows.map(rowToEdge);
