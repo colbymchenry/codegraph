@@ -4763,3 +4763,63 @@ describe('Antigravity macOS command persistence (#1443)', () => {
     expect(installCommand()).toBe('codegraph');
   });
 });
+
+describe('Installer - a local refresh refuses the home directory (#3234)', () => {
+  let tmpHome: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('installer-home-guard');
+    origCwd = process.cwd();
+    homeRestore = setHome(tmpHome);
+    // cwd = $HOME, the state `codegraph upgrade` runs in for anyone who
+    // keeps a terminal there.
+    process.chdir(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  it('skips every local target instead of writing $HOME/AGENTS.md', () => {
+    // A global Codex install is what makes the local sweep see itself as
+    // already configured: `<cwd>/.codex` is `~/.codex` when cwd is home.
+    const codex = getTarget('codex')!;
+    codex.install('global', { autoAllow: false, promptHook: undefined });
+    expect(fs.existsSync(path.join(tmpHome, '.codex', 'config.toml'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpHome, 'AGENTS.md'))).toBe(false);
+
+    const reports = refreshTargets(ALL_TARGETS, 'local');
+    expect(reports.length).toBeGreaterThan(0);
+    for (const report of reports) {
+      expect(report.status).toBe('skipped');
+      expect(report.changedPaths).toEqual([]);
+      expect(report.reason).toMatch(/home directory/);
+    }
+
+    // Nothing landed in the user's own global instructions file.
+    expect(fs.existsSync(path.join(tmpHome, 'AGENTS.md'))).toBe(false);
+    // The global refresh is unaffected.
+    expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'codex')!.status).toBe('unchanged');
+  });
+
+  it('still refreshes a project-local install from a real project directory', () => {
+    const project = mkTmpDir('installer-home-guard-project');
+    try {
+      process.chdir(project);
+      const codex = getTarget('codex')!;
+      codex.install('local', { autoAllow: false, promptHook: undefined });
+      expect(fs.existsSync(path.join(project, 'AGENTS.md'))).toBe(true);
+
+      const report = refreshTargets(ALL_TARGETS, 'local').find((r) => r.id === 'codex')!;
+      expect(report.status).toBe('unchanged');
+    } finally {
+      // Windows refuses to remove a directory that is still the cwd.
+      process.chdir(tmpHome);
+      fs.rmSync(project, { recursive: true, force: true });
+    }
+  });
+});
