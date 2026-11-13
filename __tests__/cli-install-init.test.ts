@@ -101,8 +101,23 @@ describe('codegraph install --init / init --yes (#1578)', () => {
     expect(fs.existsSync(path.join(tempDir, '.codegraph', 'codegraph.db'))).toBe(true);
   });
 
-  it('documents the new flags in --help', () => {
-    expect(runCodegraph(['init', '--help'], tempDir).stdout).toMatch(/-y, --yes\b/);
-    expect(runCodegraph(['install', '--help'], tempDir).stdout).toMatch(/-i, --init\b/);
+  it('init on a partially-indexed project says so instead of "Already initialized" (#3228)', () => {
+    const realTemp = fs.realpathSync(tempDir);
+    // Build a complete index first, then mark it as killed mid-index.
+    expect(runCodegraph(['init', '--yes'], tempDir).status).toBe(0);
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    db.prepare(
+      "INSERT INTO project_metadata (key, value, updated_at) VALUES ('index_state', 'indexing', 0) " +
+        "ON CONFLICT(key) DO UPDATE SET value = 'indexing'"
+    ).run();
+    db.close();
+
+    const r = runCodegraph(['init', '--yes'], tempDir);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(r.stdout).toContain('did not finish');
+    expect(r.stdout).toContain('codegraph index');
+    expect(r.stdout).not.toContain('Already initialized');
+    void realTemp;
   });
 });

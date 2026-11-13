@@ -502,9 +502,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph sync` and the file watcher now follow an edit that changes which declaration a module exports as its default, like `export default A` becoming `export default B` while `A` stays, or the module dropping its default. References through `import Y from './x'`, `{ default as Y }`, `require('./x').default`, a barrel that passes the default on or a route that renders it as a layout, and calls on a value typed by it, now link to the new default, or stay unlinked, as a fresh index has them. Before, they kept pointing at the old declaration until the importing file changed or the project was indexed again.
 - `codegraph sync` and the file watcher now relink a named import that a name match had linked to a declaration elsewhere while its module didn't export the name, once an edit makes the module export it, like `import { EmptyState } from './layouts/shared'` after the barrel gains `export { EmptyState } from './EmptyState'`. An import a name match had linked to a class the module exported only as its default comes unlinked once the module stops exporting it. Before, the import, the references through it and calls on values typed by it kept the old link until the importing file changed or the project was indexed again.
 
-## [1.6.2] - 2026-10-03
+- `codegraph init` now says when the last index run did not finish, instead of printing "Already initialized" and looking like a working setup. Re-run `codegraph index` to rebuild it. (#3228)
 
-### Highlights
+## [1.6.2] - 2026-10-03
 
 - **Far fewer wrong links, in every language.** A call, import or type now resolves the way its language scopes names — through imports, packages, namespaces and the class it is written in — so it stops landing on an unrelated symbol that only shares its name. This covers TypeScript and JavaScript, Python, Java, Kotlin, Scala, C#, VB.NET, Swift, Objective-C, Go, Rust, C and C++, PHP, Ruby, Dart, Lua, R and more, and makes callers, impact and `codegraph_explore` answers more trustworthy.
 - **Overloads, `super` and recursion resolve correctly.** A call reaches the overload its arguments fit, a `super` call reaches the parent's method, and a method that calls another overload, or another object's method of the same name, no longer looks like it calls itself.

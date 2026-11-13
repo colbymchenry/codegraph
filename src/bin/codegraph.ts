@@ -755,8 +755,23 @@ async function runInit(
     }
 
     if (isInitialized(projectPath)) {
-      clack.log.warn(`Already initialized in ${projectPath}`);
-      clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
+      // A previous run may have stopped partway (OOM, killed mid-index, etc.).
+      // The schema can be present while the index is incomplete, so don't
+      // just say "Already initialized" — surface that state and point at the
+      // command that rebuilds it (#3228).
+      let indexState: string | null = null;
+      try {
+        const { default: CodeGraph } = await loadCodeGraph();
+        const cg = await CodeGraph.open(projectPath, { readOnly: true });
+        try { indexState = cg.getIndexState(); } finally { cg.destroy(); }
+      } catch { /* treat an unreadable state as "unknown" */ }
+      if (indexState && indexState !== 'complete') {
+        clack.log.warn(`Initialized in ${projectPath}, but the last index run did not finish (${indexState})`);
+        clack.log.info('The index may be incomplete. Run "codegraph index" to rebuild it.');
+      } else {
+        clack.log.warn(`Already initialized in ${projectPath}`);
+        clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
+      }
       if (options.localOnly) applyLocalOnlyGitignore(clack, projectPath);
       try {
         const { offerWatchFallback } = await import('../installer');
