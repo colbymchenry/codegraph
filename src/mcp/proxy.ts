@@ -103,6 +103,22 @@ export interface ProxyResult {
 }
 
 /**
+ * Does `socketPath` exist on disk? On FUSE/virtiofs mounts `stat()` on a Unix
+ * socket returns EINVAL, so `fs.existsSync` falsely reports it missing. Treat
+ * any stat failure that is NOT a definitive ENOENT as "exists".
+ */
+export function socketFileExists(socketPath: string): boolean {
+  try {
+    fs.statSync(socketPath);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT') return false;
+    return true;
+  }
+}
+
+/**
  * Attempt to connect to the daemon at `socketPath` and pipe stdio through it.
  *
  * Returns a promise that resolves when either:
@@ -124,7 +140,7 @@ export async function runProxy(
   // POSIX: refuse to connect to a stale socket file that points at no
   // listening process. `fs.existsSync` is a cheap pre-check; a real
   // ECONNREFUSED below catches the rare "exists but unbound" race.
-  if (process.platform !== 'win32' && !fs.existsSync(socketPath)) {
+  if (process.platform !== 'win32' && !socketFileExists(socketPath)) {
     return { outcome: 'fallback-needed', reason: 'socket file missing' };
   }
 
@@ -174,7 +190,7 @@ export async function connectWithHello(
   expectedVersion: string = CodeGraphPackageVersion,
   helloTimeoutMs: number = DAEMON_HELLO_TIMEOUT_MS,
 ): Promise<net.Socket | 'older-version' | 'version-mismatch' | null> {
-  if (process.platform !== 'win32' && !fs.existsSync(socketPath)) return null;
+  if (process.platform !== 'win32' && !socketFileExists(socketPath)) return null;
   const socket = net.createConnection(socketPath);
   socket.setEncoding('utf8');
   // Keep an 'error' listener attached for the socket's ENTIRE life. readHelloLine
