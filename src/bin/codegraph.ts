@@ -3143,11 +3143,18 @@ program
         : ['global', 'local'];
       let changed = 0;
       let failed = 0;
+      let skipped = 0;
+      let skipReason: string | undefined;
       for (const loc of locs) {
         for (const report of refreshTargets(ALL_TARGETS, loc)) {
           if (report.status === 'failed') {
             failed += 1;
             error(`${report.displayName}: could not refresh — ${report.error}`);
+          }
+          if (report.status === 'skipped') {
+            skipped += 1;
+            if (!skipReason) skipReason = report.reason;
+            continue;
           }
           for (const p of report.changedPaths) {
             changed += 1;
@@ -3155,7 +3162,10 @@ program
           }
         }
       }
-      if (changed === 0 && failed === 0) {
+      if (skipped > 0 && skipReason) {
+        console.log(`Skipped local agent configs: ${skipReason}. Run this from a project directory to refresh them.`);
+      }
+      if (changed === 0 && failed === 0 && skipped === 0) {
         console.log('All configured agent surfaces are already current.');
       }
       // Non-zero so `codegraph upgrade` tells the user to look; every other

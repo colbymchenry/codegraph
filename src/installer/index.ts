@@ -30,7 +30,7 @@ import type { AgentTarget, Location, TargetId, WriteResult } from './targets/typ
 // installer must stay importable even when native modules can't load).
 import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
-import { getCodeGraphDir } from '../directory';
+import { getCodeGraphDir, unsafeIndexRootReason } from '../directory';
 import { getTelemetry, TELEMETRY_DOCS } from '../telemetry';
 import { maybeOfferBetaSignup } from './beta-signup';
 
@@ -383,13 +383,14 @@ export function uninstallTargets(
   });
 }
 
-export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsupported' | 'failed';
+export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsupported' | 'skipped' | 'failed';
 
 /**
  * Per-target outcome of a refresh sweep. `refreshed` means at least one
  * filesystem entry was created, updated, or removed; `unchanged` means the target was
  * already current (every write reported byte-identical); `failed` means a
- * write threw (`error` says why); the other two mirror `UninstallStatus`.
+ * write threw (`error` says why); `skipped` means the sweep refused to write
+ * (`reason` says why); the other two mirror `UninstallStatus`.
  */
 export interface RefreshReport {
   id: TargetId;
@@ -400,6 +401,8 @@ export interface RefreshReport {
   changedPaths: string[];
   /** Why the refresh of this target failed (status `failed` only). */
   error?: string;
+  /** Why the refresh of this target was skipped (status `skipped` only). */
+  reason?: string;
 }
 
 /**
@@ -425,8 +428,23 @@ export function refreshTargets(
   targets: readonly AgentTarget[],
   location: Location,
 ): RefreshReport[] {
+  // A project-local install resolves every path from the working directory.
+  // Run from the user's home directory or a filesystem root, it would write
+  // the instructions block into `$HOME/AGENTS.md` — the user's own global
+  // instructions file, not a project's (#3234). `codegraph upgrade` sweeps
+  // both locations by default, so this is reachable without anyone asking
+  // for a local install.
+  const unsafeRoot = location === 'local' ? unsafeIndexRootReason(process.cwd()) : null;
   return targets.map((target) => {
     const base = { id: target.id, displayName: target.displayName, location };
+    if (unsafeRoot) {
+      return {
+        ...base,
+        status: 'skipped' as const,
+        changedPaths: [],
+        reason: `this directory looks like ${unsafeRoot}, so there is no project to write a local config for`,
+      };
+    }
     if (!target.supportsLocation(location)) {
       return { ...base, status: 'unsupported' as const, changedPaths: [] };
     }
