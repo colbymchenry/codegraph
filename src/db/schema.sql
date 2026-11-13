@@ -172,6 +172,15 @@ CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target, kind);
 
+-- The order impact reads a node's dependents in: the kind first, then the
+-- source's place. This index carries that order, so the read needs no sort at
+-- all — and a read bounded by the budget's LIMIT then stops at the rows it
+-- can keep instead of sorting every dependent the node has. Without it, the
+-- read sorts every dependent of every visited node (#3248).
+-- Migration v17 adds this on existing databases.
+CREATE INDEX IF NOT EXISTS idx_edges_target_kind_source
+  ON edges(target, kind, source, line, col);
+
 -- Edge identity uniqueness. An edge IS uniquely (source, target, kind, line,
 -- col); insertEdge uses `INSERT OR IGNORE`, but without something UNIQUE to
 -- conflict on it behaved like a plain INSERT, so two passes emitting the same

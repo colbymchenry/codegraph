@@ -10,7 +10,7 @@ import { referenceNameTail, MEMBER_TAIL_SQL, MODULE_PARKED_SQL } from './referen
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 16;
+export const CURRENT_SCHEMA_VERSION = 17;
 
 /**
  * Migration definition
@@ -312,6 +312,22 @@ const migrations: Migration[] = [
       // schema.sql: the expression is MEMBER_TAIL_SQL.
       db.exec(`
         CREATE INDEX IF NOT EXISTS idx_unresolved_failed_module_member ON unresolved_refs(status, ${MEMBER_TAIL_SQL}) WHERE ${MODULE_PARKED_SQL};
+      `);
+    },
+  },
+  {
+    version: 17,
+    description: 'Index the order impact reads a node\'s dependents in, so a read bounded by the budget needs no sort',
+    up: (db) => {
+      // Impact reads a node's dependents in the order (kind, source, line,
+      // col) and keeps as many as its budget allows. Without an index that
+      // carries that order, the read sorts every dependent the node has --
+      // and a LIMIT under that sort was what made impact two to three times
+      // slower than it was (#3248). This index carries the order, so the read
+      // needs no sort, and the LIMIT stops at the rows the budget can keep.
+      // Keep the definition in lockstep with schema.sql.
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_edges_target_kind_source ON edges(target, kind, source, line, col);
       `);
     },
   },
