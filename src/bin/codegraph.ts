@@ -430,6 +430,34 @@ function cliDefinition(group: Node[]) {
   };
 }
 
+/** Emit warning when inspected files have changed on disk since the index sync (#3260). */
+function warnStaleFiles(staleFiles: string[], json?: boolean): void {
+  if (staleFiles.length === 0) return;
+  const files = staleFiles.join(', ');
+  const message = `as of the last index sync; the file has changed on disk since (${files}), so line numbers may be shifted.`;
+  if (json) {
+    console.error(`${chalk.yellow(getGlyphs().warn)} ${message}`);
+  } else {
+    warn(message);
+  }
+}
+
+/** Find any files among the given nodes or file paths that have changed on disk since the index sync (#3260). */
+async function findStaleFiles(
+  cg: import('../index').CodeGraph,
+  items: Iterable<string | Node | { filePath: string } | undefined>,
+): Promise<string[]> {
+  const { ToolHandler } = await import('../mcp/tools');
+  const handler = new ToolHandler(cg);
+  const displayedFiles = new Set<string>();
+  for (const item of items) {
+    if (!item) continue;
+    const file = typeof item === 'string' ? item : item.filePath;
+    if (file) displayedFiles.add(file);
+  }
+  return [...displayedFiles].filter((file) => handler.isFileStaleOnDisk(cg, file));
+}
+
 type IndexResult = {
   success: boolean;
   filesIndexed: number;
@@ -2565,7 +2593,13 @@ for (const direction of ['callers', 'callees'] as const) {
             lines: callSiteLines(ownEdges(node, edges)),
             recursive,
           });
+          const staleFiles = await findStaleFiles(cg, [
+            ...groups.flat(),
+            ...collected.flatMap((c) => c.nodes),
+          ]);
+
           if (options.json) {
+            warnStaleFiles(staleFiles, true);
             const definitions = collected.map(({ group, nodes, edges, recursive }) => {
               const limited = nodes.slice(0, limit);
               const shown = new Set(limited.map((node) => node.id));
@@ -2601,6 +2635,7 @@ for (const direction of ['callers', 'callees'] as const) {
             }, null, 2));
           } else {
             if (note) warn(note);
+            warnStaleFiles(staleFiles, false);
             if (ambiguous) {
               console.log(chalk.bold(`\n${title} of "${symbol}" — ${groups.length} distinct definitions (narrow with --file):`));
             }
@@ -2687,7 +2722,13 @@ program
         });
         const truncated = collected.some((c) => c.truncated);
 
+        const staleFiles = await findStaleFiles(cg, [
+          ...groups.flat(),
+          ...collected.flatMap((c) => [...c.nodes.values()]),
+        ]);
+
         if (options.json) {
+          warnStaleFiles(staleFiles, true);
           const unionNodes = new Map<string, Node>();
           const unionEdges = new Map<string, Edge>();
           const definitions = collected.map(({ group, nodes, edges, truncated }) => {
@@ -2719,6 +2760,7 @@ program
           }, null, 2));
         } else {
           if (note) warn(note);
+          warnStaleFiles(staleFiles, false);
           if (ambiguous) {
             console.log(chalk.bold(`\nImpact of changing "${symbol}" — ${groups.length} distinct definitions (each with its own blast radius; narrow with --file):`));
           }

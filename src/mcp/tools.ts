@@ -2868,7 +2868,7 @@ export class ToolHandler {
    * are handled by the existing not-found paths, and a wrong "stale" flag
    * would needlessly push the agent back to Read.
    */
-  private isFileStaleOnDisk(cg: CodeGraph, relPath: string, content?: string): boolean {
+  isFileStaleOnDisk(cg: CodeGraph, relPath: string, content?: string): boolean {
     let root: string;
     try {
       root = cg.getProjectRoot();
