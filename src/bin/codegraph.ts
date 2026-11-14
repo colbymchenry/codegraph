@@ -442,6 +442,22 @@ function warnStaleFiles(staleFiles: string[], json?: boolean): void {
   }
 }
 
+/** Find any files among the given nodes or file paths that have changed on disk since the index sync (#3260). */
+async function findStaleFiles(
+  cg: import('../index').CodeGraph,
+  items: Iterable<string | Node | { filePath: string } | undefined>,
+): Promise<string[]> {
+  const { ToolHandler } = await import('../mcp/tools');
+  const handler = new ToolHandler(cg);
+  const displayedFiles = new Set<string>();
+  for (const item of items) {
+    if (!item) continue;
+    const file = typeof item === 'string' ? item : item.filePath;
+    if (file) displayedFiles.add(file);
+  }
+  return [...displayedFiles].filter((file) => handler.isFileStaleOnDisk(cg, file));
+}
+
 type IndexResult = {
   success: boolean;
   filesIndexed: number;
@@ -2577,16 +2593,10 @@ for (const direction of ['callers', 'callees'] as const) {
             lines: callSiteLines(ownEdges(node, edges)),
             recursive,
           });
-          const { ToolHandler } = await import('../mcp/tools');
-          const handler = new ToolHandler(cg);
-          const displayedFiles = new Set<string>();
-          for (const group of groups) {
-            for (const node of group) displayedFiles.add(node.filePath);
-          }
-          for (const { nodes } of collected) {
-            for (const node of nodes) displayedFiles.add(node.filePath);
-          }
-          const staleFiles = [...displayedFiles].filter((file) => handler.isFileStaleOnDisk(cg, file));
+          const staleFiles = await findStaleFiles(cg, [
+            ...groups.flat(),
+            ...collected.flatMap((c) => c.nodes),
+          ]);
 
           if (options.json) {
             warnStaleFiles(staleFiles, true);
@@ -2712,16 +2722,10 @@ program
         });
         const truncated = collected.some((c) => c.truncated);
 
-        const { ToolHandler } = await import('../mcp/tools');
-        const handler = new ToolHandler(cg);
-        const displayedFiles = new Set<string>();
-        for (const group of groups) {
-          for (const node of group) displayedFiles.add(node.filePath);
-        }
-        for (const { nodes } of collected) {
-          for (const node of nodes.values()) displayedFiles.add(node.filePath);
-        }
-        const staleFiles = [...displayedFiles].filter((file) => handler.isFileStaleOnDisk(cg, file));
+        const staleFiles = await findStaleFiles(cg, [
+          ...groups.flat(),
+          ...collected.flatMap((c) => [...c.nodes.values()]),
+        ]);
 
         if (options.json) {
           warnStaleFiles(staleFiles, true);
