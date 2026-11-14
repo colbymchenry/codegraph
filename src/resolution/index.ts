@@ -1429,7 +1429,8 @@ export class ReferenceResolver {
     for (const imp of imports) {
       if (
         imp.localName === ref.referenceName ||
-        ref.referenceName.startsWith(imp.localName + '.')
+        ref.referenceName.startsWith(imp.localName + '.') ||
+        ref.referenceName.startsWith(imp.localName + '::')
       ) {
         return true;
       }
@@ -1828,9 +1829,9 @@ export class ReferenceResolver {
       ref.language === 'arkts' && ref.referenceName.startsWith('.')
         ? ref.referenceName.slice(1)
         : ref.referenceName;
-    // Erlang refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the
+    // Erlang/Elixir refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the
     // name index stores bare names, so existence is checked arity-less.
-    if (ref.language === 'erlang') existenceName = existenceName.replace(/\/\d{1,3}$/, '');
+    if (ref.language === 'erlang' || ref.language === 'elixir') existenceName = existenceName.replace(/\/\d{1,3}$/, '');
     // A C or C++ name written from the global scope (`::_pbi::PrivateAccess::
     // GenerateParseTable`, `::memset`) exists when the name under the `::` does.
     if ((ref.language === 'cpp' || ref.language === 'c') && existenceName.startsWith('::')) {

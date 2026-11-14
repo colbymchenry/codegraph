@@ -2003,6 +2003,8 @@ export function extractImportMappings(
     mappings.push(...extractPHPImports(content));
   } else if (language === 'c' || language === 'cpp') {
     mappings.push(...extractCppImports(content));
+  } else if (language === 'elixir') {
+    mappings.push(...extractElixirImports(content));
   }
 
   return mappings;
@@ -2493,6 +2495,65 @@ function extractCppImports(content: string): ImportMapping[] {
       localName: basename || modulePath,
       exportedName: '*',
       source: modulePath,
+      isDefault: false,
+      isNamespace: true,
+    });
+  }
+
+  return mappings;
+}
+
+function extractElixirImports(content: string): ImportMapping[] {
+  const mappings: ImportMapping[] = [];
+  let code = content.replace(/#[^\r\n]*/g, '');
+
+  // 1. Multi-alias: alias Foo.Bar.{Baz, Qux}
+  const multiAliasRegex = /\balias\s+([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)\.\{([^}]+)\}/g;
+  let match: RegExpExecArray | null;
+  while ((match = multiAliasRegex.exec(code)) !== null) {
+    const base = match[1]!;
+    const members = match[2]!.split(',').map((s) => s.trim()).filter(Boolean);
+    for (const member of members) {
+      const asMatch = /^([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)(?:\s*,\s*as:\s*([A-Z][A-Za-z0-9_]*))?$/.exec(member);
+      if (asMatch) {
+        const sub = asMatch[1]!;
+        const fullSource = `${base}.${sub}`;
+        const localName = asMatch[2] || sub.split('.').pop()!;
+        mappings.push({
+          localName,
+          exportedName: '*',
+          source: fullSource,
+          isDefault: false,
+          isNamespace: true,
+        });
+      }
+    }
+  }
+  code = code.replace(multiAliasRegex, ' ');
+
+  // 2. Single alias: alias Foo.Bar or alias Foo.Bar, as: Baz
+  const singleAliasRegex = /\balias\s+([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)(?:\s*,\s*as:\s*([A-Z][A-Za-z0-9_]*))?/g;
+  while ((match = singleAliasRegex.exec(code)) !== null) {
+    const fullSource = match[1]!;
+    const localName = match[2] || fullSource.split('.').pop()!;
+    mappings.push({
+      localName,
+      exportedName: '*',
+      source: fullSource,
+      isDefault: false,
+      isNamespace: true,
+    });
+  }
+
+  // 3. Import: import Foo.Bar
+  const importRegex = /\bimport\s+([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)/g;
+  while ((match = importRegex.exec(code)) !== null) {
+    const fullSource = match[1]!;
+    const localName = fullSource.split('.').pop()!;
+    mappings.push({
+      localName,
+      exportedName: '*',
+      source: fullSource,
       isDefault: false,
       isNamespace: true,
     });

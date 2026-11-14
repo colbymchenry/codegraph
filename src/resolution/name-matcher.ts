@@ -15134,6 +15134,77 @@ export function matchByQualifiedName(
     }
   }
 
+  // Elixir qualified refs: every Elixir function's qualifiedName carries its arity (`Mod::f/2`).
+  // Calls may reference a module via alias (e.g. `Math::double/1` -> `MyApp.Math::double/1`),
+  // full qualified name, or suffix.
+  if (ref.language === 'elixir' && ref.referenceName.includes('::')) {
+    const colonIdx = ref.referenceName.indexOf('::');
+    const modPart = ref.referenceName.slice(0, colonIdx);
+    const fnWithArity = ref.referenceName.slice(colonIdx + 2);
+    const slashIdx = fnWithArity.indexOf('/');
+    const fnName = slashIdx >= 0 ? fnWithArity.slice(0, slashIdx) : fnWithArity;
+
+    // 1. Try resolving alias mapping from imports
+    const mappings = context.getImportMappings?.(ref.filePath, 'elixir') ?? [];
+    const aliasMapping = mappings.find((m) => m.localName === modPart);
+    if (aliasMapping) {
+      const targetQn = `${aliasMapping.source}::${fnWithArity}`;
+      const cands = keepForRef(context.getNodesByQualifiedName(targetQn));
+      if (cands.length > 0) {
+        return {
+          original: ref,
+          targetNodeId: cands[0]!.id,
+          confidence: 0.95,
+          resolvedBy: 'qualified-name',
+        };
+      }
+    }
+
+    // 2. Try suffix match across modules ending with modPart
+    if (fnName) {
+      const candidates = keepForRef(context.getNodesByName(fnName)).filter(
+        (n) => n.language === 'elixir' && n.kind === 'function' && endsAtScopeBoundary(n.qualifiedName, ref.referenceName),
+      );
+      if (candidates.length === 1) {
+        return {
+          original: ref,
+          targetNodeId: candidates[0]!.id,
+          confidence: 0.9,
+          resolvedBy: 'qualified-name',
+        };
+      }
+      if (candidates.length > 1) {
+        const preferred = preferCallSiteFile(candidates, ref.filePath);
+        return {
+          original: ref,
+          targetNodeId: preferred[0]!.id,
+          confidence: 0.85,
+          resolvedBy: 'qualified-name',
+        };
+      }
+    }
+
+    if (/\/\d{1,3}$/.test(ref.referenceName)) return null;
+
+    // Arity-less call: resolve if there is exactly one arity
+    const prefix = `${ref.referenceName}/`;
+    const arityCands = keepForRef(context.getNodesByName(fnName)).filter(
+      (n) =>
+        n.language === 'elixir' &&
+        n.qualifiedName.startsWith(prefix) &&
+        /^\d{1,3}$/.test(n.qualifiedName.slice(prefix.length)),
+    );
+    if (arityCands.length === 1) {
+      return {
+        original: ref,
+        targetNodeId: arityCands[0]!.id,
+        confidence: 0.85,
+        resolvedBy: 'qualified-name',
+      };
+    }
+    return null;
+  }
+
   // Erlang qualified refs (#1610): every erlang function's qualifiedName
   // carries its arity (`mod::f/2`), and refs carry the call-site arity when it
   // is statically known.
@@ -32512,7 +32583,7 @@ function matchReferenceInner(
   // resolve to NOTHING rather than a sibling arity — the real target may be
   // macro-generated or out of repo, and a wrong-arity edge is worse than none.
   if (
-    ref.language === 'erlang' &&
+    (ref.language === 'erlang' || ref.language === 'elixir') &&
     !ref.referenceName.includes('::') &&
     (ref.referenceKind === 'calls' || ref.referenceKind === 'references')
   ) {
@@ -32524,7 +32595,7 @@ function matchReferenceInner(
         .getNodesByName(am[1]!)
         .filter(
           (n) =>
-            n.language === 'erlang' && n.kind === 'function' && n.qualifiedName.endsWith(arityTail),
+            (n.language === 'erlang' || n.language === 'elixir') && n.kind === 'function' && n.qualifiedName.endsWith(arityTail),
         );
       if (candidates.length > 0) {
         const sameFile = candidates.find((n) => n.filePath === ref.filePath);
