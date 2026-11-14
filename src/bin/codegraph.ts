@@ -26,6 +26,36 @@
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
 
+// Auto-detect compatible Node (>= 22.5.0) if running on older Node (e.g. Node 20)
+(() => {
+  const parts = process.versions.node.split('.');
+  const major = parseInt(parts[0] || '0', 10);
+  const minor = parseInt(parts[1] || '0', 10);
+  if ((major < 22 || (major === 22 && minor < 5)) && !process.env.CODEGRAPH_NODE_REEXEC) {
+    const fs = require('fs');
+    const cp = require('child_process');
+    const candidates = [
+      '/usr/local/bin/node',
+      '/opt/homebrew/bin/node',
+    ];
+    for (const cand of candidates) {
+      if (fs.existsSync(cand)) {
+        try {
+          const out = cp.execFileSync(cand, ['-e', 'process.stdout.write(process.versions.node)']).toString();
+          const [cMaj, cMin] = out.split('.').map(Number);
+          if (cMaj > 22 || (cMaj === 22 && cMin >= 5)) {
+            const res = cp.spawnSync(cand, process.argv.slice(1), {
+              stdio: 'inherit',
+              env: { ...process.env, CODEGRAPH_NODE_REEXEC: '1' },
+            });
+            process.exit(res.status ?? 0);
+          }
+        } catch {}
+      }
+    }
+  }
+})();
+
 // FIRST import, before anything else loads: capture process.ppid while our
 // launcher is (almost certainly) still alive. A launcher killed mid-startup
 // otherwise blinds the PPID watchdog forever (#1185) — see early-ppid.ts.
