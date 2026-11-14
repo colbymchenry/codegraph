@@ -228,4 +228,77 @@ end
       kind: 'calls',
     });
   });
+
+  it('extracts Ecto schema fields, struct fields, and defdelegate', async () => {
+    fs.mkdirSync(path.join(dir, 'lib'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'lib', 'order.ex'),
+      `defmodule MyApp.Order do
+  schema "orders" do
+    field :custom_order_columns, :map
+    belongs_to :shop, MyApp.Shop
+  end
+
+  defstruct [:id, :status, active: true]
+
+  defdelegate get_shop(id), to: MyApp.ShopService
+end
+`
+    );
+
+    fs.writeFileSync(
+      path.join(dir, 'lib', 'shop_service.ex'),
+      `defmodule MyApp.ShopService do
+  def get_shop(id), do: id
+end
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+
+    const nodes = db
+      .prepare(`SELECT kind, name, qualified_name FROM nodes WHERE language = 'elixir'`)
+      .all();
+
+    const edges = db
+      .prepare(
+        `SELECT s.qualified_name sq, t.qualified_name tq, e.kind
+         FROM edges e
+         JOIN nodes s ON s.id = e.source
+         JOIN nodes t ON t.id = e.target
+         WHERE s.language = 'elixir'`
+      )
+      .all();
+
+    cg.destroy();
+
+    // Ecto schema fields
+    const customCol = nodes.find((n: any) => n.name === 'custom_order_columns');
+    expect(customCol).toBeDefined();
+    expect(customCol.kind).toBe('field');
+    expect(customCol.qualified_name).toBe('MyApp.Order::custom_order_columns');
+
+    const shopField = nodes.find((n: any) => n.name === 'shop' && n.kind === 'field');
+    expect(shopField).toBeDefined();
+    expect(shopField.qualified_name).toBe('MyApp.Order::shop');
+
+    // Defstruct fields
+    const idField = nodes.find((n: any) => n.name === 'id' && n.kind === 'field');
+    expect(idField).toBeDefined();
+
+    const activeField = nodes.find((n: any) => n.name === 'active' && n.kind === 'field');
+    expect(activeField).toBeDefined();
+
+    // Defdelegate function and call edge
+    const delegateFn = nodes.find((n: any) => n.qualified_name === 'MyApp.Order::get_shop/1');
+    expect(delegateFn).toBeDefined();
+
+    expect(edges).toContainEqual({
+      sq: 'MyApp.Order::get_shop/1',
+      tq: 'MyApp.ShopService::get_shop/1',
+      kind: 'calls',
+    });
+  });
 });

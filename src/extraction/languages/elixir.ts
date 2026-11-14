@@ -414,6 +414,138 @@ function handleDirective(node: SyntaxNode, ctx: ExtractorContext, directive: str
   return true;
 }
 
+/** Handle Ecto `schema "table" do ... end` and `embedded_schema do ... end` */
+function handleSchema(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const doBlock = node.children.find((c) => c.type === 'do_block');
+  if (!doBlock) return true;
+
+  for (const child of doBlock.namedChildren) {
+    if (child.type !== 'call') continue;
+    const target = child.childForFieldName('target')?.text;
+    const args = child.children.find((c) => c.type === 'arguments');
+    if (!args) continue;
+
+    if (target === 'field') {
+      const nameNode = args.namedChildren[0];
+      if (nameNode?.type === 'atom') {
+        const fieldName = nameNode.text.replace(/^:/, '');
+        ctx.createNode('field', fieldName, child, {
+          signature: child.text,
+          visibility: 'public',
+        });
+      }
+    } else if (
+      target === 'belongs_to' ||
+      target === 'has_many' ||
+      target === 'has_one' ||
+      target === 'many_to_many'
+    ) {
+      const nameNode = args.namedChildren[0];
+      const targetModel = args.namedChildren.find((c) => c.type === 'alias')?.text;
+      if (nameNode?.type === 'atom') {
+        const fieldName = nameNode.text.replace(/^:/, '');
+        const fieldNode = ctx.createNode('field', fieldName, child, {
+          signature: child.text,
+          visibility: 'public',
+        });
+        if (fieldNode && targetModel) {
+          ctx.addUnresolvedReference({
+            fromNodeId: fieldNode.id,
+            referenceName: targetModel,
+            referenceKind: 'references',
+            line: child.startPosition.row + 1,
+            column: child.startPosition.column,
+          });
+        }
+      }
+    }
+  }
+  return true;
+}
+
+/** Handle `defstruct [:field1, :field2, key: val]` */
+function handleDefstruct(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const args = node.children.find((c) => c.type === 'arguments');
+  if (!args) return true;
+
+  for (const child of args.namedChildren) {
+    if (child.type === 'list') {
+      for (const item of child.namedChildren) {
+        if (item.type === 'atom') {
+          const fieldName = item.text.replace(/^:/, '');
+          ctx.createNode('field', fieldName, item, {
+            visibility: 'public',
+          });
+        } else if (item.type === 'keywords') {
+          for (const pair of item.namedChildren) {
+            const key = pair.childForFieldName('key');
+            if (key) {
+              const fieldName = key.text.trim().replace(/:$/, '').trim();
+              ctx.createNode('field', fieldName, pair, {
+                visibility: 'public',
+              });
+            }
+          }
+        }
+      }
+    } else if (child.type === 'keywords') {
+      for (const pair of child.namedChildren) {
+        const key = pair.childForFieldName('key');
+        if (key) {
+          const fieldName = key.text.trim().replace(/:$/, '').trim();
+          ctx.createNode('field', fieldName, pair, {
+            visibility: 'public',
+          });
+        }
+      }
+    }
+  }
+  return true;
+}
+
+/** Handle `defdelegate fun(args), to: Target, as: :alt_name` */
+function handleDefdelegate(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const args = node.children.find((c) => c.type === 'arguments');
+  if (!args) return true;
+
+  const head = parseFunctionHead(args);
+  if (!head) return true;
+
+  const fnNode = ctx.createNode('function', head.name, node, {
+    signature: `defdelegate ${head.signatureText}`,
+    visibility: 'public',
+    isExported: true,
+  });
+  if (!fnNode) return true;
+
+  fnNode.qualifiedName = `${fnNode.qualifiedName}/${head.arity}`;
+
+  const keywords = args.children.find((c) => c.type === 'keywords');
+  if (keywords) {
+    let toMod = '';
+    let asFn = head.name;
+    for (const pair of keywords.namedChildren) {
+      const key = pair.childForFieldName('key')?.text?.trim();
+      const val = pair.childForFieldName('value');
+      if (key === 'to:' && val) {
+        toMod = val.text;
+      } else if (key === 'as:' && val) {
+        asFn = val.text.replace(/^:/, '');
+      }
+    }
+    if (toMod) {
+      ctx.addUnresolvedReference({
+        fromNodeId: fnNode.id,
+        referenceName: `${toMod}::${asFn}/${head.arity}`,
+        referenceKind: 'calls',
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column,
+      });
+    }
+  }
+  return true;
+}
+
 export const elixirExtractor: LanguageExtractor = {
   functionTypes: [], // Handled in visitNode
   classTypes: [],
@@ -440,6 +572,15 @@ export const elixirExtractor: LanguageExtractor = {
       }
       if (target === 'defp' || target === 'defmacrop') {
         return handleDef(node, ctx, true);
+      }
+      if (target === 'schema' || target === 'embedded_schema') {
+        return handleSchema(node, ctx);
+      }
+      if (target === 'defstruct') {
+        return handleDefstruct(node, ctx);
+      }
+      if (target === 'defdelegate') {
+        return handleDefdelegate(node, ctx);
       }
       if (target === 'alias' || target === 'import' || target === 'require' || target === 'use') {
         return handleDirective(node, ctx, target);
