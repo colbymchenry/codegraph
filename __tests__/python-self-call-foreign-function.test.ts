@@ -155,6 +155,107 @@ describe('a Python call on self or cls', () => {
     expect(cg.getCallees(named('forward')[0]!.id).filter((c) => c.node.name === 'out')).toEqual([]);
   });
 
+  it('does not reach a module-level variable of its own file', async () => {
+    await index({
+      'lab/model.py': [
+        'out = (1, 2)',
+        '',
+        'def make():',
+        '    return 1',
+        '',
+        'class MLP:',
+        '    def __init__(self):',
+        '        self.out = make()',
+        '',
+        '    def go(self, x):',
+        '        return self.out(x)',
+      ],
+    });
+    expect(callees('go')).toEqual([]);
+  });
+
+  it('keeps an imported function the class body binds under its own name', async () => {
+    await index({
+      'other/helpers.py': ['def validate():', '    return 1'],
+      'pkg/m.py': [
+        'from other.helpers import validate',
+        '',
+        'class M:',
+        '    validate = staticmethod(validate)',
+        '',
+        '    def go(self):',
+        '        return self.validate()',
+      ],
+    });
+    expect(callees('go')).toEqual(['other/helpers.py:validate']);
+  });
+
+  it('keeps an imported function self is bound to, but not a parameter of the same name', async () => {
+    await index({
+      'other/helpers.py': ['def validate():', '    return 1', '', 'def check():', '    return 2'],
+      'pkg/m.py': [
+        'from other.helpers import validate, check',
+        '',
+        'class M:',
+        '    def __init__(self, check):',
+        '        self.validate = validate',
+        '        self.check = check',
+        '',
+        '    def go(self):',
+        '        return self.validate()',
+        '',
+        '    def other(self):',
+        '        return self.check()',
+      ],
+    });
+    expect(callees('go')).toEqual(['other/helpers.py:validate']);
+    expect(callees('other')).toEqual([]);
+  });
+
+  it('keeps a module-level alias self is bound to through its module', async () => {
+    await index({
+      'pkg/db.py': ['class _Session:', '    pass', '', 'Session = _Session'],
+      'pkg/repo.py': [
+        'from pkg import db',
+        '',
+        'class Repo:',
+        '    def __init__(self):',
+        '        self.Session = db.Session',
+        '',
+        '    def go(self):',
+        '        return self.Session()',
+      ],
+    });
+    expect(cg.getCallees(named('go')[0]!.id).map((c) => c.node.filePath)).toEqual(['pkg/db.py']);
+  });
+
+  it('keeps a function another file puts on the class', async () => {
+    await index({
+      'pkg/c.py': ['class C:', '    def go(self):', '        return self.extra()'],
+      'pkg/ext.py': ['from pkg.c import C', '', 'def extra(self):', '    return 1', '', 'C.extra = extra'],
+    });
+    expect(callees('go')).toEqual(['pkg/ext.py:extra']);
+  });
+
+  it('takes cls.x() for the class method, not a function the file imports', async () => {
+    await index({
+      'other/factories.py': ['def create():', '    return object()'],
+      'pkg/model.py': [
+        'from other.factories import create',
+        '',
+        'class Model:',
+        '    @classmethod',
+        '    def create(cls):',
+        '        return cls()',
+        '',
+        '    @classmethod',
+        '    def make(cls):',
+        '        return cls.create()',
+      ],
+    });
+    expect(callees('make')).toEqual(['pkg/model.py:create']);
+  });
+
   it('keeps a method it inherits from a class in another file', async () => {
     await index({
       'pkg/base.py': ['class Base:', '    def setup(self):', '        return 1'],

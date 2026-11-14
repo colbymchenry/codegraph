@@ -4422,18 +4422,62 @@ export function isPythonSelfCall(ref: UnresolvedRef, context: ResolutionContext)
 }
 
 /**
- * Whether a Python `self.x()` or `cls.x()` landed on a module-level name of
- * another file. That call names a member, and with no method of the name it's an
+ * Whether a Python `self.x()` or `cls.x()` landed on a module-level name it
+ * doesn't run. That call names a member, and with no method of the name it's an
  * attribute holding a callable, so nothing says which: flask's `self.create_app()`
  * is the callable `ScriptInfo` was handed, not an example app's `create_app`.
- * The caller's own file stays, since it can put its functions on a class: attrs'
- * `_cmp.py` builds `_is_comparable_to` into the classes it makes. So does a class,
- * which an attribute usually holds under its own name: networkx's `self.Graph()`
- * after `self.Graph = nx.Graph`.
+ * A function of the caller's own file stays, since the file can put its
+ * functions on a class: attrs' `_cmp.py` builds `_is_comparable_to` into the
+ * classes it makes. So does a class, which an attribute usually holds under its
+ * own name: networkx's `self.Graph()` after `self.Graph = nx.Graph`. And so does
+ * a name the attribute is bound to (see pythonBindsAttributeTo).
  */
 export function isSelfCallOnForeignName(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  return target.kind !== 'class' && target.filePath !== ref.filePath && !target.qualifiedName.includes('::') &&
-    isPythonSelfCall(ref, context);
+  if (target.kind === 'class' || target.qualifiedName.includes('::')) return false;
+  if (target.filePath === ref.filePath && target.kind === 'function') return false;
+  return isPythonSelfCall(ref, context) && !pythonBindsAttributeTo(target, ref, context);
+}
+
+/**
+ * Whether the attribute `self.x()` calls is bound to the module-level name
+ * `target`, under its own name: `x = staticmethod(x)` in a class body,
+ * `self.x = x` or `self.x = mod.x` in the caller's file, or `Cls.x = x` in the
+ * caller's file or `target`'s, with `Cls` a class around the caller. A bare `x`
+ * that is a parameter of the function it's in is that parameter, not `target`.
+ */
+function pythonBindsAttributeTo(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const attr = escapeRegExp(ref.referenceName);
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  const owners = (caller?.qualifiedName.split('::').slice(0, -1) ?? []).filter(s => /^\w+$/.test(s)).map(escapeRegExp);
+  const owner = ['self', 'cls', ...owners].join('|');
+  const value = `(?:(?:static|class)method\\(\\s*)?(?!(?:self|cls)\\.)((?:[A-Za-z_]\\w*\\.)*)${escapeRegExp(target.name)}\\s*\\)?\\s*$`;
+  const own = new RegExp(`^(\\s*)((?:${owner})\\.)?${attr}\\s*=\\s*${value}`);
+  const lines = pythonMemberLines(ref.filePath, context);
+  const bound = lines.some((line, i) => {
+    const m = own.exec(line);
+    if (!m) return false;
+    const fn = pythonFunctionAt(ref.filePath, i + 1, context);
+    // Without an owner it's a class attribute only in a class body, not a module's or a function's local.
+    if (!m[2]) return !!m[1] && !fn;
+    return m[3] !== '' || !fn || !isPythonParameterOf(target.name, fn, context);
+  });
+  if (bound || target.filePath === ref.filePath || !owners.length) return bound;
+  const outside = new RegExp(`^\\s*(?:[A-Za-z_]\\w*\\.)*(?:${owners.join('|')})\\.${attr}\\s*=\\s*${value}`);
+  return pythonMemberLines(target.filePath, context).some(line => outside.test(line));
+}
+
+/** The innermost Python function or method whose body has `line` of `filePath`. */
+function pythonFunctionAt(filePath: string, line: number, context: ResolutionContext): Node | undefined {
+  return context.getNodesInFile(filePath)
+    .filter(n => (n.kind === 'function' || n.kind === 'method') && n.startLine < line && line <= n.endLine)
+    .sort((a, b) => b.startLine - a.startLine)[0];
+}
+
+/** Whether `name` is a parameter of the Python function `fn`. */
+function isPythonParameterOf(name: string, fn: Node, context: ResolutionContext): boolean {
+  const head = pythonMemberLines(fn.filePath, context).slice(fn.startLine - 1, fn.startLine + 15).join('\n');
+  const params = /\bdef\s+\w+\s*(?:\[[^\]]*\])?\s*\(([^]*?)\)\s*(?:->[^:]*)?:/.exec(head)?.[1] ?? '';
+  return new RegExp(`(?:^|[(,*\\s])${escapeRegExp(name)}\\s*(?:[:=,)]|$)`).test(params);
 }
 
 /** Whether a call recorded by its bare name is written on something other than the caller's own object. */
