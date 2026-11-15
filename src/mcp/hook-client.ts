@@ -13,6 +13,7 @@
 
 import * as fs from 'fs';
 import type * as net from 'net';
+import * as path from 'path';
 import { daemonOptOutSet, getDaemonSocketCandidates } from './daemon-paths';
 import { connectWithHello } from './proxy';
 import { PROMPT_EXPLORE_METHOD } from './session';
@@ -48,12 +49,20 @@ const UNAVAILABLE: DaemonExplore = { status: 'unavailable' };
  * context, and one candidate is in the system temp directory, which every user
  * of the machine can write to on Linux. `lstat`, so a link left at the path is
  * refused however it resolves. A Windows named pipe has no owner to read here.
+ *
+ * The folder is checked too, because the socket is checked before it is
+ * connected to: where others can write and no sticky bit keeps a file for its
+ * owner to remove, they could put their own socket in its place in between.
+ * The folder's owner can remove any file in it, so that is this user or root.
  */
 function boundByThisUser(socketPath: string): boolean {
   if (process.platform === 'win32') return true;
   try {
-    const stat = fs.lstatSync(socketPath);
-    return stat.isSocket() && stat.uid === process.getuid?.();
+    const uid = process.getuid?.();
+    const socket = fs.lstatSync(socketPath);
+    const folder = fs.statSync(path.dirname(socketPath));
+    const othersCanReplace = (folder.mode & 0o022) !== 0 && (folder.mode & 0o1000) === 0;
+    return socket.isSocket() && socket.uid === uid && (folder.uid === uid || folder.uid === 0) && !othersCanReplace;
   } catch {
     return false;
   }

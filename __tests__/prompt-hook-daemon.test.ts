@@ -242,6 +242,33 @@ describe.runIf(process.platform !== 'win32')('exploreViaDaemon — the hook aski
     await expect(exploreViaDaemon(root, 'how does placeOrder work', 5_000)).resolves.toEqual({ status: 'unavailable' });
     expect(seen).toEqual([]);
   });
+
+  // In a folder others can write to, they can swap this user's socket for
+  // their own between the check and the connection. The sticky bit, which
+  // /tmp carries, is what stops them: only a file's owner may remove it.
+  it('never trusts a socket in a folder where others can replace it', async () => {
+    const root = await indexedProject();
+    const seen = await fakeDaemon(root, CodeGraphPackageVersion, answer('FROM THE DAEMON'));
+    const folder = path.dirname(getDaemonSocketCandidates(root)[0]!);
+    expect(folder.startsWith(root)).toBe(true);
+    fs.chmodSync(folder, 0o777);
+
+    await expect(exploreViaDaemon(root, 'how does placeOrder work', 5_000)).resolves.toEqual({ status: 'unavailable' });
+    expect(seen).toEqual([]);
+  });
+
+  it('trusts its own socket in a shared folder that has the sticky bit, like /tmp', async () => {
+    const root = await indexedProject();
+    await fakeDaemon(root, CodeGraphPackageVersion, answer('FROM THE DAEMON'));
+    const folder = path.dirname(getDaemonSocketCandidates(root)[0]!);
+    expect(folder.startsWith(root)).toBe(true);
+    fs.chmodSync(folder, 0o1777);
+
+    await expect(exploreViaDaemon(root, 'how does placeOrder work', 5_000)).resolves.toEqual({
+      status: 'answered',
+      text: 'FROM THE DAEMON',
+    });
+  });
 });
 
 /** Run the built CLI's `prompt-hook` in `dir`, as Claude Code does, and return what it injects. */
