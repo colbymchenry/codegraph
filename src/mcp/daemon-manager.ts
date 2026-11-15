@@ -7,9 +7,11 @@
  * registry's list/stop functions.
  */
 import * as path from 'path';
+import { canonicalProjectRoot } from '../directory';
+import { getDaemonIndexDir, isDefaultDaemonIndex, sameDaemonIndex } from './daemon-paths';
 import type { DaemonRecord, StopResult } from './daemon-registry';
 
-/** Sentinel option values (not real roots, so they can't collide with a project path). */
+/** Sentinel option values (not paths, so they can't collide with a daemon's registry file). */
 export const STOP_ALL = '__stop_all__';
 export const CANCEL = '__cancel__';
 
@@ -30,28 +32,52 @@ export function formatUptime(ms: number): string {
 }
 
 /**
- * Build the ordered, UI-ready option list: the current project's daemon first
- * (so it's the auto-selected default), the rest newest-first, then "Stop all"
- * (only when there's more than one) and "Cancel".
+ * Which index `daemon` serves, worded for a list of `daemons`, or null where its
+ * root says enough: an index other than its project's default is named, and so
+ * is every index of a project that runs more than one daemon, so no two rows
+ * read the same. A record from an older release that shows no index is
+ * `index unknown` when that matters.
+ */
+export function describeDaemonIndex(daemon: DaemonRecord, daemons: readonly DaemonRecord[]): string | null {
+  const root = canonicalProjectRoot(daemon.root);
+  const sharesRoot = daemons.some((other) => other.file !== daemon.file && canonicalProjectRoot(other.root) === root);
+  if (daemon.indexDir === null) return sharesRoot ? 'index unknown' : null;
+  if (!sharesRoot && isDefaultDaemonIndex(daemon.root, daemon.indexDir)) return null;
+  return `index ${path.basename(daemon.indexDir)}`;
+}
+
+/** A daemon's root, with its index when {@link describeDaemonIndex} names it. */
+export function describeDaemon(daemon: DaemonRecord, daemons: readonly DaemonRecord[]): string {
+  const index = describeDaemonIndex(daemon, daemons);
+  return index ? `${daemon.root} (${index})` : daemon.root;
+}
+
+/**
+ * Build the ordered, UI-ready option list: the daemon of the current project's
+ * index first (so it's the auto-selected default), the rest newest-first, then
+ * "Stop all" (only when there's more than one) and "Cancel". Each daemon's
+ * value is its registry file, which no other row shares.
  */
 export function buildPickItems(daemons: DaemonRecord[], cwdRoot: string | null, now: number): PickItem[] {
-  const cwd = cwdRoot != null ? path.resolve(cwdRoot) : null;
+  // The current project's index is the one this process's CODEGRAPH_DIR names;
+  // another index of the same project is not the current one.
+  const cwdIndex = cwdRoot != null ? getDaemonIndexDir(cwdRoot) : null;
+  const isCurrent = (d: DaemonRecord): boolean =>
+    cwdIndex !== null && d.indexDir !== null && sameDaemonIndex(d.indexDir, cwdIndex);
   const ordered = [...daemons].sort((a, b) => {
-    if (cwd) {
-      const aCur = path.resolve(a.root) === cwd;
-      const bCur = path.resolve(b.root) === cwd;
-      if (aCur && !bCur) return -1;
-      if (bCur && !aCur) return 1;
-    }
+    const aCur = isCurrent(a);
+    const bCur = isCurrent(b);
+    if (aCur && !bCur) return -1;
+    if (bCur && !aCur) return 1;
     return b.startedAt - a.startedAt; // newest first
   });
 
   const items: PickItem[] = ordered.map((d) => {
-    const current = cwd != null && path.resolve(d.root) === cwd;
+    const index = describeDaemonIndex(d, daemons);
     return {
-      value: d.root,
-      label: current ? `${d.root}  (current project)` : d.root,
-      hint: `pid ${d.pid} · up ${formatUptime(now - d.startedAt)} · Running`,
+      value: d.file,
+      label: isCurrent(d) ? `${d.root}  (current project)` : d.root,
+      hint: `${index ? `${index} · ` : ''}pid ${d.pid} · up ${formatUptime(now - d.startedAt)} · Running`,
     };
   });
 
@@ -62,9 +88,10 @@ export function buildPickItems(daemons: DaemonRecord[], cwdRoot: string | null, 
 
 export interface PickerDeps {
   list: () => DaemonRecord[] | Promise<DaemonRecord[]>;
-  stop: (root: string) => Promise<StopResult>;
+  /** Stop the daemon a listed record names. */
+  stop: (daemon: DaemonRecord) => Promise<StopResult>;
   stopAll: () => Promise<StopResult[]>;
-  /** Realpath'd root of the current project's daemon, or null. */
+  /** Realpath'd root of the current project, or null. Its index is the one `CODEGRAPH_DIR` names. */
   cwdRoot: string | null;
   now: () => number;
   /** Render the picker; returns the chosen value or a cancel sentinel. */
@@ -108,27 +135,30 @@ export async function runDaemonPicker(deps: PickerDeps): Promise<void> {
       return;
     }
 
-    const result = await deps.stop(String(choice));
+    const selected = daemons.find((daemon) => daemon.file === choice);
+    if (!selected) continue;
+    const result = await deps.stop(selected);
+    const where = describeDaemon(selected, daemons);
     if (result.outcome === 'still-running') {
-      deps.note(`Could not stop daemon (pid ${result.pid}); left its artifacts intact — ${choice}`);
+      deps.note(`Could not stop daemon (pid ${result.pid}); left its artifacts intact — ${where}`);
       continue;
     }
     if (result.outcome === 'unverified') {
       deps.note(
-        `Could not verify daemon (pid ${result.pid}); left it running with its artifacts intact — ${choice}`
+        `Could not verify daemon (pid ${result.pid}); left it running with its artifacts intact — ${where}`
       );
       continue;
     }
     if (result.outcome === 'not-running') {
-      deps.note(`Daemon was no longer running; removed stale artifacts — ${choice}`);
+      deps.note(`Daemon was no longer running; removed stale artifacts — ${where}`);
       continue;
     }
     if (result.outcome === 'no-daemon') {
-      deps.note(`No daemon was found — ${choice}`);
+      deps.note(`No daemon was found — ${where}`);
       continue;
     }
     const forced = result.outcome === 'kill' ? ', forced' : '';
-    deps.note(`Stopped daemon (pid ${result.pid}${forced}) — ${choice}`);
+    deps.note(`Stopped daemon (pid ${result.pid}${forced}) — ${where}`);
     // Loop: the next iteration re-lists; if more remain it re-prompts, otherwise
     // the top-of-loop empty check prints "All daemons stopped."
   }

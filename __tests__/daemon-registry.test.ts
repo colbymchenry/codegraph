@@ -13,7 +13,7 @@ import {
   listVerifiedDaemons,
   clearStaleDaemonArtifacts,
   stopDaemonAt,
-  type DaemonRecord,
+  type DaemonRegistration,
 } from '../src/mcp/daemon-registry';
 import { encodeLockInfo, getDaemonPidPath, getDaemonSocketPath } from '../src/mcp/daemon-paths';
 import { releaseWriterLock, tryAcquireWriterLock } from '../src/mcp/writer-lock';
@@ -27,7 +27,7 @@ async function deadPid(): Promise<number> {
   return pid;
 }
 
-function rec(root: string, pid: number, startedAt = Date.now()): DaemonRecord {
+function rec(root: string, pid: number, startedAt = Date.now()): DaemonRegistration {
   return { root, pid, version: '1.0.0', socketPath: `${root}/.codegraph/daemon.sock`, startedAt };
 }
 

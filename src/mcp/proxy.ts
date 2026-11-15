@@ -168,11 +168,13 @@ export async function runProxy(
  * {@link runProxy} it does NOT pipe — the caller owns the socket. Used by the
  * local-handshake proxy's background connect. `helloTimeoutMs` bounds the wait
  * for the hello, so a caller with a deadline can spend no more than it has.
+ * With `expectedPid`, a hello from any other process is no daemon (null).
  */
 export async function connectWithHello(
   socketPath: string,
   expectedVersion: string = CodeGraphPackageVersion,
   helloTimeoutMs: number = DAEMON_HELLO_TIMEOUT_MS,
+  expectedPid?: number,
 ): Promise<net.Socket | 'older-version' | 'version-mismatch' | null> {
   if (process.platform !== 'win32' && !fs.existsSync(socketPath)) return null;
   const socket = net.createConnection(socketPath);
@@ -188,7 +190,7 @@ export async function connectWithHello(
   // recoverable: the follow-up 'close' drives the caller's normal fallback.
   socket.on('error', () => { /* absorbed — see #974; 'close' drives the fallback */ });
   const hello = await readHelloLine(socket, helloTimeoutMs).catch(() => null);
-  if (!hello) {
+  if (!hello || (expectedPid !== undefined && hello.pid !== expectedPid)) {
     socket.destroy();
     return null; // no daemon yet — caller should keep polling
   }
