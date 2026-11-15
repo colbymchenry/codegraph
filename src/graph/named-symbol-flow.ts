@@ -38,6 +38,7 @@ import { isTestFile, splitAtCjkSwitches, isQueryNameToken } from '../search/quer
 
 import { qualifiedSymbolMatches } from './symbol-lookup';
 import { goPackageReaderFor } from './go-package';
+import { isTransportEdge } from './transport-edges';
 
 // Preserve the existing imports while sharing the matcher with the CLI and MCP.
 export { RUST_PATH_PREFIXES, lastQualifierPart, matchesSymbol } from './symbol-lookup';
@@ -418,6 +419,10 @@ function onRoute(parent: ReadonlyMap<string, WalkStep>, key: string, nodeId: str
  * Breadth-first over `calls` edges — synthesized ones included, which is what
  * carries a flow across a callback, a re-render or a JSX child.
  *
+ * Flows compose single hops, so they carry no transport scope: they never
+ * cross a transport edge (transport-edges.ts), whose operation edges carry
+ * the flow instead.
+ *
  * This is the `named` walk: every named symbol is a possible destination, and
  * at most `maxBridge` unnamed symbols may sit between two of them. That cap is
  * what bounds the frontier, so {@link NAMED_VISIT_CAP} is generous.
@@ -497,7 +502,7 @@ function walkCalls(
     if (id !== seed.id && named.has(id)) reached.push(key);
     if (at.depth >= maxHops - 1) continue;
     for (const c of calleesOf(id)) {
-      if (!FLOW_EDGE_KINDS.has(c.edge.kind)) continue;
+      if (isTransportEdge(c.edge) || !FLOW_EDGE_KINDS.has(c.edge.kind)) continue;
       const isNamed = named.has(c.node.id);
       // A route node is a connector, not a symbol the reader would have named:
       // crossing one costs no bridge budget. Nor does the hop from a const to the
@@ -577,7 +582,7 @@ function walkBidirectional(
       const next: Node[] = [];
       for (const node of frontF) {
         for (const c of cg.getCallees(node.id)) {
-          if (!FLOW_EDGE_KINDS.has(c.edge.kind) || forward.has(c.node.id)) continue;
+          if (isTransportEdge(c.edge) || !FLOW_EDGE_KINDS.has(c.edge.kind) || forward.has(c.node.id)) continue;
           forward.set(c.node.id, { prev: node.id, edge: c.edge, node: c.node });
           next.push(c.node);
         }
@@ -589,7 +594,7 @@ function walkBidirectional(
       const next: Node[] = [];
       for (const node of frontB) {
         for (const c of cg.getCallers(node.id)) {
-          if (!FLOW_EDGE_KINDS.has(c.edge.kind) || backward.has(c.node.id)) continue;
+          if (isTransportEdge(c.edge) || !FLOW_EDGE_KINDS.has(c.edge.kind) || backward.has(c.node.id)) continue;
           backward.set(c.node.id, { next: node.id, edge: c.edge });
           backNodes.set(c.node.id, c.node);
           next.push(c.node);

@@ -7,7 +7,7 @@
 
 export { ExtractionOrchestrator, extractFromSource } from './extraction';
 export { changedModuleConfigs, changedRoutes, createResolver, moduleConfigLanguages, parseModuleConfigSnapshot } from './resolution';
-export { hasSynthesisPattern, isJsxChildCandidate } from './resolution/callback-synthesizer';
+export { hasSynthesisPattern, isJsxChildCandidate, isLuaRustBridgeInput } from './resolution/callback-synthesizer';
 export { aliasMayName } from './resolution/const-alias-synthesizer';
 export { ESM_IMPORT_LANGUAGES } from './resolution/import-resolver';
 export {

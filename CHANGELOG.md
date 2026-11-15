@@ -50,6 +50,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CodeIgniter 3 projects are now understood: every controller method and `routes.php` entry becomes a route, HMVC modules included, and calls through what `$this->load` loads, like `$this->user_model->find($id)`, link to the method they reach, so `codegraph_explore` can follow a request from its route through the model and into the view. Thanks @darkspock.
 - In Drupal, services from `*.services.yml`, plugin definitions (attributes and docblock annotations, a contrib module's own plugin types included) and `#[Hook]` methods are now part of the graph, and a call through `\Drupal::service('x')` or `$container->get('x')` links to the method on that service's class. Thanks @mikedamoiseau and @marcelovani.
 - In Next.js, a route now links to the `proxy.ts` or `middleware.ts` that runs before it, following `config.matcher`, so `codegraph impact`, `codegraph callers` and `codegraph_explore` show which routes a change to it reaches. Thanks @RIGOandre.
+- LuaJIT programs now connect to the Rust library they call: `codegraph_explore`, callers and impact follow a call through `ffi.load(...)` or `ffi.C` to the Rust `extern "C"` function it names, and an operation name passed through one shared export, like `call("task.run")`, to the Rust handler that operation selects, so operations that share the export stay apart, while the export's own callers list every Lua call into it. Re-index projects that mix Lua and Rust after upgrading.
 
 ### Fixes
 

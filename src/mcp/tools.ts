@@ -39,6 +39,7 @@ import type { Node, Edge, SearchResult, Subgraph, NodeKind, Language } from '../
 import { isTestFile, isTestPath, normalizeNameToken, splitAtCjkSwitches, isQueryNameToken } from '../search/query-utils';
 import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol, qualifiedSymbolMatches } from '../graph/symbol-lookup';
 import { goPackageReaderFor } from '../graph/go-package';
+import { isTransportEdge } from '../graph/transport-edges';
 import {
   extractQueryPaths,
   queryMightContainPaths,
@@ -9079,6 +9080,7 @@ export class ToolHandler {
    * callback is WIRED, not where it's invoked.
    */
   private edgeLabel(edge: Edge): string | null {
+    if (isTransportEdge(edge)) return this.synthEdgeNote(edge) ?? 'transport';
     if (edge.kind === 'calls') return null;
     if (edge.metadata?.fnRef === true) return 'callback registration';
     if (edge.kind === 'instantiates') return 'instantiation';
