@@ -51,6 +51,7 @@ import { overrideFilter } from './override-parameters';
 import { declaredComponent, exportedComponent, lazyValueModules, wrappedComponentName } from './frameworks/react';
 import { jsxCode } from './jsx-code';
 import { isTestPath } from '../search/query-utils';
+import { EXPORT_LITERAL, FFI_LITERAL, luaRustBridgeEdges, luaRustBridgeOpen } from './lua-rust-synthesizer';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -5305,6 +5306,19 @@ export interface SynthPassDef {
 
 const ALWAYS = (): boolean => true;
 
+/**
+ * Whether a file's new text can open the Lua/Rust bridge: a Lua file holding
+ * "ffi" where the project holds Rust, or a Rust file declaring an export where
+ * it holds Lua. Once the bridge is open, every Lua file and every Rust file
+ * declaring an export is one of its inputs: any receiver, call or export edit
+ * can change an edge.
+ */
+export function opensLuaRustBridge(language: string | undefined, content: string, projectLanguages: ReadonlySet<string>): boolean {
+  if (language === 'lua') return projectLanguages.has('rust') && FFI_LITERAL.test(content);
+  if (language === 'rust') return projectLanguages.has('lua') && EXPORT_LITERAL.test(content);
+  return false;
+}
+
 /** Conservative input gates for SYNTH_PASSES; keep these in sync when adding a pass. */
 export function hasSynthesisPattern(filePath: string, content: string): boolean {
   // These passes consume declarations/layouts as well as dispatch sites. A
@@ -5438,6 +5452,8 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'svelteKitPageEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitPageComponentEdges(c, y) },
   { name: 'svelteKitLinkEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLinkEdges(c, y) },
   { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
+  // A LuaJIT FFI call onto the Rust C-ABI export with its symbol.
+  { name: 'luaRustBridge', gate: (has) => has('lua') && has('rust'), run: (q, c, y) => luaRustBridgeEdges(q, c, y) },
 ];
 
 /**
@@ -5621,9 +5637,20 @@ export async function synthesizeCallbackEdges(
   // own: a page given its default export, or a barrel rewired, redraws it. So
   // does every file a tag imported from the project is read through.
   const collectInputs = async (): Promise<string[]> => {
+    // An open Lua/Rust bridge reads every Lua file, since any may call through a module that holds a
+    // library, and every Rust file that declares an export.
+    const bridgeInputs = new Set<string>();
+    if (has('lua') && has('rust') && luaRustBridgeOpen(ctx)) {
+      for (const file of ctx.iterateNodesByKind?.('file') ?? ctx.getNodesByKind('file')) {
+        if (file.language === 'lua' || (file.language === 'rust' && EXPORT_LITERAL.test(ctx.readFile(file.filePath) ?? ''))) {
+          bridgeInputs.add(file.filePath);
+        }
+      }
+    }
     const found = new Set<string>();
     const tagModules = new Map<string, Set<string>>();
     for (const file of ctx.getAllFiles()) {
+      if (bridgeInputs.has(file)) { found.add(file); continue; }
       const content = ctx.readFile(file);
       if (content !== null && hasSynthesisPattern(file, content)) {
         found.add(file);
