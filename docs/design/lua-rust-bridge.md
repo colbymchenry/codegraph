@@ -1,16 +1,21 @@
-# LuaJIT → Rust FFI links
+# LuaJIT → Rust bridge
 
 A LuaJIT program that loads a Rust library calls it through the FFI, by
 symbol: `lib.router_new()` where `lib` came from `ffi.load("atc_router")`, or
 `ffi.C.native_ping()` once the library is loaded into the process. Static
 extraction stops at that call. The symbol is defined in Rust, no Lua file
 defines it, so callers, callees, impact and explore flows end on the Lua side,
-and the Rust function looks like nothing calls it.
+and the Rust function looks like nothing calls it. A program often goes
+further and calls one shared export with an operation name, like
+`core.call("task.run", …)` → `extern "C" fn wire_send(op, …)` →
+`match op { "task.run" => run(), … }`. Read through that `match`, every Lua
+caller would reach every handler.
 
-The pass in `lua-rust-synthesizer.ts` links each such call to the one Rust
-C-ABI export with that symbol, from the source alone. It runs only in a
-project that holds both a Lua file naming `"ffi"` and a Rust file declaring an
-export; no project, symbol, library or module name is built in.
+The pass in `lua-rust-synthesizer.ts` links each FFI call to the one Rust
+C-ABI export with that symbol, and each literal operation to the one handler
+its arm selects, from the source alone. It runs only in a project that holds
+both a Lua file naming `"ffi"` and a Rust file declaring an export; no
+project, symbol, library, module or operation name is built in.
 
 It is a synthesis pass rather than a resolver rule because the proof that a
 receiver is an FFI library is a flow fact on the Lua side. A name resembling
@@ -48,7 +53,55 @@ a loader opens is not in the source.
 **Calls in closures.** A call in a function no node stands for, like a closure
 passed as an argument or one in a returned table, counts for the nearest
 enclosing function one does, as the extractor's own calls do, and at chunk
-level for the file.
+level for the file. It forwards only that function's own parameters, never the
+closure's, and none at all when the closure is kept beyond the call that made
+it (`cached = cached or function() … end`), since a later call may run it.
+
+**Operations.** For a string-operation protocol, the pass follows Lua wrappers
+that forward a parameter, through modules that export them, and Rust functions
+that forward it, into a literal `match` on it. Each literal operation links
+its Lua call to the one handler its arm selects (`lua-rust-operation`, with
+the operations, the export and the dispatch site as provenance):
+
+- the first arm a literal can reach wins. A guard, a `#[cfg]` arm, an earlier
+  binding pattern or a wildcard (inside an or-pattern too) that may take the
+  literal leaves it unresolved;
+- an operation an earlier return always takes never reaches its arm: a test
+  the source spells (`==`, `!=`, `starts_with`, `ends_with`, `contains`,
+  `is_empty`, and `&&`, `||` and `!` of them) on the function's unconditional
+  path, a literal arm that returns, or a catch-all that returns after literal
+  arms. A test the analysis can't decide keeps the route;
+- an arm that hands back a function counts only where the source shows that
+  function invoked; a method on a receiver of unknown type proves nothing;
+- a C string read with `CStr::from_ptr(p).to_str()`, `to_string_lossy()` or
+  `to_bytes()` is the text it points at, as are `from_utf8` of a slice and the
+  usual `as_str`, `to_string` and `unwrap` conversions;
+- a name a `for`, `while let` or `let` chain binds shadows the operation, and
+  positions skip comments and attributes;
+- trait default methods an impl may override are not targets, and the methods
+  of an `impl` for `()`, a tuple, `dyn Trait`, an array or a function type are
+  no module's free functions.
+
+**Rust identity.** Cross-crate paths need declared module paths and local
+Cargo path dependencies, workspace-inherited ones included; `crate::` starts
+at the target root that compiles the file, through that identity, never at the
+calling file. Declarative macros and callback wrappers are followed only where
+their source proves the expression or callback is invoked.
+
+## The shared export is a boundary
+
+A call into an export whose operations dispatch to handlers is kept as a
+transport reference (`references`, `metadata.transportOnly: true`) beside the
+operation edges. An export that maps the operation to a value, a number or an
+enum variant, is no dispatcher, and its call stays a plain call. Every walk
+treats the transport hop as a boundary (`graph/transport-edges.ts`): the
+export's callers and impact list its Lua call sites, a Lua function's callees
+and paths end at the export, and code behind the export, explore's test notes
+and the viewer's walks included, reaches the export without fanning back out
+to every Lua caller. The operation edges carry each call on to its handler,
+and `codegraph_explore` and the `codegraph_node` trail label both kinds of hop
+(`graph/synthesized-hop.ts`). Code every operation shares, behind the export,
+therefore lists no Lua caller in its impact.
 
 ## What withdraws a proof
 
@@ -81,27 +134,30 @@ pays one read of its Lua and Rust files per synthesis, and records none of
 them as inputs, so a Lua or Rust edit there refreshes nothing it didn't before.
 Once a project has both, the pass:
 
-- scans only the Rust files that name `no_mangle` or `export_name`, for their
-  exports;
+- analyzes the Rust files that declare an export, then each round the files
+  that define, by name, a function the exports reach with a forwarded value,
+  a dispatch target or a macro it invokes;
 - analyzes the Lua files that hold `"ffi"`, then each round the files that can
-  name a module found to hand out a library, until a round finds no new one.
-  `require` reads only a string literal, so a file can name a module only in a
-  literal whose text ends with the module's name after a `.`, a `/` or
-  nothing. Module names resolve against every Lua file, so the rounds never
-  change which file a name means;
-- stores each file's analysis or export scan under the index directory
-  (`bridge-analyses/`), keyed by a fingerprint of the analyzers, the parse
-  runtime and the grammars, and by the file's path and text, so a sync
-  re-analyzes only what changed. An analysis cut short by its budget is never
-  stored, and each pass prunes the entries no current file uses;
-- records every Lua file and every export file as an input, and a sync that
-  brings the first FFI file or export opens it.
+  name a module found to hand out a library or carry an operation, until a
+  round finds no new one. `require` reads only a string literal, so a file can
+  name a module only in a literal whose text ends with the module's name after
+  a `.`, a `/` or nothing. Module names resolve against every Lua file, so the
+  rounds never change which file a name means;
+- stores each file's analysis, and each Rust file's module declarations, under
+  the index directory (`bridge-analyses/`), keyed by a fingerprint of the
+  analyzers, the parse runtime and the grammars, and by the file's path and
+  text, so a sync re-analyzes only what changed. A stack or parse-budget
+  failure, which depends on the machine, is never stored, and each pass prunes
+  the entries no current file uses;
+- records every Lua and Rust file as an input, and a sync that brings the
+  first FFI file or export opens it. A `Cargo.toml` edit refreshes synthesis
+  as any module-config change does.
 
 A file nested deeper than the walks follow (400 levels, as generated code with
-a long `..` chain can be), a file the parser can't read as a chunk, and an
-analysis that runs past a budget in proportion to its file are declined: they
-prove nothing, and no exception leaves the pass, so no other pass loses its
-edges.
+a long `..` or `+` chain can be), a Lua file the parser can't read as a chunk,
+a Rust function nested that deep, and an analysis that runs past a budget in
+proportion to its file or function are declined: they prove nothing, and no
+exception leaves the pass, so no other pass loses its edges.
 
 ## What it does not prove
 
@@ -113,7 +169,12 @@ edges.
   a module reached through another module's member.
 - **Values set at run time.** A library kept in `self.lib` by a constructor,
   or in a table under a computed key; C function values a table holds
-  (`api = { send = C.send }`), whose calls stay unlinked.
+  (`api = { send = C.send }`), whose calls stay unlinked; a backend chosen at
+  run time (`self.backend:call(op)`).
+- **Computed operations and dispatch the source doesn't show.** Operations
+  built at run time, a dispatcher reached through dynamic dispatch, procedural
+  macros, and a dispatcher whose operation passes through a value transform
+  the analysis doesn't model.
 - **What other files do.** A stub one file installs in another module.
 
 An empty caller list does not mean nothing calls a function.
@@ -137,7 +198,7 @@ kernel) and once with `CODEGRAPH_KERNEL=0`. On every corpus:
 indexes one Lua and Rust project on each path, requires the kernel to take every
 file, and requires the same nodes, edges, bridge edges, callers and callees.
 
-| Corpus | Indexed files | Edges, main → this | FFI edges | What it exercises |
+| Corpus | Indexed files | Edges, main → this | Bridge edges | What it exercises |
 |---|---:|---:|---:|---|
 | [Jim-Holmstroem/RunRustFromLua](https://github.com/Jim-Holmstroem/RunRustFromLua/tree/93bd640f75ce53e3081d666e8e22daef17b30d72) | 2 | 52 → 60 | 8 | a minimal example |
 | [creationix/rex](https://github.com/creationix/rex/tree/6ccc19e28ab9527816dec021198a74e1e4a9fa07) | 96 | 11,495 → 11,561 | 66 | `ffi.load` in the calling file, every call site linked |
@@ -151,17 +212,19 @@ file, and requires the same nodes, edges, bridge edges, callers and callees.
 | [cyril0124/verilua](https://github.com/cyril0124/verilua/tree/16bcfb75b0e3579d70a43bf87e43ac39237a9276) | 357 | 17,620 → 17,668 | 48 | `ffi.C` into the loaded Rust library; xmake's `os.iorun` beside the export `iorun` stays unlinked, as do calls through a table of C function values and macro-generated exports |
 | [AdeAttwood/ivy.nvim](https://github.com/AdeAttwood/ivy.nvim/tree/05981db0109fd9f1dee1448a6984532fc7bc9c3a) | 41 | 501 → 508 | 7 | Lua wrappers named like the exports stay unlinked |
 | [sheng-tse/jupynvim](https://github.com/sheng-tse/jupynvim/tree/7f35c2208bc6daa889b12a7bc135688569b4d2d4) | 178 | 41,807 → 41,807 | 0 | the library lives in `self.lib`, and a test fake defines every export again |
-| A private game monorepo (1,158 Lua and 181 Rust files) | 2,535 | 277,815 → 277,852 | 37 | several native libraries, loaders, closures |
+| A private game monorepo (1,158 Lua and 181 Rust files) | 2,535 | 277,815 → 277,977 | 33, and 125 operation routes and 4 transport hops | several native libraries; one shared export that dispatches about 40 operations |
 | [dmtrKovalenko/fff](https://github.com/dmtrKovalenko/fff/tree/924cb4d758f09bb54654555b0c9440bacd1f97f0), control | 285 | 20,830 → 20,830 | 0 | 104 exports, Lua through mlua, no LuaJIT FFI |
 | [kong-rust/kong-rust](https://github.com/kong-rust/kong-rust/tree/376eca7cd89d9658b8e9d40b0d0d67812bc8464d), control | 540 | 39,704 → 39,704 | 0 | mlua, and `ffi.C.setenv` into libc |
 | [astral-sh/ruff](https://github.com/astral-sh/ruff/tree/127e77ef8bee49f21c0e7c2ff1e38ccf27fb522a), control | 5,082 | 323,022 → 323,022 | 0 | Rust only |
 
-**Precision.** All 384 FFI edges were checked by script: each one's call line
-names its symbol as a member call. The edge lists of atc-router, cel-lua,
-ivy.nvim, juan-logs, lunet, NoitaOnline and verilua were read through, and
-verilua's names a C library might also define (`wildmatch`, `acquire_lock`,
-`get_executable_name`, `get_symbol_address`) were found as `#[no_mangle]`
-exports in its Rust source. The traps the table names link nothing.
+**FFI links.** Every public corpus gets exactly the FFI edges the FFI-linking
+part gives it, and none of them has an export that dispatches operations. All
+384 FFI edges were checked by script: each one's call line names its symbol as
+a member call. The edge lists of atc-router, cel-lua, ivy.nvim, juan-logs,
+lunet, NoitaOnline and verilua were read through, and verilua's names a C
+library might also define (`wildmatch`, `acquire_lock`, `get_executable_name`,
+`get_symbol_address`) were found as `#[no_mangle]` exports in its Rust source.
+The traps the table names link nothing.
 
 **Cost.** On the monorepo, on the kernel path: three rounds of each build in
 turn, with other work loading the machine (load average 3 to 11), and the
@@ -173,18 +236,36 @@ in a sync from a separate round with every pass timed.
 | | Fresh index | Its bridge pass | Sync, Lua edit | Sync, Rust edit | Sync, Python edit | Bridge pass in a sync |
 |---|---:|---:|---:|---:|---:|---:|
 | main | 14.8 s | — | 2.1 s | 1.9 s | 1.9 s | — |
-| this change | 15.0 s | 1.3 s | 2.1 s | 1.8 s | 2.0 s | 90 ms |
+| with FFI links | 15.0 s | 1.3 s | 2.1 s | 1.8 s | 2.0 s | 90 ms |
+| this change | 21.9 s | 6.1 s | 2.6 s | 2.2 s | 2.3 s | 503 ms |
 
-A fresh index analyzes the 61 Lua files that hold `"ffi"` and scans the 4
-export files; the pass runs beside the other synthesis passes, so the index
-takes less than its time longer. A sync reads those analyses back from the
-store.
+On top of the FFI links, a fresh index analyzes the Rust the exports reach, 162
+of the 181 Rust files, since the reach follows every call that forwards a
+value and not only the operation's, and the 104 Lua files that can name a
+module carrying an operation. A sync reads every analysis back from the store,
+and the pass's half second there goes to reading them and working out the
+routes again.
+
+**Operations.** The monorepo's native library has one export that dispatches
+about 40 operations through a `match`; read as plain calls, every Lua caller of
+the export would reach all of them. With this change its 125 operation edges
+each link a Lua call to the handler its literal selects, and its 4 calls into
+the export become transport hops. Checked by script on that index: a network
+client's `send`, which forwards three literal operations, reaches the three
+handlers they select and none of the others; two functions that each send one
+operation reach that operation's handler only; and `codegraph_explore` on the
+client's `send` labels each hop with its operation and the Rust line that
+dispatches it.
 
 **Tests.** The full suite with the kernel staged and `CODEGRAPH_KERNEL_EXPECT=1`:
-11,206 passed, 2 expected failures and 58 skipped (platform-gated), none
+11,369 passed, 2 expected failures and 58 skipped (platform-gated), none
 failed. With `CODEGRAPH_KERNEL=0`, the bridge's tests and every Lua and Rust
-resolution test, 46 files: 383 passed.
+resolution test, 49 files: 546 passed.
 
-**Not done.** The agent A/B the coverage playbook asks for has not been run.
-macOS and Windows were not run; the change adds no sockets, watchers or
-processes, and its one path is the analysis store under the index directory.
+**Not done.** No public repository was found that sends a literal operation
+through one export from LuaJIT, so operation routing is validated on the
+monorepo and on synthetic fixtures only. The agent A/B the coverage playbook
+asks for has not been run. macOS and Windows were not run; the change adds no
+sockets, watchers or processes, and its one path is the analysis store under
+the index directory.
+

@@ -33,13 +33,61 @@ describe('LuaJIT AST provenance', () => {
     expect(symbols(source)).toEqual(expected);
   });
 
+  it('resolves required module function aliases without treating them as FFI', () => {
+    const analysis = analyzeLua('local Core=require("transport"); local send=Core.call; send("job.start")');
+    const call = analysis.calls.find(c => c.callee === 'send')!;
+    expect(call).toMatchObject({ importedModule: 'transport', resolvedCallee: 'call', args: [{ kind: 'string', value: 'job.start' }] });
+    expect(call.ffiSymbol).toBeUndefined();
+  });
+
+  it('preserves constant operation values and parameter forwarding through aliases', () => {
+    const source = `local ffi=require("ffi")
+local lib=ffi.load("example")
+local OP="job.start"
+local function send(operation, body)
+  local forwarded = operation
+  lib.send(forwarded, body)
+end
+send(OP, "{}")`;
+    const analysis = analyzeLua(source);
+    expect(analysis.calls.find(c => c.callee === 'send')!.args[0]).toMatchObject({ text: 'OP', kind: 'string', value: 'job.start' });
+    expect(analysis.calls.find(c => c.ffiSymbol === 'send')!.args).toEqual([
+      { text: 'forwarded', kind: 'identifier', value: 'forwarded', parameterIndex: 0 },
+      { text: 'body', kind: 'identifier', value: 'body', parameterIndex: 1 },
+    ]);
+    expect(analysis.functions).toEqual([expect.objectContaining({ name: 'send', parameters: ['operation', 'body'], line: 4, endLine: 7 })]);
+    const call = analysis.calls.find(c => c.ffiSymbol === 'send')!;
+    expect(source.slice(call.startIndex, call.endIndex)).toBe('lib.send(forwarded, body)');
+    expect(call.functionStartIndex).toBe(analysis.functions[0]!.startIndex);
+  });
+
   it('supports long-string literals without inspecting their contents as Lua', () => {
-    expect(symbols('local ffi=require [=[ffi]=]; ffi.C.send([=[job.start]=]); local text=[[ffi.C.fake()]]')).toEqual(['send']);
+    const analysis = analyzeLua('local ffi=require [=[ffi]=]; ffi.C.send([=[job.start]=]); local text=[[ffi.C.fake()]]');
+    expect(analysis.calls.filter(c => c.ffiSymbol)).toEqual([expect.objectContaining({ ffiSymbol: 'send', args: [{ text: '[=[job.start]=]', kind: 'string', value: 'job.start' }] })]);
   });
 
   it('does not leak function-local library assignments to another function', () => {
     expect(symbols('local lib; function make() local ffi=require "ffi"; local lib=ffi.load("x") end; function run() lib.run() end')).toEqual([]);
   });
+  it('identifies lexical function targets and their direct aliases', () => {
+    const analysis = analyzeLua(`local function native(op) return op end
+local alias = native
+local assigned = function(op) return native(op) end
+function global_send(op) return alias(op) end
+native("job.start")
+alias("job.stop")
+assigned("job.read")
+global_send("job.read")`);
+    const native = analysis.functions.find(fn => fn.name === 'native')!;
+    const assigned = analysis.functions.find(fn => fn.name === 'assigned')!;
+    const global = analysis.functions.find(fn => fn.name === 'global_send')!;
+    for (const call of analysis.calls.filter(call => ['native', 'alias'].includes(call.callee))) {
+      expect(call.localFunctionStartIndex).toBe(native.startIndex);
+    }
+    expect(analysis.calls.find(call => call.callee === 'assigned')!.localFunctionStartIndex).toBe(assigned.startIndex);
+    expect(analysis.calls.find(call => call.callee === 'global_send')!.localFunctionStartIndex).toBe(global.startIndex);
+  });
+
   it('withholds callable provenance from shadowed parameters and unknown receivers', () => {
     const analysis = analyzeLua(`local Bridge=require("transport")
 local function native(op) return Bridge.call(op) end
@@ -71,9 +119,89 @@ alias.call("job.start")`);
     }
   });
 
+  it('does not relabel captured outer parameters as nested function parameters', () => {
+    const analysis = analyzeLua(`local ffi=require("ffi")
+local lib=ffi.load("example")
+local function outer(op)
+  local function nested(unrelated) return lib.wire_send(op) end
+  return nested("job.read")
+end
+function run_task() return outer("job.run") end`);
+    const call = analysis.calls.find(call => call.ffiSymbol === 'wire_send')!;
+    expect(call.args[0]).toMatchObject({ kind: 'identifier', value: 'op' });
+    expect(call.args[0]!.parameterIndex).toBeUndefined();
+    // It is outer's first parameter, captured, and nested is defined in outer.
+    const outer = analysis.functions.find(fn => fn.name === 'outer')!;
+    expect(call.args[0]!.capturedParameter).toEqual({ owner: outer.startIndex, index: 0 });
+    expect(analysis.functions.find(fn => fn.name === 'nested')!.parentStartIndex).toBe(outer.startIndex);
+    expect(outer.parentStartIndex).toBeUndefined();
+  });
+
+  it('aligns colon method calls with the implicit self parameter', () => {
+    const analysis = analyzeLua(`local Core={}
+local ffi=require("ffi")
+local lib=ffi.load("example")
+function Core:send(op) return lib.wire_send(op) end
+Core:send("job.run")
+lib:wire_send("job.run")`);
+    const fn = analysis.functions.find(fn => fn.name === 'Core:send')!;
+    expect(fn.parameters).toEqual(['self', 'op']);
+    const forward = analysis.calls.find(call => call.callee === 'lib.wire_send')!;
+    expect(forward.args[0]!.parameterIndex).toBe(1);
+    const method = analyzeLua('local Core=require("transport"); Core:send("job.run")').calls.find(call => call.callee === 'Core:send')!;
+    expect(method).toMatchObject({ importedModule: 'transport', resolvedCallee: 'send' });
+    expect(method.args).toEqual([{ text: 'Core', kind: 'unknown' }, { text: '"job.run"', kind: 'string', value: 'job.run' }]);
+    const ffiMethod = analysis.calls.find(call => call.callee === 'lib:wire_send')!;
+    expect(ffiMethod.ffiSymbol).toBe('wire_send');
+    expect(ffiMethod.args[0]).toEqual({ text: 'lib', kind: 'unknown' });
+  });
+
   it('invalidates imported-module provenance when a member declaration overwrites it', () => {
     const analysis = analyzeLua('local Bridge=require("transport"); function Bridge.call(op) return op end; Bridge.call("job.run")');
     expect(analysis.calls.find(call => call.callee === 'Bridge.call')!.importedModule).toBeUndefined();
+  });
+
+  it('exports only functions on the table actually returned by the module', () => {
+    const analysis = analyzeLua(`local Hidden={}
+local Public={}
+function Hidden.call(op) return op end
+function Public.call(op) return op end
+return Public`);
+    const hidden = analysis.functions.find(fn => fn.name === 'Hidden.call')!;
+    const publicFn = analysis.functions.find(fn => fn.name === 'Public.call')!;
+    expect(analysis.exportedFunctions).toEqual({ call: publicFn.startIndex });
+    expect(Object.values(analysis.exportedFunctions)).not.toContain(hidden.startIndex);
+    expect(analyzeLua('local Hidden={}; function Hidden.call(op) return op end; return {}').exportedFunctions).toEqual({});
+  });
+
+  it('tracks returned table aliases and member function assignments', () => {
+    const analysis = analyzeLua('local Public={}; local alias=Public; alias.call=function(op) return op end; return alias');
+    expect(analysis.exportedFunctions).toEqual({ call: analysis.functions[0]!.startIndex });
+  });
+
+  it('tracks literal returned tables, nested members and direct returned functions', () => {
+    const literal = analyzeLua('local function send(op) return op end; return {call=send,nested={send=send}}');
+    expect(literal.exportedFunctions).toEqual({ call: literal.functions[0]!.startIndex, 'nested.send': literal.functions[0]!.startIndex });
+    const direct = analyzeLua('local function send(op) return op end; return send');
+    expect(direct.exportedFunctions).toEqual({ '': direct.functions[0]!.startIndex });
+  });
+
+  it('provides exact local table member call identities', () => {
+    const analysis = analyzeLua('local Core={}; function Core.call(op) return op end; Core.call("job.run"); return Core');
+    expect(analysis.calls.find(call => call.callee === 'Core.call')!.localFunctionStartIndex).toBe(analysis.functions[0]!.startIndex);
+  });
+
+  it.each([
+    'local function send() end; if flag then return {call=send} end; return {}',
+    'local function send() end; return {[dynamic]=send}',
+    'local Public={}; function Public.call() end; Public[key]=other; return Public',
+    'local Public={}; function Public.call() end; if flag then Public.call=other end; return Public',
+    'local Public={}; function Public.call() end; while flag do Public.call=other end; return Public',
+    'local Public={}; function Public.call() end; mutate(Public); return Public',
+    'local Public={}; function Public.call() end; function change() Public.call=other end; return Public',
+    'local Public={}; function Public.call() end; Public.call=other; return Public',
+  ])('withholds dynamic or conflicting exports: %s', source => {
+    expect(analyzeLua(source).exportedFunctions).toEqual({});
   });
 
 });
@@ -135,6 +263,18 @@ end`).calls.filter(call => call.callee === 'Core.call').at(-1)!;
     expect(moduleCall('local b=require("bridge"); b:init(); b.call("step")', 'b.call')).toMatchObject({ importedModule: 'bridge', resolvedCallee: 'call' });
   });
 
+  it('forwards no parameter from a closure kept beyond the call that made it', () => {
+    const analysis = analyzeLua(head + `local lib=ffi.load("x")
+local cached
+local function send(op)
+  cached = cached or function() lib.dispatch(op, "") end
+  cached()
+end
+local function now(op) local run = function() lib.dispatch(op, "") end; run() end`);
+    const [kept, local] = analysis.calls.filter(call => call.ffiSymbol === 'dispatch');
+    expect(kept!.args[0]).not.toHaveProperty('capturedParameter');
+    expect(local!.args[0]).toMatchObject({ capturedParameter: { index: 0 } });
+  });
 });
 
 describe('files the analysis declines', () => {
@@ -224,8 +364,32 @@ local Bridge = {
 }
 return Bridge`);
     expect(analysis.functions.map(fn => fn.name)).toEqual(['Bridge.call', 'Bridge.nested.send']);
+    expect(analysis.exportedFunctions).toEqual({
+      call: analysis.functions[0]!.startIndex,
+      'nested.send': analysis.functions[1]!.startIndex,
+    });
     expect(analysis.functions[0]).toMatchObject({ line: 4, column: 9 });
-    expect(analysis.calls.filter(call => call.ffiSymbol).map(call => call.functionStartIndex)).toEqual(analysis.functions.map(fn => fn.startIndex));
+    expect(analysis.calls.filter(call => call.ffiSymbol).map(call => call.args[0]!.parameterIndex)).toEqual([0, 0]);
+  });
+
+  it('preserves callable exports when a different public state member changes', () => {
+    const analysis = analyzeLua(`local Bridge = {}
+function Bridge.call(op) return op end
+function Bridge.reset() Bridge.ready = false end
+return Bridge`);
+    expect(analysis.exportedFunctions).toEqual({
+      call: analysis.functions[0]!.startIndex,
+      reset: analysis.functions[1]!.startIndex,
+    });
+  });
+
+  it('withholds a mutated member while retaining unchanged callable members', () => {
+    const analysis = analyzeLua(`local Bridge = {}
+function Bridge.call(op) return op end
+function Bridge.read(op) return op end
+if enabled then Bridge.call = other end
+return Bridge`);
+    expect(analysis.exportedFunctions).toEqual({ read: analysis.functions[1]!.startIndex });
   });
 
   it('resolves a parameter unconditionally rebound to a module as that module', () => {
@@ -251,6 +415,17 @@ end`);
   return Bridge.call("task.run")
 end`);
     expect(analysis.calls.find(call => call.callee === 'Bridge.call')!.importedModule).toBe('bridge');
+  });
+
+  it('does not forward a member of a parameter as the entire operation parameter', () => {
+    const analysis = analyzeLua(`local ffi = require("ffi")
+local library = ffi.load("example")
+function send(request)
+  local op = request.operation
+  return library.wire_send(op)
+end`);
+    const call = analysis.calls.find(call => call.ffiSymbol === 'wire_send')!;
+    expect(call.args[0]!.parameterIndex).toBeUndefined();
   });
 
   it('proves single-return local module getters whose parameters are ignored', () => {
@@ -420,13 +595,14 @@ T.tests.first()`);
   });
 
   it('treats a metatable assignment as reading the table, not mutating it', () => {
-    const analysis = analyzeLua(`local ffi = require("ffi")
-local M = { lib = ffi.load("x") }
+    const analysis = analyzeLua(`local M = {}
 M.__index = M
 function M.new() return setmetatable({}, M) end
+function M.ping() return 1 end
 M.new()
 return M`);
-    expect(analysis.exportedLibraries).toEqual(['lib']);
+    expect(Object.keys(analysis.exportedFunctions).sort()).toEqual(['new', 'ping']);
+    expect(analysis.calls.find(call => call.callee === 'M.new')!.localFunctionStartIndex).toBeDefined();
   });
 
   it('resolves a receiver written through a call in an assignment target', () => {

@@ -9,8 +9,8 @@
  * what it joins that analysis to comes from the extractor that ran: the files'
  * languages, the functions and their positions, and the Lua calls left for
  * resolution. So this indexes one project on each path and requires the same
- * graph from both: every node and edge, the bridge's FFI edges among them, and
- * the callers and callees they answer.
+ * graph from both: every node and edge, the bridge's operation, FFI, transport
+ * and getter edges among them, and the callers and impact they answer.
  *
  * The kernel arm is skipped when no kernel binary is staged;
  * CODEGRAPH_KERNEL_EXPECT=1 turns that into a failure.
@@ -36,10 +36,33 @@ const kernelAvailable = fs.existsSync(KERNEL_PATH) || process.env.CODEGRAPH_KERN
 
 const FILES: Record<string, string> = {
   'native/Cargo.toml': '[package]\nname = "native"\nversion = "0.1.0"\n\n[lib]\ncrate-type = ["cdylib"]\n',
-  'native/src/lib.rs': `pub struct Router;
+  'native/src/lib.rs': `pub struct Engine;
 
-fn build() -> Router {
-    Router
+impl Engine {
+    pub fn run(&mut self, request: &str) {}
+    pub fn read(&mut self, request: &str) {}
+    pub fn cleanup(&mut self, request: &str) {}
+
+    pub fn handler(op: &str) -> Option<fn(&mut Engine, &str)> {
+        Some(match op {
+            "task.run" => Engine::run,
+            "task.read" => Engine::read,
+            "task.cleanup" => Engine::cleanup,
+            _ => return None,
+        })
+    }
+
+    pub fn dispatch(&mut self, op: &str, request: &str) {
+        if let Some(handler) = Engine::handler(op) {
+            handler(self, request);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wire_send(op: &str, request: &str) {
+    let mut engine = Engine;
+    engine.dispatch(op, request);
 }
 
 #[no_mangle]
@@ -49,24 +72,24 @@ pub extern "C" fn native_ping() {}
 pub extern "C" fn version_impl() -> u32 {
     1
 }
-
-#[no_mangle]
-pub extern "C" fn router_new() -> *mut Router {
-    Box::into_raw(Box::new(build()))
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn router_free(router: *mut Router) {
-    drop(Box::from_raw(router));
-}
 `,
   'scripts/bridge.lua': `local ffi = require("ffi")
 ffi.cdef[[
+  void wire_send(const char *op, const char *request);
   void native_ping(void);
   unsigned int version(void) asm("native_version");
 ]]
 local library = ffi.load("native")
 local Bridge = {}
+
+local function native(op, request)
+  return library.wire_send(op, request)
+end
+
+function Bridge.call(op, request)
+  native("task.cleanup", "{}")
+  return native(op, request)
+end
 
 function Bridge.ping()
   return library.native_ping()
@@ -78,31 +101,15 @@ end
 
 return Bridge
 `,
-  'scripts/cdefs.lua': `local ffi = require("ffi")
-ffi.cdef[[ void *router_new(void); void router_free(void *router); ]]
-local load
-do
-  function load(name)
-    local ok, lib = pcall(ffi.load, name)
-    if ok then return lib end
-    return nil, "not found"
-  end
-end
-local clib = load("native")
-return {
-  clib = clib,
-  free = function(router) clib.router_free(router) end,
-}
-`,
-  'scripts/router.lua': `local cdefs = require("cdefs")
-local clib = cdefs.clib
-local Router = {}
+  'scripts/caller.lua': `local Bridge = require("bridge")
+local function core() return require("bridge") end
+local send = Bridge.call
+local READ = "task.read"
 
-function Router.new()
-  return clib.router_new()
-end
-
-return Router
+function run_task() return Bridge.call("task.run", "{}") end
+function read_task() return send(READ, "{}") end
+function derived_task() return core().call("task.run", "{}") end
+function dynamic_task(op) return Bridge.call(op, "{}") end
 `,
 };
 
@@ -157,8 +164,9 @@ async function indexOn(arm: 'kernel' | 'wasm'): Promise<Indexed> {
       nodes.find((n) => n.name === name && n.language === language && (n.kind === 'function' || n.kind === 'method'))!;
     const names = (rows: Array<{ node: Node }>) => [...new Set(rows.map((r) => r.node.name))].sort();
     const answers: Record<string, string[]> = {};
-    for (const lua of ['ping', 'version', 'new']) answers[`callees ${lua}`] = names(cg.getCallees(fn(lua, 'lua').id, 8));
-    for (const rust of ['native_ping', 'version_impl', 'router_new', 'router_free', 'build']) answers[`callers ${rust}`] = names(cg.getCallers(fn(rust, 'rust').id, 8));
+    for (const lua of ['run_task', 'read_task', 'derived_task', 'dynamic_task']) answers[`callees ${lua}`] = names(cg.getCallees(fn(lua, 'lua').id, 8));
+    for (const rust of ['run', 'read', 'cleanup', 'native_ping', 'version_impl', 'wire_send']) answers[`callers ${rust}`] = names(cg.getCallers(fn(rust, 'rust').id, 8));
+    answers['impact run'] = [...new Set([...cg.getImpactRadius(fn('run', 'rust').id, 8).nodes.values()].map((n) => n.name))].sort();
     return {
       nodes: [...new Set(nodes.map(nodeKey))].sort(),
       edges: [...new Set(edges.map((e) => edgeKey(e, byId)))].sort(),
@@ -193,15 +201,21 @@ describe('the LuaJIT → Rust bridge on each extraction path', { timeout: 120_00
   });
 
   it('builds the bridge from wasm extraction', () => {
-    expect(new Set(wasm.bridge.map((e) => /"synthesizedBy":"([^"]+)"/.exec(e)?.[1]))).toEqual(new Set(['lua-rust-ffi']));
-    expect(wasm.answers['callees ping']).toContain('native_ping');
-    expect(wasm.answers['callees version']).toContain('version_impl');
-    expect(wasm.answers['callees new']).toEqual(expect.arrayContaining(['router_new', 'build']));
+    const kinds = wasm.bridge.map((e) => /"synthesizedBy":"([^"]+)"/.exec(e)?.[1]);
+    expect(new Set(kinds)).toEqual(new Set(['lua-rust-operation', 'lua-rust-ffi']));
+    expect(wasm.bridge.some((e) => e.includes('"transportOnly":true'))).toBe(true);
+    expect(wasm.answers['callees run_task']).toEqual(expect.arrayContaining(['run', 'cleanup']));
+    expect(wasm.answers['callees run_task']).not.toContain('read');
+    expect(wasm.answers['callees read_task']).toEqual(expect.arrayContaining(['read', 'cleanup']));
+    expect(wasm.answers['callees read_task']).not.toContain('run');
+    expect(wasm.answers['callees derived_task']).toContain('run');
+    expect(wasm.answers['callees dynamic_task']).not.toContain('run');
+    expect(wasm.answers['callers run']).toEqual(expect.arrayContaining(['run_task', 'derived_task']));
+    expect(wasm.answers['callers run']).not.toContain('read_task');
     expect(wasm.answers['callers native_ping']).toContain('ping');
     expect(wasm.answers['callers version_impl']).toContain('version');
-    expect(wasm.answers['callers router_new']).toContain('new');
-    expect(wasm.answers['callers router_free']).toContain('cdefs.lua');
-    expect(wasm.answers['callers build']).toEqual(expect.arrayContaining(['router_new', 'new']));
+    expect(wasm.answers['callers wire_send']).toContain('native');
+    expect(wasm.answers['impact run']).not.toContain('read_task');
   });
 
   it.runIf(kernelAvailable)('builds the same graph from native kernel extraction', async () => {

@@ -5309,9 +5309,8 @@ const ALWAYS = (): boolean => true;
 /**
  * Whether a file's new text can open the Lua/Rust bridge: a Lua file holding
  * "ffi" where the project holds Rust, or a Rust file declaring an export where
- * it holds Lua. Once the bridge is open, every Lua file and every Rust file
- * declaring an export is one of its inputs: any receiver, call or export edit
- * can change an edge.
+ * it holds Lua. Once the bridge is open, every Lua and Rust file is one of its
+ * inputs: any receiver, call, export or handler edit can change an edge.
  */
 export function opensLuaRustBridge(language: string | undefined, content: string, projectLanguages: ReadonlySet<string>): boolean {
   if (language === 'lua') return projectLanguages.has('rust') && FFI_LITERAL.test(content);
@@ -5452,7 +5451,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'svelteKitPageEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitPageComponentEdges(c, y) },
   { name: 'svelteKitLinkEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLinkEdges(c, y) },
   { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
-  // A LuaJIT FFI call onto the Rust C-ABI export with its symbol.
+  // A LuaJIT FFI call onto the Rust C-ABI export with its symbol, and a literal operation onto the handler it selects.
   { name: 'luaRustBridge', gate: (has) => has('lua') && has('rust'), run: (q, c, y) => luaRustBridgeEdges(q, c, y) },
 ];
 
@@ -5463,7 +5462,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
  * order after these. A wrong hint costs wall time, never edges.
  */
 const SYNTH_PASS_COST_HINT: Readonly<Record<string, number>> = {
-  cFnPtrEdges: 100, registryEdges: 60, tierEdges: 55, goFuncFieldEdges: 30, jsxEdges: 25, rnEventEdgesList: 24,
+  cFnPtrEdges: 100, luaRustBridge: 100, registryEdges: 60, tierEdges: 55, goFuncFieldEdges: 30, jsxEdges: 25, rnEventEdgesList: 24,
   ifaceEdges: 18, flutterEdges: 16, cppEdges: 15, emitterEdges: 12, fieldEdges: 11,
   mybatisEdges: 10, vuexEdges: 8, closureCollEdges: 6, piniaEdges: 5, renderEdges: 4,
 };
@@ -5638,13 +5637,11 @@ export async function synthesizeCallbackEdges(
   // does every file a tag imported from the project is read through.
   const collectInputs = async (): Promise<string[]> => {
     // An open Lua/Rust bridge reads every Lua file, since any may call through a module that holds a
-    // library, and every Rust file that declares an export.
+    // library or carries an operation, and every Rust file, since a route may pass through any of them.
     const bridgeInputs = new Set<string>();
     if (has('lua') && has('rust') && luaRustBridgeOpen(ctx)) {
       for (const file of ctx.iterateNodesByKind?.('file') ?? ctx.getNodesByKind('file')) {
-        if (file.language === 'lua' || (file.language === 'rust' && EXPORT_LITERAL.test(ctx.readFile(file.filePath) ?? ''))) {
-          bridgeInputs.add(file.filePath);
-        }
+        if (file.language === 'lua' || file.language === 'rust') bridgeInputs.add(file.filePath);
       }
     }
     const found = new Set<string>();

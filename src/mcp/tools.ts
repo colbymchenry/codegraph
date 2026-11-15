@@ -39,6 +39,7 @@ import type { Node, Edge, SearchResult, Subgraph, NodeKind, Language } from '../
 import { isTestFile, isTestPath, normalizeNameToken, splitAtCjkSwitches, isQueryNameToken } from '../search/query-utils';
 import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol, qualifiedSymbolMatches } from '../graph/symbol-lookup';
 import { goPackageReaderFor } from '../graph/go-package';
+import { isTransportEdge } from '../graph/transport-edges';
 import {
   extractQueryPaths,
   queryMightContainPaths,
@@ -4299,7 +4300,8 @@ export class ToolHandler {
       for (const node of frontier) {
         if (budget-- <= 0) break;
         let callers: Array<{ node: Node }> = [];
-        try { callers = cg.getCallers(node.id) as Array<{ node: Node }>; } catch { continue; }
+        // Past the first hop a transport edge is a boundary: the code behind an export doesn't reach every caller of it.
+        try { callers = cg.getCallers(node.id).filter((c) => !isTransportEdge(c.edge)); } catch { continue; }
         for (const c of callers) {
           const n = c?.node;
           if (!n || visited.has(n.id)) continue;
@@ -9079,6 +9081,7 @@ export class ToolHandler {
    * callback is WIRED, not where it's invoked.
    */
   private edgeLabel(edge: Edge): string | null {
+    if (isTransportEdge(edge)) return this.synthEdgeNote(edge) ?? 'transport';
     if (edge.kind === 'calls') return null;
     if (edge.metadata?.fnRef === true) return 'callback registration';
     if (edge.kind === 'instantiates') return 'instantiation';

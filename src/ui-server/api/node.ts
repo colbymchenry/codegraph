@@ -23,6 +23,7 @@
 import type { CodeGraph } from '../../index';
 import type { Edge, Node, NodeKind } from '../../types';
 import { isTestFile } from '../../search/query-utils';
+import { isTransportEdge } from '../../graph/transport-edges';
 import { buildHierarchy, type WireOverride } from './hierarchy';
 import { notFound } from './respond';
 import { findIndexedFile, hasDriftedOnDisk } from './source';
@@ -358,7 +359,8 @@ function summarizeTestCallers(cg: CodeGraph, directCallers: readonly Node[]): Wi
       if (budget-- <= 0) break;
       let callers: Array<{ node: Node }>;
       try {
-        callers = cg.getCallers(current.id) as Array<{ node: Node }>;
+        // Past the first hop a transport edge is a boundary: the code behind an export doesn't reach every caller of it.
+        callers = cg.getCallers(current.id).filter((c) => !isTransportEdge(c.edge));
       } catch {
         continue;
       }

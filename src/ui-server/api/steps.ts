@@ -41,6 +41,7 @@ import type CodeGraph from '../../index';
 import type { Edge, Language, Node, UnresolvedReference } from '../../types';
 import { badRequest, intParam, notFound } from './respond';
 import { createSiteReader } from './when';
+import { isTransportEdge } from '../../graph/transport-edges';
 import type { BranchGuard, SiteLoop, SiteTrigger } from '../../graph/branch-guards';
 import { buildProgram, type ProgramSite, type WireProgram } from './program';
 import { classifyEffect, implicitResponseStatus, responseStatus, type Effect } from './effects';
@@ -278,6 +279,8 @@ const SHARED_CHROME_MIN = 5;
 
 /** Edges walked forward. `contains` only function → function (a hook's handlers); `references` only function-as-value. */
 const WALK_KINDS: Edge['kind'][] = ['calls', 'instantiates', 'navigates', 'references', 'contains'];
+/** Edges the walk follows: a transport edge enters an export that runs every operation, which each operation's own edge already names. */
+const walked = (edges: Edge[]): Edge[] => edges.filter((e) => !isTransportEdge(e));
 
 // =============================================================================
 // Classification
@@ -595,7 +598,7 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
     if (isTestPath(target.filePath)) return false;
     const container = target.qualifiedName.replace(/[.:]+[^.:]*$/, '').split(/[.:]+/).pop() ?? '';
     if (!REPOSITORY_CONTAINER.test(container) && !/(?:^|\/)(?:repositories|repository|dao|daos|mappers)\//i.test(posix(target.filePath))) return false;
-    return cg.getOutgoingEdgesFrom([target.id], WALK_KINDS).length === 0;
+    return walked(cg.getOutgoingEdgesFrom([target.id], WALK_KINDS)).length === 0;
   };
 
   /** What runs before a route's handler: the middleware arguments at the registration, or the guard decorators on it. */
@@ -1099,7 +1102,7 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
     }
     if (step.depth >= depthCap) {
       // Something to explore, and no room in the picture for it.
-      if (cg.getOutgoingEdgesFrom([step.root.id], WALK_KINDS).length > 0) step.cut = 'depth';
+      if (walked(cg.getOutgoingEdgesFrom([step.root.id], WALK_KINDS)).length > 0) step.cut = 'depth';
       continue;
     }
 
@@ -1109,7 +1112,7 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
     for (let hop = 0; hop <= MAX_FOLD_DEPTH && frontier.length > 0; hop++) {
       const next: Fold[] = [];
       const ids = frontier.map((f) => f.node.id);
-      const outgoing = cg.getOutgoingEdgesFrom(ids, WALK_KINDS);
+      const outgoing = walked(cg.getOutgoingEdgesFrom(ids, WALK_KINDS));
       const bySource = new Map<string, Edge[]>();
       for (const e of outgoing) {
         const list = bySource.get(e.source) ?? [];

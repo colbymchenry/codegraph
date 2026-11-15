@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { loadGrammarsForLanguages } from '../src/extraction/grammars';
-import { ANALYZER_MODULES, cachedLuaAnalysis, cachedRustExports, pruneStoredAnalyses } from '../src/resolution/bridge-analysis-cache';
+import { ANALYZER_MODULES, cachedLuaAnalysis, cachedRustAnalysis, cachedRustModules, pruneStoredAnalyses } from '../src/resolution/bridge-analysis-cache';
 import type { ResolutionContext } from '../src/resolution/types';
 
 describe('stored bridge analyses', () => {
@@ -34,10 +34,14 @@ describe('stored bridge analyses', () => {
     // Changed text, or the same text at another path, is another analysis.
     cachedLuaAnalysis(context, 'cache.lua', `${lua}\n`, live);
     cachedLuaAnalysis(context, 'other.lua', lua, live);
-    const { exports } = await cachedRustExports(context, 'cache.rs', '#[no_mangle]\npub extern "C" fn ping() {}', live);
+    const { exports } = await cachedRustAnalysis(context, 'cache.rs', '#[no_mangle]\npub extern "C" fn ping() {}', live);
     expect(exports.map(exp => exp.symbolName)).toEqual(['ping']);
-    expect(entries()).toHaveLength(4);
-    expect(live.size).toBe(4);
+    expect(cachedRustModules(context, 'lib.rs', 'pub mod engine;\nmod inner { mod deep {} }', live).modules).toEqual([
+      ['', [{ name: 'engine', inline: false, customPath: false }, { name: 'inner', inline: true, customPath: false }]],
+      ['inner', [{ name: 'deep', inline: true, customPath: false }]],
+    ]);
+    expect(entries()).toHaveLength(5);
+    expect(live.size).toBe(5);
   });
 
   it('prunes entries no current file uses and every other analyzer version', () => {

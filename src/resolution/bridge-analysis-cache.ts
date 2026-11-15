@@ -16,7 +16,8 @@ import { threadId } from 'node:worker_threads';
 import { getCodeGraphDir } from '../directory';
 import { resolveWasmPath } from '../extraction/grammars';
 import { analyzeLua, type LuaAnalysis } from './lua-ffi-analysis';
-import { findRustExports, type RustFfiExport } from './rust-ffi-exports';
+import { analyzeRustFfiFile, type RustFfiFileAnalysis } from './rust-ffi-analysis';
+import { scanModuleDeclarations, type ModuleDeclarations } from './rust-bridge-identity';
 import type { ResolutionContext } from './types';
 
 const STORE = 'bridge-analyses';
@@ -27,7 +28,8 @@ const STORE = 'bridge-analyses';
  * reads an analysis another version of the code made.
  */
 export const ANALYZER_MODULES: readonly string[] = [
-  'bridge-analysis-cache', 'lua-ffi-analysis', 'rust-ffi-exports', 'syntax-mirror', '../extraction/parse-budget',
+  'bridge-analysis-cache', 'lua-ffi-analysis', 'rust-ffi-analysis', 'rust-ffi-exports', 'rust-bridge-identity',
+  'syntax-mirror', '../extraction/parse-budget',
 ];
 
 let fingerprint: string | null | undefined;
@@ -94,12 +96,26 @@ export function cachedLuaAnalysis(context: ResolutionContext, file: string, sour
   return analysis;
 }
 
-export async function cachedRustExports(context: ResolutionContext, file: string, source: string, live?: Set<string>): Promise<{ exports: RustFfiExport[]; partial?: true }> {
+export async function cachedRustAnalysis(context: ResolutionContext, file: string, source: string, live?: Set<string>): Promise<RustFfiFileAnalysis> {
   const store = storeOf(context);
-  const key = keyOf('rust-exports', file, source);
-  let scan = read<{ exports: RustFfiExport[]; partial?: true }>(store, key);
+  const key = keyOf('rust', file, source);
+  let analysis = read<RustFfiFileAnalysis>(store, key);
+  if (!analysis) {
+    analysis = await analyzeRustFfiFile(file, source);
+    if (analysis.partial) return analysis;
+    write(store, key, analysis);
+  }
+  live?.add(key);
+  return analysis;
+}
+
+/** The `mod` items a Rust file declares, which place every file in its crate's module tree. */
+export function cachedRustModules(context: ResolutionContext, file: string, source: string, live?: Set<string>): ModuleDeclarations {
+  const store = storeOf(context);
+  const key = keyOf('rust-modules', file, source);
+  let scan = read<ModuleDeclarations>(store, key);
   if (!scan) {
-    scan = await findRustExports(file, source);
+    scan = scanModuleDeclarations(source);
     if (scan.partial) return scan;
     write(store, key, scan);
   }

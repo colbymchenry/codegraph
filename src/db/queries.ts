@@ -2774,14 +2774,16 @@ export class QueryBuilder {
    * displace actual calls in capped caller lists. Keep deterministic ties
    * without changing the target/kind index's established kind precedence.
    */
-  getIncomingEdges(targetId: string, kinds?: EdgeKind[], limit?: number): Edge[] {
-    if ((kinds && kinds.length > 0) || limit !== undefined) {
+  getIncomingEdges(targetId: string, kinds?: EdgeKind[], limit?: number, options: { exceptTransport?: boolean } = {}): Edge[] {
+    if ((kinds && kinds.length > 0) || limit !== undefined || options.exceptTransport) {
       let sql = 'SELECT * FROM edges WHERE target = ?';
       const params: (string | number)[] = [targetId];
       if (kinds && kinds.length > 0) {
         sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
         params.push(...kinds);
       }
+      // A transport edge (see graph/transport-edges.ts) is a boundary past a walk's first hop.
+      if (options.exceptTransport) sql += " AND NOT COALESCE(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.transportOnly') END, 0)";
       sql += ' ORDER BY kind, source, line, col';
       if (limit !== undefined) {
         sql += ' LIMIT ?';

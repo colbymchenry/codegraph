@@ -16,6 +16,15 @@ import { getParser } from '../extraction/grammars';
 import { parseWithinBudget } from '../extraction/parse-budget';
 import { mirrorTree, type SyntaxMirror as SyntaxNode } from './syntax-mirror';
 
+export interface LuaArgument {
+  text: string;
+  kind: 'string' | 'identifier' | 'number' | 'unknown';
+  value?: string;
+  /** Zero-based parameter index when this expression forwards a parameter of the function making the call. */
+  parameterIndex?: number;
+  /** When it forwards a parameter of an enclosing function instead: that function's start and the parameter's index. */
+  capturedParameter?: { owner: number; index: number };
+}
 export interface LuaCall {
   callee: string;
   resolvedCallee?: string;
@@ -24,8 +33,11 @@ export interface LuaCall {
   endIndex: number;
   line: number;
   column: number;
+  args: LuaArgument[];
   ffiSymbol?: string;
   functionStartIndex?: number;
+  /** Proven lexical target, distinct from the function enclosing this call. */
+  localFunctionStartIndex?: number;
 }
 export interface LuaFunction {
   name: string;
@@ -34,12 +46,14 @@ export interface LuaFunction {
   line: number;
   column: number;
   endLine: number;
+  parameters: string[];
   /** The function whose body defines this one; none at chunk level. */
   parentStartIndex?: number;
 }
 export interface LuaAnalysis {
   calls: LuaCall[];
   functions: LuaFunction[];
+  exportedFunctions: Record<string, number>;
   /** Member paths of the returned module that hold a library (`''` for the module itself), and of its functions that return one. */
   exportedLibraries: string[];
   exportedLoaders: string[];
@@ -86,6 +100,7 @@ interface Unit {
   readonly node: SyntaxNode;
   readonly name: string;
   readonly params: Binding[];
+  readonly parameterNames: string[];
   /** It takes `...`: arguments past its parameters reach code the analysis does not follow. */
   readonly vararg: boolean;
 }
@@ -154,7 +169,7 @@ function resolveScopes(root: SyntaxNode) {
   const decls = new Map<number, Binding>();
   const globals = new Map<string, Binding>();
   const bindings: Binding[] = [];
-  const units: Unit[] = [{ id: CHUNK, parent: CHUNK, node: root, name: '', params: [], vararg: true }];
+  const units: Unit[] = [{ id: CHUNK, parent: CHUNK, node: root, name: '', params: [], parameterNames: [], vararg: true }];
   const scopes: Array<Map<string, Binding>> = [];
   let unit = CHUNK;
   // Statements inside a block that holds a label may run out of order.
@@ -206,6 +221,7 @@ function resolveScopes(root: SyntaxNode) {
   const fn = (node: SyntaxNode, name: string, method: boolean): void => {
     const params = field(node, 'parameters');
     const parameters = params ? children(params).filter(p => p.type === 'identifier') : [];
+    const names = [...(method ? ['self'] : []), ...parameters.map(p => p.text)];
     const saved = { unit, regions };
     const parent = unit;
     unit = node.startIndex; regions = 0;
@@ -214,7 +230,7 @@ function resolveScopes(root: SyntaxNode) {
     if (method) { const self = make('self', 'parameter'); scopes.at(-1)!.set('self', self); bound.push(self); }
     parameters.forEach(p => bound.push(declare(p, 'parameter')));
     const vararg = !!params && children(params).some(p => p.type === 'vararg_expression');
-    units.push({ id: node.startIndex, parent, node, name, params: bound, vararg });
+    units.push({ id: node.startIndex, parent, node, name, params: bound, parameterNames: names, vararg });
     statements(field(node, 'body'));
     scopes.pop();
     ({ unit, regions } = saved);
@@ -351,7 +367,7 @@ class OverBudget extends Error {}
 
 /** The caller preloads the Lua grammar; no AST objects escape this function. */
 export function analyzeLua(source: string): LuaAnalysis {
-  const partial: LuaAnalysis = { calls: [], functions: [], exportedLibraries: [], exportedLoaders: [], cdefSymbols: {}, partial: true };
+  const partial: LuaAnalysis = { calls: [], functions: [], exportedFunctions: {}, exportedLibraries: [], exportedLoaders: [], cdefSymbols: {}, partial: true };
   const parser = getParser('lua');
   const tree = parser && parseWithinBudget(parser, source);
   if (!tree) return partial;
@@ -375,7 +391,7 @@ function analyzeTree(root: SyntaxNode): LuaAnalysis | null {
   let steps = 0;
   const stepBudget = 100_000 + 200 * root.size;
   const step = (): void => { if (++steps > stepBudget) throw new OverBudget(); };
-  const result: LuaAnalysis = { calls: [], functions: [], exportedLibraries: [], exportedLoaders: [], cdefSymbols: {} };
+  const result: LuaAnalysis = { calls: [], functions: [], exportedFunctions: {}, exportedLibraries: [], exportedLoaders: [], cdefSymbols: {} };
   // Shared facts, each the join of the latest run of every unit.
   const bindingWrites = new Map<number, Map<number, Value>>();
   const memberWrites = new Map<number, Map<string, Map<number, Value>>>();
@@ -449,6 +465,23 @@ function analyzeTree(root: SyntaxNode): LuaAnalysis | null {
     if (!keys) byParameter.set(value.index, keys = new Set());
     invalidate(keys, effect, 's' + value.owner);
   };
+  /**
+   * Closures kept beyond the call that made them, in an upvalue, a global or a
+   * table: a later call may run one an earlier call made, with that call's
+   * parameters, so a kept closure forwards none.
+   */
+  const kept = new Set<number>();
+  const keep = (value: Value): void => {
+    if (value.kind === 'function' && unitsById.has(value.startIndex)) invalidate(kept, value.startIndex, 'c' + value.startIndex);
+  };
+  /** Whether a call in `unit` forwards a parameter of `owner`, an enclosing function: no closure between them is kept. */
+  const forwards = (unit: number, owner: number, run: Run): boolean => {
+    for (let u = unit; u !== owner && u !== CHUNK; u = parentOf.get(u)!) {
+      run.reads.add('c' + u);
+      if (kept.has(u)) return false;
+    }
+    return true;
+  };
   const membersOf = (id: number, run: Run): Value[] => {
     const values: Value[] = [];
     for (const writes of memberWrites.get(id)?.values() ?? []) values.push(...writes.values());
@@ -476,6 +509,7 @@ function analyzeTree(root: SyntaxNode): LuaAnalysis | null {
     const value = join(a, b);
     if (value.kind === 'unknown' && current) for (const lost of [a, b]) {
       if (lost.kind === 'table' || lost.kind === 'parameter' || lost.kind === 'parameter_member') escape(lost, current);
+      else if (lost.kind === 'function') keep(lost);
       // What a module's function returned is another object than the module: losing it loses nothing of the module.
       else if (lost.kind === 'module' && !lost.member.includes('()')) invalidate(escapedModules, lost.module, 'm' + lost.module);
       else if (lost.kind === 'ffi') invalidate(escapedModules, 'ffi', 'mffi');
@@ -590,6 +624,7 @@ function analyzeTree(root: SyntaxNode): LuaAnalysis | null {
     const stored = binding.volatile ? UNKNOWN : scoped(value, binding.unit);
     // Any file can reach a global, and a parameter held outside its function outlives the call.
     if (binding.kind === 'global' || (stored.kind === 'unknown' && value.kind !== 'unknown')) escape(value, run);
+    if (value.kind === 'function' && binding.unit !== parentOf.get(value.startIndex)) keep(value);
     run.state.values.set(binding.id, stored);
     run.writes.set(binding.id, merge(run.writes.get(binding.id) ?? BOTTOM, stored));
   };
@@ -609,6 +644,7 @@ function analyzeTree(root: SyntaxNode): LuaAnalysis | null {
     else if (escaped.has(id)) escape(value, run);
     // Tables outlive the call that filled them, so a stored parameter is no longer one.
     if (value.kind === 'parameter' || value.kind === 'parameter_member') addEffect(value, '^');
+    keep(value);
     const members = run.members.get(id) ?? new Map<string, Value>();
     members.set(key, merge(members.get(key) ?? BOTTOM, scoped(value, undefined)));
     run.members.set(id, members);
@@ -697,6 +733,15 @@ function analyzeTree(root: SyntaxNode): LuaAnalysis | null {
       default: return UNKNOWN;
     }
   };
+  const argument = (n: SyntaxNode, run: Run): LuaArgument => {
+    const value = valueOf(n, run);
+    if (value.kind === 'string' || value.kind === 'number') return { text: n.text, kind: value.kind, value: value.value };
+    if (n.type !== 'identifier') return { text: n.text, kind: 'unknown' };
+    const parameter = value.kind !== 'parameter' ? {}
+      : value.owner === run.unit.id ? { parameterIndex: value.index }
+      : forwards(run.unit.id, value.owner, run) ? { capturedParameter: { owner: value.owner, index: value.index } } : {};
+    return { text: n.text, kind: 'identifier', value: n.text, ...parameter };
+  };
   const assignMember = (target: SyntaxNode, value: Value, run: Run): void => {
     const receiver = valueOf(field(target, 'table'), run);
     const member = memberName(target);
@@ -710,6 +755,7 @@ function analyzeTree(root: SyntaxNode): LuaAnalysis | null {
     // Not yet known: a later run, which knows the receiver, places the write.
     if (receiver.kind === 'bottom' || receiver.kind === 'nil') return;
     escape(value, run);
+    keep(value);
     rewrite(receiver, member ?? '*', run);
     // A receiver the analysis can't resolve may be any table that has left its sight.
     if (!['module', 'ffi', 'library', 'builtin'].includes(receiver.kind)) invalidate(untracked, member ?? '*', 'u' + (member ?? '*'));
@@ -886,7 +932,9 @@ function analyzeTree(root: SyntaxNode): LuaAnalysis | null {
           }
           run.log.calls.push({ callee: name.text, startIndex: n.startIndex, endIndex: n.endIndex,
             line: n.startPosition.row + 1, column: n.startPosition.column,
+            args: [...(name.type === 'method_index_expression' ? [{ text: field(name, 'table')?.text ?? '', kind: 'unknown' as const }] : []), ...argsOf(n).map(a => argument(a, run))],
             ...(value.kind === 'symbol' ? { ffiSymbol: value.name } : {}),
+            ...(value.kind === 'function' ? { localFunctionStartIndex: value.startIndex } : {}),
             ...(value.kind === 'module' ? { resolvedCallee: value.member, importedModule: value.module } : {}),
             ...(run.unit.id === CHUNK ? {} : { functionStartIndex: run.unit.id }) });
         }
@@ -976,15 +1024,17 @@ function analyzeTree(root: SyntaxNode): LuaAnalysis | null {
     if (unit.id === CHUNK) continue;
     const node = unit.node;
     result.functions.push({ name: unit.name, startIndex: node.startIndex, endIndex: node.endIndex, line: node.startPosition.row + 1,
-      column: node.startPosition.column, endLine: node.endPosition.row + 1,
+      column: node.startPosition.column, endLine: node.endPosition.row + 1, parameters: unit.parameterNames,
       ...(unit.parent === CHUNK ? {} : { parentStartIndex: unit.parent }) });
   }
   const moduleReturns = logs.get(CHUNK)!.returns;
   if (moduleReturns.length === 1 && moduleReturns[0]!.unconditional) {
+    const exports: Record<string, number> = {};
     const library = (value: Value | undefined): boolean => value?.kind === 'library' && !value.ids.some(id => invalidLibraries.has(id));
     const collect = (value: Value, prefix: string, seen: Set<number>): void => {
       if (library(value)) result.exportedLibraries.push(prefix);
       if (value.kind === 'function') {
+        exports[prefix] = value.startIndex;
         if (library(returnsOf.get(value.startIndex))) result.exportedLoaders.push(prefix);
       } else if (value.kind === 'table' && !seen.has(value.id)) {
         const next = new Set(seen).add(value.id);
@@ -992,6 +1042,7 @@ function analyzeTree(root: SyntaxNode): LuaAnalysis | null {
       }
     };
     collect(moduleReturns[0]!.value, '', new Set());
+    result.exportedFunctions = exports;
   }
   result.calls.sort((a, b) => a.startIndex - b.startIndex);
   result.functions.sort((a, b) => a.startIndex - b.startIndex);

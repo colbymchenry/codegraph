@@ -418,6 +418,10 @@ function onRoute(parent: ReadonlyMap<string, WalkStep>, key: string, nodeId: str
  * Breadth-first over `calls` edges — synthesized ones included, which is what
  * carries a flow across a callback, a re-render or a JSX child.
  *
+ * Flows compose single hops, so they carry no transport scope: they never
+ * cross a transport edge (transport-edges.ts), whose operation edges carry
+ * the flow instead.
+ *
  * This is the `named` walk: every named symbol is a possible destination, and
  * at most `maxBridge` unnamed symbols may sit between two of them. That cap is
  * what bounds the frontier, so {@link NAMED_VISIT_CAP} is generous.
