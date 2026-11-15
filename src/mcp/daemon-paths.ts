@@ -96,6 +96,13 @@ export function getDaemonSocketPath(projectRoot: string): string {
   return getDaemonSocketCandidates(projectRoot)[0]!;
 }
 
+/** Whether `CODEGRAPH_NO_DAEMON` was set to a truthy value. */
+export function daemonOptOutSet(): boolean {
+  const raw = process.env.CODEGRAPH_NO_DAEMON;
+  if (!raw) return false;
+  return raw !== '0' && raw.toLowerCase() !== 'false';
+}
+
 /** Absolute path to the daemon pid lockfile for `projectRoot`. */
 export function getDaemonPidPath(projectRoot: string): string {
   return path.join(getCodeGraphDir(projectRoot), 'daemon.pid');

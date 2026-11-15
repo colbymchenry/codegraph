@@ -108,6 +108,14 @@ export function toolCallArguments(params: { arguments?: unknown }): Record<strin
 const ROOTS_LIST_TIMEOUT_MS = 5000;
 
 /**
+ * The request the Claude Code prompt hook sends a running daemon instead of
+ * running its own explore (#3284). Not an MCP method: the hook is no agent, so
+ * its explore claims no once-per-client warning, joins no client's explore
+ * history and counts as no tool call. See `./hook-client`.
+ */
+export const PROMPT_EXPLORE_METHOD = 'codegraph/promptExplore';
+
+/**
  * Convert a file:// URI to a filesystem path. Handles URL encoding and
  * Windows drive letter paths.
  */
@@ -218,6 +226,9 @@ export class MCPSession {
         break;
       case 'tools/call':
         if (isRequest) await this.handleToolsCall(message as JsonRpcRequest);
+        break;
+      case PROMPT_EXPLORE_METHOD:
+        if (isRequest) await this.handlePromptExplore(message as JsonRpcRequest);
         break;
       case 'ping':
         if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, {});
@@ -372,6 +383,16 @@ export class MCPSession {
     // After the reply is on the wire — telemetry must never delay a tool
     // response (in-memory increment only; see src/telemetry).
     getTelemetry().recordUsage('mcp_tool', toolName, !result.isError, this.clientInfo);
+  }
+
+  private async handlePromptExplore(request: JsonRpcRequest): Promise<void> {
+    const query = (request.params as { query?: unknown } | undefined)?.query;
+    if (typeof query !== 'string') {
+      this.transport.sendError(request.id, ErrorCodes.InvalidParams, 'Missing query');
+      return;
+    }
+    await this.retryInitIfNeeded();
+    this.transport.sendResult(request.id, await this.engine.getToolHandler().execute('codegraph_explore', { query }));
   }
 
   /**
