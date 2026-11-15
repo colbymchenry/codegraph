@@ -455,7 +455,7 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
-function resolveWasmPath(lang: GrammarLanguage): string {
+export function resolveWasmPath(lang: GrammarLanguage): string {
   const wasmFile = WASM_GRAMMAR_FILES[lang];
   return VENDORED_WASM_LANGS.has(lang)
     ? path.join(__dirname, 'wasm', wasmFile)

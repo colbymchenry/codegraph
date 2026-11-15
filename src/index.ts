@@ -56,7 +56,7 @@ import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
-import { loadDeprioritizePatterns } from './project-config';
+import { loadDeprioritizePatterns, loadExtensionOverrides } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
@@ -1116,6 +1116,7 @@ export class CodeGraph {
       createImportReader,
       hasSynthesisPattern,
       isJsxChildCandidate,
+      opensLuaRustBridge,
       moduleConfigLanguages,
       parseModuleConfigSnapshot,
       reopenNameMatchedImports,
@@ -1223,12 +1224,29 @@ export class CodeGraph {
         const watchRoutes = this.resolver.hasNavigationRouters();
         let routesBefore = null as Node[] | null;
         const flowChange = this.resolver.trackParameterFlows();
+        // Whether a file's new text opens the Lua/Rust bridge (an open bridge
+        // records its files as inputs). An indexed file keeps its recorded
+        // language, a new one is detected as extraction will. The project's
+        // languages are read at the first Lua or Rust file, so a sync that
+        // touches neither reads nothing more, and each Lua or Rust file this
+        // sync touches joins them, so a sync that brings the first of both
+        // opens the bridge too.
+        let bridgeLanguages: Set<string> | undefined;
+        let overrides: Record<string, Language> | undefined;
+        const opensBridge = (filePath: string, content: string | undefined): boolean => {
+          if (content === undefined) return false;
+          const language = this.queries.getFileByPath(filePath)?.language ??
+            detectLanguage(filePath, content, overrides ??= loadExtensionOverrides(this.projectRoot), this.projectRoot);
+          if (language !== 'lua' && language !== 'rust') return false;
+          (bridgeLanguages ??= this.queries.getDistinctFileLanguages()).add(language);
+          return opensLuaRustBridge(language, content, bridgeLanguages);
+        };
         const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure,
           (filePath, content) => {
             flowChange.before(filePath);
             if (watchRoutes && routesBefore === null) routesBefore = this.queries.getNodesByKind('route');
             if (!refreshSynthesis && (this.queries.hasSynthesizedEdgesTouchingFile(filePath) ||
-              this.queries.wasSynthesisInput(filePath) ||
+              this.queries.wasSynthesisInput(filePath) || opensBridge(filePath, content) ||
               (content !== undefined && hasSynthesisPattern(filePath, content)))) {
               refreshSynthesis = true;
               this.queries.setMetadata('synthesis_pending', '1');

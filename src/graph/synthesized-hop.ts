@@ -89,6 +89,8 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
       // Go: a call through a struct field holding a function, `d.refreshf(ctx)`;
       // `via` is the field it was copied from, which the wiring site writes.
       return hop(`func field ${quoted(m.field, 'a func field')}${m.via ? ` (set from \`${String(m.via)}\`)` : ''}`);
+    case 'lua-rust-ffi':
+      return hop(`LuaJIT → Rust FFI${m.nativeSymbol ? ` \`${String(m.nativeSymbol)}\`` : ''}`);
     default:
       // redux-thunk, cpp-override, gin-middleware-chain, flutter-build, …
       return hop(by.replace(/-/g, ' '));
