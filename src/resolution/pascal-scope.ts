@@ -1010,6 +1010,13 @@ function classNamed(typeName: string, fromFile: string, context: ResolutionConte
 }
 
 /**
+ * The steps an alias walk takes at most: well past any real chain, and short
+ * enough that its recursion can't run out of stack. The walk reads no memo, so
+ * where it stops depends on where it started alone.
+ */
+const MAX_ALIAS_WALK = 1000;
+
+/**
  * The class `simple` names from `fromFile`, through its type aliases: a walk,
  * since a name can be an alias several times over (once in each branch of an
  * `{$IFDEF}`), and the first of them that leads to a class is the answer. `seen`
@@ -1044,6 +1051,7 @@ function classThroughAliases(simple: string, fromFile: string, context: Resoluti
     const target = /=\s*(?:\^|class\s+of\b)?\s*([A-Za-z_][\w.]*)\s*;/i.exec(line)?.[1]?.split('.').pop()!.toLowerCase();
     const key = `${alias.filePath}|${target}`;
     if (!target || seen.has(key)) continue;
+    if (seen.size >= MAX_ALIAS_WALK) return null;
     seen.add(key);
     const through = classThroughAliases(target, alias.filePath, context, seen);
     if (through) return through;
