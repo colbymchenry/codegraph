@@ -89,6 +89,19 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
       // Go: a call through a struct field holding a function, `d.refreshf(ctx)`;
       // `via` is the field it was copied from, which the wiring site writes.
       return hop(`func field ${quoted(m.field, 'a func field')}${m.via ? ` (set from \`${String(m.via)}\`)` : ''}`);
+    case 'lua-rust-operation': {
+      // One hop per Lua caller and Rust handler, naming every operation that selects it.
+      const names = Array.isArray(m.operations) ? m.operations.map(String) : m.operation ? [String(m.operation)] : [];
+      const operations = names.length > 0 ? ` ${names.map((name) => `\`${name}\``).join(', ')}` : '';
+      return hop(`LuaJIT → Rust operation${operations}${m.nativeSymbol ? ` via \`${String(m.nativeSymbol)}\`` : ''}`);
+    }
+    case 'lua-rust-ffi': {
+      const via = m.nativeSymbol ? ` \`${String(m.nativeSymbol)}\`` : '';
+      // A transport hop enters an export that runs every operation: walks stop at it.
+      return m.transportOnly === true
+        ? hop(`LuaJIT → Rust transport${via}, every operation`, ' — each operation hop names its handler')
+        : hop(`LuaJIT → Rust FFI${via}`);
+    }
     default:
       // redux-thunk, cpp-override, gin-middleware-chain, flutter-build, …
       return hop(by.replace(/-/g, ' '));

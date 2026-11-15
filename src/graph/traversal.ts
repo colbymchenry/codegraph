@@ -2,10 +2,12 @@
  * Graph Traversal Algorithms
  *
  * BFS and DFS traversal for the code knowledge graph.
+ * Every walk treats a transport edge as a boundary (transport-edges.ts).
  */
 
 import { Node, Edge, Subgraph, TraversalOptions, EdgeKind, ImpactOptions, EDGE_KINDS } from '../types';
 import { QueryBuilder } from '../db/queries';
+import { isTransportEdge } from './transport-edges';
 
 /**
  * Default traversal options
@@ -138,6 +140,11 @@ export class GraphTraverser {
 
       for (const adjEdge of adjacentEdges) {
         const nextNodeId = adjEdge.source === node.id ? adjEdge.target : adjEdge.source;
+        // A backward walk crosses transport only at its start; any other walk
+        // keeps the far end of a transport edge unexpanded.
+        const transport = isTransportEdge(adjEdge);
+        if (transport && opts.direction === 'incoming' && depth > 0) continue;
+        const ends = transport && opts.direction !== 'incoming';
         const nextNode = neighborNodes.get(nextNodeId) ?? nodes.get(nextNodeId);
         if (!nextNode) continue;
 
@@ -148,11 +155,15 @@ export class GraphTraverser {
         // Enqueue each neighbor exactly once, and only while under the node
         // budget — the cap is checked per-add here, not just on the outer
         // `while`, so one high-degree node can't overshoot `opts.limit` (#1087).
+        // An unexpanded far end is kept but not queued, so a walk that reaches
+        // it another way still expands it.
         if (!visited.has(nextNodeId) && !enqueued.has(nextNodeId)) {
-          if (nodes.size >= opts.limit) continue;
-          enqueued.add(nextNodeId);
+          if (!nodes.has(nextNodeId) && nodes.size >= opts.limit) continue;
           nodes.set(nextNode.id, nextNode);
-          queue.push({ node: nextNode, edge: adjEdge, depth: depth + 1 });
+          if (!ends) {
+            enqueued.add(nextNodeId);
+            queue.push({ node: nextNode, edge: adjEdge, depth: depth + 1 });
+          }
         }
 
         // Record every distinct edge among kept nodes. Collecting on the
@@ -242,6 +253,10 @@ export class GraphTraverser {
       const nextNodeId = edge.source === node.id ? edge.target : edge.source;
       if (visited.has(nextNodeId)) continue;
 
+      // A backward walk crosses transport only at its start (see traverseBFS).
+      const transport = isTransportEdge(edge);
+      if (transport && opts.direction === 'incoming' && depth > 0) continue;
+
       const nextNode = neighborNodes.get(nextNodeId);
       if (!nextNode) continue;
 
@@ -254,7 +269,8 @@ export class GraphTraverser {
       nodes.set(nextNode.id, nextNode);
       edges.push(edge);
 
-      // Recurse
+      // Recurse, except past the far end of a forward or undirected transport hop
+      if (transport && opts.direction !== 'incoming') continue;
       this.dfsRecursive(nextNode, depth + 1, opts, nodes, edges, visited);
     }
   }
@@ -338,7 +354,9 @@ export class GraphTraverser {
     // caller of the class. Without it, `callers <Class>` surfaced only the
     // importing file (via `imports`) and missed every construction site —
     // the opposite of "what breaks if I change this class?" (#774).
-    const incomingEdges = this.queries.getIncomingEdges(nodeId, CALL_EDGE_KINDS);
+    // Transport callers belong to the entry itself, not to the code behind it.
+    const incomingEdges = this.queries.getIncomingEdges(nodeId, CALL_EDGE_KINDS)
+      .filter((e) => currentDepth === 0 || !isTransportEdge(e));
     if (incomingEdges.length === 0) return;
 
     // Batch-fetch all caller nodes in one round-trip instead of one
@@ -407,6 +425,8 @@ export class GraphTraverser {
         reported.add(calleeNode.id);
         result.push({ node: calleeNode, edge });
       }
+      // A transport hop ends the path at its entry.
+      if (isTransportEdge(edge)) continue;
       this.getCalleesRecursive(calleeNode.id, maxDepth, currentDepth + 1, result, visited, reported);
     }
   }
@@ -694,7 +714,8 @@ export class GraphTraverser {
     const remaining = budget.maxEdges - edges.length;
     // Fetch one extra row so hitting the SQL LIMIT is distinguishable from an
     // exact-size result and can be surfaced as explicit truncation.
-    const fetched = this.queries.getIncomingEdges(nodeId, IMPACT_INCOMING_KINDS, remaining + 1);
+    // Transport dependents belong to the entry itself (see getCallersRecursive), so past it they take no slot.
+    const fetched = this.queries.getIncomingEdges(nodeId, IMPACT_INCOMING_KINDS, remaining + 1, { exceptTransport: currentDepth > 0 });
     if (fetched.length > remaining) budget.truncated = true;
     const incomingEdges = fetched.slice(0, remaining);
     if (incomingEdges.length === 0) return;
@@ -784,7 +805,8 @@ export class GraphTraverser {
       const nextNodes = wantIds.length > 0 ? this.queries.getNodesByIds(wantIds) : new Map();
 
       for (const edge of outgoingEdges) {
-        if (enqueued.has(edge.target)) continue;
+        // A transport hop ends a path at its entry and continues none.
+        if (enqueued.has(edge.target) || (isTransportEdge(edge) && edge.target !== toId)) continue;
         const nextNode = nextNodes.get(edge.target);
         if (!nextNode) continue;
         enqueued.add(edge.target);
