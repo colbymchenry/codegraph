@@ -216,6 +216,32 @@ describe.runIf(process.platform !== 'win32')('exploreViaDaemon — the hook aski
     await expect(exploreViaDaemon(root, 'how does placeOrder work', 300)).resolves.toEqual({ status: 'timed-out' });
     expect(Date.now() - started).toBeLessThan(2_000);
   });
+
+  // One socket candidate is in the system temp directory, which other users
+  // of the machine can write to on Linux. Whoever puts a socket there first
+  // would read every prompt and write into the agent's context.
+  it('never sends the prompt to a socket another user created', async () => {
+    const root = await indexedProject();
+    const seen = await fakeDaemon(root, CodeGraphPackageVersion, answer('FROM SOMEONE ELSE'));
+    const mine = process.getuid!();
+    vi.spyOn(process, 'getuid').mockReturnValue(mine + 1);
+
+    await expect(exploreViaDaemon(root, 'how does placeOrder work', 5_000)).resolves.toEqual({ status: 'unavailable' });
+    expect(seen).toEqual([]);
+  });
+
+  it('never follows a link left where the daemon socket goes', async () => {
+    const root = await indexedProject();
+    const elsewhere = await indexedProject();
+    const seen = await fakeDaemon(elsewhere, CodeGraphPackageVersion, answer('FROM SOMEWHERE ELSE'));
+    const expected = getDaemonSocketCandidates(root)[0]!;
+    fs.mkdirSync(path.dirname(expected), { recursive: true });
+    fs.symlinkSync(getDaemonSocketCandidates(elsewhere)[0]!, expected);
+    cleanups.push(() => fs.rmSync(expected, { force: true }));
+
+    await expect(exploreViaDaemon(root, 'how does placeOrder work', 5_000)).resolves.toEqual({ status: 'unavailable' });
+    expect(seen).toEqual([]);
+  });
 });
 
 /** Run the built CLI's `prompt-hook` in `dir`, as Claude Code does, and return what it injects. */

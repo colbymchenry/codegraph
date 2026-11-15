@@ -11,6 +11,7 @@
  * project's writer lock and a file watcher, which no prompt should cost.
  */
 
+import * as fs from 'fs';
 import type * as net from 'net';
 import { daemonOptOutSet, getDaemonSocketCandidates } from './daemon-paths';
 import { connectWithHello } from './proxy';
@@ -41,8 +42,26 @@ export function promptHookDaemonTimeoutMs(): number {
 
 const UNAVAILABLE: DaemonExplore = { status: 'unavailable' };
 
+/**
+ * Whether the socket at `socketPath` is one this user's daemon bound. The
+ * prompt goes to whoever listens there and their answer goes into the agent's
+ * context, and one candidate is in the system temp directory, which every user
+ * of the machine can write to on Linux. `lstat`, so a link left at the path is
+ * refused however it resolves. A Windows named pipe has no owner to read here.
+ */
+function boundByThisUser(socketPath: string): boolean {
+  if (process.platform === 'win32') return true;
+  try {
+    const stat = fs.lstatSync(socketPath);
+    return stat.isSocket() && stat.uid === process.getuid?.();
+  } catch {
+    return false;
+  }
+}
+
 async function connectToDaemon(projectRoot: string): Promise<net.Socket | null> {
   for (const socketPath of getDaemonSocketCandidates(projectRoot)) {
+    if (!boundByThisUser(socketPath)) continue;
     const socket = await connectWithHello(socketPath);
     if (socket && typeof socket !== 'string') return socket;
   }
