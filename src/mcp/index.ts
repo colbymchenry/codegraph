@@ -64,6 +64,7 @@ import {
   getDaemonPidPath,
   getDaemonSocketCandidates,
   probeDaemonIdentity,
+  rootDaemonSocketPath,
 } from './daemon-paths';
 import { getTelemetry } from '../telemetry';
 import { checkForUpdateInBackground } from '../upgrade/update-check';
@@ -206,6 +207,42 @@ export async function connectAnyDaemonCandidate(
     if (s) return s;
   }
   return null;
+}
+
+/** The pid the lock of `root`'s index names, or undefined when it has none to read. */
+function lockedDaemonPid(root: string): number | undefined {
+  try {
+    return decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'))?.pid;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Connect to `socketPath`, one of the socket candidates of `root`'s index, as
+ * {@link connectWithHello} does, but when the index's lock names a daemon, only
+ * to that one: whatever else answers there is no daemon of this index.
+ */
+export function connectIndexDaemon(
+  root: string,
+  socketPath: string,
+  expectedVersion: string = CodeGraphPackageVersion,
+  helloTimeoutMs: number = DAEMON_HELLO_TIMEOUT_MS,
+): Promise<Awaited<ReturnType<typeof connectWithHello>>> {
+  return connectWithHello(socketPath, expectedVersion, helloTimeoutMs, lockedDaemonPid(root));
+}
+
+/**
+ * Connect to a daemon of `root`'s index from a release before an index had
+ * names of its own, which listens under the root's name
+ * ({@link rootDaemonSocketPath}). A daemon of any index of the project may hold
+ * that name, so only the one the index's lock names is joined, and without a
+ * lock none is.
+ */
+export async function connectRootNamedDaemon(root: string): Promise<Awaited<ReturnType<typeof connectWithHello>>> {
+  const pid = lockedDaemonPid(root);
+  if (pid === undefined) return null;
+  return connectWithHello(rootDaemonSocketPath(root), CodeGraphPackageVersion, DAEMON_HELLO_TIMEOUT_MS, pid);
 }
 
 /**
@@ -748,12 +785,20 @@ export class MCPServer {
     // fallback. We don't read the bound path from the lockfile — both sides walk
     // the SAME ordered candidate list, so we converge on whichever the daemon
     // bound with zero coordination. The in-project candidate is tried first, so a
-    // normal repo pays nothing extra (it connects on the very first probe).
-    const candidates = getDaemonSocketCandidates(root);
-    const connectAnyCandidate = (deadline?: number) => connectAnyDaemonCandidate(candidates, deadline);
+    // normal repo pays nothing extra (it connects on the very first probe). When
+    // the index's lock names a daemon, only that one is joined.
+    const connect: typeof connectWithHello = (socketPath, version, timeoutMs) =>
+      connectIndexDaemon(root, socketPath, version, timeoutMs);
+    // The candidates of the index the root resolves to at each attempt, as the
+    // lock, the spawn and the fallback are: on a Windows drive under WSL that can
+    // change while a session runs (#995), and a daemon spawned since serves the
+    // new one.
+    const connectAnyCandidate = (deadline?: number) =>
+      connectAnyDaemonCandidate(getDaemonSocketCandidates(root), deadline, connect);
     const getDaemonSocket = async () => {
-      // Fast path: a daemon may already be listening (on either candidate).
-      const probe = await connectAnyCandidate();
+      // Fast path: a daemon may already be listening (on either candidate), or,
+      // built before an index had names of its own, under the root's name.
+      const probe = await connectAnyCandidate() ?? await connectRootNamedDaemon(root);
       if (probe === 'version-mismatch') return null; // definitive — serve in-process, don't poll for 6s
       if (probe && probe !== 'older-version') return probe;
       // A daemon of an older release answered — or none did, while the project

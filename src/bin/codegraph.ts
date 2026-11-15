@@ -2150,8 +2150,8 @@ program
   .aliases(['daemons'])
   .description('Manage running CodeGraph background daemons — pick one and press enter to stop it')
   .action(async () => {
-    const { listVerifiedDaemons, stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
-    const { runDaemonPicker } = await import('../mcp/daemon-manager');
+    const { listVerifiedDaemons, stopRecordedDaemon, stopAllDaemons } = await import('../mcp/daemon-registry');
+    const { describeDaemon, runDaemonPicker } = await import('../mcp/daemon-manager');
 
     const daemons = await listVerifiedDaemons();
     if (daemons.length === 0) {
@@ -2163,7 +2163,7 @@ program
     // just print what's running instead of crashing on a prompt with no input.
     if (!process.stdout.isTTY || !process.stdin.isTTY) {
       for (const d of daemons) {
-        console.log(`pid ${d.pid}  v${d.version}  up ${formatDuration(Date.now() - d.startedAt)}  ${d.root}`);
+        console.log(`pid ${d.pid}  v${d.version}  up ${formatDuration(Date.now() - d.startedAt)}  ${describeDaemon(d, daemons)}`);
       }
       return;
     }
@@ -2177,7 +2177,7 @@ program
     clack.intro('CodeGraph daemons');
     await runDaemonPicker({
       list: listVerifiedDaemons,
-      stop: stopDaemonAt,
+      stop: stopRecordedDaemon,
       stopAll: stopAllDaemons,
       cwdRoot,
       now: () => Date.now(),

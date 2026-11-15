@@ -1,8 +1,8 @@
 /**
  * Daemon socket + lockfile path helpers — issue #411.
  *
- * One shared `codegraph serve --mcp` daemon per project root means we need a
- * stable, project-keyed rendezvous between cooperating processes. The IPC
+ * One shared `codegraph serve --mcp` daemon per index means we need a
+ * stable, index-keyed rendezvous between cooperating processes. The IPC
  * surface area is just two file paths:
  *
  *   - `daemon.sock` — Unix domain socket / named pipe the daemon listens on.
@@ -28,44 +28,109 @@
  * converge on whichever the daemon bound with zero coordination.
  */
 
+import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
-import { canonicalProjectRoot, getCodeGraphDir } from '../directory';
+import { canonicalProjectRoot, defaultCodeGraphDirNameFor, getCodeGraphDir } from '../directory';
 
 /** Soft upper bound for in-project socket paths. */
 const POSIX_SOCKET_PATH_LIMIT = 100;
 
 /**
- * Short stable identifier for a project root — used in tmpdir/pipe names.
- *
- * Hashed over {@link canonicalProjectRoot}, never a raw `path.resolve`: the key
- * is a rendezvous, so every spelling of one directory must land on one name or
- * a proxy probes a pipe the running daemon never bound (see that function).
+ * The directory of the index a daemon for `projectRoot` serves (the one
+ * `CODEGRAPH_DIR` names), spelled as the root is. A path to read and write,
+ * never case-folded; compare two with {@link sameDaemonIndex}.
  */
-function projectHash(projectRoot: string): string {
-  // `crypto` is the slowest builtin to load, and every CLI command loads this file.
-  const { createHash } = require('crypto') as typeof import('crypto');
-  return createHash('sha256').update(canonicalProjectRoot(projectRoot)).digest('hex').slice(0, 16);
+export function getDaemonIndexDir(projectRoot: string): string {
+  return path.resolve(getCodeGraphDir(projectRoot));
 }
 
 /**
- * The deterministic tmpdir socket path for `projectRoot` — the fallback used
- * when the in-project location can't host a socket (too long, or an FS that
- * doesn't support AF_UNIX). Hash keeps it project-scoped, and being purely a
- * function of the root means the daemon and the proxy compute the identical
- * path without talking to each other.
+ * An index directory as one string for every spelling of it, for hashing and
+ * comparing only ({@link canonicalProjectRoot}). One not made yet is spelled
+ * through its project root, which is.
  */
-function tmpdirSocketPath(projectRoot: string): string {
-  return path.join(os.tmpdir(), `codegraph-${projectHash(projectRoot)}.sock`);
+function canonicalIndexDir(indexDir: string): string {
+  const resolved = path.resolve(indexDir);
+  if (fs.existsSync(resolved)) return canonicalProjectRoot(resolved);
+  const name = path.basename(resolved);
+  return path.join(canonicalProjectRoot(path.dirname(resolved)), process.platform === 'win32' ? name.toLowerCase() : name);
+}
+
+/** Whether two index directories are one index, however each is spelled. */
+export function sameDaemonIndex(a: string, b: string): boolean {
+  return canonicalIndexDir(a) === canonicalIndexDir(b);
+}
+
+/**
+ * Whether `indexDir` is the index `projectRoot` gets with no `CODEGRAPH_DIR`
+ * set: `.codegraph`, or on a Windows drive under WSL the one WSL picks (#995).
+ * For what a list shows only: which index that is can change while daemons
+ * run, so no daemon name depends on it.
+ */
+export function isDefaultDaemonIndex(projectRoot: string, indexDir: string): boolean {
+  return sameDaemonIndex(indexDir, path.join(projectRoot, defaultCodeGraphDirNameFor(projectRoot)));
+}
+
+function nameHash(key: string): string {
+  // `crypto` is the slowest builtin to load, and every CLI command loads this file.
+  const { createHash } = require('crypto') as typeof import('crypto');
+  return createHash('sha256').update(key).digest('hex').slice(0, 16);
+}
+
+/**
+ * Short stable identifier for an index, in the names of the daemon serving it:
+ * its named pipe, its tmpdir fallback socket and its registry record. Every
+ * index is named after its own directory, so two `CODEGRAPH_DIR` indexes of one
+ * project never meet at one daemon, whichever of them is the project's default.
+ *
+ * Hashed over the canonical index directory, never a raw `path.resolve`: the
+ * key is a rendezvous, so every spelling of one directory must land on one name
+ * or a proxy probes a pipe the running daemon never bound (see
+ * {@link canonicalProjectRoot}).
+ */
+export function daemonNameHash(indexDir: string): string {
+  return nameHash(canonicalIndexDir(indexDir));
+}
+
+/**
+ * The hash a release from before an index had names of its own gave the daemon
+ * of every index of `projectRoot`: the canonical root's.
+ */
+export function rootDaemonNameHash(projectRoot: string): string {
+  return nameHash(canonicalProjectRoot(projectRoot));
+}
+
+/**
+ * The deterministic tmpdir socket path for a name hash — the fallback used
+ * when the in-project location can't host a socket (too long, or an FS that
+ * doesn't support AF_UNIX). Being purely a function of the index means the
+ * daemon and the proxy compute the identical path without talking to each
+ * other.
+ */
+function tmpdirSocketPath(hash: string): string {
+  return path.join(os.tmpdir(), `codegraph-${hash}.sock`);
+}
+
+/**
+ * Where a daemon of a release from before an index had names of its own
+ * listens when not on its in-project socket, whatever index it serves: the
+ * named pipe (Windows) or the tmpdir fallback (elsewhere) named after
+ * `projectRoot`. No daemon of this release binds it.
+ */
+export function rootDaemonSocketPath(projectRoot: string): string {
+  const hash = rootDaemonNameHash(projectRoot);
+  return process.platform === 'win32' ? `\\\\.\\pipe\\codegraph-${hash}` : tmpdirSocketPath(hash);
 }
 
 /**
  * Ordered socket / named-pipe path candidates the daemon should try to bind (and
- * the proxy should try to connect) for `projectRoot`, most-preferred first.
- * Deterministic given a project root, so independent processes converge without
- * coordination — even when the preferred candidate is unusable and both fall
- * through to the same fallback.
+ * the proxy should try to connect) for `projectRoot`'s index (`indexDir`, by
+ * default the one `CODEGRAPH_DIR` names), most-preferred first. Deterministic
+ * given the index, so independent processes converge without coordination —
+ * even when the preferred candidate is unusable and both fall through to the
+ * same fallback.
  *
  *   - Windows: a single named pipe (lives in the kernel pipe namespace, not on
  *     the project FS, so neither the length nor the ExFAT hazard applies).
@@ -74,12 +139,13 @@ function tmpdirSocketPath(projectRoot: string): string {
  *   - Long in-project path (deep monorepos, Bazel out dirs): `[ <tmpdir> ]` only
  *     — bind would throw ENAMETOOLONG, so we skip straight to tmpdir.
  */
-export function getDaemonSocketCandidates(projectRoot: string): string[] {
+export function getDaemonSocketCandidates(projectRoot: string, indexDir = getDaemonIndexDir(projectRoot)): string[] {
+  const hash = daemonNameHash(indexDir);
   if (process.platform === 'win32') {
-    return [`\\\\.\\pipe\\codegraph-${projectHash(projectRoot)}`];
+    return [`\\\\.\\pipe\\codegraph-${hash}`];
   }
-  const inProject = path.join(getCodeGraphDir(projectRoot), 'daemon.sock');
-  const tmp = tmpdirSocketPath(projectRoot);
+  const inProject = path.join(indexDir, 'daemon.sock');
+  const tmp = tmpdirSocketPath(hash);
   if (inProject.length > POSIX_SOCKET_PATH_LIMIT) return [tmp];
   return [inProject, tmp];
 }
@@ -96,9 +162,9 @@ export function getDaemonSocketPath(projectRoot: string): string {
   return getDaemonSocketCandidates(projectRoot)[0]!;
 }
 
-/** Absolute path to the daemon pid lockfile for `projectRoot`. */
-export function getDaemonPidPath(projectRoot: string): string {
-  return path.join(getCodeGraphDir(projectRoot), 'daemon.pid');
+/** Absolute path to the daemon pid lockfile for `projectRoot`'s index (`indexDir`). */
+export function getDaemonPidPath(projectRoot: string, indexDir = getDaemonIndexDir(projectRoot)): string {
+  return path.join(indexDir, 'daemon.pid');
 }
 
 /** Structured contents of the pid lockfile. */
@@ -165,6 +231,41 @@ export function probeDaemonIdentity(info: DaemonLockInfo, timeoutMs = 1_000): Pr
     });
     socket.on('error', () => finish(false));
     socket.on('close', () => finish(false));
+  });
+}
+
+/**
+ * Whether a process listens on the socket file at `socketPath`. One left by a
+ * daemon that was killed refuses the connection (or is gone); anything else,
+ * a connection still pending after `timeoutMs` included, counts as listening,
+ * so a caller never removes a socket in use. The connect is injectable for
+ * tests.
+ */
+export function socketAnswers(
+  socketPath: string,
+  timeoutMs = 1_000,
+  connect: (socketPath: string) => net.Socket = (target) => net.createConnection(target),
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let socket: net.Socket | null = null;
+    let done = false;
+    const finish = (answers: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      socket?.destroy();
+      resolve(answers);
+    };
+    const timer = setTimeout(() => finish(true), timeoutMs);
+    timer.unref?.();
+    try {
+      socket = connect(socketPath);
+    } catch {
+      finish(true);
+      return;
+    }
+    socket.once('connect', () => finish(true));
+    socket.once('error', (err: NodeJS.ErrnoException) => finish(err.code !== 'ECONNREFUSED' && err.code !== 'ENOENT'));
   });
 }
 

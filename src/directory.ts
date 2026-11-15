@@ -107,7 +107,17 @@ export function isCodeGraphDataDir(name: string): boolean {
  * cached per process.
  */
 export function codeGraphDirNameFor(projectRoot: string): string {
-  if (process.env.CODEGRAPH_DIR?.trim() || !isWslWindowsDrive(projectRoot)) return codeGraphDirName();
+  if (process.env.CODEGRAPH_DIR?.trim()) return codeGraphDirName();
+  return defaultCodeGraphDirNameFor(projectRoot);
+}
+
+/**
+ * The data directory name `projectRoot` gets with no `CODEGRAPH_DIR` set:
+ * `.codegraph`, or on a Windows drive under WSL the one
+ * {@link codeGraphDirNameFor} describes.
+ */
+export function defaultCodeGraphDirNameFor(projectRoot: string): string {
+  if (!isWslWindowsDrive(projectRoot)) return DEFAULT_CODEGRAPH_DIR;
   try {
     if (fs.statSync(path.join(projectRoot, WSL_CODEGRAPH_DIR)).isDirectory()) return WSL_CODEGRAPH_DIR;
   } catch {

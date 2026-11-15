@@ -30,10 +30,14 @@ function isProcessAlive(pid: number): boolean {
 
 
 /** Absolute path to the writer pid lockfile for `projectRoot`. */
-export function getWriterPidPath(projectRoot: string, lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid'): string {
+export function getWriterPidPath(
+  projectRoot: string,
+  lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid',
+  indexDir?: string,
+): string {
   let root = projectRoot;
   try { root = fs.realpathSync(projectRoot); } catch { /* keep lexical */ }
-  return path.join(getCodeGraphDir(root), lockName);
+  return path.join(indexDir ?? getCodeGraphDir(root), lockName);
 }
 
 /** Structured contents of the writer pidfile. */
@@ -77,8 +81,9 @@ export function tryAcquireWriterLock(
   projectRoot: string,
   mode: string,
   lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid',
+  indexDir?: string,
 ): WriterAcquireResult {
-  const pidPath = getWriterPidPath(projectRoot, lockName);
+  const pidPath = getWriterPidPath(projectRoot, lockName, indexDir);
   fs.mkdirSync(path.dirname(pidPath), { recursive: true });
 
   const info: WriterLockInfo = {
@@ -204,8 +209,12 @@ export function swapWriterLock(projectRoot: string, fromPid: number, next: Write
 }
 
 /** Release if we still own the lock (pid match). */
-export function releaseWriterLock(projectRoot: string, lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid'): void {
-  const pidPath = getWriterPidPath(projectRoot, lockName);
+export function releaseWriterLock(
+  projectRoot: string,
+  lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid',
+  indexDir?: string,
+): void {
+  const pidPath = getWriterPidPath(projectRoot, lockName, indexDir);
   try {
     if (!fs.existsSync(pidPath)) return;
     const info = decodeWriterLockInfo(fs.readFileSync(pidPath, 'utf8'));
@@ -216,8 +225,12 @@ export function releaseWriterLock(projectRoot: string, lockName: 'writer.pid' | 
 }
 
 /** Read current lock without acquiring. */
-export function readWriterLock(projectRoot: string, lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid'): WriterLockInfo | null {
-  const pidPath = getWriterPidPath(projectRoot, lockName);
+export function readWriterLock(
+  projectRoot: string,
+  lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid',
+  indexDir?: string,
+): WriterLockInfo | null {
+  const pidPath = getWriterPidPath(projectRoot, lockName, indexDir);
   try {
     return decodeWriterLockInfo(fs.readFileSync(pidPath, 'utf8'));
   } catch {

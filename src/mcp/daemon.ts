@@ -222,6 +222,8 @@ export class Daemon {
   private stopping = false;
   private socketPath: string;
   private pidPath: string;
+  /** The registry record this daemon wrote, which it removes on shutdown. */
+  private registryFile: string | null = null;
   /** The launcher holding the writer slot for this daemon, when it replaced an older one (#2335). */
   private handoverFrom: number | null;
 
@@ -361,7 +363,7 @@ export class Daemon {
 
     // Drop a discovery record so `codegraph list` / `stop --all` can find us.
     // Best-effort; a missing record only means list's liveness prune covers it.
-    registerDaemon({ root: this.projectRoot, ...lock });
+    this.registryFile = registerDaemon({ root: this.projectRoot, ...lock }, path.dirname(this.pidPath));
 
     process.stderr.write(
       `[CodeGraph daemon] Listening on ${this.socketPath} (pid ${process.pid}, v${CodeGraphPackageVersion}). Idle timeout ${this.idleTimeoutMs}ms.\n`
@@ -422,7 +424,7 @@ export class Daemon {
     }
     await this.engine.stop();
     this.cleanupLockfile();
-    deregisterDaemon(this.projectRoot);
+    if (this.registryFile) deregisterDaemon(this.projectRoot, process.pid, this.registryFile);
     if (process.platform !== 'win32') {
       try { fs.unlinkSync(this.socketPath); } catch { /* may already be gone */ }
     }
