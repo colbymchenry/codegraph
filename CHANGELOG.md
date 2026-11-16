@@ -51,6 +51,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Drupal, services from `*.services.yml`, plugin definitions (attributes and docblock annotations, a contrib module's own plugin types included) and `#[Hook]` methods are now part of the graph, and a call through `\Drupal::service('x')` or `$container->get('x')` links to the method on that service's class. Thanks @mikedamoiseau and @marcelovani.
 - In Next.js, a route now links to the `proxy.ts` or `middleware.ts` that runs before it, following `config.matcher`, so `codegraph impact`, `codegraph callers` and `codegraph_explore` show which routes a change to it reaches. Thanks @RIGOandre.
 
+### New Features
+
+- QML, the declarative language used with the Qt framework, is now indexed, including component structure, module imports and flows from QML handlers into C++ through Qt signals, slots, invokable methods and properties.
+- Qt macros in C++ files no longer disturb the parser: source positions stay exact, comments and string literals are untouched, and QML objects, bindings and multi-line functions keep their place in the component hierarchy with their full bodies.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
