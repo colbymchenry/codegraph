@@ -159,6 +159,25 @@ export function cppIncludedFile(include: Node, context: ResolutionContext): stri
 }
 
 /**
+ * The indexed files an `#include` names under a source file's name
+ * (`#include "impl.c"`, `"unity.cc"`, `"tables.inc"`), sorted. Each is part of
+ * the file including it, which a header is by nature and these only by this
+ * directive. Names with no extension are the standard library's (`<vector>`).
+ */
+export function cppIncludedSources(context: ResolutionContext): string[] {
+  const memo = memoFor(context);
+  const found = new Set<string>();
+  for (const [name, includes] of includesByName(context, memo)) {
+    if (!name.includes('.') || /\.(?:h|hh|hpp|hxx)$/i.test(name)) continue;
+    for (const include of includes) {
+      const file = includedFile(include, context, memo);
+      if (file !== null) found.add(file);
+    }
+  }
+  return [...found].sort();
+}
+
+/**
  * Every file that includes `filePath`, directly or through the files that
  * include it: the translation units (and headers) it is part of.
  */
