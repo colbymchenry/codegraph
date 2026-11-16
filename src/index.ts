@@ -145,6 +145,8 @@ export interface IndexOptions {
 const PYTHON_ROOTS_METADATA_KEY = 'python_root_fingerprint';
 /** Metadata key: the digest of the workspace packages and path dependencies the index was resolved by. */
 const WORKSPACE_METADATA_KEY = 'js_workspace_fingerprint';
+/** Metadata key: where the walk that read those packages found their manifests (see ManifestStamp); '' for none. */
+const WORKSPACE_MANIFESTS_METADATA_KEY = 'js_workspace_manifests';
 /** The tsconfig / jsconfig and go.mod files the index was resolved by, with a digest of each (#2977). */
 const MODULE_CONFIG_METADATA_KEY = 'module_config_snapshot';
 /** Metadata key: the frameworks (sorted JSON names) the last full index extracted every file with. */
@@ -887,6 +889,7 @@ export class CodeGraph {
         // extraction stamp (the bulk would still be stale). See extraction-version.ts.
         if (result.success) this.stampPythonRootFingerprint();
         if (result.success) this.stampWorkspaceFingerprint();
+        if (result.success) this.stampWorkspaceManifests(this.orchestrator.takeManifestEvidence());
         if (result.success) this.stampModuleConfigSnapshot();
         if (result.success) this.stampIndexedFrameworks();
 
@@ -1030,6 +1033,20 @@ export class CodeGraph {
     } catch { /* metadata is advisory */ }
   }
 
+  /**
+   * Record where the last walk found the package manifests, with what git's
+   * listings said then (see ManifestStamp), so a sync that sees the same can
+   * read them without walking the tree. '' when there is nothing to trust.
+   */
+  private stampWorkspaceManifests(evidence: ReturnType<ExtractionOrchestrator['takeManifestEvidence']>): void {
+    try {
+      const discovery = this.resolver.getWorkspaceDiscovery();
+      const stamp = discovery ? engine().manifestStamp(evidence, discovery) : null;
+      const value = stamp ? JSON.stringify(stamp) : '';
+      if (this.queries.getMetadata(WORKSPACE_MANIFESTS_METADATA_KEY) !== value) this.queries.setMetadata(WORKSPACE_MANIFESTS_METADATA_KEY, value);
+    } catch { /* metadata is advisory */ }
+  }
+
   /** Record the frameworks a full index extracted every file with; none has come or gone since. */
   private stampIndexedFrameworks(): void {
     const names = this.orchestrator.getDetectedFrameworkNames();
@@ -1117,6 +1134,7 @@ export class CodeGraph {
       hasSynthesisPattern,
       isJsxChildCandidate,
       moduleConfigLanguages,
+      parseManifestStamp,
       parseModuleConfigSnapshot,
       reopenNameMatchedImports,
       reopenReferencesThroughAddedFiles,
@@ -1124,6 +1142,7 @@ export class CodeGraph {
       reopenReferencesThroughChangedDefaults,
       reopenReferencesThroughDeclaredPackages,
       reopenReferencesThroughRetargetedModules,
+      trustedManifestList,
     } = engine();
     return this.indexMutex.withLock(async () => {
       const startedAt = Date.now();
@@ -1340,10 +1359,22 @@ export class CodeGraph {
           }
         }
 
+        // Finding the manifests takes a walk of the tree. Git's listings, which
+        // this sync's scan made anyway, tell whether the walk could find any
+        // but those it found last time; when not, they are read where they
+        // are, each one again, so an edit to one is seen all the same.
         if (fullReconcile) {
           const tWorkspace = Date.now();
           const before = this.queries.getMetadata(WORKSPACE_METADATA_KEY);
-          const now = this.resolver.refreshWorkspacePackages();
+          const evidence = this.orchestrator.takeManifestEvidence();
+          const known = before === null ? null : trustedManifestList(
+            this.projectRoot, parseManifestStamp(this.queries.getMetadata(WORKSPACE_MANIFESTS_METADATA_KEY)), evidence
+          );
+          const now = this.resolver.refreshWorkspacePackages(known ?? undefined);
+          if (!known) this.stampWorkspaceManifests(evidence);
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+            console.error(`[phase-timing] sync-workspace-manifests: ${Date.now() - tWorkspace}ms (${known ? `${known.length} read where the last walk found them` : 'walked'})`);
+          }
           if (before !== null && before !== now) {
             let reopened = 0;
             for (const language of ESM_IMPORT_LANGUAGES) reopened += this.orchestrator.resurrectResolutionEdgesForLanguage(language);
