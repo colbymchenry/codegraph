@@ -3032,11 +3032,12 @@ export function blankQtMacros(source: string): string {
   }
 
   const masked = maskCppNonCode(source);
-  const chars = source.split('');
+    // Offset → replacement char: a Qt file changes a handful of spans, so the text is never split per character.
+    const edits = new Map<number, string>();
   const blank = (start: number, end: number): void => {
     for (let offset = start; offset < end; offset++) {
-      const char = source[offset] as string;
-      if (char !== '\r' && char !== '\n' && char.charCodeAt(0) < 128) chars[offset] = ' ';
+        const code = source.charCodeAt(offset);
+        if (code !== 13 && code !== 10 && code < 128) edits.set(offset, ' ');
     }
   };
   const argumentMacros = /\bQML_(?:NAMED_ELEMENT|UNCREATABLE|VALUE_TYPE|ANONYMOUS|FOREIGN)\s*\(/g;
@@ -3056,10 +3057,10 @@ export function blankQtMacros(source: string): string {
     }
     blank(match.index, end);
     if (hasUnicode) {
-      chars[match.index] = '/';
-      chars[match.index + 1] = '*';
-      chars[end - 2] = '*';
-      chars[end - 1] = '/';
+        edits.set(match.index, '/');
+        edits.set(match.index + 1, '*');
+        edits.set(end - 2, '*');
+        edits.set(end - 1, '/');
     }
     argumentMacros.lastIndex = end;
   }
@@ -3072,16 +3073,22 @@ export function blankQtMacros(source: string): string {
     blank(start, start + alias.length);
     if (header[2] === undefined) {
       if (alias === 'signals' || alias === 'Q_SIGNALS') {
-        for (let offset = 0; offset < 'public'.length; offset++) chars[start + offset] = 'public'[offset] as string;
+          for (let offset = 0; offset < 'public'.length; offset++) edits.set(start + offset, 'public'[offset] as string);
       } else {
-        chars[header.index + header[0].length - 1] = ' ';
+          edits.set(header.index + header[0].length - 1, ' ');
       }
     }
   }
   for (const token of masked.matchAll(/\b(?:Q_EMIT|emit)\b(?=\s+[A-Za-z_]\w*\s*\()/g)) {
     blank(token.index, token.index + token[0].length);
   }
-  return chars.join('');
+    let out = '';
+    let copied = 0;
+    for (const offset of [...edits.keys()].sort((a, b) => a - b)) {
+        out += source.slice(copied, offset) + edits.get(offset);
+        copied = offset + 1;
+    }
+    return out + source.slice(copied);
 }
 
 /**

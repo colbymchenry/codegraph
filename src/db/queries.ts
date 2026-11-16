@@ -1684,18 +1684,17 @@ export class QueryBuilder {
    * Used to bypass the O(N-methods) qtSignalChannelEdges pass on non-Qt C++ codebases like Chromium.
    */
   hasQtIndicators(): boolean {
-    const hasSignalOrSlot = this.db.prepare(
-      "SELECT 1 FROM nodes WHERE kind = 'method' AND (signature LIKE 'signal %' OR signature LIKE 'slot %') LIMIT 1"
+      // Qt context properties from C++ registration; the qualified-name range uses its index.
+      const hasContextProperty = this.db.prepare(
+          "SELECT 1 FROM nodes WHERE qualified_name >= 'qt-context-property::' AND qualified_name < 'qt-context-property:;' AND kind = 'variable' LIMIT 1"
     ).get();
-    if (hasSignalOrSlot) return true;
+      if (hasContextProperty) return true;
 
-    // Qt context properties from QML registration
-    const hasQmlReg = this.db.prepare(
-      "SELECT 1 FROM nodes WHERE kind = 'variable' AND name LIKE 'qt-context-property:%' LIMIT 1"
-    ).get();
-    if (hasQmlReg) return true;
-
-    return false;
+      // `signal` / `slot` is a token of the signature, so FTS finds the few candidates and no method row is scanned.
+      const signalOrSlot = this._fts5Available
+          ? "SELECT 1 FROM nodes_fts JOIN nodes n ON n.rowid = nodes_fts.rowid WHERE nodes_fts MATCH 'signature : signal OR signature : slot' AND n.kind = 'method' AND (n.signature LIKE 'signal %' OR n.signature LIKE 'slot %') LIMIT 1"
+          : "SELECT 1 FROM nodes WHERE kind = 'method' AND (signature LIKE 'signal %' OR signature LIKE 'slot %') LIMIT 1";
+      return Boolean(this.db.prepare(signalOrSlot).get());
   }
 
   /**

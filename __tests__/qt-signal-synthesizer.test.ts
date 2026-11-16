@@ -1,8 +1,11 @@
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { CodeGraph } from '../src';
+import { DatabaseConnection } from '../src/db';
+import { QueryBuilder } from '../src/db/queries';
+import type { Node } from '../src/types';
 import { initGrammars } from '../src/extraction/grammars';
 import { ToolHandler } from '../src/mcp/tools';
 import { qtResolver } from '../src/resolution/frameworks/qt';
@@ -768,4 +771,80 @@ void wire(Source *source, Relay *relay) {
       }
     });
   });
+});
+
+describe('Qt indicators in the index', () => {
+    let dir: string;
+    let db: DatabaseConnection;
+    let queries: QueryBuilder;
+
+    beforeEach(() => {
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-qt-indicators-'));
+        db = DatabaseConnection.initialize(path.join(dir, 'test.db'));
+        queries = new QueryBuilder(db.getDb());
+    });
+
+    afterEach(() => {
+        db.close();
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    const node = (id: string, kind: Node['kind'], name: string, qualifiedName: string, signature?: string): Node => ({
+        id, kind, name, qualifiedName, signature, filePath: 'a.cpp', language: 'cpp',
+        startLine: 1, endLine: 1, startColumn: 0, endColumn: 0, updatedAt: 0,
+    });
+
+    it('is false for a project with neither signals, slots nor context properties', () => {
+        queries.insertNodes([
+            node('m1', 'method', 'signal', 'Os::signal', 'void signal(int)'),
+            node('m2', 'method', 'slotCount', 'Table::slotCount', 'int slotCount()'),
+        ]);
+        expect(queries.hasQtIndicators()).toBe(false);
+    });
+
+    it.each(['signal changed()', 'slot apply()'])('is true for a method whose signature starts with "%s"', (signature) => {
+        queries.insertNodes([node('m1', 'method', 'x', 'Foo::x', signature)]);
+        expect(queries.hasQtIndicators()).toBe(true);
+    });
+
+    it('is true for a Qt context property node', () => {
+        queries.insertNodes([node('v1', 'variable', 'reportService', 'qt-context-property::reportService', 'qt.context-property|reportService|Demo::Bridge')]);
+        expect(queries.hasQtIndicators()).toBe(true);
+    });
+});
+
+describe('qtResolver — detection sample', () => {
+    const contextFor = (files: Record<string, string>) => {
+        const read: string[] = [];
+        return {
+            read,
+            ctx: {
+                getAllFiles: () => Object.keys(files),
+                readFile: (file: string) => { read.push(file); return files[file] ?? null; },
+                getNodesByName: () => [],
+                getNodesByQualifiedName: () => [],
+                getNodesByKind: () => [],
+                getNodesByLowerName: () => [],
+                fileExists: () => false,
+                getProjectRoot: () => '/tmp',
+                getImportMappings: () => [],
+            },
+        };
+    };
+
+    it('finds Qt in a file past the first 200 C++ files', () => {
+        const files: Record<string, string> = {};
+        for (let i = 0; i < 400; i++) files[`util/f${String(i).padStart(3, '0')}.cpp`] = 'int f() { return 0; }\n';
+        for (let i = 0; i < 100; i++) files[`zz-gui/w${String(i).padStart(3, '0')}.cpp`] = '#include <QObject>\nclass W : public QObject { Q_OBJECT };\n';
+        const { ctx, read } = contextFor(files);
+        // @ts-expect-error — minimal mock
+        expect(qtResolver.detect(ctx)).toBe(true);
+        expect(read.filter((file) => file.endsWith('.cpp')).length).toBeLessThanOrEqual(200);
+    });
+
+    it('reads .cc and .cxx files too', () => {
+        const { ctx } = contextFor({ 'src/widget.cc': '#include <QWidget>\n', 'src/other.cxx': 'int x;\n' });
+        // @ts-expect-error — minimal mock
+        expect(qtResolver.detect(ctx)).toBe(true);
+    });
 });

@@ -100,6 +100,7 @@ const QML_ELEMENT_PATTERN = /\bQML_ELEMENT\b/;
 
 /** C++ files `detect()` reads at most, so a large non-Qt tree is not read whole on every detection. */
 const QT_DETECT_FILE_SAMPLE = 200;
+const QT_DETECT_CPP_FILE = /\.(?:cpp|cc|cxx|h|hpp|hxx)$/;
 
 function hasQtCppMarkers(content: string, code: string): boolean {
   if (Q_OBJECT_PATTERN.test(code) || QML_ELEMENT_PATTERN.test(code)) return true;
@@ -895,12 +896,12 @@ export const qtResolver: FrameworkResolver = {
     }
 
     // Check for Qt headers in C++ files. Every file read here is a detection input
-    // that a sync re-runs detection for, so the scan is bounded, as React Native's is.
-    let sampled = 0;
-    for (const file of allFiles) {
-      if (!file.endsWith('.cpp') && !file.endsWith('.h') && !file.endsWith('.hpp')) continue;
-      if (++sampled > QT_DETECT_FILE_SAMPLE) break;
-      const content = context.readFile(file);
+      // that a sync re-runs detection for, so the scan is bounded, and spread over the
+      // whole list: the first N alphabetically could all be a non-Qt utility tree.
+      const cppFiles = allFiles.filter((f) => QT_DETECT_CPP_FILE.test(f));
+      const stride = Math.max(1, cppFiles.length / QT_DETECT_FILE_SAMPLE);
+      for (let i = 0; i < Math.min(cppFiles.length, QT_DETECT_FILE_SAMPLE); i++) {
+          const content = context.readFile(cppFiles[Math.floor(i * stride)]!);
       const code = content && maskCppNonCode(content);
       if (content && code && hasQtCppMarkers(content, code)) {
         return true;
