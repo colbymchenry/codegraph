@@ -75,7 +75,7 @@ describe('standalone installer Windows shell guidance (#1294)', () => {
 // `$HOME` (POSIX) / `$USERPROFILE` (Windows) env vars that
 // `os.homedir()` reads first. Same trick the rest of the suite uses
 // when it needs a mock home.
-const AGENT_HOME_OVERRIDES = ['QWEN_HOME', 'DSH_HOME', 'GROK_HOME', 'KIMI_CODE_HOME', 'QODER_CONFIG_DIR', 'PI_CODING_AGENT_DIR'];
+const AGENT_HOME_OVERRIDES = ['QWEN_HOME', 'DSH_HOME', 'GROK_HOME', 'KIMI_CODE_HOME', 'QODER_CONFIG_DIR', 'PI_CODING_AGENT_DIR', 'CODEGRAPH_TARGETS_FILE'];
 
 function setHome(dir: string): { restore: () => void } {
   const overrides = AGENT_HOME_OVERRIDES.map((name) => [name, process.env[name]] as const);
@@ -3921,8 +3921,10 @@ function useTmpDirs(label: string): { home: () => string; cwd: () => string } {
   let homeRestore: { restore: () => void };
 
   beforeEach(() => {
-    tmpHome = mkTmpDir(`${label}-home`);
-    tmpCwd = mkTmpDir(`${label}-cwd`);
+    // Resolved, so a path built from the dir matches one built from
+    // `process.cwd()`, which macOS reports as `/private/var/...` for `/var/...`.
+    tmpHome = fs.realpathSync(mkTmpDir(`${label}-home`));
+    tmpCwd = fs.realpathSync(mkTmpDir(`${label}-cwd`));
     origCwd = process.cwd();
     process.chdir(tmpCwd);
     homeRestore = setHome(tmpHome);
