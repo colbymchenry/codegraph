@@ -129,6 +129,13 @@ export interface IndexResult {
 const RE_EXPORTING_LANGUAGES = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
 
 /**
+ * Files a resolution answer's receiver type can be read from (`typeFrom`):
+ * python modules and stubs, and TS/JS modules, whose signatures type the
+ * callbacks other files pass them.
+ */
+const TYPE_FROM_FILE = /\.(?:pyi?|[mc]?[jt]sx?)$/;
+
+/**
  * Result of a sync operation
  */
 export interface SyncResult {
@@ -3700,14 +3707,16 @@ export class ExtractionOrchestrator {
    * Re-open resolution edges whose answer was READ from a file this sync
    * touched, although neither end of the edge changed: a python attribute typed
    * through a factory or a base class in another file records those files as
-   * `metadata.typeFrom`. The definition delta cannot see these — editing what a
-   * factory returns, or what a base `__init__` assigns, adds or removes no
+   * `metadata.typeFrom`, as does a TS/JS receiver typed by the signature of a
+   * function in another file (a callback's parameter). The definition delta
+   * cannot see these — editing what a factory returns, what a base `__init__`
+   * assigns or the type a callee gives its callback adds or removes no
    * definition — so without this a synced index keeps the old type forever.
    * The edges go back to pending refs; returns the files they come from, whose
    * pending rows the caller resolves.
    */
   resurrectTypeDependentEdges(touchedPaths: string[], changedFilePaths: string[]): string[] {
-    const touched = new Set(touchedPaths.filter((p) => /\.pyi?$/.test(p)));
+    const touched = new Set(touchedPaths.filter((p) => TYPE_FROM_FILE.test(p)));
     if (touched.size === 0) return [];
     const alreadyFresh = new Set(changedFilePaths);
 
