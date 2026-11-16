@@ -317,7 +317,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python calls through an attribute, like `self.sink.stop()`, now reach the method of the class your code gives that attribute instead of one matched by name alone. Thanks @inth3shadows. (#1704)
 - A Python call through an attribute set by a factory or a base class's `__init__`, or straight on a factory's result, like `Client.from_env().send()`, now reaches the right method. Thanks @inth3shadows. (#1704, #750)
 - Python imports now resolve from your package roots, like `src/` layouts and each `pyproject.toml`, so `import requests` no longer links to a same-named file in a test fixture or vendored copy. (#1704)
-- In Python, a call to a function or method declared with `typing.overload` now links to the `def` that runs instead of the first `@overload` stub, so the implementation shows its callers and a call path goes on through it, while a stub with no implementation below it, as in a `Protocol`, stays the target. (#2963)
+- In Python, a call to a function or method declared with `typing.overload` now links to the `def` that runs instead of the first `@overload` stub, so the implementation shows its callers and a call path goes on through it, while a stub with no implementation below it, as in a `Protocol`, stays the target. Only `typing`'s and `typing_extensions`' `overload` counts, not another library's like plum's, whose bodies run, and `codegraph sync` moves the call when an implementation is added or removed. Re-index Python projects after upgrading, since an existing index keeps the stub link. (#2963)
 
 #### Java, Kotlin and Scala
 

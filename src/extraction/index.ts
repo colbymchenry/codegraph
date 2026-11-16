@@ -4089,7 +4089,7 @@ export class ExtractionOrchestrator {
     // first measurement of this fix.
     const pairsAfter = this.queries.getNodeNamePairsByFiles(filesToIndex);
     const deltaNames = new Set<string>();
-    const nameOf = (pair: string) => pair.slice(pair.indexOf('\0') + 1);
+    const nameOf = (pair: string) => pair.split('\0')[1]!;
     for (const pair of pairsBefore) if (!pairsAfter.has(pair)) deltaNames.add(nameOf(pair));
     for (const pair of pairsAfter) if (!pairsBefore.has(pair)) deltaNames.add(nameOf(pair));
     const definitionDelta = [...deltaNames];

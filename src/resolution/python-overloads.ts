@@ -23,16 +23,26 @@ export function clearPythonOverloadMemos(context: ResolutionContext): void {
   IMPLEMENTATIONS.delete(context);
 }
 
+/** The modules whose `overload` declares stubs. */
+const TYPING_MODULES = new Set(['typing', 'typing_extensions']);
+
 /**
- * Whether the decorators above a `def` hold `overload`, spelled bare, through a
- * module (`typing.overload`, `t.overload`) or under the name the file imported it
- * as (`from typing import overload as ov`). Decorators are not kept on Python
+ * Whether the decorators above a `def` hold typing's `overload`, spelled bare,
+ * through the module (`typing.overload`, `t.overload` after `import typing as
+ * t`) or under the name the file imported it as (`from typing import overload
+ * as ov`). Another library's `overload`, like plum's, whose bodies run, is not
+ * it: a bare `overload` the file imports from elsewhere, or one reached
+ * through a module other than typing's. Decorators are not kept on Python
  * nodes, so they're read from the source, upward from the `def`.
  */
 function isOverloadStub(n: Node, context: ResolutionContext): boolean {
   const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
-  const names = new Set(['overload']);
-  for (const m of context.getImportMappings(n.filePath, 'python')) if (m.exportedName === 'overload') names.add(m.localName);
+  const imports = context.getImportMappings(n.filePath, 'python');
+  const names = new Set<string>();
+  for (const m of imports) if (m.exportedName === 'overload' && TYPING_MODULES.has(m.source)) names.add(m.localName);
+  // A bare `overload` no import binds, as under `from typing import *`, is typing's.
+  if (!imports.some((m) => m.localName === 'overload')) names.add('overload');
+  const typingAliases = new Set(imports.filter((m) => m.isNamespace && TYPING_MODULES.has(m.source)).map((m) => m.localName));
   let open = 0;
   for (let i = n.startLine - 2; i >= 0 && i >= n.startLine - 1 - DECORATOR_LOOKBACK; i--) {
     const text = lines[i]?.trim() ?? '';
@@ -41,7 +51,10 @@ function isOverloadStub(n: Node, context: ResolutionContext): boolean {
     open += (text.match(/\)/g)?.length ?? 0) - (text.match(/\(/g)?.length ?? 0);
     if (open > 0) continue;
     if (!text.startsWith('@')) return false;
-    if (names.has(/^@(?:\w+\.)*(\w+)/.exec(text)?.[1] ?? '')) return true;
+    const decorator = /^@((?:\w+\.)*)(\w+)/.exec(text);
+    if (!decorator) continue;
+    const via = decorator[1]!.slice(0, -1);
+    if (via ? decorator[2] === 'overload' && (typingAliases.has(via) || TYPING_MODULES.has(via)) : names.has(decorator[2]!)) return true;
   }
   return false;
 }

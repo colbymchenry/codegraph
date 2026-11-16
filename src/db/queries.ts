@@ -5727,7 +5727,8 @@ export class QueryBuilder {
 
   /**
    * Distinct `file\0name` pairs defined by the given files — the shape sync's
-   * definition delta needs (CG-33).
+   * definition delta needs (CG-33), with `\0count` after a Python name that
+   * is defined more than once in its file.
    *
    * Deliberately NOT `getNodeNamesByFiles`: a bare name set is taken over the
    * WHOLE changed batch, so a name that moves between two files in one commit
@@ -5744,10 +5745,15 @@ export class QueryBuilder {
       const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
       const rows = this.db
-        .prepare(`SELECT DISTINCT file_path, name FROM nodes WHERE file_path IN (${placeholders})`)
-        .all(...chunk) as Array<{ file_path: string; name: string }>;
+        .prepare(`SELECT file_path, name,
+                         SUM(CASE WHEN language = 'python' AND kind IN ('function', 'method') THEN 1 ELSE 0 END) AS defs
+                    FROM nodes WHERE file_path IN (${placeholders}) GROUP BY file_path, name`)
+        .all(...chunk) as Array<{ file_path: string; name: string; defs: number }>;
       // NUL-joined: a path or a symbol name can contain a space, never a NUL.
-      for (const row of rows) pairs.add(`${row.file_path}\0${row.name}`);
+      // A Python name defined more than once in a file carries how many times:
+      // the `def` below a name's `@overload` stubs is the one that runs, so
+      // adding or removing one moves a call no other name change records.
+      for (const row of rows) pairs.add(row.defs > 1 ? `${row.file_path}\0${row.name}\0${row.defs}` : `${row.file_path}\0${row.name}`);
     }
     return pairs;
   }

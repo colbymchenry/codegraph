@@ -224,3 +224,84 @@ describe('a call to a Python name declared with typing.overload', () => {
     expect(calleeLines('use', 'go')).toEqual([6, 10]);
   });
 });
+
+describe('a Python overload a sync or another library changes', () => {
+  let root: string;
+  let cg: CodeGraph;
+
+  const write = (file: string, lines: string[]): void => {
+    fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+    fs.writeFileSync(path.join(root, file), lines.join('\n') + '\n');
+  };
+
+  afterEach(() => {
+    cg.destroy();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const calleeLines = (caller: string, name: string): number[] => {
+    const from = cg.getNodesByKind('function').find((n) => n.name === caller)!;
+    return cg.getCallees(from.id).filter((c) => c.node.name === name).map((c) => c.node.startLine).sort((a, b) => a - b);
+  };
+
+  const STUBS = [
+    'import typing as t',
+    '',
+    '',
+    '@t.overload',
+    'def command(name: str) -> str: ...',      // 5
+    '',
+    '',
+    '@t.overload',
+    'def command(name: int) -> int: ...',      // 9
+  ];
+
+  it('moves the call to an implementation a sync adds below the stubs, and back when it goes', async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-py-overload-sync-'));
+    write('pkg/deco.py', STUBS);
+    write('use.py', ['from pkg.deco import command', '', '', 'def go():', '    return command("x")']);
+    cg = await CodeGraph.init(root, { index: true });
+    expect(calleeLines('go', 'command')).toEqual([5]);
+
+    write('pkg/deco.py', [...STUBS, '', '', 'def command(name=None):', '    return name']);
+    await cg.sync();
+    expect(calleeLines('go', 'command')).toEqual([12]);
+
+    write('pkg/deco.py', STUBS);
+    await cg.sync();
+    expect(calleeLines('go', 'command')).toEqual([5]);
+  });
+
+  it("leaves another library's overload alone: its bodies run", async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-py-overload-plum-'));
+    write('multi/g.py', [
+      'from plum import dispatch, overload',
+      '',
+      '@overload',
+      'def g(x: int):',                          // 4
+      '    return x + 1',
+      '',
+      '@overload',
+      'def g(x: str):',                          // 8
+      '    return x',
+      '',
+      '@dispatch',
+      'def g(x):',                               // 12
+      '    pass',
+    ]);
+    write('multi/h.py', [
+      'import plum',
+      '',
+      '@plum.overload',
+      'def h(x: int):',                          // 4
+      '    return x',
+      '',
+      'def h(x):',                               // 7
+      '    pass',
+    ]);
+    write('use.py', ['from multi.g import g', 'from multi.h import h', '', '', 'def go():', '    return g(1), h(1)']);
+    cg = await CodeGraph.init(root, { index: true });
+    expect(calleeLines('go', 'g')).toEqual([4]);
+    expect(calleeLines('go', 'h')).toEqual([4]);
+  });
+});
