@@ -35,6 +35,7 @@ import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { logDebug } from '../errors';
+import { readRegularFile } from '../file-limits';
 
 export interface WorkspacePackages {
   /**
@@ -221,7 +222,7 @@ const MAIN_FIELDS = ['source', 'module', 'main', 'types', 'typings'];
 function readPackageEntries(projectRoot: string, dirRel: string): PackageEntries | null {
   let pkg: Record<string, unknown> | null;
   try {
-    pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, dirRel, 'package.json'), 'utf-8')) as Record<string, unknown> | null;
+    pkg = JSON.parse(readRegularFile(path.join(projectRoot, dirRel, 'package.json'), 'utf-8')) as Record<string, unknown> | null;
   } catch {
     return null;
   }
@@ -274,7 +275,7 @@ function readOhpmMain(projectRoot: string, dirRel: string): string | null {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     parsed = require('jsonc-parser').parse(
-      fs.readFileSync(path.join(projectRoot, dirRel, OHPM_MANIFEST), 'utf-8')
+      readRegularFile(path.join(projectRoot, dirRel, OHPM_MANIFEST), 'utf-8')
     );
   } catch {
     return null;
@@ -390,7 +391,7 @@ function isDirectory(abs: string): boolean {
 function readNpmPathDeps(manifestAbs: string): Array<[string, string]> {
   let pkg: Record<string, unknown> | null;
   try {
-    pkg = JSON.parse(fs.readFileSync(manifestAbs, 'utf-8')) as Record<string, unknown> | null;
+    pkg = JSON.parse(readRegularFile(manifestAbs, 'utf-8')) as Record<string, unknown> | null;
   } catch {
     return [];
   }
@@ -415,7 +416,7 @@ function readOhpmFileDeps(manifestAbs: string): Array<[string, string]> {
     // JSON5 tolerates comments and trailing commas; jsonc-parser (already a
     // dependency, used by the opencode installer target) handles both.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    parsed = require('jsonc-parser').parse(fs.readFileSync(manifestAbs, 'utf-8'));
+    parsed = require('jsonc-parser').parse(readRegularFile(manifestAbs, 'utf-8'));
   } catch {
     return out;
   }
@@ -603,7 +604,7 @@ function readWorkspaceGlobs(projectRoot: string): string[] {
   // `{ packages: [...], nohoist: [...] }` object form.
   try {
     const pkg = JSON.parse(
-      fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf-8')
+      readRegularFile(path.join(projectRoot, 'package.json'), 'utf-8')
     );
     const ws = pkg?.workspaces;
     if (Array.isArray(ws)) {
@@ -618,7 +619,7 @@ function readWorkspaceGlobs(projectRoot: string): string[] {
   // pnpm-workspace.yaml `packages:` list. Parsed with a minimal line
   // scanner so we don't pull in a YAML dependency.
   try {
-    const yaml = fs.readFileSync(path.join(projectRoot, 'pnpm-workspace.yaml'), 'utf-8');
+    const yaml = readRegularFile(path.join(projectRoot, 'pnpm-workspace.yaml'), 'utf-8');
     out.push(...parsePnpmPackages(yaml));
   } catch {
     /* no pnpm-workspace.yaml */
@@ -780,7 +781,7 @@ function globClosure(glob: GlobSegment[], states: Set<number>): Set<number> {
 /** Read the `name` field from a member directory's package.json. */
 function readPackageName(dirAbs: string): string | null {
   try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(dirAbs, 'package.json'), 'utf-8'));
+    const pkg = JSON.parse(readRegularFile(path.join(dirAbs, 'package.json'), 'utf-8'));
     return typeof pkg?.name === 'string' && pkg.name ? pkg.name : null;
   } catch {
     return null;

@@ -27,6 +27,7 @@ import * as path from 'path';
 import { Language } from './types';
 import { isLanguageSupported } from './extraction/grammars';
 import { logWarn } from './errors';
+import { isNonRegularFile, readRegularFile } from './file-limits';
 
 /** Filename of the project-scoped config, resolved relative to the project root. */
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
@@ -144,7 +145,7 @@ function normalizeExtKey(raw: string): string | null {
 function parseConfig(file: string): ParsedConfig {
   let raw: string;
   try {
-    raw = fs.readFileSync(file, 'utf-8');
+    raw = readRegularFile(file, 'utf-8');
   } catch {
     return EMPTY_CONFIG;
   }
@@ -413,8 +414,11 @@ export function addIncludeIgnoredPatterns(rootDir: string, patterns: string[]): 
   const file = path.join(rootDir, PROJECT_CONFIG_FILENAME);
   let config: Record<string, unknown> = {};
   let raw: string | null = null;
+  if (isNonRegularFile(file)) {
+    throw new Error(`${PROJECT_CONFIG_FILENAME} is not a regular file — replace it with one, then re-run.`);
+  }
   try {
-    raw = fs.readFileSync(file, 'utf-8');
+    raw = readRegularFile(file, 'utf-8');
   } catch {
     raw = null; // missing file — create a fresh one below
   }

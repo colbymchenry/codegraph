@@ -6,6 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { readRegularFile } from '../file-limits';
 import { Language, Node, IMPLICIT_RECORD_ACCESSOR_DOC } from '../types';
 import { escapeRegExp, escapesRoot } from '../utils';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
@@ -8073,7 +8074,7 @@ function csharpProjectStaticUsings(dir: string, context: ResolutionContext, memo
     if (!/\.(?:csproj|props)$/i.test(entry)) continue;
     let text = '';
     try {
-      text = fs.readFileSync(path.join(context.getProjectRoot(), dir === '.' ? '' : dir, entry), 'utf8');
+      text = readRegularFile(path.join(context.getProjectRoot(), dir === '.' ? '' : dir, entry), 'utf8');
     } catch {
       continue;
     }
@@ -8139,7 +8140,7 @@ function csharpProjectUsings(dir: string, context: ResolutionContext, memo: Map<
     if (!/\.(?:csproj|props)$/i.test(entry)) continue;
     let text = '';
     try {
-      text = fs.readFileSync(path.join(context.getProjectRoot(), root ? '' : dir, entry), 'utf8');
+      text = readRegularFile(path.join(context.getProjectRoot(), root ? '' : dir, entry), 'utf8');
     } catch {
       continue;
     }

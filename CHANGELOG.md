@@ -134,6 +134,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A folder named `build` inside `src/` is now indexed for its TypeScript, JSX, Vue, Svelte, Astro, Go, C# and Rust files instead of being skipped as build output; `build` folders elsewhere still are.
 - A folder git ignores at the top of your project no longer hides every folder of the same name further down, like a package's own `lib/` or an app's `static/`. Thanks @Victor-Rodriguez-Garcia. (#2849)
 - `.gitignore` rules and `codegraph.json` patterns now follow git's rules for escapes, character classes and triple asterisks, and a lone `!` line no longer brings back everything ignored. Thanks @johnhldiver-beep.
+- `codegraph init`, `codegraph index` and `codegraph sync` no longer hang forever when a project has a named pipe (FIFO) with the name of a file CodeGraph reads, such as `package.json`, `pnpm-workspace.yaml`, `go.mod`, `.gitignore`, `codegraph.json` or a `.vbproj`, at the root or in a subfolder; it is skipped as unreadable and left in place.
 
 #### Better answers from `codegraph_explore` and the other tools
 

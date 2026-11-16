@@ -36,7 +36,7 @@ import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
 import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
 import { createImportReader, reopenReferencesThroughRemovedFiles } from '../resolution/module-importers';
-import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync, readRegularFile } from '../file-limits';
 export { oversizeStamp };
 
 /**
@@ -450,7 +450,7 @@ function isValidUtf8(buf: Buffer): boolean {
 function readGitignorePatterns(giPath: string): string {
   let buf: Buffer;
   try {
-    buf = fs.readFileSync(giPath);
+    buf = readRegularFile(giPath);
   } catch {
     return ''; // unreadable (permissions / race) — treat as absent
   }
@@ -2376,7 +2376,7 @@ export class ExtractionOrchestrator {
     const rel = dir ? `${dir}/package.json` : 'package.json';
     if (this.detectionInputs && !this.detectionInputs.diskPaths.has(rel)) this.detectionInputs.diskPaths.set(rel, diskSignature(manifest));
     try {
-      const pkg = JSON.parse(fs.readFileSync(manifest, 'utf8')) as Record<string, unknown>;
+      const pkg = JSON.parse(readRegularFile(manifest, 'utf8')) as Record<string, unknown>;
       declared = new Set();
       for (const field of ['dependencies', 'devDependencies', 'peerDependencies']) {
         const group = pkg[field];

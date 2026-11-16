@@ -7,6 +7,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { readRegularFile } from '../file-limits';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases, aliasAndBaseUrlCandidates } from './path-aliases';
@@ -1740,7 +1741,7 @@ export function loadCppIncludeDirsFromCompileDB(projectRoot: string): string[] |
 /** The include directories the compilation database at `dbPath` names; null when it can't be read. */
 export function readCompileDbIncludeDirs(dbPath: string, projectRoot: string): string[] | null {
   try {
-    const content = fs.readFileSync(dbPath, 'utf-8');
+    const content = readRegularFile(dbPath, 'utf-8');
     const entries = JSON.parse(content) as Array<{
       directory: string;
       command?: string;

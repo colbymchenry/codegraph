@@ -30,6 +30,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { readRegularFile } from '../file-limits';
 import { logDebug } from '../errors';
 import { escapesRoot } from '../utils';
 
@@ -234,7 +235,7 @@ function loadEffectiveOptions(
 
 function readTsconfigLike(filePath: string): RawTsconfig | null {
   try {
-    const raw = fs.readFileSync(filePath, 'utf-8');
+    const raw = readRegularFile(filePath, 'utf-8');
     const parsed = JSON.parse(stripJsonc(raw)) as RawTsconfig;
     return parsed && typeof parsed === 'object' ? parsed : null;
   } catch (err) {

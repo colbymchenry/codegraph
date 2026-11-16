@@ -15,8 +15,8 @@
  * that declares the longest prefix of it (#2322).
  */
 
-import * as fs from 'fs';
 import * as path from 'path';
+import { readRegularFile } from '../file-limits';
 
 export interface GoModule {
   /** The module path declared in `go.mod`, e.g. `github.com/example/myproject` */
@@ -33,7 +33,7 @@ export function loadGoModule(moduleDir: string): GoModule | null {
   const goModPath = path.join(moduleDir, 'go.mod');
   let content: string;
   try {
-    content = fs.readFileSync(goModPath, 'utf-8');
+    content = readRegularFile(goModPath, 'utf-8');
   } catch {
     return null;
   }

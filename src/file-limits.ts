@@ -49,6 +49,38 @@ export function readSourceText(file: string, encoding: BufferEncoding = 'utf-8')
   }
 }
 
+/**
+ * Read a project file that is not source (a manifest, a build config, an ignore file) whole, but
+ * only when it is a regular file. Opening a FIFO for reading waits for a writer, so a named pipe
+ * with a config file's name would otherwise stop indexing for good; the open here does not wait.
+ * Anything that is not a regular file throws, as a missing one does, so a caller's existing
+ * catch treats it as unreadable. No size limit: a compile database can be far larger than source.
+ */
+export function readRegularFile(file: string): Buffer;
+export function readRegularFile(file: string, encoding: BufferEncoding): string;
+export function readRegularFile(file: string, encoding?: BufferEncoding): string | Buffer {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`Not a regular file: ${file}`);
+    return encoding ? fs.readFileSync(fd, encoding) : fs.readFileSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Whether something other than a regular file (a FIFO, a socket, a directory) sits at `file`. A
+ * caller that writes a file back after reading it checks this first: a write would open a FIFO
+ * and wait for a reader, and the thing there is not the caller's to replace.
+ */
+export function isNonRegularFile(file: string): boolean {
+  try {
+    return !fs.statSync(file).isFile();
+  } catch {
+    return false; // absent, or a link to nothing: free to write
+  }
+}
+
 /** A source file's stats, and its bytes when they are within the limit (null = oversize). */
 export interface BoundedSource {
   stats: fs.Stats;
