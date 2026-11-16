@@ -2158,8 +2158,18 @@ export class ExtractionOrchestrator {
    * source file until a sync changes it, any other path while its signature
    * holds. Detecting again then reads only what changed, not the couple of
    * hundred files some detectors sample (react-native-bridge reads up to 200).
+   * The contents are kept only while {@link keepDetectionContents} says so.
    */
   private detectionReads = new Map<string, { full: string; signature: string; content?: string | null }>();
+  /**
+   * Whether detection keeps what it read for the next detection: in a graph
+   * that watches the project, which detects again as files change. A one-off
+   * sync detects once, and what Spring's detector reads (every `.java` file of
+   * a project without Spring, 50 MB on elasticsearch) would only sit in memory
+   * through the rest of the sync, raising its peak. The signatures are kept
+   * either way; they are what tells a later sync whether to detect again.
+   */
+  private keepDetectionContents = false;
   /**
    * Scope matcher for SCOPED syncs, memoized on the mtimes of the two root
    * files it is derived from (`codegraph.json`, `.gitignore`). See
@@ -2308,9 +2318,11 @@ export class ExtractionOrchestrator {
     this.detectionFileListChanged = false;
     this.detectedFrameworkNames = detectFrameworks(context).map((r) => r.name);
     const declared = declaredDependencies(context);
-    // Keep only what this detection read.
-    for (const rel of this.detectionReads.keys()) {
+    // Keep only what this detection read, and its contents only for a graph
+    // that will detect again (see keepDetectionContents).
+    for (const [rel, known] of this.detectionReads) {
       if (!inputs.sourceFiles.has(rel) && !inputs.diskPaths.has(rel)) this.detectionReads.delete(rel);
+      else if (!this.keepDetectionContents) known.content = undefined;
     }
     this.gatedFrameworks = new Map();
     for (const name of this.detectedFrameworkNames) {
@@ -2385,6 +2397,16 @@ export class ExtractionOrchestrator {
     } catch { /* no or unreadable manifest */ }
     this.manifestDependencies.set(dir, declared);
     return declared;
+  }
+
+  /**
+   * Keep what framework detection reads for the next detection (a graph that
+   * watches the project), or stop keeping it and let it go (see
+   * keepDetectionContents).
+   */
+  setKeepDetectionContents(keep: boolean): void {
+    this.keepDetectionContents = keep;
+    if (!keep) for (const known of this.detectionReads.values()) known.content = undefined;
   }
 
   /** The frameworks extraction last detected, or null before any detection. */

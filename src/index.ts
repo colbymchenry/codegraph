@@ -320,7 +320,12 @@ export class CodeGraph {
   private builtResolver: ReferenceResolver | null = null;
 
   private get orchestrator(): ExtractionOrchestrator {
-    return (this.builtOrchestrator ??= new (engine().ExtractionOrchestrator)(this.projectRoot, this.queries));
+    if (!this.builtOrchestrator) {
+      this.builtOrchestrator = new (engine().ExtractionOrchestrator)(this.projectRoot, this.queries);
+      // A graph that watches detects again as files change (see watch()).
+      if (this.watcher) this.builtOrchestrator.setKeepDetectionContents(true);
+    }
+    return this.builtOrchestrator;
   }
 
   private get resolver(): ReferenceResolver {
@@ -2038,7 +2043,12 @@ export class CodeGraph {
         : undefined
     );
 
-    return this.watcher.start();
+    // A watching graph detects frameworks again as files change: keep what
+    // detection reads, so that reads only what changed (#2516).
+    this.orchestrator.setKeepDetectionContents(true);
+    const started = this.watcher.start();
+    if (!started) this.orchestrator.setKeepDetectionContents(false);
+    return started;
   }
 
   /**
@@ -2049,6 +2059,7 @@ export class CodeGraph {
       this.watcher.stop();
       this.watcher = null;
     }
+    if (this.builtOrchestrator) this.builtOrchestrator.setKeepDetectionContents(false);
   }
 
   /**
