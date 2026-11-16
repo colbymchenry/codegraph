@@ -63,6 +63,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Drupal, services from `*.services.yml`, plugin definitions and `#[Hook]` methods are now in the graph, and a call through `\Drupal::service('x')` reaches the method on that service's class. Thanks @mikedamoiseau and @marcelovani.
 - In Next.js, a route now links to the `proxy.ts` or `middleware.ts` that runs before it, following `config.matcher`, so impact, callers and `codegraph_explore` show which routes a change to it reaches. Thanks @RIGOandre.
 
+### New Features
+
+- QML, the declarative language used with the Qt framework, is now indexed: components and nested objects, `id`s, properties, signals, functions with their JavaScript bodies, `Connections`, enums, imports and `qmldir` modules. (#759)
+- A flow that starts in QML now continues into C++: handlers link to the C++ they trigger through signals and slots, `Q_INVOKABLE` methods, `Q_PROPERTY` accessors, context properties, types registered with `QML_ELEMENT` or `qmlRegisterType`, and objects reached with `findChild` and `invokeMethod`, so `codegraph_explore` can follow an action from the UI down into C++.
+- Qt C++ classes that use macros such as `Q_OBJECT`, `signals:`, `slots:`, `Q_INVOKABLE` and `emit` now index cleanly, with every method and signal in its place. Re-index Qt projects after upgrading.
+
 ### Fixes
 
 #### Windows

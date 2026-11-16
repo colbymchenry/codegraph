@@ -5,6 +5,8 @@ description: Every language CodeGraph parses, and the extensions it recognizes.
 
 Language support is automatic from the file extension — there's nothing to configure.
 
+QML is a declarative language used with Qt, a cross-platform application development framework.
+
 | Language | Extensions | Status |
 |---|---|---|
 | TypeScript | `.ts`, `.tsx` | Full support |
@@ -28,6 +30,7 @@ Language support is automatic from the file extension — there's nothing to con
 | Astro | `.astro` | Full support (frontmatter + script extraction, template component/call references, `src/pages/` routes) |
 | Liquid | `.liquid` | Full support |
 | Pascal / Delphi | `.pas`, `.dpr`, `.dpk`, `.lpr` | Full support (classes, records, interfaces, enums, DFM/FMX forms) |
+| QML | `.qml`, `qmldir` | Full support (components, `id`s, properties, signals, functions, `Connections`, enums, imports and `qmldir` module manifests; links to C++ through the Qt framework's signals and slots, `Q_INVOKABLE`, `Q_PROPERTY`, context objects and registered types) |
 | Lua | `.lua` | Full support (functions, methods, locals, `require` imports, call edges) |
 | R | `.R`, `.r` | Full support (functions, S4/R5/R6 classes with methods, `library`/`require` imports, `source()` file references, call edges) |
 | Luau | `.luau` | Full support (Lua, plus typed signatures, `type` aliases, Roblox `require`) |
