@@ -31,3 +31,4 @@ Language support is automatic from the file extension — there's nothing to con
 | Lua | `.lua` | Full support (functions, methods, locals, `require` imports, call edges) |
 | R | `.R`, `.r` | Full support (functions, S4/R5/R6 classes with methods, `library`/`require` imports, `source()` file references, call edges) |
 | Luau | `.luau` | Full support (Lua, plus typed signatures, `type` aliases, Roblox `require`) |
+| SQL | `.sql` | Partial support (plain SQL only: tables and views as `struct` nodes, functions, `FROM`/`JOIN`/`INSERT`/`UPDATE`/`DELETE` table references, foreign keys and function calls, linked only to other SQL. Names match by bare, case-sensitive name, ignoring schemas. `CREATE PROCEDURE`, procedural bodies such as plpgsql or T-SQL `BEGIN … END`, and templated SQL such as dbt/Jinja or Dataform `.sqlx` are not parsed) |

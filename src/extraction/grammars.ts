@@ -51,6 +51,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  sql: 'tree-sitter-sql.wasm',
 };
 
 /**
@@ -171,6 +172,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  // Plain SQL only: dialect-templated files (dbt/Jinja, Dataform .sqlx) are not valid.
+  '.sql': 'sql',
 };
 
 /** MPEG transport stream: fixed 188-byte packets, each opening with 0x47. */
@@ -377,6 +380,16 @@ export async function initGrammars(): Promise<void> {
  * nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli 0.25.10
  * (`generate` + `build --wasm`, ABI 15 — upstream's checked-in parser.c is
  * still ABI 13; all 54 upstream corpus tests pass on the regenerated parser).
+ * SQL: tree-sitter-wasms doesn't ship it, and upstream publishes no wasm; we
+ * vendor a wasm we built ourselves from DerekStride/tree-sitter-sql v0.3.11
+ * (tag commit 7b51ecd, MIT, ABI 15). Source: the v0.3.11 release tarball's
+ * generated src/parser.c (sha256 add99a0b…) + src/scanner.c (sha256 de17b5cf…),
+ * both byte-identical to what `tree-sitter generate` produces from the tag's
+ * grammar.js with tree-sitter-cli 0.25.10. Rebuild:
+ *   tree-sitter build --wasm --docker -o tree-sitter-sql.wasm   (cli 0.25.10,
+ *   emscripten/emsdk:4.0.4, run in the extracted release tarball)
+ * → src/extraction/wasm/tree-sitter-sql.wasm (sha256 d16a31c4…). Used for
+ * plain `.sql` only; the grammar has no CREATE PROCEDURE or procedural bodies.
  *
  * TypeScript/TSX/JavaScript (+jsx, which shares the javascript grammar): the
  * tree-sitter-wasms builds are 2023-era (^0.20.x); we vendor wasm built from
@@ -396,7 +409,7 @@ export async function initGrammars(): Promise<void> {
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
-  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix', 'sql',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -958,6 +971,7 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    sql: 'SQL',
     unknown: 'Unknown',
   };
   return names[language] || language;
