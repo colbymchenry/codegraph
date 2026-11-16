@@ -22523,6 +22523,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUBY_FILE_SCOPES.delete(context);
   CSHARP_TYPE_ARITY.delete(context);
   CSHARP_EXTENSION_METHODS.delete(context);
+  CSHARP_PARAMETERS.delete(context);
   JS_ASSIGNED_MEMBERS.delete(context);
   CFML_CHAINS.delete(context);
   NO_RECEIVER_LINES.delete(context);
@@ -25419,6 +25420,15 @@ export function matchMethodCall(
       // decides. staxrip's main app and its AutoCrop tool each declare a
       // `ColorHSL`, and the first indexed took about 90 of the app's calls.
       if (ref.language === 'vbnet' && tied.length > 1 && bestScore >= 2) bestMatch = breakVbTie(tied, ref, context) ?? undefined;
+      // A C# extension method's overloads tie on the receiver's words; the
+      // arguments decide, before the caller is ruled out: jellyfin's
+      // `path.NormalizePath(Path.DirectorySeparatorChar)` inside the overload
+      // taking none is the one taking a `char`.
+      if (bestMatch && bestScore >= 2 && ref.language === 'csharp') {
+        const overload = csharpExtensionOverload(bestMatch, ref, context);
+        if (overload === null) return null;
+        if (overload) bestMatch = overload;
+      }
 
       // A wrapper handing its call on — BookStack's `FileStorage::delete` doing
       // `$storage->delete($path)`, `CommentRepo::delete` doing
@@ -25745,6 +25755,91 @@ function isCsharpExtensionMethod(method: Node, context: ResolutionContext): bool
   }
   memo.set(method.id, extension);
   return extension;
+}
+
+/** A C# parameter as a call binds to it: its name, how an argument is passed (`out`, `ref`, `in`, `ref readonly`, '' by value), a default, `params`. */
+type CsharpParameter = { name: string; passing: string; optional: boolean; variadic: boolean };
+
+const CSHARP_PARAMETERS = new WeakMap<ResolutionContext, Map<string, CsharpParameter[] | null>>();
+
+/** A C# method's parameters, `this` among them, read past their attributes; null when the list can't be read. */
+function csharpParameters(method: Node, context: ResolutionContext): CsharpParameter[] | null {
+  let memo = CSHARP_PARAMETERS.get(context);
+  if (!memo) CSHARP_PARAMETERS.set(context, (memo = new Map()));
+  const hit = memo.get(method.id);
+  if (hit !== undefined) return hit;
+  const source = csharpDeclarationSource(method, context);
+  const list = cppParenListIn(source, 0, method.name);
+  const params = list === null ? null : list.trim() === '' ? [] : splitCppTopLevel(cppWithoutComments(list)).map((p): CsharpParameter => {
+    const written = p.slice(csharpPastAttributes(p, 0)).replace(/^(?:this\s+)?(?:scoped\s+)?/, '');
+    const passing = /^(ref\s+readonly|out|ref|in)\s/.exec(written)?.[1]?.replace(/\s+/, ' ') ?? '';
+    const head = written.split('=')[0]!.trim();
+    return { name: /([A-Za-z_]\w*)$/.exec(head)?.[1] ?? '', passing, optional: written.includes('='), variadic: /^params\s/.test(written) };
+  });
+  memo.set(method.id, params);
+  return params;
+}
+
+/** How a C# argument is passed, as written at the call site: `out var x` → out, `ref x` → ref, `in x` → in, '' by value. */
+function csharpArgumentPassing(arg: string): string {
+  return /^(out|ref|in)\s/.exec(arg)?.[1] ?? '';
+}
+
+/**
+ * Whether a C# call's arguments can bind to `params`: as many as it takes
+ * (defaults and a `params` array aside), each passed the way its parameter
+ * declares (`out` to `out`, `ref` to `ref`, a plain value to neither). A named
+ * argument (`separator: out var s`) binds by its name.
+ */
+function csharpArgumentsFit(params: CsharpParameter[], args: string[]): boolean {
+  const variadic = params.length > 0 && params[params.length - 1]!.variadic;
+  const required = params.filter((p) => !p.optional && !p.variadic).length;
+  if (args.length < required || (!variadic && args.length > params.length)) return false;
+  return args.every((arg, i) => {
+    const named = /^([A-Za-z_]\w*)\s*:(?!:)\s*/.exec(arg);
+    const param = named ? params.find((p) => p.name === named[1]) : params[Math.min(i, params.length - 1)];
+    if (!param) return false;
+    const passing = param.variadic ? '' : param.passing;
+    const written = csharpArgumentPassing(named ? arg.slice(named[0].length) : arg);
+    if (written === 'out') return passing === 'out';
+    if (written === 'ref') return passing === 'ref' || passing === 'ref readonly';
+    if (written === 'in') return passing === 'in' || passing === 'ref readonly';
+    return passing !== 'out' && passing !== 'ref';
+  });
+}
+
+/**
+ * Of a C# extension method's overloads — its class's methods of its name —
+ * the one a call can bind to. The `this` parameter is the receiver of
+ * `path.NormalizePath('/')`, not an argument, so that call takes the overload
+ * with one parameter past it; through the class or bare inside it
+ * (`PathExtensions.NormalizePath(path, '/')`) the receiver is the first
+ * argument. Then an `out` or `ref` at the call site picks the overload that
+ * declares it. Undefined when `picked` is no such method or the call can't be
+ * read; null when no overload fits, or several do and `picked` is none of
+ * them. Of several that fit, `picked` stays: the arguments say nothing more.
+ */
+function csharpExtensionOverload(picked: Node, ref: UnresolvedRef, context: ResolutionContext): Node | null | undefined {
+  if (picked.language !== 'csharp' || picked.kind !== 'method' || ref.referenceKind !== 'calls') return undefined;
+  const owner = picked.qualifiedName.slice(0, Math.max(0, picked.qualifiedName.lastIndexOf('::')));
+  const overloads = (context.getNodesInFileNamed?.(picked.filePath, picked.name) ?? context.getNodesInFile(picked.filePath).filter((n) => n.name === picked.name))
+    .filter((n) => n.kind === 'method' && n.qualifiedName === picked.qualifiedName);
+  if (overloads.length < 2 || !isCsharpExtensionMethod(picked, context)) return undefined;
+  // The receiver is written before the name, unless it is the class itself.
+  const cut = ref.referenceName.lastIndexOf('.');
+  const throughValue = cut > 0 && ref.referenceName.slice(0, cut).split('.').pop() !== owner.split(/::|\./).pop();
+  const pool = throughValue ? overloads.filter((n) => isCsharpExtensionMethod(n, context)) : overloads;
+  const list = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), picked.name, context);
+  if (list === null) return undefined;
+  const args = list.trim() === '' ? [] : splitCppTopLevel(cppWithoutComments(list));
+  const fitting: Node[] = [];
+  for (const n of pool) {
+    const params = csharpParameters(n, context);
+    if (!params) return undefined;
+    if (csharpArgumentsFit(throughValue ? params.slice(1) : params, args)) fitting.push(n);
+  }
+  if (fitting.length === 1) return fitting[0]!;
+  return fitting.some((n) => n.id === picked.id) ? picked : null;
 }
 
 /** The directory of a Go file, which is its package: Go keeps one package per directory. */
@@ -32229,6 +32324,13 @@ export function matchReference(
   // basicRequest.get(…).response(asStringAlways)` is a request's `response`.
   if (result && result.targetNodeId === ref.fromNodeId && ref.referenceKind === 'calls' &&
       VALUE_KINDS.has(context.getNodeById?.(ref.fromNodeId)?.kind ?? '')) return null;
+  // Of a C# extension method's overloads, the one the call binds to.
+  if (result && ref.language === 'csharp' && ref.referenceKind === 'calls') {
+    const target = context.getNodeById?.(result.targetNodeId);
+    const overload = target ? csharpExtensionOverload(target, ref, context) : undefined;
+    if (overload === null) return null;
+    if (overload) return overload.id === result.targetNodeId ? result : { ...result, targetNodeId: overload.id };
+  }
   return result ? retargetSelfOverload(result, ref, context) : result;
 }
 
