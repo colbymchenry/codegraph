@@ -226,6 +226,85 @@ describe.each(ARMS)('a Python local built from a class ($arm)', ({ env }) => {
     expect(callees('run')).not.toContain('Transaction::query');
   });
 
+  it('does not guess by the name when __aenter__ is not known to return self', async () => {
+    await index({
+      'pkg/__init__.py': ['from ._client import Client, AsyncClient'],
+      'pkg/_client.py': CLIENT.slice(0, 8),
+      'use.py': [
+        'import pkg',
+        '',
+        '',
+        'async def go():',
+        '    async with pkg.AsyncClient() as client:',
+        '        return await client.fetch("/")',
+      ],
+    });
+    expect(callees('go')).toEqual([]);
+  });
+
+  it('does not fall back to an older binding of a local a with rebinds', async () => {
+    await index({
+      'db.py': [
+        'class Pool:',
+        '    def query(self):',
+        '        return 1',
+        '',
+        '',
+        'class Tx:',
+        '    def __enter__(self):',
+        '        return object()',
+        '',
+        '    def __exit__(self, *exc):',
+        '        pass',
+      ],
+      'use.py': [
+        'import db',
+        '',
+        '',
+        'def go():',
+        '    h = db.Pool()',
+        '    with db.Tx() as h:',
+        '        return h.query()',
+      ],
+    });
+    expect(callees('go')).toEqual([]);
+  });
+
+  it('takes the class a submodule path names, not a namesake of another module', async () => {
+    const runner = ['class Runner:', '    def run(self):', '        return 1'];
+    await index({
+      'pkg/__init__.py': [''],
+      'pkg/a.py': runner,
+      'pkg/b.py': runner,
+      'use.py': [
+        'import pkg.b',
+        '',
+        '',
+        'def go():',
+        '    r = pkg.b.Runner()',
+        '    return r.run()',
+      ],
+    });
+    expect(cg.getCallees(fn('go').id).filter((c) => c.node.kind === 'method')
+      .map((c) => `${c.node.filePath}:${c.node.qualifiedName}`)).toEqual(['pkg/b.py:Runner::run']);
+  });
+
+  it('takes the class a module re-exports under another name', async () => {
+    await index({
+      'pkg/__init__.py': ['from ._m import Impl as Public'],
+      'pkg/_m.py': ['class Impl:', '    def run(self):', '        return 1'],
+      'use.py': [
+        'import pkg',
+        '',
+        '',
+        'def go():',
+        '    x = pkg.Public()',
+        '    return x.run()',
+      ],
+    });
+    expect(callees('go')).toEqual(['Impl::run']);
+  });
+
   it('does not type a local built from a class of an outside module', async () => {
     await index({
       'session.py': [

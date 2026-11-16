@@ -550,6 +550,14 @@ function pythonLocalType(receiver: string, ref: UnresolvedRef, context: Resoluti
 const PYTHON_WITH_TARGET = /(?:\0|;)\s*(async\s+)?with\s[^\0]*\bas\s+\w+$/;
 
 /**
+ * The type inferLocalReceiverType gives a Python local that a `with ... as x`
+ * binds to something it can't name: not the class written, which
+ * pythonInferredClassHolds refused, and not an older binding of `x` either.
+ * The method call is then left unresolved, not guessed by the receiver's name.
+ */
+const PYTHON_UNREAD_TYPE = '<with>';
+
+/**
  * Whether a Python local the receiver patterns typed holds an instance of the
  * class they read. A class reached through a module (`client =
  * pkg.AsyncClient()`) must be the project's: an outside module's class says
@@ -23505,7 +23513,11 @@ export function inferLocalReceiverType(
     for (const re of i >= ownFrom ? withListed : patterns) {
       const m = re.exec(input);
       if (m && m[2]) {
-        if (ref.language === 'python' && !pythonInferredClassHolds(m[0], m[2], ref, context)) continue;
+        if (ref.language === 'python' && !pythonInferredClassHolds(m[0], m[2], ref, context)) {
+          if (!PYTHON_WITH_TARGET.test(m[0])) continue;
+          lastRaw = undefined;
+          return PYTHON_UNREAD_TYPE;
+        }
         let type = ref.language === 'java' ? javaTypeName(m[2]) : normalizeInferredTypeName(m[2]);
         // Delphi dereferences a pointer for a member (`P.Method` is
         // `P^.Method`), and a class reference reaches its class's methods.
@@ -24472,6 +24484,19 @@ export function matchMethodCall(
       ref.language === 'cpp'
         ? inferCppReceiverType(objectOrClass!, ref, context, 0, cppDecl)
         : inferLocalReceiverType(objectOrClass!, ref, context, decl));
+    // A Python local bound by `with` to what the class can't say: no edge,
+    // where the receiver's name would guess a namesake class (#2957).
+    if (ref.language === 'python' && inferredType === PYTHON_UNREAD_TYPE) return null;
+    // One built or annotated through a module (`r = pkg.b.Runner()`) is of the
+    // class that path names, which its last name alone doesn't pick: `Runner`
+    // may be another module's, and `pkg.Public` a re-export of `Impl`.
+    if (ref.language === 'python' && inferredType && decl.raw && /^[a-z_]\w*\./.test(decl.raw) && dotMatch) {
+      const cls = pythonRefClass(decl.raw, ref, context);
+      const members = cls ? pythonMembers(cls, methodName!, ref, context) : [];
+      if (members.length === 1 && members[0]!.kind === 'method') {
+        return { original: ref, targetNodeId: members[0]!.id, confidence: 0.9, resolvedBy: 'instance-method' };
+      }
+    }
     // Read on another line than the binding the call sees, it is another
     // binding's type: the strategies below guess, unless no project type has
     // that name — as before the binding was read.
