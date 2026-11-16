@@ -54,6 +54,19 @@ function methodCalls(graph: CodeGraph, file: string): string[] {
   return out.sort();
 }
 
+/** `caller -> target` for every `calls` edge out of `file`. */
+function allCalls(graph: CodeGraph, file: string): string[] {
+  const out: string[] = [];
+  for (const node of graph.getNodesInFile(file)) {
+    for (const e of graph.getOutgoingEdges(node.id)) {
+      if (e.kind !== 'calls') continue;
+      const target = graph.getNode(e.target)!;
+      out.push(`${node.name} -> ${target.name}`);
+    }
+  }
+  return out.sort();
+}
+
 const BOUNDARY = 'import { Component } from "react";\nexport class Boundary extends Component<{ children?: React.ReactNode }> {\n  render() { return this.props.children; }\n}\n';
 
 describe('a receiver is read by its binding in scope at the call', () => {
@@ -165,5 +178,94 @@ describe('a receiver is read by its binding in scope at the call', () => {
       'destructuredDefault -> Chart::render',
       'laterDeclarator -> Chart::render',
     ]);
+  }, 120_000);
+
+  it('bounds declaration list scanning and preserves outer bindings across non-declarator commas (#3293)', async () => {
+    const list30 = Array.from({ length: 30 }, (_, i) => `a${i}`).join(', ');
+    const jqueryList = Array.from({ length: 15 }, (_, i) => `    j${i} = ${i}`).join(',\n');
+    const graph = await index({
+      'package.json': JSON.stringify({ name: 'app' }),
+      'src/gauge.ts': 'export class Gauge {\n  paint() { return 1; }\n}\nexport class Other {\n  paint() { return 2; }\n}\nexport function defaultSize() { return 10; }\n',
+      'src/long-list.ts':
+        'import { Gauge } from "./gauge";\n' +
+        'let ob: Gauge = new Gauge();\n' +
+        `var ${list30};\n` +
+        `var\n${jqueryList};\n` +
+        'export function run() { return ob.paint(); }\n',
+      'src/for-of.ts':
+        'import { Gauge } from "./gauge";\n' +
+        'let ob: Gauge = new Gauge();\n' +
+        'export function loop(items: any[]) {\n' +
+        '  for (const [ob] of items) { ob.paint(); }\n' +
+        '}\n' +
+        'export function loopObj(items: any[]) {\n' +
+        '  for (const { ob } of items) { ob.paint(); }\n' +
+        '}\n',
+      'src/non-declarator-commas.tsx':
+        'import { Gauge } from "./gauge";\n' +
+        'let ob: Gauge = new Gauge();\n' +
+        'declare function make(): any;\n' +
+        'declare function log(x: any): void;\n' +
+        'export function jsx() {\n' +
+        '  const el = <p>Hi, ob is set</p>;\n' +
+        '  return ob.paint();\n' +
+        '}\n' +
+        'export function objType() {\n' +
+        '  const o: { a: number, ob: string } = make();\n' +
+        '  return ob.paint();\n' +
+        '}\n' +
+        'export function generic() {\n' +
+        '  const m = new Map<string, typeof ob>();\n' +
+        '  return ob.paint();\n' +
+        '}\n' +
+        'export function commaExpr() {\n' +
+        '  const n = 1\n' +
+        '  log(n), ob.paint()\n' +
+        '}\n',
+      'src/multiline-destruct.ts':
+        'import { Gauge } from "./gauge";\n' +
+        'let ob: Gauge = new Gauge();\n' +
+        'declare function useState(n: number): any;\n' +
+        'export function semiFree(c: any) {\n' +
+        '  const [s, setS] = useState(0)\n' +
+        '  ob.paint()\n' +
+        '  c[s] = 1\n' +
+        '}\n' +
+        'export function forEntries(c: any) {\n' +
+        '  for (const [k, v] of Object.entries(ob)) {\n' +
+        '    c[k] = v;\n' +
+        '    ob.paint();\n' +
+        '  }\n' +
+        '}\n',
+      'src/default-val.ts':
+        'import { defaultSize } from "./gauge";\n' +
+        'export function check(opts: any) {\n' +
+        '  const { size = defaultSize() } = opts;\n' +
+        '  return defaultSize();\n' +
+        '}\n',
+      'src/foo.ts': 'export function foo() { return 1; }\n',
+      'src/shadow.ts':
+        'import { foo } from "./foo";\n' +
+        'declare function make(): any;\n' +
+        'export function run() {\n' +
+        '  let n = 0, foo = make();\n' +
+        '  foo();\n' +
+        '}\n',
+    });
+
+    expect(methodCalls(graph, 'src/long-list.ts')).toEqual(['run -> Gauge::paint']);
+    expect(methodCalls(graph, 'src/for-of.ts')).toEqual([]);
+    expect(methodCalls(graph, 'src/non-declarator-commas.tsx')).toEqual([
+      'commaExpr -> Gauge::paint',
+      'generic -> Gauge::paint',
+      'jsx -> Gauge::paint',
+      'objType -> Gauge::paint',
+    ]);
+    expect(methodCalls(graph, 'src/multiline-destruct.ts')).toEqual([
+      'forEntries -> Gauge::paint',
+      'semiFree -> Gauge::paint',
+    ]);
+    expect(allCalls(graph, 'src/default-val.ts')).toEqual(['check -> defaultSize', 'check -> defaultSize']);
+    expect(allCalls(graph, 'src/shadow.ts')).toEqual(['run -> make']);
   }, 120_000);
 });

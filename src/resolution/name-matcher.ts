@@ -13557,6 +13557,31 @@ function jsFunctionLocalScope(name: string, ref: UnresolvedRef, context: Resolut
  */
 const JS_CODE_BINDS = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
+// The balanced groups a parameter's type or default can hold, two levels deep.
+const PARAM_PAREN = '\\((?:[^()]|\\([^()]*\\))*\\)';
+const PARAM_BRACE = '\\{(?:[^{}]|\\{[^{}]*\\})*\\}';
+const PARAM_BRACKET = '\\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*\\]';
+const PARAM_ANGLE = '<(?!\\s)(?:=>|=(?!>)|[^<>=]|<(?:=>|=(?!>)|[^<>=])*>)*>';
+/**
+ * One piece of a parameter's type or default: a character other than a comma,
+ * or a balanced group, which may hold commas (`Map<K, V>`, `{ a: A, b: B }`,
+ * `(a: number, b: number) => number`). Every alternative starts with a
+ * character of its own — `=>` is the arrow of a function type, and a `<` or
+ * `>` spaced like an operator (`f.length > 0`) is no bracket — so a type has
+ * one parse.
+ */
+const PARAM_PART = `(?:=>|=(?!>)|[^,(){}\\[\\]<>=]|<(?=\\s)|>(?=[\\s=])|${PARAM_PAREN}|${PARAM_BRACE}|${PARAM_BRACKET}|${PARAM_ANGLE})`;
+/** A TypeScript type annotation piece: balanced brackets/braces/angles or non-separator characters, allowing `=>` but never `=`. */
+const TYPE_PART = `(?:=>|[^,(){}\\[\\]<>=]|<(?=\\s)|>(?=[\\s=])|${PARAM_PAREN}|${PARAM_BRACE}|${PARAM_BRACKET}|${PARAM_ANGLE})`;
+/** A TypeScript parameter property's modifiers: `constructor(private readonly store: Store)`. */
+const PARAM_MODIFIERS = '(?:(?:public|private|protected|readonly|override)\\s+)*';
+/** A single declarator preceding the target variable: name or destructuring, optional type, optional initializer. */
+const PREV_DECL_ITEM = `(?:[\\w$]+|${PARAM_BRACE}|${PARAM_BRACKET})(?:\\s*(?:\\?\\s*)?:${PARAM_PART}+|\\s*=${PARAM_PART}+|\\s*)`;
+/** Earlier declarators before the target variable in a `const`/`let`/`var` list (#3293). */
+const PREV_VAR_DECL = `(?:${PREV_DECL_ITEM},\\s*)*`;
+/** Characters that may follow a declared variable name in valid JS/TS (not `.` or arbitrary text). */
+const DECL_FOLLOW = '(?=\\s*(?:[=,;)]|\\bin\\b|\\bof\\b|$|\\r?\\n))';
+
 /**
  * Whether the function's code in `filePath`, from its first line through
  * `line` (a reference's, or a JSX tag's), declares `name`, or names it in a
@@ -13574,7 +13599,7 @@ export function jsCodeBindsName(name: string, fn: Node, filePath: string, line: 
     // the same name — `const { t } = useI18n()`, `const { getLabel } =
     // useProps(props)` — which is the same-named function more often than not.
     const sites = jsNameSites(text, name);
-    const declared = sites.declaration && new RegExp(`\\b(?:const|let|var)\\s+${n}(?![\\w$])(?!\\s*[,\\]}])`).test(text);
+    const declared = sites.declaration && new RegExp(`\\b(?:const|let|var)\\s+${PREV_VAR_DECL}${n}(?![\\w$])(?!\\s*[,\\]}])`).test(text);
     binds = declared || (sites.parameter && jsParameterListPattern(name, '').test(text));
     memo.set(key, binds);
   }
@@ -13658,7 +13683,7 @@ function jsBindingEnclosesReference(name: string, fn: Node, ref: UnresolvedRef, 
   const code = chars.join('');
   const n = escapeRegExp(name);
   const declaration = new RegExp(
-    `\\b(?:(?:const|let|var)\\s+${n}(?![\\w$])(?!\\s*[,\\]}])(\\s*=\\s*(?:await\\s+)?(?:require|import)\\s*\\()?|(?:function|class)\\s+${n}(?![\\w$]))`,
+    `\\b(?:(?:const|let|var)\\s+${PREV_VAR_DECL}${n}(?![\\w$])(?!\\s*[,\\]}])(\\s*=\\s*(?:await\\s+)?(?:require|import)\\s*\\()?|(?:function|class)\\s+${n}(?![\\w$]))`,
     'g'
   );
   for (const m of code.matchAll(declaration)) {
@@ -13861,34 +13886,19 @@ const JS_BINDING_NAME = /^[\w$]+$/;
 const ARROW_HEAD_CHAR = /[\w$.]/;
 const IMPORT_BINDING_VALUE = /^\s*(?:await\s+)?(?:require|import)\s*\(/;
 
-// The balanced groups a parameter's type or default can hold, two levels deep.
-const PARAM_PAREN = '\\((?:[^()]|\\([^()]*\\))*\\)';
-const PARAM_BRACE = '\\{(?:[^{}]|\\{[^{}]*\\})*\\}';
-const PARAM_BRACKET = '\\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*\\]';
-const PARAM_ANGLE = '<(?!\\s)(?:=>|=(?!>)|[^<>=]|<(?:=>|=(?!>)|[^<>=])*>)*>';
-/**
- * One piece of a parameter's type or default: a character other than a comma,
- * or a balanced group, which may hold commas (`Map<K, V>`, `{ a: A, b: B }`,
- * `(a: number, b: number) => number`). Every alternative starts with a
- * character of its own — `=>` is the arrow of a function type, and a `<` or
- * `>` spaced like an operator (`f.length > 0`) is no bracket — so a type has
- * one parse.
- */
-const PARAM_PART = `(?:=>|=(?!>)|[^,(){}\\[\\]<>=]|<(?=\\s)|>(?=[\\s=])|${PARAM_PAREN}|${PARAM_BRACE}|${PARAM_BRACKET}|${PARAM_ANGLE})`;
-/** A TypeScript parameter property's modifiers: `constructor(private readonly store: Store)`. */
-const PARAM_MODIFIERS = '(?:(?:public|private|protected|readonly|override)\\s+)*';
-/** Earlier declarators before the target variable in a `const`/`let`/`var` list (#3293). */
-const PREV_VAR_DECL = `(?:\\s*(?:[\\w$]+|${PARAM_BRACE}|${PARAM_BRACKET})(?:\\s*:[^=,;]+)?(?:\\s*=(?:[^,;(){}\\[\\]]|${PARAM_PAREN}|${PARAM_BRACE}|${PARAM_BRACKET})*)?\\s*,\\s*)*`;
-
 function localBindingPatterns(name: string, flags: string): LocalBindingPatterns {
   const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const targetInPattern = `(?:(?<=[{,\\[])\\s*|(?<=[{,\\[])\\s*[\\w$]+\\s*:\\s*|(?<=[{,\\[])\\s*[\\w$]+\\s*:\\s*[{[\\]]\\s*|\\.\\.\\.\\s*)${n}(?![\\w$])`;
+  const bracketPattern = `\\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*?${targetInPattern}(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*?\\]`;
+  const bracePattern = `\\{(?:[^{}]|\\{[^{}]*\\})*?${targetInPattern}(?:[^{}]|\\{[^{}]*\\})*?\\}`;
+  const destructPattern = `(?:${bracketPattern}|${bracePattern})`;
   return {
     // `const { name } = require('./m')` / `= await import('./m')` binds an IMPORT,
     // not a shadow: the symbol lives in the other file and the call means it.
     decl: new RegExp(
       '\\b(?:const|let|var)\\s+' + PREV_VAR_DECL +
-        '(?:' + n + '(?![\\w$])\\s*(?:\\??\\s*:[^=;]+)?\\s*(?:=\\s*([^;\\n]*))?|' +
-        '[{\\[][^;]*?\\b' + n + '(?![\\w$])[^;]*?[}\\]]\\s*(?:\\??\\s*:[^=;]+)?\\s*=\\s*([^;\\n]*))',
+        '(?:' + n + '(?![\\w$])(?:\\s*!?\\s*:' + TYPE_PART + '+)?' + DECL_FOLLOW + '(?:\\s*=\\s*([^;\\n]*))?|' +
+        destructPattern + '(?:\\s*!?\\s*:' + TYPE_PART + '+)?(?:\\s*(?:=|\\bin\\b|\\bof\\b)\\s*([^;\\n)]*))?)',
       flags
     ),
     fn: new RegExp('\\b(?:function|class)\\s+' + n + '(?![\\w$])', flags),
