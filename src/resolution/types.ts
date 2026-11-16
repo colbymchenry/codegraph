@@ -132,6 +132,12 @@ export interface ResolutionContext {
   /** `readFile(filePath)?.includes(needle) ?? false` for an ASCII `needle`, without decoding a file that lacks it. */
   fileContains?(filePath: string, needle: string): boolean;
   /**
+   * An indexed file's text for a walk over all of them, which keeps none: it
+   * stays out of the content cache, and each byte is a character, so anything
+   * outside ASCII reads wrongly. Null when the file can't be read.
+   */
+  scanFile?(filePath: string): string | null;
+  /**
    * `readFile(filePath)` split into lines, LRU-cached per file. Receiver-type
    * inference scans source lines for EVERY `receiver.method()` ref; splitting
    * the whole file per ref made that O(refs-in-file × file-size) — ~20% of
