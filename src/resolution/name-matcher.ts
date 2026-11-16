@@ -23852,9 +23852,21 @@ function jsScopeFile(filePath: string, context: ResolutionContext): JsScopeFile 
     // A bundle's names are nothing a person declares a receiver with.
     if (source !== null && source.length <= 1_000_000 && !isMinifiedContent(filePath, source)) {
       const regexes: number[] = [];
-      const chars = blankStringContents(stripCommentsForRegex(source, 'javascript'), regexes).split('');
-      for (let r = 0; r + 1 < regexes.length; r += 2) chars.fill(' ', regexes[r]! + 1, regexes[r + 1]!);
-      const code = chars.join('');
+      let code = blankStringContents(stripCommentsForRegex(source, 'javascript'), regexes);
+      if (regexes.length > 1) {
+        // A regex literal's contents are blanked too, the text between copied by the slice.
+        const parts: string[] = [];
+        let from = 0;
+        for (let r = 0; r + 1 < regexes.length; r += 2) {
+          const start = regexes[r]! + 1;
+          const end = regexes[r + 1]!;
+          if (end <= start) continue;
+          parts.push(code.slice(from, start), ' '.repeat(end - start));
+          from = end;
+        }
+        parts.push(code.slice(from));
+        code = parts.join('');
+      }
       const lineStarts = [0];
       const scopes = [{ start: -1, end: code.length, parent: -1 }];
       const open = [0];
