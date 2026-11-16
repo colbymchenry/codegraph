@@ -16,6 +16,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { getCodeGraphDir } from '../directory';
+import { readRegularFile } from '../file-limits';
 /** Signal-0 liveness (EPERM ⇒ alive). Local copy to avoid a daemon↔writer cycle. */
 function isProcessAlive(pid: number): boolean {
   try {
@@ -122,7 +123,7 @@ export function tryAcquireWriterLock(
 
     let existing: WriterLockInfo | null = null;
     try {
-      existing = decodeWriterLockInfo(fs.readFileSync(pidPath, 'utf8'));
+      existing = decodeWriterLockInfo(readRegularFile(pidPath, 'utf8'));
     } catch { /* unreadable */ }
     return { kind: 'taken', existing, pidPath };
   };
@@ -137,7 +138,7 @@ export function tryAcquireWriterLock(
     if (!existing || existing.pid <= 0 || !isProcessAlive(existing.pid)) {
       // Stale — clear (pid-verified) and retry once.
       try {
-        const raw = fs.readFileSync(pidPath, 'utf8');
+        const raw = readRegularFile(pidPath, 'utf8');
         const cur = decodeWriterLockInfo(raw);
         if (!cur || cur.pid === existing?.pid) {
           if (!cur || cur.pid <= 0 || !isProcessAlive(cur.pid)) {
@@ -208,7 +209,7 @@ export function releaseWriterLock(projectRoot: string, lockName: 'writer.pid' | 
   const pidPath = getWriterPidPath(projectRoot, lockName);
   try {
     if (!fs.existsSync(pidPath)) return;
-    const info = decodeWriterLockInfo(fs.readFileSync(pidPath, 'utf8'));
+    const info = decodeWriterLockInfo(readRegularFile(pidPath, 'utf8'));
     if (info && info.pid === process.pid) {
       fs.unlinkSync(pidPath);
     }
@@ -219,7 +220,7 @@ export function releaseWriterLock(projectRoot: string, lockName: 'writer.pid' | 
 export function readWriterLock(projectRoot: string, lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid'): WriterLockInfo | null {
   const pidPath = getWriterPidPath(projectRoot, lockName);
   try {
-    return decodeWriterLockInfo(fs.readFileSync(pidPath, 'utf8'));
+    return decodeWriterLockInfo(readRegularFile(pidPath, 'utf8'));
   } catch {
     return null;
   }

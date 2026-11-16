@@ -33,6 +33,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { threadId } from 'worker_threads';
+import { isNonRegularFile } from './file-limits';
 
 // ============================================================
 // SECURITY UTILITIES
@@ -565,6 +566,8 @@ export class FileLock {
 
   private readHolder(): LockHolder {
     let content: string;
+    // A FIFO (or anything not a file) holds no PID, and opening it to read would wait for good.
+    if (isNonRegularFile(this.lockPath)) return { state: 'held' };
     try {
       content = fs.readFileSync(this.lockPath, 'utf-8').trim();
     } catch (err) {
@@ -592,7 +595,8 @@ export class FileLock {
   release(): void {
     if (!this.held) return;
     try {
-      // Only remove if we still own it (check PID)
+      // Only remove if we still own it (check PID). A FIFO is no lock of ours.
+      if (isNonRegularFile(this.lockPath)) { this.held = false; return; }
       const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
       if (parseInt(content, 10) === process.pid) {
         fs.unlinkSync(this.lockPath);

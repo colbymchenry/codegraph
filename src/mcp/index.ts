@@ -73,6 +73,7 @@ import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
 import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
+import { readRegularFile } from '../file-limits';
 
 /** Default worker cap for a direct (single-client) session; see MCPEngineOptions.queryPoolDefaultMax (#1465). */
 const DIRECT_QUERY_POOL_MAX = 2;
@@ -126,7 +127,7 @@ function makeFallbackEngine(root: string): MCPEngine {
   assertNoRebuild(root);
   let existing: ReturnType<typeof decodeLockInfo> = null;
   try {
-    existing = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'));
+    existing = decodeLockInfo(readRegularFile(getDaemonPidPath(root), 'utf8'));
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT') {
@@ -440,7 +441,7 @@ async function outwaitCandidate(root: string, handoverFrom: number | null, pid: 
   while (Date.now() < deadline) {
     if (!heldForUs()) return false;
     let holder: number | undefined;
-    try { holder = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'))?.pid; } catch { holder = undefined; }
+    try { holder = decodeLockInfo(readRegularFile(getDaemonPidPath(root), 'utf8'))?.pid; } catch { holder = undefined; }
     if (holder !== pid || !isProcessAlive(pid)) return true;
     await sleep(25);
   }
