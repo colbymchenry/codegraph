@@ -33,7 +33,7 @@
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 import { isTestPath } from '../search/query-utils';
-import { rubyAncestry, rubyMethodsOfKindFirst, type RubyMethodKind } from './name-matcher';
+import { isRubyDeclarationVisible, rubyAncestry, rubyMethodsOf, rubyMethodsOfKindFirst, type RubyMethodKind } from './name-matcher';
 import { stripCommentsForRegex } from './strip-comments';
 
 /** `A::B`, `::A`, `::A::B`: a constant path. Group 1 is a leading `::`. */
@@ -122,15 +122,16 @@ function isNamespaced(m: RegExpExecArray): boolean {
  * project declares, the scope being the class or module around the
  * reference — only `<path>` itself when it is written from the top level.
  * A class or module comes before a value of the name, then the reference's
- * own file, then production code.
+ * own file, then production code. Only the declarations the reference's file
+ * runs with count: production code sees no test suite's, and a test no other
+ * suite's (isRubyDeclarationVisible).
  */
 function constantsNamed(path: string, absolute: boolean, ref: UnresolvedRef, context: ResolutionContext): Node[] {
-  const production = !isTestPath(ref.filePath);
   let prefix = absolute ? '' : lexicalScope(ref, context);
   for (;;) {
     const qn = prefix ? `${prefix}::${path}` : path;
     const found = context.getNodesByQualifiedName(qn).filter((n) =>
-      n.language === 'ruby' && CONSTANT_KINDS.has(n.kind) && !(production && isTestPath(n.filePath)));
+      n.language === 'ruby' && CONSTANT_KINDS.has(n.kind) && isRubyDeclarationVisible(n, ref.filePath));
     if (found.length > 0) return ordered(found, ref);
     if (!prefix) return [];
     const cut = prefix.lastIndexOf('::');
@@ -342,8 +343,11 @@ function skipParens(s: string, i: number): number {
  * of its superclasses and mixed-in modules that declares one (rubyAncestry).
  * Of a class's `def self.m` and `def m`, which share one qualified name, a
  * call on the class reaches the class method, and a call on an instance
- * (`kind` 'instance') the instance method. Production code never reaches one
- * a test declares.
+ * (`kind` 'instance') the instance method. Only the declarations the
+ * reference's file runs with count: production code reaches no test suite's
+ * method, and a test no other suite's (isRubyDeclarationVisible). Each
+ * ancestor's methods of the name come from one read of every method of the
+ * name (rubyMethodsOf), not a query per ancestor.
  */
 function methodOf(
   owner: string,
@@ -352,10 +356,8 @@ function methodOf(
   context: ResolutionContext,
   kind: RubyMethodKind = 'class',
 ): { node: Node; own: boolean } | null {
-  const production = !isTestPath(ref.filePath);
-  for (const qn of rubyAncestry(owner, context, kind === 'instance')) {
-    const methods = context.getNodesByQualifiedName(`${qn}::${name}`).filter((n) =>
-      n.kind === 'method' && n.language === 'ruby' && !(production && isTestPath(n.filePath)));
+  for (const qn of rubyAncestry(owner, context, kind === 'instance', ref.filePath)) {
+    const methods = rubyMethodsOf(qn, name, context, ref.filePath);
     if (methods.length > 0) return { node: rubyMethodsOfKindFirst(ordered(methods, ref), kind)[0]!, own: qn === owner };
   }
   return null;

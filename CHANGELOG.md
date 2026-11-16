@@ -534,7 +534,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Ruby, a call on a class written with its namespace, like `Billing::ChargeCard.call(…)`, now links the caller to that class and to the class method it calls. Thanks @james-jang and @drakeo338. (#2503)
 - In Ruby, a call to a method ending in `!` or `?` now links when its receiver's class is known, and so does a method called straight on a new object, like `CacheWriter.new(key).write_cache`. Thanks @ricobl.
 - In Ruby, a call on an instance variable, like `@writer.flush`, now links to the method of the class the variable holds when the class's `initialize` sets it to a new object of one class.
-- In Ruby, a call now follows a class's real ancestors in the order Ruby looks a method up, and a call on a class reaches the methods it `extend`s and the `ClassMethods` of the concerns it includes.
+- In Ruby, a call now follows a class's real ancestors in the order Ruby looks a method up, as the calling file's test suite loads them, and a call on a class reaches what it `extend`s and what the concerns it includes add to it.
+- In Ruby, a class name like `Topic` now links to the class Ruby's constant lookup finds where the name is written, and a call with no receiver to the method Ruby runs first, so classes of one name in different test suites or namespaces are no longer mixed up.
 - In Ruby, a call on a method's parameter now links to the right class when every call of that method in the project passes a value of one class.
 - In Ruby, a class method, `def self.build` or a `def` inside `class << self`, is now told apart from an instance method of the same name, so a call on the class or on an instance links to the right one.
 - JSON files in a `templates` or `sections` folder are now read as Shopify Liquid only inside a Shopify theme, so a .NET project template's `template.json` no longer shows up as an empty Liquid file.

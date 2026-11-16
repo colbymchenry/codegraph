@@ -8895,6 +8895,67 @@ function readNoReceiverOnLine(ref: UnresolvedRef, context: ResolutionContext): b
 
 const RUBY_ANCESTRY = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
 
+/** A Ruby test suite's folder, `test/` (minitest) or `spec/` (RSpec), at the start of a path or after a `/`. */
+const RUBY_SUITE_DIR = /(?:^|\/)(?:tests?|specs?)\//;
+/** The folders a Ruby library or app keeps its own code in. */
+const RUBY_CODE_DIR = /(?:^|\/)(?:lib|app)\//;
+
+/** rubyTestSuite's answers by path: it is asked of every candidate a Ruby lookup weighs. */
+const RUBY_TEST_SUITES = new Map<string, string | null>();
+
+/**
+ * The test suite a Ruby file runs in: its path up to the first `test`,
+ * `tests`, `spec` or `specs` folder, or null for a file in none (production
+ * code, and the test helpers a library ships, like `lib/…/testing/`). A
+ * folder of that name inside `lib/` or `app/` is code: railties'
+ * `lib/rails/commands/test/` is the `rails test` command.
+ */
+function rubyTestSuite(filePath: string): string | null {
+  const hit = RUBY_TEST_SUITES.get(filePath);
+  if (hit !== undefined) return hit;
+  const m = RUBY_SUITE_DIR.exec(filePath);
+  const suite = m && !RUBY_CODE_DIR.test(filePath.slice(0, m.index + 1)) ? filePath.slice(0, m.index + m[0].length - 1) : null;
+  RUBY_TEST_SUITES.set(filePath, suite);
+  return suite;
+}
+
+/**
+ * Whether a Ruby declaration is one that code in `filePath` runs with. What a
+ * test suite declares exists only in that suite's runs: rails' activemodel
+ * tests load their own `Topic`, never activerecord's `Topic < ActiveRecord::Base`,
+ * and production code none of them. The test helpers a library ships
+ * (`ActiveSupport::Testing::Assertions`, `ActionView::TestCase`) are no suite's.
+ */
+export function isRubyDeclarationVisible(decl: Node, filePath: string): boolean {
+  const suite = rubyTestSuite(decl.filePath);
+  return suite === null || suite === rubyTestSuite(filePath);
+}
+
+/** isRubyDeclarationVisible from `filePath`, its suite read once, for a filter over many candidates. */
+function rubyVisibleFrom(filePath: string): (decl: Node) => boolean {
+  const here = rubyTestSuite(filePath);
+  return (decl) => {
+    const suite = rubyTestSuite(decl.filePath);
+    return suite === null || suite === here;
+  };
+}
+
+/** Which declarations code in `filePath` runs with (isRubyDeclarationVisible), as a memo key. */
+function rubyRunOf(filePath: string): string {
+  return rubyTestSuite(filePath) ?? '';
+}
+
+/**
+ * The Ruby classes and modules of the qualified name `qn`. One written from
+ * the top level, `class ::ApplicationController`, is indexed with its `::`
+ * (`::ApplicationController`, or `Outer::::Foo` inside a namespace), and is
+ * the top-level constant all the same.
+ */
+function rubyNamespacesNamed(qn: string, context: ResolutionContext): Node[] {
+  const found = context.getNodesByQualifiedName(qn).filter(isRubyNamespace);
+  return qn.includes('::') ? found : [...found, ...context.getNodesByName(`::${qn}`).filter(isRubyNamespace)];
+}
+
 /**
  * Whether a bare Ruby call written inside a class body can mean `method`: a
  * receiver-less call is a call on `self`, so it reaches the class's own
@@ -8909,12 +8970,50 @@ const RUBY_ANCESTRY = new WeakMap<ResolutionContext, Map<string, Set<string>>>()
 function isRubyMethodInScope(method: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const cut = method.qualifiedName.lastIndexOf('::');
   if (cut < 0) return true;
-  const here = context
-    .getNodesInFile(ref.filePath)
-    .filter((n) => (n.kind === 'class' || n.kind === 'module') && n.startLine <= ref.line && n.endLine >= ref.line)
-    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+  const here = rubyInnermostScope(ref, context);
   if (!here || here.kind !== 'class') return true;
-  return rubyAncestry(here.qualifiedName, context).has(method.qualifiedName.slice(0, cut));
+  return isRubyDeclarationVisible(method, ref.filePath) &&
+    rubyAncestry(here.qualifiedName, context, false, ref.filePath).has(method.qualifiedName.slice(0, cut));
+}
+
+/**
+ * Of the methods a bare Ruby call in an instance method can mean, the one
+ * Ruby runs: a bare call is a call on `self`, and Ruby takes the method from
+ * the first of the class's ancestors that declares it. rails' `render` in an
+ * `ActionView::TestCase` is `TestCase::Behavior`'s, which comes before the
+ * `RenderingHelper` that `Behavior` includes. Only when that order holds
+ * whatever order the files load in: the first owner has every other one among
+ * its own ancestors. Two modules mixed into one class from two files
+ * (actionpack's tests reopen `ActionController::TestCase` to include
+ * `SharedRoutes`) leave the choice to the other rules. Null when the call is
+ * in no instance method of a class, or no candidate is a method of its
+ * ancestry.
+ */
+function rubyFirstInAncestry(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  if (candidates.length < 2) return null;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller || caller.kind !== 'method' || caller.language !== 'ruby' || caller.isStatic === true) return null;
+  const here = rubyInnermostScope(ref, context);
+  if (!here || here.kind !== 'class') return null;
+  // One the reference may not link to (production code to a test helper's
+  // `test_case.rb`, a test to another suite's) is out of the running.
+  const byOwner = new Map<string, Node[]>();
+  for (const c of candidates) {
+    const cut = c.qualifiedName.lastIndexOf('::');
+    if (c.kind !== 'method' || c.isStatic === true || cut < 0) return null;
+    if (!isVisibleAcrossFiles(c, ref, context) || !isRubyDeclarationVisible(c, ref.filePath)) continue;
+    const owner = c.qualifiedName.slice(0, cut);
+    byOwner.set(owner, [...(byOwner.get(owner) ?? []), c]);
+  }
+  for (const owner of rubyAncestry(here.qualifiedName, context, true, ref.filePath)) {
+    const methods = byOwner.get(owner);
+    if (!methods) continue;
+    const below = rubyAncestry(owner, context, true, ref.filePath);
+    return [...byOwner.keys()].every((other) => below.has(other))
+      ? methods.find((m) => m.filePath === ref.filePath) ?? methods[0]!
+      : null;
+  }
+  return null;
 }
 
 /**
@@ -8951,6 +9050,8 @@ interface RubyMixins {
   prepended: string[];
   included: string[];
   extended: string[];
+  /** What a concern's `included do … end` extends the class that includes it with. */
+  extendedWhenIncluded: string[];
   superclass: string | null;
 }
 
@@ -8966,20 +9067,39 @@ function rubyMixinsOf(decl: Node, context: ResolutionContext): RubyMixins {
   const hit = memo.get(decl.id);
   if (hit) return hit;
   const q = decl.qualifiedName;
-  const found: RubyMixins = { prepended: [], included: [], extended: [], superclass: null };
+  const found: RubyMixins = { prepended: [], included: [], extended: [], extendedWhenIncluded: [], superclass: null };
   const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
   const sup = /^\s*class\s+[\w:]+\s*<\s*(::)?([A-Z][\w:]*)/.exec(lines[decl.startLine - 1] ?? '');
   if (sup) found.superclass = rubyConstantQn(sup[2]!, sup[1] || !q.includes('::') ? '' : q.slice(0, q.lastIndexOf('::')), context);
   const nested = context.getNodesInFile(decl.filePath).filter((n) => (n.kind === 'class' || n.kind === 'module') && n.id !== decl.id &&
     n.startLine > decl.startLine && n.endLine < decl.endLine);
+  const inNested = (i: number): boolean => nested.some((n) => n.startLine <= i + 1 && n.endLine >= i + 1);
+  // The `end` of the `included do` block the loop is in, -1 outside one: a
+  // concern's block runs in the class that includes it, so what it `extend`s
+  // there gives that class class methods (ActiveModel's `Validations` brings
+  // `validates_length_of` from `HelperMethods` so).
+  let includedEnd = -1;
   for (let i = decl.startLine; i < decl.endLine && i < lines.length; i++) {
+    if (i === includedEnd) includedEnd = -1;
+    const opener = includedEnd < 0 ? /^(\s*)included\s+do\b/.exec(lines[i]!) : null;
+    if (opener && !inNested(i)) {
+      const close = new RegExp(`^${opener[1]}end\\b`);
+      for (let j = i + 1; j < decl.endLine - 1 && j < lines.length; j++) {
+        if (close.test(lines[j]!)) {
+          includedEnd = j;
+          break;
+        }
+      }
+      continue;
+    }
     // A module a call returns (`include RouteSet.new.tap { … }.url_helpers`,
     // actionpack's tests) is no mixin of the constant the call starts at.
     const mix = /^\s*(include|extend|prepend)\s+([A-Z:][\w:]*(?:\s*,\s*[A-Z:][\w:]*)*)(?![\w:]|\s*[.(])/.exec(lines[i]!);
-    if (!mix || nested.some((n) => n.startLine <= i + 1 && n.endLine >= i + 1)) continue;
+    if (!mix || inNested(i)) continue;
     const names = mix[2]!.split(/\s*,\s*/).map((name) => name.startsWith('::') ? rubyConstantQn(name.slice(2), '', context) : rubyConstantQn(name, q, context));
     const list = mix[1] === 'include' ? found.included : mix[1] === 'prepend' ? found.prepended : found.extended;
     list.unshift(...names);
+    if (mix[1] === 'extend' && includedEnd > i) found.extendedWhenIncluded.unshift(...names);
   }
   memo.set(decl.id, found);
   return found;
@@ -8989,12 +9109,13 @@ function rubyMixinsOf(decl: Node, context: ResolutionContext): RubyMixins {
  * A Ruby class's qualified name, those of its superclasses, and of every
  * module mixed into any of them, in the order Ruby looks a method up. For
  * what an instance answers (`instance`), a module the class `extend`s is
- * left out: its methods are the class's own.
+ * left out: its methods are the class's own. Read `from` a file, only the
+ * declarations that file runs with count (isRubyDeclarationVisible).
  */
-export function rubyAncestry(qn: string, context: ResolutionContext, instance = false): Set<string> {
+export function rubyAncestry(qn: string, context: ResolutionContext, instance = false, from?: string): Set<string> {
   let memo = RUBY_ANCESTRY.get(context);
   if (!memo) RUBY_ANCESTRY.set(context, (memo = new Map()));
-  const key = instance ? `instance ${qn}` : qn;
+  const key = `${instance ? 'instance ' : ''}${from === undefined ? '' : `${rubyRunOf(from)}\0`}${qn}`;
   const hit = memo.get(key);
   if (hit) return hit;
   const seen = new Set<string>();
@@ -9002,8 +9123,8 @@ export function rubyAncestry(qn: string, context: ResolutionContext, instance = 
   const visit = (q: string): void => {
     if (seen.has(q) || seen.size >= 250) return;
     seen.add(q);
-    const mixins = context.getNodesByQualifiedName(q)
-      .filter((decl) => decl.language === 'ruby' && (decl.kind === 'class' || decl.kind === 'module'))
+    const mixins = rubyNamespacesNamed(q, context)
+      .filter((decl) => from === undefined || isRubyDeclarationVisible(decl, from))
       .map((decl) => rubyMixinsOf(decl, context));
     for (const m of mixins) m.prepended.forEach(visit);
     order.add(q);
@@ -9032,8 +9153,8 @@ function rubyInstanceMethodOf(typeName: string, name: string, ref: UnresolvedRef
   const classes = context.getNodesByQualifiedName(looked).some(isRubyNamespace) ? [looked]
     : [...new Set(context.getNodesByName(typeName.split('::').pop()!).filter(isRubyNamespace).map((n) => n.qualifiedName))];
   for (const qn of classes) {
-    for (const owner of rubyAncestry(qn, context, true)) {
-      const methods = rubyMethodsOf(owner, name, context);
+    for (const owner of rubyAncestry(qn, context, true, ref.filePath)) {
+      const methods = rubyMethodsOf(owner, name, context, ref.filePath);
       if (methods.length > 0) return rubyMethodsOfKindFirst(methods, 'instance')[0]!;
     }
   }
@@ -9042,8 +9163,12 @@ function rubyInstanceMethodOf(typeName: string, name: string, ref: UnresolvedRef
 
 const RUBY_METHOD_OWNERS = new WeakMap<ResolutionContext, Map<string, Map<string, Node[]>>>();
 
-/** The Ruby methods `name` of the class or module `owner`. A walk up a class's ancestors asks this of each one, for each method name. */
-export function rubyMethodsOf(owner: string, name: string, context: ResolutionContext): Node[] {
+/**
+ * The Ruby methods `name` of the class or module `owner`, only those code in
+ * `from` runs with when given. A walk up a class's ancestors asks this of
+ * each one, for each method name.
+ */
+export function rubyMethodsOf(owner: string, name: string, context: ResolutionContext, from?: string): Node[] {
   let memo = RUBY_METHOD_OWNERS.get(context);
   if (!memo) RUBY_METHOD_OWNERS.set(context, (memo = new Map()));
   let owners = memo.get(name);
@@ -9059,7 +9184,8 @@ export function rubyMethodsOf(owner: string, name: string, context: ResolutionCo
       else owners.set(of, [n]);
     }
   }
-  return owners.get(owner) ?? [];
+  const methods = owners.get(owner) ?? [];
+  return from === undefined || methods.length === 0 ? methods : methods.filter((n) => isRubyDeclarationVisible(n, from));
 }
 
 function isRubyNamespace(n: Node): boolean {
@@ -9070,6 +9196,11 @@ const RUBY_FILE_SCOPES = new WeakMap<ResolutionContext, Map<string, Node[]>>();
 
 /** The qualified name of the innermost class or module around `ref`, or '' at the top of its file. */
 function rubyScopeAt(ref: UnresolvedRef, context: ResolutionContext): string {
+  return rubyInnermostScope(ref, context)?.qualifiedName ?? '';
+}
+
+/** The classes and modules of `ref`'s file, smallest first (a file's are read once). */
+function rubyFileScopes(ref: UnresolvedRef, context: ResolutionContext): Node[] {
   let memo = RUBY_FILE_SCOPES.get(context);
   if (!memo) RUBY_FILE_SCOPES.set(context, (memo = new Map()));
   let scopes = memo.get(ref.filePath);
@@ -9078,8 +9209,25 @@ function rubyScopeAt(ref: UnresolvedRef, context: ResolutionContext): string {
       .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine));
     memo.set(ref.filePath, scopes);
   }
-  return scopes.find((n) => n.startLine <= ref.line && n.endLine >= ref.line)?.qualifiedName ?? '';
+  return scopes;
 }
+
+/** The innermost class or module around `ref`, if any. */
+function rubyInnermostScope(ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  return rubyFileScopes(ref, context).find((n) => n.startLine <= ref.line && n.endLine >= ref.line);
+}
+
+/**
+ * The classes and modules written around `ref`, innermost first: Ruby's
+ * `Module.nesting` there. A compact `class ActivityPub::Activity::Create`
+ * opens that class alone, not `ActivityPub` around it.
+ */
+function rubyNestingAt(ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  return rubyFileScopes(ref, context).filter((n) => n.startLine <= ref.line && n.endLine >= ref.line);
+}
+
+/** rubyClassMethodOf's answers by run, class and name: rails' tests call `Topic.create` hundreds of times. */
+const RUBY_CLASS_METHODS = new WeakMap<ResolutionContext, Map<string, Node | null>>();
 
 /**
  * The class method `name` a Ruby class answers past its own: up its
@@ -9087,15 +9235,28 @@ function rubyScopeAt(ref: UnresolvedRef, context: ResolutionContext): string {
  * them `extend`s, or of the `ClassMethods` a module they include brings along
  * (ActiveSupport::Concern). Never an instance method of a module they
  * include, nor a `def self.` of one, which stays that module's:
- * rails' `Topic.create` is no `Reflection.create`.
+ * rails' `Topic.create` is no `Reflection.create`. Read `from` a file, only
+ * the declarations that file runs with count (isRubyDeclarationVisible).
  */
-export function rubyClassMethodOf(qn: string, name: string, context: ResolutionContext): Node | null {
+export function rubyClassMethodOf(qn: string, name: string, context: ResolutionContext, from?: string): Node | null {
+  let memo = RUBY_CLASS_METHODS.get(context);
+  if (!memo) RUBY_CLASS_METHODS.set(context, (memo = new Map()));
+  // Of the file it's asked from, only the run it's in changes the answer.
+  const key = `${from === undefined ? '' : `${rubyRunOf(from)}\0`}${qn}\0${name}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const found = findRubyClassMethod(qn, name, context, from);
+  memo.set(key, found);
+  return found;
+}
+
+function findRubyClassMethod(qn: string, name: string, context: ResolutionContext, from?: string): Node | null {
   const named = (owner: string, isStatic: boolean): Node | undefined =>
-    rubyMethodsOf(owner, name, context).find((n) => (n.isStatic === true) === isStatic);
+    rubyMethodsOf(owner, name, context, from).find((n) => (n.isStatic === true) === isStatic);
   const seen = new Set<string>();
   for (let cls: string | null = qn; cls !== null && !seen.has(cls);) {
     seen.add(cls);
-    const decls: Node[] = context.getNodesByQualifiedName(cls).filter(isRubyNamespace);
+    const decls: Node[] = rubyNamespacesNamed(cls, context).filter((d) => from === undefined || isRubyDeclarationVisible(d, from));
     if (cls !== qn) {
       const own = named(cls, true);
       if (own) return own;
@@ -9103,13 +9264,24 @@ export function rubyClassMethodOf(qn: string, name: string, context: ResolutionC
     for (const decl of decls) {
       const mixins = rubyMixinsOf(decl, context);
       for (const module of mixins.extended) {
-        for (const owner of rubyAncestry(module, context, true)) {
+        for (const owner of rubyAncestry(module, context, true, from)) {
           const method = named(owner, false);
           if (method) return method;
         }
       }
       for (const module of mixins.included) {
-        for (const owner of rubyAncestry(module, context, true)) {
+        for (const owner of rubyAncestry(module, context, true, from)) {
+          // A concern extends the class with its `included do` block's
+          // modules after its `ClassMethods`, so they are asked first.
+          for (const extra of context.getNodesByQualifiedName(owner)) {
+            if (!isRubyNamespace(extra) || (from !== undefined && !isRubyDeclarationVisible(extra, from))) continue;
+            for (const extension of rubyMixinsOf(extra, context).extendedWhenIncluded) {
+              for (const up of rubyAncestry(extension, context, true, from)) {
+                const method = named(up, false);
+                if (method) return method;
+              }
+            }
+          }
           const method = named(`${owner}::ClassMethods`, false);
           if (method) return method;
         }
@@ -9126,11 +9298,11 @@ export function rubyClassMethodOf(qn: string, name: string, context: ResolutionC
  * Ruby's constant lookup. A base's bare name finds a namesake's method:
  * `ActiveRecord::Base` is every `Base` in rails.
  */
-function rubyAncestorMethod(qn: string, name: string, context: ResolutionContext, kind?: RubyMethodKind): Node | null {
-  if (kind === 'class') return rubyClassMethodOf(qn, name, context);
-  for (const owner of rubyAncestry(qn, context)) {
+function rubyAncestorMethod(qn: string, name: string, context: ResolutionContext, kind?: RubyMethodKind, from?: string): Node | null {
+  if (kind === 'class') return rubyClassMethodOf(qn, name, context, from);
+  for (const owner of rubyAncestry(qn, context, false, from)) {
     if (owner === qn) continue;
-    const methods = rubyMethodsOf(owner, name, context);
+    const methods = rubyMethodsOf(owner, name, context, from);
     // A module's `def self.` stays the module's: rails' `topic.create` is no
     // `Reflection.create`.
     const reached = methods.find((n) => n.isStatic !== true) ??
@@ -9147,6 +9319,203 @@ export function rubyConstantQn(name: string, scope: string, context: ResolutionC
     if (context.getNodesByQualifiedName(qn).some((n) => n.language === 'ruby' && (n.kind === 'class' || n.kind === 'module'))) return qn;
     if (!prefix) return name;
   }
+}
+
+/**
+ * The declarations of the class or module a bare Ruby constant names where
+ * `ref` is written, found the way Ruby's lookup finds it: in the namespaces
+ * around the reference, innermost first, then in the ancestors of the
+ * innermost one (a constant of a module its class includes), then at the
+ * top level; at each place, only the declarations the file runs with
+ * (isRubyDeclarationVisible). Undefined when what the lookup finds first is
+ * a value (`Key = ActiveRecord::Key`), or nothing the project declares; an
+ * empty list when the project declares the constant only where that run
+ * never looks: rails' railties tests load none of the other gems' `Topic`.
+ * `place.othersHidden` says whether the place the declarations were found at
+ * also holds ones another run declares.
+ */
+export function rubyBareConstantDeclarations(
+  name: string, ref: UnresolvedRef, context: ResolutionContext, place?: { othersHidden: boolean },
+): Node[] | undefined {
+  const pool = rubyConstantsEnding(name, context);
+  // No class, module or value of the name anywhere: no place has it.
+  if (pool !== null && pool.byQn.size === 0) return undefined;
+  const visible = rubyVisibleFrom(ref.filePath);
+  let hidden = false;
+  const at = (qn: string): Node[] | 'value' | null => {
+    let found: Node[];
+    if (pool === null) {
+      found = [...rubyNamespacesNamed(qn, context),
+        ...context.getNodesByQualifiedName(qn).filter((n) => n.language === 'ruby' && (n.kind === 'variable' || n.kind === 'constant'))];
+    } else {
+      const exact = pool.byQn.get(qn) ?? [];
+      found = qn.includes('::') ? exact
+        : [...exact.filter(isRubyNamespace), ...pool.topLevel, ...exact.filter((n) => !isRubyNamespace(n))];
+    }
+    if (found.length === 0) return null;
+    const seen = found.filter((n) => visible(n) && isLexicallyReachable(n, ref, context));
+    if (seen.length === 0) {
+      hidden = true;
+      return null;
+    }
+    if (place) place.othersHidden = found.some((n) => !visible(n));
+    return seen.some(isRubyNamespace) ? seen.filter(isRubyNamespace) : 'value';
+  };
+  // The constant in the class or module `owner`; none where nothing of the
+  // name is declared.
+  const inside = (owner: string): Node[] | 'value' | null =>
+    pool !== null && !pool.owners.has(owner) ? null : at(`${owner}::${name}`);
+  const nesting = rubyNestingAt(ref, context);
+  const scope = nesting[0]?.qualifiedName ?? '';
+  for (const n of nesting) {
+    const found = inside(n.qualifiedName);
+    if (found !== null) return found === 'value' ? undefined : found;
+  }
+  if (scope) {
+    for (const owner of rubyAncestry(scope, context, true, ref.filePath)) {
+      if (owner === scope) continue;
+      const found = inside(owner);
+      if (found !== null) return found === 'value' ? undefined : found;
+    }
+  }
+  const found = at(name);
+  if (found !== null) return found === 'value' ? undefined : found;
+  return hidden ? [] : undefined;
+}
+
+/** The kinds of node a Ruby constant names: a class or module, or a value (`Key = ActiveRecord::Key`). */
+const RUBY_CONSTANT_KINDS: readonly Node['kind'][] = ['class', 'module', 'variable', 'constant'];
+
+/** Per context, the names with a `::` (a compact `class A::B`, a `class ::B`) of Ruby classes, modules and values, by their last segment; null when the context lists no names. */
+const RUBY_CONSTANT_NAMES = new WeakMap<ResolutionContext, Map<string, Set<string>> | null>();
+const RUBY_CONSTANTS_ENDING = new WeakMap<ResolutionContext, Map<string, RubyConstantsEnding>>();
+
+/** The Ruby classes, modules and values whose qualified names end in one constant's name. */
+interface RubyConstantsEnding {
+  /** By qualified name: its classes and modules, then its values, each in the order a lookup by qualified name returns them. */
+  byQn: Map<string, Node[]>;
+  /** The classes and modules written from the top level (`class ::B`), as rubyNamespacesNamed adds them to `B`. */
+  topLevel: Node[];
+  /** The qualified names of the classes and modules that declare one, `A` for `A::B`. */
+  owners: Set<string>;
+}
+
+/**
+ * Every Ruby class, module and value whose qualified name ends in the
+ * constant `name`: the nodes named `name`, and those a compact `class A::B`
+ * or a `class ::B` names whole. A constant lookup tries a place for each
+ * class and module around the reference and for each ancestor of the
+ * innermost one, dozens for a reference in a rails model; read once, these
+ * answer every place without a query. Null when the context lists no names,
+ * for the lookup to query each place.
+ */
+function rubyConstantsEnding(name: string, context: ResolutionContext): RubyConstantsEnding | null {
+  let names = RUBY_CONSTANT_NAMES.get(context);
+  if (names === undefined) {
+    const all = context.getNodeNamesOfKinds?.('ruby', RUBY_CONSTANT_KINDS);
+    names = all ? new Map() : null;
+    for (const n of all ?? []) {
+      const cut = n.lastIndexOf('::');
+      if (cut < 0) continue;
+      const last = n.slice(cut + 2);
+      const list = names!.get(last);
+      if (list) list.add(n);
+      else names!.set(last, new Set([n]));
+    }
+    RUBY_CONSTANT_NAMES.set(context, names);
+  }
+  if (names === null) return null;
+  let memo = RUBY_CONSTANTS_ENDING.get(context);
+  if (!memo) RUBY_CONSTANTS_ENDING.set(context, (memo = new Map()));
+  const hit = memo.get(name);
+  if (hit) return hit;
+  const byQn = new Map<string, Node[]>();
+  const topLevel: Node[] = [];
+  // Qualified names two lookups by name contribute to, to put back in the
+  // order one lookup by qualified name returns.
+  const merged = new Set<string>();
+  for (const source of [name, ...(names.get(name) ?? [])]) {
+    const here = new Set<string>();
+    for (const n of context.getNodesByName(source)) {
+      if (n.language !== 'ruby' || !RUBY_CONSTANT_KINDS.includes(n.kind)) continue;
+      if (isRubyNamespace(n) && n.name === `::${name}`) topLevel.push(n);
+      const group = byQn.get(n.qualifiedName);
+      if (!group) byQn.set(n.qualifiedName, [n]);
+      else {
+        if (!here.has(n.qualifiedName)) merged.add(n.qualifiedName);
+        group.push(n);
+      }
+      here.add(n.qualifiedName);
+    }
+  }
+  const order = (a: Node, b: Node): number =>
+    (a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0) || a.startLine - b.startLine || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  const owners = new Set<string>();
+  for (const [qn, group] of byQn) {
+    if (merged.has(qn)) group.sort(order);
+    byQn.set(qn, [...group.filter(isRubyNamespace), ...group.filter((n) => !isRubyNamespace(n))]);
+    if (qn.endsWith(`::${name}`)) owners.add(qn.slice(0, qn.length - name.length - 2));
+  }
+  const found = { byQn, topLevel, owners };
+  memo.set(name, found);
+  return found;
+}
+
+/**
+ * What a bare Ruby constant can name, of the candidates for a reference to
+ * it: the declarations of the class or module Ruby's lookup finds where it
+ * is written (rubyBareConstantDeclarations), the ones a call on it reaches.
+ * Of rails' `Topic`s an activerecord test means its suite's top-level one,
+ * not the `SerializedAttributeTest::Topic` a folder nearer declares, and a
+ * railties test none. The candidates as they are when the nearest of them is
+ * already one of those, for any other reference, or for a constant the
+ * lookup doesn't find. Nor when the nearest is another run's, beside this
+ * run's at the place the lookup finds, and this run's are only scripts (no
+ * suite's, outside `lib/` and `app/`): what decides then is which program
+ * the reference is part of, which no folder says (actionmailbox's
+ * `ApplicationMailbox` is its test app's, or a guide's script's), so the
+ * nearest is refused as before.
+ */
+function rubyConstantPool(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  if (ref.referenceKind !== 'references' || !/^[A-Z]\w*$/.test(ref.referenceName) || !candidates.some(isRubyNamespace)) return candidates;
+  const place = { othersHidden: false };
+  const decls = rubyBareConstantDeclarations(ref.referenceName, ref, context, place);
+  if (decls === undefined) return candidates;
+  const ids = new Set(decls.map((d) => d.id));
+  const named = candidates.filter((c) => ids.has(c.id));
+  if (named.length === candidates.length) return candidates;
+  const nearest = candidates.length > 1 && candidates.length <= AMBIGUOUS_NAME_CEILING ? findBestMatch(ref, candidates, context) : null;
+  if (nearest && ids.has(nearest.id)) return candidates;
+  if (nearest && place.othersHidden && !isRubyDeclarationVisible(nearest, ref.filePath) &&
+      decls.every((d) => rubyTestSuite(d.filePath) === null && !RUBY_CODE_DIR.test(d.filePath))) return candidates;
+  // One the name doesn't find (`class ::ApplicationController`, indexed as
+  // `::ApplicationController`) is no less the class.
+  return named.length > 0 ? named : decls;
+}
+
+/**
+ * The method a call on a Ruby class reaches, the class being `decls`, the
+ * declarations of it the calling file runs with: a class method of its own
+ * (`def self.`, or in `class << self`), from the calling file's declaration
+ * first, then the nearest, else one its ancestry gives it
+ * (rubyClassMethodOf), before an instance method of its own: rails'
+ * `Relation.create(…)` is the `create` its `Delegation` concern's
+ * `ClassMethods` declares, not the `def create` of a relation. An instance
+ * method answers only when nothing else does, for a class that hands calls
+ * to an instance (`delegate :collect?, to: :instance`).
+ */
+function rubyClassCallTarget(decls: Node[], name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const classes = decls.filter((d) => d.kind === 'class')
+    .sort((a, b) => Number(b.filePath === ref.filePath) - Number(a.filePath === ref.filePath) ||
+      sharedDirDepth(ref.filePath, b.filePath) - sharedDirDepth(ref.filePath, a.filePath));
+  if (classes.length === 0) return null;
+  let instance: Node | undefined;
+  for (const decl of classes) {
+    const own = findOwnMethod(context.getNodesInFile(decl.filePath), decl, name, 'class');
+    if (own?.isStatic === true) return own;
+    instance ??= own;
+  }
+  return rubyClassMethodOf(classes[0]!.qualifiedName, name, context, ref.filePath) ?? instance ?? null;
 }
 
 const KOTLIN_FILE_SCOPES = new WeakMap<ResolutionContext, Map<string, { pkg: string; imports: Set<string>; stars: Set<string> }>>();
@@ -14730,6 +15099,13 @@ export function matchByExactName(
   const swiftShape = ref.language === 'swift' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
     ? swiftCallShape(ref, context) : null;
   const phpSelf = phpSelfReceiver(ref, context);
+  // A Ruby test suite's declarations exist only in that suite's runs, so one
+  // the reference's run can't see is never what it links to. It is ruled out
+  // as the one candidate picked, not from the candidates: rails' production
+  // `send(…)` and `Concurrent::Map.new` would otherwise be left one project
+  // `send` or `Map` once the tests' were gone, and take it.
+  const rubyVisible = ref.language === 'ruby' ? rubyVisibleFrom(ref.filePath) : null;
+  const rubyHidden = (n: Node): boolean => rubyVisible !== null && n.language === 'ruby' && !rubyVisible(n);
   const filtered = sameName.filter((n) =>
     !(kotlinStdChain !== null && !isKotlinStdChainTarget(n, kotlinStdChain)) &&
     !(swiftShape && !isSwiftCallTarget(n, swiftShape, ref, context)) &&
@@ -14849,6 +15225,7 @@ export function matchByExactName(
     : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context)
     : kotlinBare ? lexicalKotlinMembers(filtered, ref, context)
     : rubyBare ? rubyMethodsOfCallerKind(filtered, ref, context)
+    : ref.language === 'ruby' ? rubyConstantPool(filtered, ref, context)
     : objcDeclaredType ? objcTypeDeclarations(filtered, ref) : cppSpecializationPool(filtered, ref, context);
   // (Above the ceiling below nothing is picked, so no translation unit is read.)
   const candidates = ranked.length <= AMBIGUOUS_NAME_CEILING ? withinCppTranslationUnit(ranked, ref, context, true) : ranked;
@@ -14860,7 +15237,7 @@ export function matchByExactName(
   // If only one match, use it — but penalize a match in another language
   // family (a `.tsx` component calling a `.ts` helper is not one, #1662)
   if (candidates.length === 1) {
-    if (!isCrossFileReachable(candidates[0]!, ref, context)) return null;
+    if (!isCrossFileReachable(candidates[0]!, ref, context) || rubyHidden(candidates[0]!)) return null;
     const isCrossLanguage = !sameLanguageFamily(candidates[0]!.language, ref.language);
     return {
       original: ref,
@@ -14875,13 +15252,15 @@ export function matchByExactName(
   // call written on `super`: the one in a class expression's method gets here
   // (js-super-calls declines to place it), and its `super` is that
   // expression's parent, never the enclosing class's (#2497).
-  const member = isJsSuperCallSite(ref, context) ? null : matchEnclosingScopeMember(ref, candidates, context);
+  const member = isJsSuperCallSite(ref, context) ? null
+    : (rubyBare ? rubyFirstInAncestry(candidates, ref, context) : null) ?? matchEnclosingScopeMember(ref, candidates, context);
   // The scope names the member, not the overload: when the class declares
   // the name more than once, the one the arguments fit, else the nearest, is
   // chosen below — among those overloads only, so a sibling class's namesake
   // stays out of it.
   let pool = candidates;
   if (member) {
+    if (rubyHidden(member)) return null;
     const overloads = candidates.filter((c) => c.qualifiedName === member.qualifiedName && c.filePath === member.filePath);
     if (overloads.length <= 1) {
       return { original: ref, targetNodeId: member.id, confidence: 0.9, resolvedBy: 'exact-match' };
@@ -14901,6 +15280,7 @@ export function matchByExactName(
   // Multiple matches - try to narrow down
   const nearest = findBestMatch(ref, pool, context);
   const bestMatch = nearest && cppFunctionOverload(nearest, pool, ref, context);
+  if (bestMatch && rubyHidden(bestMatch)) return null;
   if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
@@ -22784,6 +23164,10 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUBY_MIXINS.delete(context);
   RUBY_METHOD_OWNERS.delete(context);
   RUBY_FILE_SCOPES.delete(context);
+  RUBY_CONSTANT_NAMES.delete(context);
+  RUBY_CONSTANTS_ENDING.delete(context);
+  RUBY_CLASS_METHODS.delete(context);
+  RUBY_TEST_SUITES.clear();
   CSHARP_TYPE_ARITY.delete(context);
   CSHARP_EXTENSION_METHODS.delete(context);
   CSHARP_PARAMETERS.delete(context);
@@ -25277,6 +25661,17 @@ export function matchMethodCall(
   // own file first — otherwise the first-indexed class wins and a call in `b/`
   // resolves to `a/`'s method (#1079).
   const strat1 = nmTimedT('mc-class', ref, (): ResolvedRef | null => {
+    // A Ruby constant is the class Ruby's lookup finds where the call is
+    // written, as the calling file's run declares it, never a namesake:
+    // rails' activemodel tests call their own `Topic`, whose ancestry has no
+    // `validates_length_of` of activerecord's `Topic < ActiveRecord::Base`.
+    if (ref.language === 'ruby' && /^[A-Z]\w*$/.test(objectOrClass!)) {
+      const decls = rubyBareConstantDeclarations(objectOrClass!, ref, context);
+      if (decls !== undefined) {
+        const method = rubyClassCallTarget(decls, methodName!, ref, context);
+        return method ? { original: ref, targetNodeId: method.id, confidence: 0.85, resolvedBy: 'qualified-name' } : null;
+      }
+    }
     let classCandidates = preferCallSiteFile(
       withinCppTranslationUnit(context.getNodesByName(objectOrClass!).filter(isMethodOwnerKind), ref, context),
       ref.filePath,
@@ -25309,6 +25704,8 @@ export function matchMethodCall(
       // `manager.check()` in `Model._check_managers` is no test app's
       // `Manager` model (whose `check` it inherits from `Model`).
       if (productionCaller && isTestPath(classNode.filePath)) continue;
+      // Nor, in Ruby, another test suite's class (isRubyDeclarationVisible).
+      if (ref.language === 'ruby' && !isRubyDeclarationVisible(classNode, ref.filePath)) continue;
 
       // C++'s `Outer::Count()` is the member C++ looks up in `Outer`: its
       // own, else one a base declares (cppMethodOf), never one of a class
@@ -25322,7 +25719,8 @@ export function matchMethodCall(
 
       // A Ruby call on a class is a call of its class method: `Widget.build`
       // reaches `def self.build`, not `def build`, whichever comes first.
-      const methodNode = classStrategyMethod(classNode, methodName!, context, ref.language === 'ruby' ? 'class' : undefined);
+      const methodNode = ref.language === 'ruby' ? classStrategyMethod(classNode, methodName!, context, 'class', ref.filePath)
+        : classStrategyMethod(classNode, methodName!, context);
 
       // A Kotlin extension beside the class (`fun Modes.shared()`) needs an
       // import of its own from another package.
@@ -25454,6 +25852,8 @@ export function matchMethodCall(
         // class from production code (see Strategy 1).
         if (!isLexicallyReachable(classNode, ref, context)) continue;
         if (productionCaller && isTestPath(classNode.filePath)) continue;
+        // Nor, in Ruby, another test suite's class (isRubyDeclarationVisible).
+        if (ref.language === 'ruby' && !isRubyDeclarationVisible(classNode, ref.filePath)) continue;
 
         // A Ruby receiver named after a class may hold the class as well as an
         // instance of it (rubocop's `cop.cop_name` runs over its registry's
@@ -25465,7 +25865,7 @@ export function matchMethodCall(
           ? phpUnnamedClassMethod(classNode, methodName!, fuzzyClassCandidates.filter((c) => c.language === 'php').length === 1, context)
           : ref.language === 'csharp' && isStdMethodName('csharp', methodName!)
             ? findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName!)
-            : classStrategyMethod(classNode, methodName!, context);
+            : classStrategyMethod(classNode, methodName!, context, undefined, ref.language === 'ruby' ? ref.filePath : undefined);
         // Inside the class a PHP variable is named after, it is another
         // instance of that class by its name alone, for what the class declares
         // or takes from its traits: `$model->fill()` in `Model`. Not for what it
@@ -25568,6 +25968,19 @@ export function matchMethodCall(
     // rest_framework/renderers.py's `view.reverse_action(…)` is not a test's
     // `DummyView`. The test's methods were never in the running.
     if (!isTestPath(ref.filePath)) targetMethods = targetMethods.filter((m) => !isTestPath(m.filePath));
+    // Nor a Ruby test another suite's: its classes exist only in that suite's
+    // runs (isRubyDeclarationVisible). The ones left are scored as they were
+    // with it among them, never taken as the one method of the name:
+    // `ActiveRecord.after_all_transactions_commit` in activerecord's tests is
+    // still `ActiveRecord`'s once activejob's test double is out of the
+    // running, but `self.class.send` no lone project `send`.
+    let rubySuiteNarrowed = false;
+    if (ref.language === 'ruby') {
+      const visible = rubyVisibleFrom(ref.filePath);
+      const kept = targetMethods.filter((m) => m.language !== 'ruby' || visible(m));
+      rubySuiteNarrowed = kept.length !== targetMethods.length;
+      targetMethods = kept;
+    }
     // Nor is it a method of a class another function declares: Django's
     // `file.write(…)` in one test is not the `File` a serializer test
     // declares in its body. The one method such a filter may leave is still
@@ -25610,7 +26023,7 @@ export function matchMethodCall(
     // (`web_push_request.legacy_encrypt` → WebPushRequest). rubocop's
     // `node.loc` on a rubocop-ast node went to the one `loc` in the project
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
-    if (targetMethods.length === 1 && !narrowed && !scopedOut && !pythonChain && targetMethods[0]!.language === ref.language &&
+    if (targetMethods.length === 1 && !narrowed && !rubySuiteNarrowed && !scopedOut && !pythonChain && targetMethods[0]!.language === ref.language &&
         !(JS_FAMILY.has(ref.language) && targetMethods[0]!.filePath !== ref.filePath && jsFileAssignsMember(ref.filePath, methodName!, context)) &&
         // A test double is only what a test names — as in the scoring below:
         // allauth's `resp.json()` on a Django test response is not the one
@@ -25648,7 +26061,7 @@ export function matchMethodCall(
     // (`MarshalWithFallback.dumped?`) still names its owner.
     const rubyBangOrPredicate = ref.language === 'ruby' && /[!?]$/.test(methodName!) && /^[a-z_]/.test(receiverLink(objectOrClass!));
     if (!rubyBangOrPredicate &&
-        (targetMethods.length > 1 || (targetMethods.length === 1 && (scopedOut || pythonChain) && !narrowed))) {
+        (targetMethods.length > 1 || (targetMethods.length === 1 && (scopedOut || pythonChain || rubySuiteNarrowed) && !narrowed))) {
       // What the receiver is named after is its last link: `builder.tokeniser`
       // is a Tokeniser, `table.Columns` no kind of table. In a python chain the
       // last link as written: Django's `request.META` and `request.GET` are
@@ -31405,12 +31818,13 @@ function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string,
  * its own (findOwnMethod), else the nearest one a declared supertype has, as a
  * call on an instance of the class finds it. Django's `form.is_valid()` on
  * `Form` reaches `BaseForm::is_valid`, which the substring test this replaced
- * only found because `BaseForm` contains `Form`.
+ * only found because `BaseForm` contains `Form`. Read `from` a file, a Ruby
+ * class's ancestors are the declarations that file runs with.
  */
-function classStrategyMethod(classNode: Node, methodName: string, context: ResolutionContext, kind?: RubyMethodKind): Node | undefined {
+function classStrategyMethod(classNode: Node, methodName: string, context: ResolutionContext, kind?: RubyMethodKind, from?: string): Node | undefined {
   const own = findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName, kind);
   if (own) return own;
-  if (classNode.language === 'ruby') return rubyAncestorMethod(classNode.qualifiedName, methodName, context, kind) ?? undefined;
+  if (classNode.language === 'ruby') return rubyAncestorMethod(classNode.qualifiedName, methodName, context, kind, from) ?? undefined;
   if (classNode.language === 'php') return phpAncestorMethod(classNode, methodName, context) ?? undefined;
   return inheritedClassMethod([classNode], methodName, context, kind) ?? undefined;
 }
@@ -32506,7 +32920,9 @@ export function matchFuzzy(
     // A bare PHP call is a function call (case-insensitive, so fuzzy may find
     // one) — never the class `View` for `view(…)`, never a method.
     !(finalCandidates[0]!.kind !== 'function' && isBarePhpCall(ref, context)) &&
-    isLexicallyReachable(finalCandidates[0]!, ref, context)
+    isLexicallyReachable(finalCandidates[0]!, ref, context) &&
+    // Nor another Ruby test suite's: its declarations exist only in its runs.
+    !(ref.language === 'ruby' && finalCandidates[0]!.language === 'ruby' && !isRubyDeclarationVisible(finalCandidates[0]!, ref.filePath))
   ) {
     const isCrossLanguage = !sameLanguageFamily(finalCandidates[0]!.language, ref.language);
     return {
