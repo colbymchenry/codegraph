@@ -21,21 +21,45 @@ const CPP_NS_FRAMES = new WeakMap<ResolutionContext, Map<string, Array<{ start: 
 const CPP_CLOSER_BODY = /^(?:[A-Za-z_]\w*\s+)*\}(?:\s*\})*\s*;?$/;
 const CPP_NS_ALIASES = new WeakMap<ResolutionContext, Map<string, string>>();
 
+/** The files that can declare a namespace alias, as far as the project's aliases are read. */
+const CPP_NS_ALIAS_FILE = /\.(?:h|hh|hpp|hxx|inl|c|cc|cpp|cxx)$/i;
+
+/** Add what a file declares. The first declaration of a name stands. */
+function addNamespaceAliases(file: string, source: string, aliases: Map<string, string>): void {
+  // (Few files declare one, and this looks for it without looking at every line.)
+  if (!CPP_NS_ALIAS_FILE.test(file) || !/\bnamespace[ \t]+\w+[ \t]*=/.test(source)) return;
+  for (const m of source.matchAll(/^[ \t]*namespace[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*(?:::)?([A-Za-z_][\w:]*)[ \t]*;/gm)) {
+    if (!aliases.has(m[1]!)) aliases.set(m[1]!, m[2]!);
+  }
+}
+
 /** The project's namespace aliases: `namespace py = pybind11;`. */
 export function cppNamespaceAliases(context: ResolutionContext): Map<string, string> {
   const hit = CPP_NS_ALIASES.get(context);
   if (hit) return hit;
   const aliases = new Map<string, string>();
   for (const file of context.getAllFiles()) {
-    if (!/\.(?:h|hh|hpp|hxx|inl|c|cc|cpp|cxx)$/i.test(file)) continue;
-    const source = context.readFile(file);
-    if (!source || !source.includes('namespace')) continue;
-    for (const m of source.matchAll(/^[ \t]*namespace[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*(?:::)?([A-Za-z_][\w:]*)[ \t]*;/gm)) {
-      if (!aliases.has(m[1]!)) aliases.set(m[1]!, m[2]!);
-    }
+    const source = CPP_NS_ALIAS_FILE.test(file) ? context.readFile(file) : null;
+    if (source) addNamespaceAliases(file, source, aliases);
   }
   CPP_NS_ALIASES.set(context, aliases);
   return aliases;
+}
+
+/**
+ * For a walk over `getAllFiles` in its order, which holds every file's text
+ * anyway: reads the aliases from that text, so that nothing reads every file
+ * for them again. Null when they are known. The text may be latin1: what the
+ * aliases read is ASCII, on lines latin1 breaks where UTF-8 does (only U+2028
+ * and U+2029 end a line in one and not the other).
+ */
+export function cppNamespaceAliasWalk(context: ResolutionContext): { add(file: string, source: string): void; finish(): void } | null {
+  if (CPP_NS_ALIASES.has(context)) return null;
+  const aliases = new Map<string, string>();
+  return {
+    add: (file, source) => addNamespaceAliases(file, source, aliases),
+    finish: () => { CPP_NS_ALIASES.set(context, aliases); },
+  };
 }
 
 /**

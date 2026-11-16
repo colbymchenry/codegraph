@@ -1732,7 +1732,7 @@ export const CPP_COMPILE_DB_FILES = [
 export function loadCppIncludeDirsFromCompileDB(projectRoot: string): string[] | null {
   for (const file of CPP_COMPILE_DB_FILES) {
     const dbPath = path.join(projectRoot, file);
-    if (fs.existsSync(dbPath)) return readCompileDbIncludeDirs(dbPath, projectRoot);
+    if (fs.statSync(dbPath, { throwIfNoEntry: false })?.isFile()) return readCompileDbIncludeDirs(dbPath, projectRoot);
   }
   return null;
 }
