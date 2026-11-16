@@ -12,6 +12,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSuperty
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { isJsSuperCallSite } from './js-super-calls';
 import { JS_ARRAY_METHODS, JS_BROWSER_HOST_GLOBALS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
+import { defaultExportValueHasMember, getFileExportIndex } from './file-export-index';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, dartPrivateVisible, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
@@ -25388,7 +25389,27 @@ function isImportedModuleReceiver(receiver: string, ref: UnresolvedRef, context:
   const root = receiver.split('.')[0]!;
   const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === root);
   if (!binding) return false;
-  return binding.isNamespace || context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+  if (binding.isNamespace || context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true) {
+    return true;
+  }
+  if (binding.isDefault && !binding.isNamespace) {
+    const accessedMember = ref.referenceName.includes('.') ? ref.referenceName.split('.')[1]! : ref.referenceName;
+    const sourceFile = binding.source;
+    if (sourceFile !== undefined && context.fileExists(sourceFile)) {
+      const idx = getFileExportIndex(sourceFile, context);
+      if (idx.byName.has(accessedMember) || idx.defaultComponent?.name === accessedMember) {
+        return false;
+      }
+      if (idx.members.has(accessedMember)) {
+        return false;
+      }
+      if (defaultExportValueHasMember(sourceFile, accessedMember, context)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return false;
 }
 
 const JS_ASSIGNED_MEMBERS = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
