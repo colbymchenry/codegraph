@@ -9246,24 +9246,215 @@ function isPhpMethodInScope(method: Node, ref: UnresolvedRef, via: 'self' | 'par
   const cut = method.qualifiedName.lastIndexOf('::');
   if (cut < 0) return true;
   const ownerQn = method.qualifiedName.slice(0, cut);
-  const enclosing = context
+  // Inside `new class … { … }` the class is that anonymous one, which the
+  // index holds no node for: what it extends and the traits it uses.
+  const anonymous = phpAnonymousClassAt(ref, context);
+  const enclosing = anonymous ? undefined : context
     .getNodesInFile(ref.filePath)
     .filter((n) => PHP_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
     .sort((a, b) => b.startLine - a.startLine)[0];
   // Inside a trait, `$this` is whichever class uses it: Laravel's
   // ValidatesAttributes calls the Validator's `getValue()`.
-  if (!enclosing || enclosing.kind === 'trait') return true;
-  const up = phpAncestry(via === 'parent' ? phpSupertypeQns(enclosing, context) : [enclosing.qualifiedName], context);
+  if (!anonymous && (!enclosing || enclosing.kind === 'trait')) return true;
+  const up = phpAncestry(anonymous ? anonymous.supers : via === 'parent' ? phpSupertypeQns(enclosing!, context) : [enclosing!.qualifiedName], context);
   if (up.qns.has(ownerQn)) return true;
   // A base class may call what a subclass defines (BookStack's Entity calls
   // `$this->chapter()`, a Page method): the owner descends from the caller.
-  if (via === 'self' && phpAncestry([ownerQn], context).qns.has(enclosing.qualifiedName)) return true;
+  if (via === 'self' && enclosing && phpAncestry([ownerQn], context).qns.has(enclosing.qualifiedName)) return true;
   // Past an ancestor outside the repository (Orchestra's TestCase) that
   // ancestor's members are unseen — the repository's traits it uses among
   // them. A trait's method may still be the one meant; an unrelated class's
   // (Drupal's comparator `assertEquals`) never is. Nor a trait's, for a call
   // written `parent::x()`: that is what the outside parent declares.
   return via === 'self' && up.leavesRepo && context.getNodesByQualifiedName(ownerQn).some((d) => d.kind === 'trait');
+}
+
+/**
+ * PHP source with its comments, string contents and heredoc bodies blanked,
+ * offsets kept, so the braces and keywords left are code. (`#[` opens an
+ * attribute, not a comment.)
+ */
+function phpCodeText(text: string): string {
+  const parts: string[] = [];
+  let copied = 0;
+  const blank = (from: number, to: number): void => {
+    parts.push(text.slice(copied, from), text.slice(from, to).replace(/[^\n]/g, ' '));
+    copied = to;
+  };
+  const n = text.length;
+  for (let i = 0; i < n;) {
+    const c = text[i]!;
+    if (c === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2);
+      const stop = end < 0 ? n : end + 2;
+      blank(i, stop);
+      i = stop;
+    } else if ((c === '/' && text[i + 1] === '/') || (c === '#' && text[i + 1] !== '[')) {
+      const end = text.indexOf('\n', i);
+      const stop = end < 0 ? n : end;
+      blank(i, stop);
+      i = stop;
+    } else if (c === '<' && text.startsWith('<<<', i)) {
+      const head = /^<<<[ \t]*(["']?)([A-Za-z_]\w*)\1\r?\n/.exec(text.slice(i, i + 80));
+      if (!head) { i += 3; continue; }
+      const from = i + head[0].length;
+      const end = new RegExp(String.raw`^[ \t]*${head[2]}\b`, 'm').exec(text.slice(from));
+      const stop = end ? from + end.index : n;
+      blank(from, stop);
+      i = stop;
+    } else if (c === '"' || c === "'" || c === '`') {
+      let j = i + 1;
+      while (j < n && text[j] !== c) j += text[j] === '\\' ? 2 : 1;
+      blank(i + 1, Math.min(j, n));
+      i = j + 1;
+    } else {
+      i++;
+    }
+  }
+  parts.push(text.slice(copied));
+  return parts.join('');
+}
+
+/** Where the bracket opened at `open` closes in blanked code, or -1. */
+function closingBracket(code: string, open: number): number {
+  const opener = code[open]!;
+  const closer = opener === '(' ? ')' : opener === '[' ? ']' : '}';
+  let depth = 0;
+  for (let i = open; i < code.length; i++) {
+    if (code[i] === opener) depth++;
+    else if (code[i] === closer && --depth === 0) return i;
+  }
+  return -1;
+}
+
+type PhpAnonymousClass = {
+  fromLine: number; fromCol: number; toLine: number; toCol: number;
+  /** What it extends and the traits it uses, as the file names them, the traits first. */
+  supers: string[];
+  traits: string[];
+  parent: string | null;
+  /** The methods its body declares, lowercased: the index holds no node for them. */
+  own: Set<string>;
+};
+const PHP_ANONYMOUS_CLASSES = new WeakMap<ResolutionContext, Map<string, PhpAnonymousClass[]>>();
+
+/**
+ * A PHP file's anonymous classes (`new class($x) extends Base implements I {
+ * use T; … }`): where each body runs, what it extends and uses, and the
+ * methods it declares.
+ */
+function phpAnonymousClasses(file: string, context: ResolutionContext): PhpAnonymousClass[] {
+  let memo = PHP_ANONYMOUS_CLASSES.get(context);
+  if (!memo) PHP_ANONYMOUS_CLASSES.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const found: PhpAnonymousClass[] = [];
+  const text = context.readFile(file) ?? '';
+  if (/\bnew\s+(?:#\[[^\]]*\]\s*)*(?:readonly\s+)?class\b/i.test(text)) {
+    const code = phpCodeText(text);
+    const lineStarts = [0];
+    for (let i = text.indexOf('\n'); i >= 0; i = text.indexOf('\n', i + 1)) lineStarts.push(i + 1);
+    const position = (offset: number): [number, number] => {
+      let lo = 0;
+      let hi = lineStarts.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (lineStarts[mid]! <= offset) lo = mid;
+        else hi = mid - 1;
+      }
+      return [lo + 1, offset - lineStarts[lo]!];
+    };
+    for (const m of code.matchAll(/\bnew\s+(?:#\[[^\]]*\]\s*)*(?:readonly\s+)?class\b/gi)) {
+      let at = m.index + m[0].length;
+      while (/\s/.test(code[at] ?? '')) at++;
+      if (code[at] === '(') {
+        const args = closingBracket(code, at);
+        if (args < 0) continue;
+        at = args + 1;
+      }
+      const open = code.indexOf('{', at);
+      if (open < 0) continue;
+      const head = code.slice(at, open);
+      const shape = /^\s*(?:extends\s+(\\?[A-Za-z_][\w\\]*)\s*)?(?:implements\s+[\w\\,\s]+)?$/i.exec(head);
+      if (!shape) continue;
+      const close = closingBracket(code, open);
+      if (close < 0) continue;
+      // The class's own statements: its body with every nested block taken out.
+      let level = '';
+      let depth = 0;
+      for (let i = open + 1; i < close; i++) {
+        const c = code[i]!;
+        if (c === '{') depth++;
+        else if (c === '}') {
+          if (--depth === 0) level += '}';
+        } else if (depth === 0) level += c;
+      }
+      const traits: string[] = [];
+      for (const used of level.matchAll(/(?<=^|[;}])\s*use\s+([\w\\,\s]+?)\s*(?=[;}])/g)) {
+        for (const t of used[1]!.split(',')) if (t.trim()) traits.push(phpTypeQn(t.trim(), file, context));
+      }
+      const own = new Set([...level.matchAll(/\bfunction\s+&?\s*([A-Za-z_]\w*)\s*\(/g)].map((f) => f[1]!.toLowerCase()));
+      const parent = shape[1] ? phpTypeQn(shape[1], file, context) : null;
+      const [fromLine, fromCol] = position(open);
+      const [toLine, toCol] = position(close);
+      found.push({ fromLine, fromCol, toLine, toCol, supers: parent ? [...traits, parent] : traits, traits, parent, own });
+    }
+  }
+  memo.set(file, found);
+  return found;
+}
+
+/**
+ * The PHP anonymous class whose body holds the reference, the innermost, or
+ * null when none does: there `$this`, `self`, `static` and `parent` are that
+ * class, what it extends and its traits, never the named class whose method
+ * writes `new class`.
+ */
+function phpAnonymousClassAt(ref: UnresolvedRef, context: ResolutionContext): PhpAnonymousClass | null {
+  const col = Math.max(0, ref.column);
+  let inner: PhpAnonymousClass | null = null;
+  for (const a of phpAnonymousClasses(ref.filePath, context)) {
+    const after = ref.line > a.fromLine || (ref.line === a.fromLine && col > a.fromCol);
+    const before = ref.line < a.toLine || (ref.line === a.toLine && col < a.toCol);
+    if (after && before && (!inner || a.fromLine > inner.fromLine || (a.fromLine === inner.fromLine && a.fromCol > inner.fromCol))) inner = a;
+  }
+  return inner;
+}
+
+/**
+ * `parent::x()`, `self::x()`, `static::x()` or `$this->x()` inside a PHP
+ * anonymous class, looked up as PHP does: `parent::` in what the class
+ * extends, the others in the class's own methods (which the index holds no
+ * node for), then its traits, then what it extends. framework's
+ * `parent::many($keys)` in `new class extends ArrayStore` is ArrayStore's
+ * trait `RetrievesMultipleKeys::many`, and a `parent::__construct($app)` above
+ * `QueueFake` is QueueFake's own, not the `QueueManager` one it overrides.
+ * Undefined outside an anonymous class, or past a parent from outside the
+ * project, where the name strategies decide as for a named class. The
+ * anonymous classes come first: they are read once a file, and most files
+ * have none, so most calls skip the receiver's regular expressions.
+ */
+function matchPhpAnonymousClassCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const anonymous = phpAnonymousClassAt(ref, context);
+  if (!anonymous) return undefined;
+  const via = phpSelfReceiver(ref, context);
+  if (!via) return undefined;
+  const name = ref.referenceName;
+  const found = (hit: { method: Node | null } | undefined): ResolvedRef | null =>
+    hit?.method ? { original: ref, targetNodeId: hit.method.id, confidence: 0.9, resolvedBy: 'exact-match' } : null;
+  if (via === 'self') {
+    if (anonymous.own.has(name.toLowerCase())) return null;
+    for (const trait of anonymous.traits) {
+      const hit = found(phpTypeMethod(trait, name, context));
+      if (hit) return hit;
+    }
+  }
+  if (!anonymous.parent) return via === 'parent' || anonymous.traits.every((t) => phpTypeMethod(t, name, context) !== undefined) ? null : undefined;
+  const onParent = phpTypeMethod(anonymous.parent, name, context);
+  const hit = found(onParent);
+  if (hit) return hit;
+  // A parent the project declares, through ancestors it declares too, lacks it.
+  return onParent !== undefined && !phpAncestry([anonymous.parent], context).leavesRepo ? null : undefined;
 }
 
 /**
@@ -9410,6 +9601,66 @@ function phpAncestorMethod(decl: Node, name: string, context: ResolutionContext,
   return null;
 }
 
+const PHP_CLASS_IMPORTS = new WeakMap<ResolutionContext, Map<string, Map<string, string>>>();
+
+/**
+ * The fully qualified name that a PHP file's `use` gives the short class name
+ * `name`, matched without regard to case as PHP does; undefined when none
+ * does. (`use function` and `use const` name no class.)
+ */
+function phpImportedAs(name: string, file: string, context: ResolutionContext): string | undefined {
+  let memo = PHP_CLASS_IMPORTS.get(context);
+  if (!memo) PHP_CLASS_IMPORTS.set(context, (memo = new Map()));
+  let imports = memo.get(file);
+  if (!imports) {
+    imports = new Map();
+    const text = context.readFile(file) ?? '';
+    const header = text.slice(0, text.search(/^\s*(?:(?:abstract|final|readonly)\s+)*(?:class|trait|interface|enum)\s/m) >>> 0 || text.length);
+    const others = new Set<string>();
+    for (const m of header.matchAll(/^\s*use\s+(?:function|const)\s+([\w\\]+)(?:\s+as\s+(\w+))?\s*;/gm)) others.add((m[2] ?? m[1]!.split('\\').pop()!).toLowerCase());
+    for (const m of header.matchAll(/^\s*use\s+(?:function|const)\s+[\w\\]+\\\{([^}]*)\}\s*;/gm)) {
+      for (const item of m[1]!.split(',')) {
+        const named = /^\s*([\w\\]+)(?:\s+as\s+(\w+))?\s*$/.exec(item);
+        if (named) others.add((named[2] ?? named[1]!.split('\\').pop()!).toLowerCase());
+      }
+    }
+    for (const [alias, fqn] of phpFileScope(file, context).uses) if (!others.has(alias.toLowerCase())) imports.set(alias.toLowerCase(), fqn);
+    memo.set(file, imports);
+  }
+  return imports.get(name.toLowerCase());
+}
+
+/**
+ * Whether a PHP class is a Laravel facade: a static proxy, whose name a
+ * variable holding what it hands out (`$validator = Validator::make(…)`)
+ * shares without being one.
+ */
+function isPhpFacadeName(fqn: string, context: ResolutionContext): boolean {
+  return context.getNodesByQualifiedName(phpTypeQn(`\\${fqn}`, '', context))
+    .some((n) => n.language === 'php' && n.kind === 'class' && phpSupertypeQns(n, context).some((qn) => qn.endsWith('::Facade')));
+}
+
+const PHP_IMPORTED_CLASSES = new WeakMap<ResolutionContext, Map<string, { facade: boolean; nodes: Node[] }>>();
+
+/**
+ * A class a PHP file imports, by its fully qualified name, once per
+ * resolution pass: whether it is a Laravel facade, and its nodes in the
+ * project (none when it comes from outside).
+ */
+function phpImportedClass(fqn: string, context: ResolutionContext): { facade: boolean; nodes: Node[] } {
+  let memo = PHP_IMPORTED_CLASSES.get(context);
+  if (!memo) PHP_IMPORTED_CLASSES.set(context, (memo = new Map()));
+  let hit = memo.get(fqn);
+  if (!hit) {
+    hit = {
+      facade: isPhpFacadeName(fqn, context),
+      nodes: context.getNodesByQualifiedName(phpTypeQn(`\\${fqn}`, '', context)).filter((n) => n.language === 'php' && isMethodOwnerKind(n)),
+    };
+    memo.set(fqn, hit);
+  }
+  return hit;
+}
+
 /**
  * Whether a PHP file names a class by its short name, under any alias: one of
  * its own namespace, or one a `use` imports. A variable named after a class
@@ -9435,6 +9686,12 @@ function phpFileNamesClass(candidate: Node, file: string, context: ResolutionCon
 function phpUnnamedClassMethod(cls: Node, name: string, onlyOfName: boolean, context: ResolutionContext): Node | undefined {
   const own = findOwnMethod(fileMethodsNamed(cls.filePath, name, context), cls, name);
   return own ?? (onlyOfName ? phpAncestorMethod(cls, name, context) ?? undefined : undefined);
+}
+
+/** Whether a PHP class has `method` from a parent class, not declaring it nor taking it from a trait. */
+function isPhpInheritedFromParent(method: Node, cls: Node, context: ResolutionContext): boolean {
+  const owner = method.qualifiedName.slice(0, Math.max(0, method.qualifiedName.lastIndexOf('::')));
+  return owner !== cls.qualifiedName && !context.getNodesByQualifiedName(owner).some((n) => n.language === 'php' && n.kind === 'trait');
 }
 
 /**
@@ -9473,8 +9730,11 @@ function phpTypeMethod(qn: string, name: string, context: ResolutionContext): { 
 
 const PHP_TYPE_METHODS = new WeakMap<ResolutionContext, Map<string, { method: Node | null } | undefined>>();
 
-/** Eloquent's static methods that hand back a model of the class they are called on. */
-const ELOQUENT_FACTORY_CALL = /^\s*(?:(?:\$\w+\s*=\s*)*)(\\?[A-Z][\w\\]*)::(?:query\(\)\s*->\s*)?(?:create|forceCreate|firstOrCreate|firstOrNew|updateOrCreate|find|findOrFail)\s*\(/;
+/**
+ * Eloquent's static methods that hand back a model of the class they are
+ * called on, through Laravel's `tap(…)`, which hands back what it is given.
+ */
+const ELOQUENT_FACTORY_CALL = /^\s*(?:(?:\$\w+\s*=\s*)*)(?:tap\s*\(\s*)?(\\?[A-Z][\w\\]*)::(?:query\(\)\s*->\s*)?(?:create|createQuietly|forceCreate|forceCreateQuietly|createOrFirst|firstOrCreate|firstOrNew|updateOrCreate|incrementOrCreate|find|findOrFail|findOrNew|findSole|firstOrFail|sole)\s*\(/;
 
 /**
  * The model a PHP local holds when the nearest assignment to it above the
@@ -22518,6 +22778,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUBY_ANCESTRY.delete(context);
   PHP_TYPE_METHODS.delete(context);
   PHP_ANCESTRIES.delete(context);
+  PHP_ANONYMOUS_CLASSES.delete(context);
+  PHP_CLASS_IMPORTS.delete(context);
+  PHP_IMPORTED_CLASSES.delete(context);
   RUBY_MIXINS.delete(context);
   RUBY_METHOD_OWNERS.delete(context);
   RUBY_FILE_SCOPES.delete(context);
@@ -25157,9 +25420,27 @@ export function matchMethodCall(
         withinCppTranslationUnit(context.getNodesByName(capitalizedReceiver).filter(isMethodOwnerKind), ref, context),
         ref.filePath,
       );
-      // A class the PHP file can name comes first.
+      // A class the PHP file can name comes first. A name its `use` imports
+      // means that class there: the one the call reaches when it has the
+      // method, before namesakes the file may also import under an alias
+      // (`use …\Eloquent\Builder as EloquentBuilder; use …\Query\Builder;`).
+      // A class from outside the project leaves no namesake: Drupal's `$url`
+      // under `use Drupal\Core\Url;` is no views field plugin `Url`. (A
+      // Laravel facade's name is shared by what it hands out, so it says
+      // nothing, nor does an imported class without the method.)
       const phpNamed = ref.language === 'php' ? fuzzyClassCandidates.filter((c) => phpFileNamesClass(c, ref.filePath, context)) : [];
-      if (ref.language === 'php') fuzzyClassCandidates = [...phpNamed, ...fuzzyClassCandidates.filter((c) => !phpNamed.includes(c))];
+      if (ref.language === 'php') {
+        fuzzyClassCandidates = [...phpNamed, ...fuzzyClassCandidates.filter((c) => !phpNamed.includes(c))];
+        const imported = phpImportedAs(capitalizedReceiver, ref.filePath, context);
+        const meant = imported === undefined ? undefined : phpImportedClass(imported, context);
+        if (meant && !meant.facade) {
+          if (meant.nodes.length === 0) fuzzyClassCandidates = [];
+          else if (meant.nodes.some((c) => classStrategyMethod(c, methodName!, context))) {
+            fuzzyClassCandidates = [...meant.nodes];
+            phpNamed.push(...meant.nodes);
+          }
+        }
+      }
       // In Ruby, the class constant lookup finds from the call comes first.
       if (ref.language === 'ruby' && fuzzyClassCandidates.length > 1) {
         const looked = rubyConstantQn(capitalizedReceiver, rubyScopeAt(ref, context), context);
@@ -25185,6 +25466,14 @@ export function matchMethodCall(
           : ref.language === 'csharp' && isStdMethodName('csharp', methodName!)
             ? findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName!)
             : classStrategyMethod(classNode, methodName!, context);
+        // Inside the class a PHP variable is named after, it is another
+        // instance of that class by its name alone, for what the class declares
+        // or takes from its traits: `$model->fill()` in `Model`. Not for what it
+        // inherits from a parent class, which is no likelier than what another
+        // class has: `$view` inside the views area plugin `View` holds a
+        // `ViewExecutable`, and reached `HandlerBase::access` three classes up.
+        if (methodNode && ref.language === 'php' && classNode.filePath === ref.filePath &&
+            classNode.startLine <= ref.line && classNode.endLine >= ref.line && isPhpInheritedFromParent(methodNode, classNode, context)) continue;
 
         if (methodNode && !(ref.language === 'kotlin' && !isKotlinExtensionInScope(methodNode, ref, context))) {
           if (throughCppNamespace()) return null;
@@ -32593,6 +32882,13 @@ function matchReferenceInner(
   // worse than none).
   if (ref.referenceKind === 'function_ref') {
     return matchFunctionRef(ref, context);
+  }
+
+  // `parent::x()`, `self::x()` or `$this->x()` inside a PHP anonymous class:
+  // what that class reaches, as PHP looks it up.
+  if (ref.language === 'php' && ref.referenceKind === 'calls') {
+    const anonymous = matchPhpAnonymousClassCall(ref, context);
+    if (anonymous !== undefined) return anonymous;
   }
 
   // A python name imported from a module the project does not provide — `from
