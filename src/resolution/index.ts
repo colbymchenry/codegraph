@@ -299,7 +299,8 @@ function moduleConfigEntry(abs: string, previous: string | undefined, projectRoo
   try {
     stat = fs.statSync(abs, { throwIfNoEntry: false });
   } catch { /* a file that can't be looked at is not there */ }
-  if (!stat) return 'absent';
+  // (A FIFO under one of these names would park the read.)
+  if (!stat?.isFile()) return 'absent';
   const stamp = `${stat.mtimeMs}:${stat.size}`;
   return previous?.endsWith(`@${stamp}`) ? previous : `${moduleConfigDigest(abs, projectRoot)}@${stamp}`;
 }
@@ -857,6 +858,16 @@ export class ReferenceResolver {
     }
   }
 
+  /** The text a walk over the indexed files reads: see ResolutionContext.scanFile. */
+  private scanFile(filePath: string): string | null {
+    if (this.fileCache.has(filePath)) return this.fileCache.get(filePath) ?? null;
+    try {
+      return readSourceText(path.join(this.projectRoot, filePath), 'latin1');
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Create the resolution context
    */
@@ -1044,6 +1055,7 @@ export class ReferenceResolver {
       readFile: (filePath: string) => this.readFileCached(filePath),
 
       fileContains: (filePath: string, needle: string) => this.fileContains(filePath, needle),
+      scanFile: (filePath: string) => this.scanFile(filePath),
 
       getFileLines: (filePath: string) => {
         const cached = this.fileLinesCache.get(filePath);
@@ -3375,7 +3387,8 @@ export class ReferenceResolver {
       ...this.context,
       readFile: (filePath: string) => {
         try {
-          return fs.readFileSync(path.join(this.projectRoot, filePath), 'utf-8');
+          const abs = path.join(this.projectRoot, filePath);
+          return fs.statSync(abs).isFile() ? fs.readFileSync(abs, 'utf-8') : null;
         } catch {
           return null;
         }
