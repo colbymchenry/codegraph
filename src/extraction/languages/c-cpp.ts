@@ -2995,6 +2995,11 @@ export function isCppConstructorDeclaration(node: SyntaxNode): boolean {
     && getChildByField(declarator, 'declarator')?.text === getChildByField(owner, 'name')?.text;
 }
 
+/** A bare `signals:` / `slots:` section header, as `blankQtMacros` reads one. */
+const QT_BARE_SECTION_RE = /^[ \t]*(?:(?:public|private|protected)[ \t]+)?(?:signals|slots)[ \t]*:(?!:)/m;
+/** A bare `emit name(` statement, as `blankQtMacros` reads one. */
+const QT_BARE_EMIT_RE = /\bemit\s+[A-Za-z_]\w*\s*\(/;
+
 /**
  * Blank Qt-specific macros that cause tree-sitter to misparse C++ class bodies.
  *
@@ -3009,19 +3014,20 @@ export function isCppConstructorDeclaration(node: SyntaxNode): boolean {
  *   lets tree-sitter see a clean return type and extract the method normally.
  */
 export function blankQtMacros(source: string): string {
-  // Fast path: not a Qt file
+  // Fast path: not a Qt file. `signals`, `slots` and `emit` are ordinary words
+  // elsewhere, so only the shapes the blanks below act on count.
   if (!source.includes('Q_OBJECT') && !source.includes('Q_GADGET') &&
     !source.includes('Q_NAMESPACE') &&
-    !source.includes('signals') && !source.includes('Q_SIGNALS') &&
-    !source.includes('slots') && !source.includes('Q_SLOTS') &&
+    !source.includes('Q_SIGNALS') && !source.includes('Q_SLOTS') &&
     !source.includes('Q_INVOKABLE') && !source.includes('Q_REQUIRED_RESULT') &&
     !source.includes('Q_DECL_') &&
-    !source.includes('emit') && !source.includes('Q_EMIT') &&
+    !source.includes('Q_EMIT') &&
     !source.includes('QML_ELEMENT') && !source.includes('QML_NAMED_ELEMENT') &&
     !source.includes('QML_SINGLETON') && !source.includes('QML_UNCREATABLE') &&
     !source.includes('QML_FOREIGN') &&
     !source.includes('QML_INTERFACE') && !source.includes('QML_VALUE_TYPE') &&
-    !source.includes('QML_ANONYMOUS')) {
+    !source.includes('QML_ANONYMOUS') &&
+    !QT_BARE_SECTION_RE.test(source) && !QT_BARE_EMIT_RE.test(source)) {
     return source;
   }
 

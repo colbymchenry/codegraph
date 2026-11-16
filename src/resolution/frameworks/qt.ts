@@ -98,6 +98,9 @@ const RE_QML_NAMED_ELEMENT = /\bQML_NAMED_ELEMENT\s*\(\s*(\w+)\s*\)/g;
  */
 const QML_ELEMENT_PATTERN = /\bQML_ELEMENT\b/;
 
+/** C++ files `detect()` reads at most, so a large non-Qt tree is not read whole on every detection. */
+const QT_DETECT_FILE_SAMPLE = 200;
+
 function hasQtCppMarkers(content: string, code: string): boolean {
   if (Q_OBJECT_PATTERN.test(code) || QML_ELEMENT_PATTERN.test(code)) return true;
   for (const match of content.matchAll(new RegExp(QT_INCLUDE_PATTERN.source, 'gm'))) {
@@ -880,16 +883,6 @@ export const qtResolver: FrameworkResolver = {
     // Check for .qml files in the project
     if (allFiles.some((f) => f.endsWith('.qml'))) return true;
 
-    // Check for Qt headers in C++ files
-    for (const file of allFiles) {
-      if (!file.endsWith('.cpp') && !file.endsWith('.h') && !file.endsWith('.hpp')) continue;
-      const content = context.readFile(file);
-      const code = content && maskCppNonCode(content);
-      if (content && code && hasQtCppMarkers(content, code)) {
-        return true;
-      }
-    }
-
     // Check CMakeLists.txt for Qt
     const cmake = context.readFile('CMakeLists.txt');
     if (cmake && /find_package\s*\(\s*Qt/i.test(cmake)) return true;
@@ -899,6 +892,19 @@ export const qtResolver: FrameworkResolver = {
     if (proFile) {
       const pro = context.readFile(proFile);
       if (pro && /QT\s*[+]?=/.test(pro)) return true;
+    }
+
+    // Check for Qt headers in C++ files. Every file read here is a detection input
+    // that a sync re-runs detection for, so the scan is bounded, as React Native's is.
+    let sampled = 0;
+    for (const file of allFiles) {
+      if (!file.endsWith('.cpp') && !file.endsWith('.h') && !file.endsWith('.hpp')) continue;
+      if (++sampled > QT_DETECT_FILE_SAMPLE) break;
+      const content = context.readFile(file);
+      const code = content && maskCppNonCode(content);
+      if (content && code && hasQtCppMarkers(content, code)) {
+        return true;
+      }
     }
 
     return false;
@@ -1111,5 +1117,20 @@ export const qtResolver: FrameworkResolver = {
     // `onCountChanged` names a change signal no node declares: the property's.
     return ref.referenceKind === 'references' && /^\w+Changed$/.test(name) &&
       !!ref.candidates?.some((candidate) => candidate.endsWith(`::${name}`));
+  },
+
+  // Qt proves these or they stay unresolved: name matching would land an import
+  // on the import node of the same name, and an owner-qualified member on a namesake.
+  ownsReference(ref: UnresolvedRef): boolean {
+    if (ref.language === 'qml' && ref.referenceKind === 'imports') return true;
+    return !!ref.candidates?.some(
+      (candidate) =>
+        candidate.startsWith('qt.property-accessor|') ||
+        (ref.language === 'qml' &&
+          (candidate.startsWith('qt.qml-id|') ||
+            candidate.startsWith('qt.context-property|') ||
+            candidate.startsWith('qt.enum-member|') ||
+            (ref.referenceKind === 'references' && candidate.endsWith(`::${ref.referenceName}`)))),
+    );
   },
 };

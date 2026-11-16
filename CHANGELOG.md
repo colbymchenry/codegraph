@@ -53,8 +53,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
-- QML, the declarative language used with the Qt framework, is now indexed, including component structure, module imports and flows from QML handlers into C++ through Qt signals, slots, invokable methods and properties.
-- Qt macros in C++ files no longer disturb the parser: source positions stay exact, comments and string literals are untouched, and QML objects, bindings and multi-line functions keep their place in the component hierarchy with their full bodies.
+- QML, the declarative language used with the Qt framework, is now indexed: components and nested objects, `id`s, properties, signals, functions with their JavaScript bodies, `Connections`, enums, imports and `qmldir` modules. (#759)
+- A flow that starts in QML now continues into C++: handlers link to the C++ they trigger through signals and slots, `Q_INVOKABLE` methods, `Q_PROPERTY` accessors, context properties, types registered with `QML_ELEMENT` or `qmlRegisterType`, and objects reached with `findChild` and `invokeMethod`, so `codegraph_explore` can follow an action from the UI down into C++.
+- Qt C++ classes that use macros such as `Q_OBJECT`, `signals:`, `slots:`, `Q_INVOKABLE` and `emit` now index cleanly, with every method and signal in its place. Re-index Qt projects after upgrading.
 
 ### Fixes
 

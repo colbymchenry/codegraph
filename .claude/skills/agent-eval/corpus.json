@@ -1,12 +1,56 @@
 {
   "_comment": "Test corpus for /agent-eval. Add entries freely. size: Small (<~150 files), Medium (~150-1500), Large (>~1500). 'question' is a representative architectural question that exercises cross-file understanding.",
-  "C++": [
+"QML": [
     {
+    "name": "cool-retro-term",
+    "repo": "https://github.com/Swordfish90/cool-retro-term",
+    "size": "Small",
+    "files": "~35",
+    "question": "How does a setting changed in the settings window (for example in SettingsEffectsTab) reach the ShaderTerminal effect, and how is it saved through Storage and the fileIO object that main.cpp exposes to QML?"
+},
+{
+    "name": "caelestia-shell",
+    "repo": "https://github.com/caelestia-dots/shell",
+    "size": "Medium",
+    "files": "~450",
+    "question": "How does the C++ audio visualiser (CavaProvider) feed the QML that draws it, and how does a new audio frame update the bars?"
+},
+{
+    "name": "plasma-desktop",
+    "repo": "https://github.com/KDE/plasma-desktop",
+    "size": "Medium",
+    "files": "~630",
+    "question": "How does the Task Manager applet's QML call into its C++ Backend (applets/taskmanager/backend.h) to act on a window?"
+}
+],
+"Qt": [
+{
+    "name": "sddm",
+    "repo": "https://github.com/sddm/sddm",
+    "size": "Small",
+    "files": "~120",
+    "question": "How does the QML theme's login call on the sddm context object reach the daemon, and how do the login result signals come back to QML?"
+},
+{
       "name": "kdeconnect-kde",
       "repo": "https://invent.kde.org/network/kdeconnect-kde",
       "size": "Medium",
-      "files": "~800",
+    "files": "~350",
       "question": "How do plugin signals (e.g. ping received) route to the DBus interface and eventually to the QML UI?"
+    },
+    {
+        "name": "keepassxc",
+        "repo": "https://github.com/keepassxreboot/keepassxc",
+        "size": "Medium",
+        "files": "~810",
+        "question": "When an entry is edited, how does the change propagate from Entry through ModifiableObject::modified to Database::markAsModified and the signals the UI listens to?"
+    },
+    {
+        "name": "qgroundcontrol",
+        "repo": "https://github.com/mavlink/qgroundcontrol",
+        "size": "Large",
+        "files": "~3200",
+        "question": "How does a MAVLink message received in MAVLinkProtocol::receiveBytes reach Vehicle::_mavlinkMessageReceived and end up as a Fact value shown in the Fly View QML?"
     }
   ],
   "TypeScript": [

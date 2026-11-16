@@ -467,7 +467,8 @@ function resolveWasmPath(lang: GrammarLanguage): string {
  * those grammars must be loaded even when no plain .ts/.js file is in the index
  * set (e.g. a pure-.astro content site). A Vue `<script lang="tsx">` is read
  * with the TSX grammar (#2570), which nothing else loads in a project without
- * a .tsx or .js file. CFML (.cfc/.cfm) likewise delegates
+ * a .tsx or .js file. QML hands the JavaScript in its handlers and functions
+ * to the JS extractor. CFML (.cfc/.cfm) likewise delegates
  * bare-script content, <cfscript> tag bodies, and <cfquery> SQL bodies to the
  * cfscript/cfquery grammars (see injections.scm in tree-sitter-cfml).
  */
@@ -477,6 +478,9 @@ function expandGrammarLanguages(languages: Language[]): Language[] {
   }
   if (languages.includes('vue')) {
     languages = [...languages, 'tsx'];
+  }
+  if (languages.includes('qml')) {
+    languages = [...languages, 'javascript'];
   }
   if (languages.some((l) => l === 'cfml')) {
     languages = [...languages, 'cfscript', 'cfquery'];
@@ -560,12 +564,6 @@ export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?
 export async function loadAllGrammars(): Promise<void> {
   const allLanguages = Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[];
   await loadGrammarsForLanguages(allLanguages);
-}
-
-export function includeEmbeddedGrammarDependencies(languages: Language[]): Language[] {
-  const required = new Set(languages);
-  if (required.has('qml')) required.add('javascript');
-  return [...required];
 }
 
 /**

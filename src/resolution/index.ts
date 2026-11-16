@@ -1987,39 +1987,6 @@ export class ReferenceResolver {
         ? viaNamespace : null;
     }
 
-    // A QML import names a file or module that Qt either proves or does not:
-    // name matching would land it on the import node of the same name.
-    if (ref.language === 'qml' && ref.referenceKind === 'imports') {
-      return candidates.length > 0
-        ? candidates.reduce((best, curr) => curr.confidence > best.confidence ? curr : best)
-        : null;
-    }
-
-    // A Q_PROPERTY accessor is owner-qualified too: when Qt cannot prove the
-    // accessor, name matching must not bind it to the property of the same name.
-    if (ref.candidates?.some((candidate) => candidate.startsWith('qt.property-accessor|'))) {
-      return candidates.length > 0
-        ? candidates.reduce((best, curr) => curr.confidence > best.confidence ? curr : best)
-        : null;
-    }
-
-    // Owner-qualified QML refs are terminal: if Qt cannot prove the owner,
-    // generic name matching must not guess among same-named members.
-    if (
-      ref.language === 'qml' &&
-      ref.candidates?.some(
-        (candidate) =>
-          candidate.startsWith('qt.qml-id|') ||
-          candidate.startsWith('qt.context-property|') ||
-          candidate.startsWith('qt.enum-member|') ||
-          (ref.referenceKind === 'references' && candidate.endsWith(`::${ref.referenceName}`)),
-      )
-    ) {
-      return candidates.length > 0
-        ? candidates.reduce((best, curr) => curr.confidence > best.confidence ? curr : best)
-        : null;
-    }
-
     // Strategy 2: Try import-based resolution
     // A TS/JS/Python call-receiver chain (`useStore.getState().reset`, #1683)
     // names the ROOT's import, not the method's: letting resolveViaImport see

@@ -24,7 +24,7 @@ import { ParseWorkerPool, parseWindowSize, resolveParsePoolSize, resolveParseTim
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { detectLanguage, includeEmbeddedGrammarDependencies, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -999,11 +999,9 @@ export function preloadLanguagesForFiles(
   overrides?: Record<string, Language>,
   rootDir?: string
 ): Language[] {
-  const detected = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides, rootDir)))];
+  const languages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides, rootDir)))];
   // A Flow-typed `.js` is read with the TSX grammar (see detectLanguage).
-  if ((detected.includes('javascript') || detected.includes('jsx')) && !detected.includes('tsx')) detected.push('tsx');
-  // Only files on disk count above: the JavaScript a QML file embeds is not a Flow-typed `.js`.
-  const languages = includeEmbeddedGrammarDependencies(detected);
+  if ((languages.includes('javascript') || languages.includes('jsx')) && !languages.includes('tsx')) languages.push('tsx');
   if (languages.includes('c')) {
     for (const ambiguous of ['cpp', 'objc'] as const) {
       if (!languages.includes(ambiguous)) languages.push(ambiguous);

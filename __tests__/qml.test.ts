@@ -8,14 +8,13 @@
 import { beforeAll, describe, it, expect } from 'vitest';
 import { QmlExtractor } from '../src/extraction/qml-extractor';
 import { TreeSitterExtractor } from '../src/extraction/tree-sitter';
-import { preloadLanguagesForFiles } from '../src/extraction';
 import { qtResolver } from '../src/resolution/frameworks/qt';
 import {
     detectLanguage,
-    includeEmbeddedGrammarDependencies,
     initGrammars,
     isSourceFile,
     loadGrammarsForLanguages,
+    readGrammarWasmBytes,
 } from '../src/extraction/grammars';
 import { blankQtMacros } from '../src/extraction/languages/c-cpp';
 
@@ -38,12 +37,8 @@ describe('QML language detection', () => {
     expect(isSourceFile('ui/Main.qml')).toBe(true);
   });
 
-    it('loads JavaScript grammar for embedded QML bodies', () => {
-        expect(includeEmbeddedGrammarDependencies(['qml'])).toEqual(['qml', 'javascript']);
-    });
-
-    it('preloads JavaScript for QML files', () => {
-        expect(preloadLanguagesForFiles(['ui/Main.qml'])).toEqual(['qml', 'javascript']);
+    it('loads the JavaScript grammar for embedded QML bodies', async () => {
+        expect(Object.keys(await readGrammarWasmBytes(['qml']))).toEqual(['javascript']);
     });
 });
 
