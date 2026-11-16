@@ -230,6 +230,25 @@ describe('a sync follows a module-config change (#2977)', () => {
     expect(stateOf(root, graph)).toEqual(await fullIndexWithDb('other'));
   }, 120_000);
 
+  it('a folder under a config\'s name is no config: it counts as absent, and the next candidate is read', async () => {
+    const root = tempRoot();
+    write(root, { ...C_BEFORE, 'build/compile_commands.json': compileDb(root, 'third') });
+    fs.mkdirSync(path.join(root, 'compile_commands.json'));
+    fs.mkdirSync(path.join(root, 'Cargo.toml'));
+    const graph = await index(root);
+    expect(includeTarget(graph, 'src/a.c')).toEqual(['third/foo.h']);
+    const db = DatabaseConnection.open(getDatabasePath(root));
+    try {
+      const stored = db.getDb().prepare("SELECT value FROM project_metadata WHERE key = 'module_config_snapshot'").get() as { value: string };
+      const snapshot = JSON.parse(stored.value) as Record<string, string>;
+      expect(snapshot['compile_commands.json']).toBe('absent');
+      expect(snapshot['Cargo.toml']).toBe('absent');
+      expect(snapshot['build/compile_commands.json']).not.toBe('absent');
+    } finally {
+      db.close();
+    }
+  }, 120_000);
+
   it('a later process sees the change too', async () => {
     const root = tempRoot();
     write(root, TS_BEFORE);
