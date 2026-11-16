@@ -36,6 +36,7 @@ import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
 import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
 import { createImportReader, reopenReferencesThroughRemovedFiles } from '../resolution/module-importers';
+import { manifestEvidence, type ManifestEvidence } from '../resolution/workspace-packages';
 import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
 export { oversizeStamp };
 
@@ -602,7 +603,7 @@ function readGitExcludeExtraPatterns(rootDir: string): string {
  * same way the indexer skips them (#1728). Each one is a path, not a pattern:
  * see {@link ScopeIgnore}.
  */
-function listGitIgnoredDirectories(rootDir: string): string[] {
+function listGitIgnoredDirectories(rootDir: string, sink?: string[]): string[] {
   try {
     const out = execFileSync(
       'git',
@@ -622,6 +623,8 @@ function listGitIgnoredDirectories(rootDir: string): string[] {
       if (isWholeCwdEntry(raw)) continue;
       const entry = normalizePath(raw);
       dirs.push(entry.endsWith('/') ? entry : `${entry}/`);
+      // As git gave it: a folder with its trailing slash, a file without.
+      sink?.push(entry);
     }
     return dirs;
   } catch {
@@ -1105,7 +1108,7 @@ export class ScopeIgnore {
  * embedded roots (the scanner discovers them during collection), pass them to
  * skip rediscovery; otherwise they're discovered here (the watcher path).
  */
-export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<string>): ScopeIgnore {
+export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<string>, ignoredEntries?: string[]): ScopeIgnore {
   const roots = embeddedRoots ? [...embeddedRoots] : discoverEmbeddedRepoRoots(rootDir);
   const include = loadIncludeMatcher(rootDir);
   // The root matcher has defaults + root `.gitignore` + info/exclude +
@@ -1118,7 +1121,7 @@ export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<strin
     loadExcludeMatcher(rootDir),
     include,
     include ? includeStaticRoots(loadIncludePatterns(rootDir)) : [],
-    new Set(listGitIgnoredDirectories(rootDir)),
+    new Set(listGitIgnoredDirectories(rootDir, ignoredEntries)),
   );
 }
 
@@ -1367,7 +1370,7 @@ function isGitlinkEntry(entry: string): boolean {
  * found) is recorded in `embeddedRoots` so callers can exempt its files from the
  * parent's own gitignore rules.
  */
-function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, embeddedRoots?: Set<string>, includeIgnored: Ignore | null = null): void {
+function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, embeddedRoots?: Set<string>, includeIgnored: Ignore | null = null, gitlinks?: string[]): void {
   const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true };
 
   // Tracked files. --recurse-submodules pulls in files from active submodules,
@@ -1409,6 +1412,7 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
     const rel = entry.slice(tab + 1);
     if (isGitlinkEntry(entry)) {
       gitlinkRels.push(rel); // an unexpanded gitlink — recursed into below, not a source file itself
+      gitlinks?.push(normalizePath(prefix + rel));
       continue;
     }
     if (entry[0] === 'S' && !fs.existsSync(path.join(repoDir, rel))) continue;
@@ -1528,7 +1532,7 @@ function gitRepoPrefix(dir: string): string {
  * embedded (nested, non-submodule) git repos. Returns null on failure
  * (non-git project) so callers can fall back to a filesystem walk.
  */
-function getGitVisibleFiles(rootDir: string): Set<string> | null {
+function getGitVisibleFiles(rootDir: string, onManifestEvidence?: (evidence: ManifestEvidence) => void): Set<string> | null {
   try {
     // Check if the project directory is gitignored by a parent repo.
     // When rootDir lives inside a parent git repo that ignores it,
@@ -1550,14 +1554,24 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
 
     const files = new Set<string>();
     const embeddedRoots = new Set<string>();
-    collectGitFiles(rootDir, '', files, embeddedRoots, loadIncludeIgnoredMatcher(rootDir));
+    const gitlinks: string[] = [];
+    collectGitFiles(rootDir, '', files, embeddedRoots, loadIncludeIgnoredMatcher(rootDir), gitlinks);
     // Apply built-in default ignores uniformly — to tracked files too, since
     // committing a dependency/build dir doesn't make it project code. A
     // `.gitignore` negation (e.g. `!vendor/`) is the explicit opt-in. (issue #407)
     // Files inside an EMBEDDED repo are matched against that repo's own rules,
     // not the parent's: the parent's .gitignore hides the child repo from git,
     // not from the index. (#514)
-    const ig = buildScopeIgnore(rootDir, embeddedRoots);
+    const ignoredEntries: string[] | undefined = onManifestEvidence ? [] : undefined;
+    const ig = buildScopeIgnore(rootDir, embeddedRoots, ignoredEntries);
+    // What git's listings say about the package manifests the workspace walk
+    // reads, taken from the lists this scan made anyway: every file git
+    // lists, before any scope rule, and what it ignores. A full sync compares
+    // it with what the last walk found (see trustedManifestList).
+    if (onManifestEvidence) {
+      onManifestEvidence(manifestEvidence(rootDir, files, ignoredEntries!,
+        embeddedRoots.size === 0 && gitlinks.length === 0 && !fs.existsSync(path.join(gitRoot, '.gitmodules'))));
+    }
     const visible = new Set([...files].filter((f) => !ig.ignores(f)));
     // Force-include first-party source the project whitelisted in
     // `codegraph.json` `include`. These are gitignored, so `git ls-files` never
@@ -1888,12 +1902,14 @@ function tallySkip(stats: ScanSkipStats | undefined, rel: string): void {
 export async function scanDirectoryAsync(
   rootDir: string,
   onProgress?: (current: number, file: string) => void,
-  stats?: ScanSkipStats
+  stats?: ScanSkipStats,
+  /** Given what git's listings say about the package manifests (git repositories only; see ManifestEvidence). */
+  onManifestEvidence?: (evidence: ManifestEvidence) => void
 ): Promise<string[]> {
   // Custom extension → language overrides from the project's codegraph.json.
   const overrides = loadExtensionOverrides(rootDir);
 
-  const gitFiles = getGitVisibleFiles(rootDir);
+  const gitFiles = getGitVisibleFiles(rootDir, onManifestEvidence);
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
@@ -2153,6 +2169,12 @@ export class ExtractionOrchestrator {
   private detectionInputs: { sourceFiles: Set<string>; diskPaths: Map<string, string> } | null = null;
   /** Files were added or removed since the last detection: the file list it read is out of date. */
   private detectionFileListChanged = false;
+  /**
+   * What the last full scan's git listings said about the package manifests
+   * (see ManifestEvidence): null when it listed no git repository, or before
+   * a full index or full sync has scanned. Taken once by the caller.
+   */
+  private manifestEvidence: ManifestEvidence | null = null;
   /**
    * What detection read, by project-relative path, kept between detections: a
    * source file until a sync changes it, any other path while its signature
@@ -2475,6 +2497,7 @@ export class ExtractionOrchestrator {
     // attributed — these labels settle scan vs framework-detect vs grammars.
     const tScan = Date.now();
     const skipStats: ScanSkipStats = { unsupportedByExtension: new Map() };
+    this.manifestEvidence = null;
     const files = await scanDirectoryAsync(this.rootDir, (current, file) => {
       onProgress?.({
         phase: 'scanning',
@@ -2482,7 +2505,7 @@ export class ExtractionOrchestrator {
         total: 0,
         currentFile: file,
       });
-    }, skipStats);
+    }, skipStats, (evidence) => { this.manifestEvidence = evidence; });
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] scan: ${Date.now() - tScan}ms (${files.length} files)`);
     /** Only meaningful when nothing was indexable — see IndexResult (#1502). */
     const skipSummary = (): Pick<IndexResult, 'filesSkippedUnsupported' | 'topUnsupportedExtensions'> => {
@@ -3881,7 +3904,8 @@ export class ExtractionOrchestrator {
       // `.gitignore` / exclude-standard change that forced this full sync is
       // visible to the next scoped sync (#1728).
       this.scopedMatcher = null;
-      currentFiles = await scanDirectoryAsync(this.rootDir);
+      this.manifestEvidence = null;
+      currentFiles = await scanDirectoryAsync(this.rootDir, undefined, undefined, (evidence) => { this.manifestEvidence = evidence; });
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
       filesChecked = currentFiles.length;
 
@@ -4129,6 +4153,13 @@ export class ExtractionOrchestrator {
       ...(removedFilePaths.length > 0 ? { removedFilePaths } : {}),
       ...(detectedFrameworks ? { detectedFrameworks } : {}),
     };
+  }
+
+  /** What the last full scan's git listings said about the package manifests, once (see manifestEvidence). */
+  takeManifestEvidence(): ManifestEvidence | null {
+    const evidence = this.manifestEvidence;
+    this.manifestEvidence = null;
+    return evidence;
   }
 
   private indexedDirtyPaths(stamp: string | null): string[] | null {
