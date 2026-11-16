@@ -2567,7 +2567,7 @@ const LUA_NAME_ALIAS = /^([A-Za-z_]\w*)((?:\s*\.\s*[A-Za-z_]\w*)*)\s*$/;
 function luaAliasTarget(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
   const decl = luaLocalDecl(ref.referenceName, ref.filePath, ref.line, context);
   if (!decl) return undefined;
-  const target = luaAliasOf(decl, context, 0);
+  const target = luaAliasOf(decl, context);
   if (target === undefined) return undefined;
   if (target === null) return null;
   return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
@@ -2611,26 +2611,52 @@ interface LuaSite { file: string; line: number; name: string; node: Node }
  * global), null for the standard library or an outside module, `undefined`
  * for an initializer that is not an alias.
  */
-function luaAliasOf(decl: Node, context: ResolutionContext, depth: number): Node | null | undefined {
+function luaAliasOf(decl: Node, context: ResolutionContext): Node | null | undefined {
+  return luaFollow(luaAliasOfStep(decl, context), context);
+}
+
+function luaAliasOfStep(decl: Node, context: ResolutionContext): LuaStep {
   const rhs = decl.signature!.replace(/^\s*=\s*/, '').trim();
-  return luaAliasExpr(rhs, { file: decl.filePath, line: decl.startLine, name: decl.name, node: decl }, context, depth);
+  return luaAliasStep(rhs, { file: decl.filePath, line: decl.startLine, name: decl.name, node: decl }, context);
 }
 
 const luaMembers = (chain: string): string[] => chain.split('.').map((s) => s.trim()).filter(Boolean);
 
-function luaAliasExpr(rhs: string, site: LuaSite, context: ResolutionContext, depth: number): Node | null | undefined {
+/**
+ * One step of a Lua alias: what it names, or the module member it leads to,
+ * which the walk in luaModuleMember takes next. Steps rather than calls keep a
+ * chain of re-exports from taking a stack frame per module.
+ */
+type LuaStep = { done: Node | null | undefined } | { member: { name: string; path: string[]; decl: Node } };
+
+function luaFollow(step: LuaStep, context: ResolutionContext): Node | null | undefined {
+  return 'member' in step ? luaModuleMember(step.member.name, step.member.path, step.member.decl, context) : step.done;
+}
+
+/** `require(name)` from `decl`'s file, then `path`: a member to walk to, or, with no path, the module itself. */
+function luaMemberStep(name: string, path: string[], decl: Node, context: ResolutionContext): LuaStep {
+  // `require "kong.conf_loader"` called directly: the module's returned value.
+  if (path.length === 0) return { done: luaModuleFile(name, decl, context) ? undefined : null };
+  return { member: { name, path, decl } };
+}
+
+function luaAliasStep(rhs: string, site: LuaSite, context: ResolutionContext): LuaStep {
   const req = LUA_REQUIRE_ALIAS.exec(rhs);
-  if (req) return luaModuleMember(req[2]!, luaMembers(req[3]!), site.node, context, depth);
+  if (req) return luaMemberStep(req[2]!, luaMembers(req[3]!), site.node, context);
   const named = LUA_NAME_ALIAS.exec(rhs);
-  if (!named) return undefined;
+  if (!named) return { done: undefined };
   const root = named[1]!;
   const path = luaMembers(named[2]!);
   const rootDecl = root === site.name ? null : luaLocalDecl(root, site.file, site.line - 1, context);
   if (rootDecl) {
     const module = LUA_REQUIRE_ALIAS.exec(rootDecl.signature!.replace(/^\s*=\s*/, '').trim());
-    if (module && path.length > 0) return luaModuleMember(module[2]!, [...luaMembers(module[3]!), ...path], rootDecl, context, depth);
-    return undefined;
+    return module && path.length > 0 ? luaMemberStep(module[2]!, [...luaMembers(module[3]!), ...path], rootDecl, context) : { done: undefined };
   }
+  return { done: luaGlobalAlias(root, path, site, context) };
+}
+
+/** An alias of a name no local in reach holds: a host table's method, a library function the project patches, or nothing of the project's. */
+function luaGlobalAlias(root: string, path: string[], site: LuaSite, context: ResolutionContext): Node | null | undefined {
   if (path.length === 0) return LUA_GLOBAL_FUNCTIONS.has(root) ? null : undefined;
   if (!LUA_LIBRARY_TABLES.has(root)) {
     // A member of a global table the host provides — kong's `local clear_header =
@@ -2654,33 +2680,64 @@ function luaAliasExpr(rhs: string, site: LuaSite, context: ResolutionContext, de
 /** Per-context memo: `file\0a.b` → what that module member is. */
 const LUA_MEMBERS = new WeakMap<ResolutionContext, Map<string, Node | null | undefined>>();
 
-/** `member` of the module `require(name)` returns, from `decl`'s file: its function of that name. */
-function luaModuleMember(name: string, path: string[], decl: Node, context: ResolutionContext, depth: number): Node | null | undefined {
-  const file = luaModuleFile(name, decl, context);
-  if (!file) return null;
-  // `require "kong.conf_loader"` called directly: the module's returned value.
-  if (path.length === 0) return undefined;
+/**
+ * `member` of the module `require(name)` returns, from `decl`'s file: its
+ * function of that name. A member a module re-exports from another is followed
+ * to its end, in a loop: each module leads to one place, so a chain has one
+ * answer wherever it's entered, which every module the walk passes gets, and a
+ * chain that comes back to itself has none.
+ */
+function luaModuleMember(name: string, path: string[], decl: Node, context: ResolutionContext): Node | null | undefined {
   let memo = LUA_MEMBERS.get(context);
   if (!memo) LUA_MEMBERS.set(context, (memo = new Map()));
-  const key = `${file}\0${path.join('.')}`;
-  if (memo.has(key)) return memo.get(key);
-  memo.set(key, null); // a cycle of re-exports names nothing
-  const found = luaMemberIn(file, path, context, depth);
-  memo.set(key, found);
+  const walked = new Set<string>();
+  let found: Node | null | undefined = null;
+  let at: { name: string; path: string[]; decl: Node } | null = { name, path, decl };
+  while (at) {
+    const file = luaModuleFile(at.name, at.decl, context);
+    if (!file) {
+      found = null;
+      break;
+    }
+    if (at.path.length === 0) {
+      found = undefined;
+      break;
+    }
+    const key = `${file}\0${at.path.join('.')}`;
+    if (memo.has(key)) {
+      found = memo.get(key);
+      break;
+    }
+    if (walked.has(key)) {
+      found = null;
+      break;
+    }
+    walked.add(key);
+    const step = luaMemberIn(file, at.path, context);
+    if ('member' in step) {
+      at = step.member;
+    } else {
+      found = step.done;
+      at = null;
+    }
+  }
+  for (const key of walked) memo.set(key, found);
   return found;
 }
 
-function luaMemberIn(file: string, path: string[], context: ResolutionContext, depth: number): Node | null | undefined {
+/** What module `file` has as `path`: a function of its own, or the step to where it re-exports it from. */
+function luaMemberIn(file: string, path: string[], context: ResolutionContext): LuaStep {
   const member = path[path.length - 1]!;
   const nodes = context.getNodesInFile(file);
   const inFile = nodes.filter((n) => n.name === member);
   const fns = inFile.filter((n) => n.kind === 'function' || n.kind === 'method');
   if (fns.length > 0) {
     const owner = path.length > 1 ? path[path.length - 2]! : null;
-    return fns.find((n) => owner !== null && n.qualifiedName.endsWith(`${owner}::${member}`)) ??
-      fns.find((n) => n.kind === 'method') ?? fns[0]!;
+    return {
+      done: fns.find((n) => owner !== null && n.qualifiedName.endsWith(`${owner}::${member}`)) ??
+        fns.find((n) => n.kind === 'method') ?? fns[0]!,
+    };
   }
-  if (depth >= 3) return null;
   // The module exports something under this name: `return { check = check_phase }`,
   // `_M.check = check_phase`, `kong_exec = cmd.kong_exec,` (spec helpers' table).
   const source = (context.readFile(file) ?? '')
@@ -2692,20 +2749,21 @@ function luaMemberIn(file: string, path: string[], context: ResolutionContext, d
     const line = source.slice(0, exported.index).split('\n').length + 1;
     if (/^[A-Za-z_]\w*$/.test(rhs)) {
       const fn = nodes.find((n) => n.name === rhs && (n.kind === 'function' || n.kind === 'method'));
-      if (fn) return fn;
+      if (fn) return { done: fn };
     }
     const at = nodes.find((n) => n.kind === 'file') ?? nodes[0];
-    const next = at ? luaAliasExpr(rhs, { file, line, name: member, node: at }, context, depth + 1) : undefined;
-    if (next !== undefined) return next;
+    // (A member to walk to always ends in an answer: only no step at all falls through.)
+    const next: LuaStep = at ? luaAliasStep(rhs, { file, line, name: member, node: at }, context) : { done: undefined };
+    if (!('done' in next) || next.done !== undefined) return next;
   }
   // The module re-exports an alias of its own (`local splitn = require(…).splitn`).
   const alias = inFile.find((n) => n.kind === 'variable' && n.signature && isLuaLocal(n, context));
   if (alias) {
-    const next = luaAliasOf(alias, context, depth + 1);
-    if (next !== undefined) return next;
+    const next = luaAliasOfStep(alias, context);
+    if (!('done' in next) || next.done !== undefined) return next;
   }
   const global = inFile.find((n) => n.kind === 'variable' && !isLuaLocal(n, context));
-  return global ?? null;
+  return { done: global ?? null };
 }
 
 /** The project file `require(name)` loads from `decl`'s file, or null for a module outside it. */
@@ -17421,7 +17479,7 @@ const CPP_CALLERS_MEMBERS = new WeakMap<ResolutionContext, Map<string, CppWritte
  * `TEST_F(Fixture, Name)` or `TEST_P` body is a method of a class derived
  * from `Fixture`. Null when none of them declares it.
  */
-function cppCallersMember(name: string, caller: Node, ref: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
+export function cppCallersMember(name: string, caller: Node, ref: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
   let memo = CPP_CALLERS_MEMBERS.get(context);
   if (!memo) CPP_CALLERS_MEMBERS.set(context, (memo = new Map()));
   const key = `${caller.id}\u0000${name}`;
@@ -18555,7 +18613,7 @@ function cppBasesKnown(cls: Node, context: ResolutionContext, depth = 0, seen = 
  * `inner(…).name(…)` keeps the first: the arguments at its position are the
  * inner call's.)
  */
-function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: ResolutionContext, depth = 0, seen = new Set<string>()): Node | null {
+export function cppMethodOf(cls: Node, name: string, ref: UnresolvedRef, context: ResolutionContext, depth = 0, seen = new Set<string>()): Node | null {
   const want = `${cls.qualifiedName}::${name}`;
   const named = context.getMethodMatches?.(cls.name, name, ref.language) ??
     context.getNodesByName(name).filter((n) => n.kind === 'method' && sameLanguageFamily(n.language, ref.language));
@@ -19303,7 +19361,7 @@ export function cppSpecializationArguments(n: Node, context: ResolutionContext):
  * calls — `unsigned short` for fmt's `num_bits<unsigned short>()` — or null
  * when it writes none, leaving them to be deduced.
  */
-function cppCallTemplateArguments(ref: UnresolvedRef, context: ResolutionContext): string[] | null {
+export function cppCallTemplateArguments(ref: UnresolvedRef, context: ResolutionContext): string[] | null {
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
   const text = lines.slice(ref.line - 1, ref.line + 3).join('\n');
   return cppTemplateArgumentsAfter(text, ref.referenceName.split(/::|\.|->/).pop()!, Math.max(0, ref.column));
@@ -19379,7 +19437,7 @@ type CppArgumentType =
  * `TryLock(column_family[i], keys[i], …)` on a `std::vector<Slice>`. Null
  * otherwise. (String literals are cppOverloadFit's.)
  */
-function cppArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionContext): CppArgumentType | null {
+export function cppArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionContext): CppArgumentType | null {
   const text = arg.trim();
   if (/^(?:u8|u|U|L)?'(?:[^'\\]|\\.)+'$/.test(text)) return { kind: 'char' };
   if (text === 'true' || text === 'false') return { kind: 'bool' };
@@ -19696,7 +19754,7 @@ function isCppDependentBase(decl: Node, base: Node, context: ResolutionContext):
  * declaration in an earlier block the call is outside of counts too: the
  * name strategies decide, as before.
  */
-function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+export function isCppLocalName(name: string, caller: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (caller.filePath !== ref.filePath || CPP_CLASS_KINDS.has(caller.kind)) return false;
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
   if (!lines) return false;
@@ -30562,27 +30620,39 @@ const TS_ALIASED_TYPES = new WeakMap<ResolutionContext, Map<string, Node | null>
  * The class or interface a type alias `file` declares stands for: react's
  * `export type BackendBridge = Bridge<BackendEvents, FrontendEvents>`, through
  * an alias of an alias, each name read the way the alias's own file reads it.
+ * An alias names one thing, so the walk is a loop that follows the chain to
+ * its end, however long, and every alias it passes gets that one answer; a
+ * chain that comes back to itself has none.
  */
-function tsAliasedType(name: string, file: string, at: UnresolvedRef, context: ResolutionContext, depth = 0): Node | null {
+function tsAliasedType(name: string, file: string, at: UnresolvedRef, context: ResolutionContext): Node | null {
   let memo = TS_ALIASED_TYPES.get(context);
   if (!memo) TS_ALIASED_TYPES.set(context, (memo = new Map()));
-  const key = file + '\0' + name;
-  const hit = memo.get(key);
-  if (hit !== undefined) return hit;
+  const walked = new Set<string>();
   let found: Node | null = null;
-  const alias = (context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file).filter((n) => n.name === name))
-    .find((n) => n.kind === 'type_alias');
-  const written = alias && depth < 4 ? tsAliasValueName(alias, context) : null;
-  // `type Box<T> = T | null` holds whatever its argument is.
-  if (alias && written && !tsClassTypeParameter(alias, written, context)) {
-    const named = tsNamedType(written, alias, at, context);
-    if (named && named !== 'outside') found = named;
-    else if (!named) {
-      const there = { ...at, filePath: alias.filePath, language: alias.language };
-      found = tsAliasedType(written.split('.').pop()!, tsImportedTypeFile(written, there, context) ?? alias.filePath, at, context, depth + 1);
+  for (;;) {
+    const key = file + '\0' + name;
+    const hit = memo.get(key);
+    if (hit !== undefined) {
+      found = hit;
+      break;
     }
+    if (walked.has(key)) break;
+    walked.add(key);
+    const alias = (context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file).filter((n) => n.name === name))
+      .find((n) => n.kind === 'type_alias');
+    const written = alias ? tsAliasValueName(alias, context) : null;
+    // `type Box<T> = T | null` holds whatever its argument is.
+    if (!alias || !written || tsClassTypeParameter(alias, written, context)) break;
+    const named = tsNamedType(written, alias, at, context);
+    if (named) {
+      if (named !== 'outside') found = named;
+      break;
+    }
+    const there = { ...at, filePath: alias.filePath, language: alias.language };
+    name = written.split('.').pop()!;
+    file = tsImportedTypeFile(written, there, context) ?? alias.filePath;
   }
-  memo.set(key, found);
+  for (const key of walked) memo.set(key, found);
   return found;
 }
 
@@ -32917,7 +32987,7 @@ function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext)
 }
 
 /** Split `a, f(b, c), d<e, f>` at its top-level commas. */
-function splitCppTopLevel(text: string): string[] {
+export function splitCppTopLevel(text: string): string[] {
   const out: string[] = [];
   let depth = 0;
   // Where each template argument list open around the current character closes.
@@ -33034,7 +33104,7 @@ function cppWithoutComments(text: string): string {
   return out;
 }
 
-function cppCallArguments(ref: UnresolvedRef, name: string, context: ResolutionContext): string[] | null {
+export function cppCallArguments(ref: UnresolvedRef, name: string, context: ResolutionContext): string[] | null {
   const list = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), name, context);
   return list === null ? null : splitCppTopLevel(cppWithoutComments(list));
 }
@@ -33052,7 +33122,7 @@ const CPP_OVERLOAD_PARAMETERS = new WeakMap<ResolutionContext, Map<string, strin
  * declares the method with the same parameter types and no default, or
  * not at all. A method a macro defines writes its list in its expansion.
  */
-function cppOverloadParameters(n: Node, name: string, context: ResolutionContext): string | null {
+export function cppOverloadParameters(n: Node, name: string, context: ResolutionContext): string | null {
   let memo = CPP_OVERLOAD_PARAMETERS.get(context);
   if (!memo) CPP_OVERLOAD_PARAMETERS.set(context, (memo = new Map()));
   const key = `${n.id}\u0000${name}`;
