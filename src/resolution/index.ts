@@ -1566,8 +1566,13 @@ export class ReferenceResolver {
     const unviewed = this.classExpressionFreeBases.get(outer) ?? outer;
     const base = unviewed === this.mocklessContext && this.mocklessBase ? this.mocklessBase : unviewed;
     const mockless = this.mocklessContextFor(ref, base) ?? base;
-    return this.resolveOneWith(this.classExpressionFreeContextFor(ref, mockless) ?? mockless, ref);
+    const context = this.classExpressionFreeContextFor(ref, mockless) ?? mockless;
+    this.lastResolved = { ref, context };
+    return this.resolveOneWith(context, ref);
   }
+
+  /** The reference resolveOne read last and the context it read it through, for parkable. */
+  private lastResolved: { ref: UnresolvedRef; context: ResolutionContext } | null = null;
 
   /** resolveOneIn with every strategy reading the graph through `context`. */
   private resolveOneWith(context: ResolutionContext, ref: UnresolvedRef): ResolvedRef | null {
@@ -2269,10 +2274,13 @@ export class ReferenceResolver {
    * that is not the one its name gives: a reference through an import
    * binding the module doesn't declare by that name waits for the module
    * (see importBindingTail). Decided here, where the file's import mappings
-   * are still cached from the attempt — in a resolver-pool worker too.
+   * are still cached from the attempt — in a resolver-pool worker too. A
+   * receiver's type is read through the context the attempt read it in,
+   * whose readings it reuses.
    */
   private parkable(ref: UnresolvedRef): UnresolvedRef {
-    const tail = importBindingTail(ref, this.context);
+    const read = this.lastResolved?.ref === ref ? this.lastResolved.context : this.context;
+    const tail = importBindingTail(ref, this.context, read);
     if (tail) ref.nameTail = tail;
     return ref;
   }

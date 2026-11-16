@@ -23234,6 +23234,12 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   JS_FN_CODE.delete(context);
   JS_SCOPE_FILES.delete(context);
   JS_MODULE_VALUES.delete(context);
+  JS_RECEIVER_CANDIDATES.delete(context);
+  JS_READER_TEXT.delete(context);
+  JS_FUNCTION_WRITTEN_TWICE.delete(context);
+  TS_RETURNED_TYPES.delete(context);
+  JS_GUARDED_NAMES.delete(context);
+  TS_TYPE_GUARD_NAMES.delete(context);
   REACT_LIFECYCLE_MEMO.delete(context);
   TS_FIELD_DECL_MEMO.delete(context);
   TS_CLASS_LINES.delete(context);
@@ -24458,6 +24464,12 @@ interface JsScopeFile {
   fnDecls: number[];
   arrows: number[];
   bindings: Map<string, JsBindingSite[]>;
+  /** Per name, the type guards that test it (jsGuardsOf), read when first asked. */
+  guards?: Map<string, JsGuard[]>;
+  /** Where the body of the arrow at an offset ends (jsFunctionHolds), read when first asked. */
+  arrowEnds?: Map<number, number>;
+  /** Per callback's parameter list offset, its callee and argument position (jsCallbackCall + jsCalledFunction). */
+  callees?: Map<number, { callee: Node; index: number } | null>;
 }
 
 /**
@@ -24475,6 +24487,10 @@ interface JsBindingSite {
   at: number;
   kind: 'declaration' | 'parameter' | 'function' | 'other';
   reading?: JsBindingReading | null;
+  /** What jsReceiverReadElsewhere reads for the binding, and where an assignment would start to matter. */
+  elsewhere?: { read: JsReadElsewhere; from: number } | null;
+  /** Where the binding's name is assigned within its extent (jsAssignedBetween), read once. */
+  assigns?: number[];
 }
 
 /**
@@ -24823,6 +24839,1039 @@ function jsReceiverBindingReading(receiver: string, ref: UnresolvedRef, context:
 }
 
 /**
+ * A receiver's type read in another file than the call's: the type as
+ * written there (`raw`), on `line` of `file`, which is read as `language`;
+ * `bound` is the line of the call's file where the receiver's binding is
+ * written, and `from` lists every file other than the call's that the
+ * reading consulted, for a sync to re-open the answer when one of them
+ * changes (`typeFrom`).
+ */
+type JsReadElsewhere = JsBindingReading & { file: string; language: Language; bound: number; from: string[] };
+
+/**
+ * Where the `(`, `[` or `{` at `open` closes in `code`, counting only those
+ * brackets, or -1 when it doesn't within `limit` characters.
+ */
+function jsCloseOf(code: string, open: number, limit = 20_000): number {
+  let depth = 0;
+  for (let i = open, end = Math.min(code.length, open + limit); i < end; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if ((c === ')' || c === ']' || c === '}') && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * A TS parameter list's (or type argument list's) top-level parts, split at
+ * the commas outside every bracket: `a: Map<K, V>, cb: (x: X) => void` is two.
+ * A function type's `=>` closes nothing. Null when the brackets don't
+ * balance, which no well-formed list gives.
+ */
+function tsTopLevelParts(text: string): string[] | null {
+  const parts: string[] = [];
+  let depth = 0;
+  let from = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '(' || c === '[' || c === '{' || c === '<') depth++;
+    else if (c === ')' || c === ']' || c === '}' || (c === '>' && text[i - 1] !== '=')) {
+      if (--depth < 0) return null;
+    } else if (c === ',' && depth === 0) {
+      parts.push(text.slice(from, i));
+      from = i + 1;
+    }
+  }
+  if (depth !== 0) return null;
+  const last = text.slice(from);
+  if (last.trim() !== '' || parts.length > 0) parts.push(last);
+  return parts.map((p) => p.trim());
+}
+
+/**
+ * The type a TS parameter declaration is written with (`cb?: (x: X) => void`
+ * gives `(x: X) => void`, a default after it cut off), or null for none, a
+ * rest parameter or a `this` parameter.
+ */
+function tsParameterType(param: string): string | null {
+  const head = /^(?:(?:public|private|protected|readonly|override)\s+)*([A-Za-z_$][\w$]*)\s*\??\s*:/.exec(param);
+  if (!head || head[1] === 'this') return null;
+  const text = param.slice(head[0].length);
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '(' || c === '[' || c === '{' || c === '<') depth++;
+    else if (c === ')' || c === ']' || c === '}' || (c === '>' && text[i - 1] !== '=')) depth--;
+    else if (c === '=' && depth === 0 && text[i + 1] !== '>') return text.slice(0, i).trim() || null;
+  }
+  return text.trim() || null;
+}
+
+/**
+ * The parameters of the function type a TS type is written as, `(a: A, b:
+ * B) => R` (in parentheses, or with `| undefined` or `| null` beside it: a
+ * callback that may be left out), or null for any other type: a named type,
+ * a generic or constructor signature, a union of functions.
+ */
+function tsFunctionTypeParameters(type: string): string[] | null {
+  let text = type.trim();
+  for (let unwrap = 0; unwrap < 4 && text.startsWith('('); unwrap++) {
+    const close = jsCloseOf(text, 0);
+    if (close < 0) return null;
+    const after = text.slice(close + 1).trim();
+    if (/^=>/.test(after)) return tsTopLevelParts(text.slice(1, close));
+    // `(F) | undefined`: the function type F, which an argument fills.
+    if (after !== '' && !/^(?:\|\s*(?:undefined|null)\s*)+$/.test(after)) return null;
+    text = text.slice(1, close).trim();
+  }
+  return null;
+}
+
+/** The type parameters a TS function's head declares (`function f<T, K extends keyof T>(`), or null when it can't be read. */
+function tsFunctionTypeParameterNames(fn: Node, context: ResolutionContext): Set<string> | null {
+  const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(fn.startLine - 1, fn.startLine + 2).join('\n');
+  const named = new RegExp(`\\bfunction\\s*\\*?\\s*${escapeRegExp(fn.name)}\\s*(<)?`).exec(head);
+  if (!named) return null;
+  if (!named[1]) return new Set();
+  const open = named.index + named[0].length - 1;
+  let depth = 0;
+  for (let i = open; i < head.length; i++) {
+    const c = head[i];
+    if (c === '<' || c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}' || (c === '>' && head[i - 1] !== '=')) {
+      if (--depth === 0) {
+        const parts = tsTopLevelParts(head.slice(open + 1, i));
+        return parts ? new Set(parts.map((p) => p.replace(/^(?:in|out|const)\s+/, '').split(/[\s=]/)[0]!)) : null;
+      }
+    }
+  }
+  return null;
+}
+
+/** Words before a `(` that make it no call: a control-flow head, a declaration, an operator keyword. */
+const JS_NOT_CALLEE = new Set(['if', 'for', 'while', 'switch', 'catch', 'with', 'function', 'return', 'typeof', 'void', 'delete', 'in', 'of', 'instanceof', 'yield', 'await', 'new', 'super', 'import', 'class', 'async']);
+
+/** The last non-space offset in `code` before `at`, or -1. */
+function jsPrevNonSpace(code: string, at: number): number {
+  let i = at - 1;
+  while (i >= 0 && WHITESPACE.test(code[i]!)) i--;
+  return i;
+}
+
+/** The word (`[\w$]+`) that ends at `end` in `code`, with where it starts. */
+function jsWordEndingAt(code: string, end: number): { word: string; start: number } {
+  let s = end;
+  while (s >= 0 && /[\w$]/.test(code[s]!)) s--;
+  return { word: code.slice(s + 1, end + 1), start: s + 1 };
+}
+
+/**
+ * Where the JS/TS function whose parameter list is `code[list..close]`
+ * starts, when it is an arrow (`(a) =>`, `async (a) =>`) or a function
+ * expression (`function (a) {`, `function name(a) {`, `async function* (a)
+ * {`), or -1 for anything else, such as a method or a function declaration
+ * (whose parameters the callback reader doesn't type: none is an argument),
+ * or a generic arrow.
+ */
+function jsFunctionExpressionStart(code: string, list: number, close: number): number {
+  const after = code.slice(close + 1, close + 400);
+  const p = jsPrevNonSpace(code, list);
+  const { word, start } = jsWordEndingAt(code, p);
+  if (/^\s*(?::[^=;{]*)?=>/.test(after)) {
+    if (word === '') return code[p] === '.' || code[p] === '>' ? -1 : list;
+    if (word !== 'async' || code[jsPrevNonSpace(code, start)] === '.') return -1;
+    return start;
+  }
+  if (!/^\s*(?::[^=;{]*)?\{/.test(after)) return -1;
+  // Where `function` starts: right before the list, or before the
+  // function's name, with a generator's `*` maybe between.
+  let at: number;
+  if (word === 'function') {
+    at = start;
+  } else {
+    let q = word === '' ? p : jsPrevNonSpace(code, start);
+    if (code[q] === '*') q = jsPrevNonSpace(code, q);
+    const fn = jsWordEndingAt(code, q);
+    if (fn.word !== 'function') return -1;
+    at = fn.start;
+  }
+  const lead = jsWordEndingAt(code, jsPrevNonSpace(code, at));
+  return lead.word === 'async' && code[jsPrevNonSpace(code, lead.start)] !== '.' ? lead.start : at;
+}
+
+/**
+ * The call a JS/TS function written at `fnStart` (an arrow's or a function
+ * expression's first character) is passed straight to as an argument: the
+ * callee's name, where its argument list opens, and the argument's
+ * position. Null when the function is anything else — an object's or an
+ * array's member, a spread or generic call's argument (where a position or
+ * a type argument can't be read), a member, optional or `new` call.
+ */
+function jsCallbackCall(code: string, fnStart: number): { callee: string; open: number; index: number } | null {
+  let i = jsPrevNonSpace(code, fnStart);
+  if (code[i] !== '(' && code[i] !== ',') return null;
+  let index = 0;
+  let depth = 0;
+  for (let limit = Math.max(0, fnStart - 100_000); i >= limit; i--) {
+    const c = code[i]!;
+    if (c === ')' || c === ']' || c === '}') depth++;
+    else if (c === '(' || c === '[' || c === '{') {
+      if (depth > 0) {
+        depth--;
+        continue;
+      }
+      if (c !== '(') return null;
+      // The callee: a name right before the `(`, not a member's, a `new`'s or a keyword.
+      const { word, start } = jsWordEndingAt(code, jsPrevNonSpace(code, i));
+      if (!/^[A-Za-z_$][\w$]*$/.test(word) || JS_NOT_CALLEE.has(word)) return null;
+      const b = jsPrevNonSpace(code, start);
+      if (code[b] === '.' || jsWordEndingAt(code, b).word === 'new') return null;
+      return { callee: word, open: i, index };
+    } else if (depth === 0) {
+      if (c === ',') index++;
+      else if (c === ';' || c === '<' || (c === '>' && code[i - 1] !== '=') || (c === '.' && code.startsWith('...', i - 2))) return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The one project function a bare call's name means where the call is: the
+ * declaration of the name in scope at `at`, or the file's import of it. Null
+ * for any other binding (a local or a parameter holding a function), a name
+ * the file neither declares nor imports, and a function declared more than
+ * once (overloads), whose signature for the call can't be told.
+ */
+function jsCalledFunction(name: string, at: number, file: JsScopeFile, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const site = jsBindingAt(name, file, at);
+  if (site) {
+    // Overloads are declarations of the name in one block; another block's helper of the name is another function.
+    if (site.kind !== 'function' || jsBindingSites(name, file).filter((s) => s.kind === 'function' && s.from === site.from).length !== 1) return null;
+    const line = jsLineOf(file, site.at);
+    const own = context.getNodesInFile(ref.filePath).find((n) => n.kind === 'function' && n.name === name && n.startLine === line);
+    return own && own.signature && ESM_FAMILY.has(own.language) ? own : null;
+  }
+  if (!(context.getImportMappings?.(ref.filePath, ref.language) ?? []).some((m) => m.localName === name)) return null;
+  const line = jsLineOf(file, at);
+  const resolved = context.resolveImport?.({ ...ref, referenceName: name, referenceKind: 'calls', line, column: at - file.lineStarts[line - 1]! });
+  const fn = resolved ? context.getNodeById?.(resolved.targetNodeId) : undefined;
+  if (!fn || fn.kind !== 'function' || !fn.signature || !ESM_FAMILY.has(fn.language)) return null;
+  // An exported function declared more than once is overloaded.
+  const named = (context.getNodesInFileNamed?.(fn.filePath, fn.name) ?? context.getNodesInFile(fn.filePath))
+    .filter((n) => n.kind === 'function' && n.name === fn.name && n.qualifiedName === fn.qualifiedName);
+  return named.length === 1 && !jsFunctionWrittenTwice(fn, context) ? fn : null;
+}
+
+/** Per context: `<file>\0<name>` → whether the file writes `function <name>` more than once. */
+/** Per context: a file → how many times it writes `function <name>`, per name (null: the file can't be read). */
+const JS_FUNCTION_WRITTEN_TWICE = new WeakMap<ResolutionContext, Map<string, Map<string, number> | null>>();
+
+/** `function <name>` (`function*`, `async function`) followed by its parameter list or type parameters, on one line. */
+const JS_FUNCTION_WRITTEN = /(?<![\w$.])function\s*\*?\s*([A-Za-z_$][\w$]*)\s*[<(]/g;
+
+/**
+ * Whether `fn`'s file writes `function <its name>` more than once: an
+ * overload's signatures (`export function timeout(millis: number):
+ * CancelablePromise<void>;` above the implementation), which the index keeps
+ * no node for. A caller sees the signature its arguments match, never the
+ * implementation's, so the function is no one signature to read. Each file
+ * is counted once, through its cached lines (getFileLines), as receiver
+ * inference reads them.
+ */
+function jsFunctionWrittenTwice(fn: Node, context: ResolutionContext): boolean {
+  let files = JS_FUNCTION_WRITTEN_TWICE.get(context);
+  if (!files) JS_FUNCTION_WRITTEN_TWICE.set(context, (files = new Map()));
+  let written = files.get(fn.filePath);
+  if (written === undefined) {
+    const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/) ?? null;
+    written = lines ? new Map() : null;
+    for (const line of lines ?? []) {
+      if (!line.includes('function')) continue;
+      for (const m of line.matchAll(JS_FUNCTION_WRITTEN)) written!.set(m[1]!, (written!.get(m[1]!) ?? 0) + 1);
+    }
+    if (files.size >= PATTERN_MEMO_CAP) files.delete(files.keys().next().value!);
+    files.set(fn.filePath, written);
+  }
+  return written === null || (written.get(fn.name) ?? 0) > 1;
+}
+
+/**
+ * A JS/TS file's text for the readers' per-file scans (jsReceiverCandidates,
+ * jsGuardedNames): its cached lines (getFileLines), as receiver inference
+ * reads them (#1122), with a generated or minified line (over 10,000
+ * characters) read as empty. Only a context without lines gives the raw
+ * source. The scans keep names only, never offsets into the file.
+ */
+function jsReaderText(filePath: string, context: ResolutionContext): string {
+  if (!context.getFileLines) return context.readFile(filePath) ?? '';
+  // Both scans read a file on its first reference, one after the other: the last text joined is kept for the second.
+  const last = JS_READER_TEXT.get(context);
+  if (last?.filePath === filePath) return last.text;
+  const lines = context.getFileLines(filePath);
+  const text = !lines ? ''
+    : (lines.some((line) => line.length > 10_000) ? lines.map((line) => (line.length > 10_000 ? '' : line)) : lines).join('\n');
+  JS_READER_TEXT.set(context, { filePath, text });
+  return text;
+}
+
+/** Per context: the last file jsReaderText joined, and its text. */
+const JS_READER_TEXT = new WeakMap<ResolutionContext, { filePath: string; text: string }>();
+
+/** Per context and file: jsReceiverCandidates' answer. */
+const JS_RECEIVER_CANDIDATES = new WeakMap<ResolutionContext, Map<string, { params: Set<string>; calls: Set<string> }>>();
+
+/**
+ * A `const`/`let`/`var` of a name whose value is a bare call (`x = f(`) or a
+ * member call around a call or a `new` (`x = store.add(f(`) on a receiver
+ * other than `this` or `super`, the shapes jsCallResultReading reads,
+ * matched at a declaration's keyword.
+ */
+const JS_CALL_DECLARATION = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:([A-Za-z_$][\w$]*)\s*\(|(?!(?:this|super)\s*\.)[A-Za-z_$][\w$]*\s*\.\s*[A-Za-z_$][\w$]*\s*\(\s*(?:new\s+)?[A-Za-z_$][\w$]*\s*(?:\.\s*[A-Za-z_$][\w$]*\s*)?\()/y;
+
+/** Bare calls whose value no project function's signature gives. */
+const JS_NOT_TYPED_CALLEE = new Set(['require', 'import', 'await', 'typeof', 'new', 'function', 'async', 'super']);
+
+/**
+ * The names a JS/TS file may type from another declaration's signature
+ * (jsReceiverReadElsewhere), read off the raw text at the file's arrows,
+ * `function` keywords and declarations (localBindingSites): `params`, those
+ * written with no type in the parameter list of an arrow or a `function`
+ * passed to a call by a bare name the file imports or declares,
+ * `run((editor, model) => …)`, `run(editor => …)`, `run(function (editor)
+ * {…})`; `calls`, those a declaration gives a call's value in the shapes
+ * jsCallResultReading reads. More than the readers take — a string can hold
+ * an arrow — and seldom less (a bracket in a string before a callback), so
+ * a name not among them costs them no scope reading of the file.
+ */
+function jsReceiverCandidates(filePath: string, language: Language, context: ResolutionContext): { params: Set<string>; calls: Set<string> } {
+  let files = JS_RECEIVER_CANDIDATES.get(context);
+  if (!files) JS_RECEIVER_CANDIDATES.set(context, (files = new Map()));
+  const known = files.get(filePath);
+  if (known) return known;
+  const names = new Set<string>();
+  const calls = new Set<string>();
+  const source = jsReaderText(filePath, context);
+  // The sites of this text (not localBindingSites' memo, which holds the raw source's offsets for #2589's reader).
+  const arrows: number[] = [];
+  for (let a = source.indexOf('=>'); a !== -1; a = source.indexOf('=>', a + 2)) arrows.push(a);
+  const sites = {
+    varDecls: Array.from(source.matchAll(VAR_DECL_SITE), (m) => m.index!),
+    fnDecls: Array.from(source.matchAll(FN_DECL_SITE), (m) => m.index!),
+    arrows,
+  };
+  // A bare callee is one of the project's only when the file imports or declares it.
+  const callees = new Set((context.getImportMappings?.(filePath, language) ?? []).map((m) => m.localName));
+  for (const m of source.matchAll(/\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)\s*[<(]/g)) callees.add(m[1]!);
+  for (const at of sites.varDecls) {
+    JS_CALL_DECLARATION.lastIndex = at;
+    const m = JS_CALL_DECLARATION.exec(source);
+    if (m && !(m[2] && (JS_NOT_TYPED_CALLEE.has(m[2]) || !callees.has(m[2])))) calls.add(m[1]!);
+  }
+  // A function at `fnStart` with parameters in source[open..close], when a
+  // call by a bare name the file imports or declares takes it: its untyped
+  // ones. The call is read only for a list with one not yet found.
+  const add = (fnStart: number, open: number, close: number): void => {
+    let found: string[] | undefined;
+    for (const part of source.slice(open + 1, close).split(',')) {
+      const m = /^\s*([A-Za-z_$][\w$]*)\s*\??\s*$/.exec(part);
+      if (m) (found ??= []).push(m[1]!);
+    }
+    if (!found || found.every((n) => names.has(n))) return;
+    const call = jsCallbackCall(source, fnStart);
+    if (!call || !callees.has(call.callee)) return;
+    for (const n of found) names.add(n);
+  };
+  const asyncBefore = (at: number): number => {
+    const lead = jsWordEndingAt(source, jsPrevNonSpace(source, at));
+    return lead.word === 'async' ? lead.start : at;
+  };
+  for (const arrow of sites.arrows) {
+    let i = jsPrevNonSpace(source, arrow);
+    if (/[\w$]/.test(source[i] ?? '')) {
+      // A lone parameter, `editor =>`.
+      const lone = jsWordEndingAt(source, i);
+      add(asyncBefore(lone.start), lone.start - 1, lone.start + lone.word.length);
+    }
+    // Past a return type, `(editor): void =>`.
+    if (source[i] !== ')') {
+      const typed = /\)\s*:[^=;{}()]*$/.exec(source.slice(Math.max(0, arrow - 200), arrow));
+      if (!typed) continue;
+      i = arrow - typed[0].length;
+    }
+    let depth = 0;
+    for (let j = i; j >= 0 && i - j <= 2000; j--) {
+      if (source[j] === ')') depth++;
+      else if (source[j] === '(' && --depth === 0) {
+        add(asyncBefore(j), j, i);
+        break;
+      }
+    }
+  }
+  for (const at of sites.fnDecls) {
+    if (!source.startsWith('function', at)) continue;
+    const open = source.indexOf('(', at);
+    if (open < 0 || open - at > 200) continue;
+    let depth = 0;
+    for (let i = open; i < source.length && i - open <= 2000; i++) {
+      if (source[i] === '(') depth++;
+      else if (source[i] === ')' && --depth === 0) {
+        add(asyncBefore(at), open, i);
+        break;
+      }
+    }
+  }
+  const found = { params: names, calls };
+  if (files.size >= 64) files.delete(files.keys().next().value!);
+  files.set(filePath, found);
+  return found;
+}
+
+/**
+ * A JS/TS receiver whose binding in scope at the call says its type through
+ * another declaration's signature: a callback's untyped parameter, by its
+ * callee's (jsCallbackParameterReading), or a local a call's value
+ * initializes, by what the called function returns (jsCallResultReading).
+ * Null when it says nothing so; the receiver is then read as before.
+ */
+function jsReceiverReadElsewhere(name: string, ref: UnresolvedRef, context: ResolutionContext): JsReadElsewhere | null {
+  const candidates = jsReceiverCandidates(ref.filePath, ref.language, context);
+  const param = candidates.params.has(name);
+  if (!param && !candidates.calls.has(name)) return null;
+  const file = jsScopeFile(ref.filePath, context);
+  if (!file) return null;
+  const callAt = (file.lineStarts[ref.line - 1] ?? file.code.length) + ref.column;
+  const site = jsBindingAt(name, file, callAt);
+  if (!site) return null;
+  // Read once per binding: every call on it reads the same declaration.
+  if (site.elsewhere === undefined) {
+    const read = site.kind === 'declaration'
+      ? (candidates.calls.has(name) ? jsCallResultReading(name, site, file, ref, context) : null)
+      : (param ? jsCallbackParameterReading(name, site, file, ref, context) : null);
+    site.elsewhere = read;
+  }
+  // An assignment between the binding and the call gives the receiver what it assigns, which this doesn't read.
+  const known = site.elsewhere;
+  return known && !jsAssignedBetween(name, site, file, known.from, callAt) ? known.read : null;
+}
+
+/**
+ * The file a JS/TS member call's receiver type is read from, when a reader
+ * of its binding (jsReceiverReadElsewhere) types it there and not in the
+ * call's own file: for a call that links nothing to wait for that file
+ * (importBindingTail), whose next edit may give the receiver a project type.
+ * Read with matchMethodCall's precedence: a type the scan read on or after
+ * the binding's line is the scan's. A member no node is named is none: the
+ * matcher reads no receiver for it, and its own name is the key a sync
+ * retries it by once a node of that name appears.
+ */
+export function jsReceiverTypeFile(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  if (ref.language !== 'typescript' && ref.language !== 'tsx' && ref.language !== 'javascript' && ref.language !== 'jsx') return undefined;
+  if (!/^[A-Za-z_$][\w$]*$/.test(receiver) || receiver === 'this' || receiver === 'super') return undefined;
+  if (context.isAbsentName?.(ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1))) return undefined;
+  if (typeof context.getImportMappings !== 'function') return undefined;
+  const reading = jsReceiverReadElsewhere(receiver, ref, context);
+  if (!reading) return undefined;
+  const decl: GoReceiverDecl = {};
+  if (inferLocalReceiverType(receiver, ref, context, decl) && decl.line !== undefined && decl.line >= reading.bound) return undefined;
+  return reading.file !== ref.filePath ? reading.file : reading.from[0];
+}
+
+/**
+ * A TS/JS callback's own parameter with no type written, as the TypeScript
+ * checker types it from the call it is passed to: `withTestCodeEditor(text,
+ * (editor, viewModel) => …)`, whose callee declares `callback: (editor:
+ * ITestCodeEditor, viewModel: ViewModel) => void`, makes `editor` an
+ * `ITestCodeEditor`. Read only where that is exact: the callback is an arrow
+ * or a function expression passed straight to a call, at a position the
+ * argument list says; the callee is one project function, the declaration
+ * of its name in scope or the file's import of it (jsCalledFunction); the
+ * callee's signature writes that parameter as a function type, whose own
+ * parameter at the callback parameter's position is written with a type.
+ * A rest parameter on either side, a type parameter of the callee's, a
+ * default value or any other shape reads as nothing, and the receiver is
+ * read as before. The type is the callee's file's to name (`file`).
+ */
+function jsCallbackParameterReading(
+  name: string, site: JsBindingSite, file: JsScopeFile, ref: UnresolvedRef, context: ResolutionContext,
+): { read: JsReadElsewhere; from: number } | null {
+  const { code } = file;
+  // The callback's parameter list (its `(`), its position in it, where the function starts, and where its body does.
+  let list = -1;
+  let position = 0;
+  let fnStart: number;
+  let body: number;
+  if (site.kind === 'parameter') {
+    list = enclosingOpenParen(code, site.at);
+    const close = list < 0 ? -1 : jsCloseOf(code, list);
+    if (close < site.at) return null;
+    body = close + 1;
+    const params = tsTopLevelParts(code.slice(list + 1, close));
+    if (!params) return null;
+    // The parameter, written alone: no type (the reading above had it), default or rest.
+    position = params.findIndex((p) => p === name || p === `${name}?`);
+    if (position < 0 || params.slice(0, position).some((p) => p.startsWith('...') || /^this\s*[?:]/.test(p))) return null;
+    fnStart = jsFunctionExpressionStart(code, list, close);
+    if (fnStart < 0) return null;
+  } else if (site.kind === 'other' && code.startsWith(name, site.at) && /^\s*=>/.test(code.slice(site.at + name.length, site.at + name.length + 40))) {
+    // A lone arrow parameter, `editor => …` or `async editor => …`.
+    body = code.indexOf('=>', site.at) + 2;
+    const lead = jsWordEndingAt(code, jsPrevNonSpace(code, site.at));
+    fnStart = lead.word === 'async' && code[jsPrevNonSpace(code, lead.start)] !== '.' ? lead.start : site.at;
+    list = site.at;
+  } else {
+    return null;
+  }
+  const callees = (file.callees ??= new Map());
+  let called = callees.get(list);
+  if (called === undefined) {
+    const call = jsCallbackCall(code, fnStart);
+    const callee = call ? jsCalledFunction(call.callee, call.open, file, ref, context) : null;
+    called = callee && call ? { callee, index: call.index } : null;
+    callees.set(list, called);
+  }
+  if (!called) return null;
+  const { callee, index } = called;
+  const signature = stripCommentsForRegex(callee.signature!, 'typescript').trim();
+  if (!signature.startsWith('(')) return null;
+  const sigClose = jsCloseOf(signature, 0);
+  const declared = sigClose < 0 ? null : tsTopLevelParts(signature.slice(1, sigClose));
+  if (!declared) return null;
+  const params = /^this\s*[?:]/.test(declared[0] ?? '') ? declared.slice(1) : declared;
+  if (index >= params.length || params.slice(0, index + 1).some((p) => p.startsWith('...'))) return null;
+  const cbType = tsParameterType(params[index]!);
+  const inner = cbType ? tsFunctionTypeParameters(cbType) : null;
+  if (!inner || position >= inner.length || inner.slice(0, position + 1).some((p) => p.startsWith('...'))) return null;
+  const type = tsParameterType(inner[position]!);
+  const raw = type && !tsHidesMembers(type, context) ? new RegExp(`^${TS_ANNOTATED_TYPE}`).exec(type)?.[1] : undefined;
+  // An array or an indexed type is read through the call's file's names (matchMethodCall), not the callee's.
+  if (!raw || raw.endsWith(']') || !tsOneType(type!, raw)) return null;
+  const typeParameters = tsFunctionTypeParameterNames(callee, context);
+  if (!typeParameters || typeParameters.has(raw.split(/[.<\s]/)[0]!)) return null;
+  const resolvedType = normalizeInferredTypeName(raw);
+  if (!resolvedType) return null;
+  return {
+    read: {
+      type: resolvedType,
+      raw,
+      line: callee.startLine,
+      file: callee.filePath,
+      language: callee.language,
+      bound: jsLineOf(file, site.at),
+      from: callee.filePath === ref.filePath ? [] : [callee.filePath],
+    },
+    from: body,
+  };
+}
+
+/** A type as a file of the project writes it (`raw`, on `line` of `file`, read as `language`), and every file the reading looked at (`from`). */
+type TsTypeRead = { raw: string; file: string; language: Language; line: number; from: string[] };
+
+/** Per context: `<file>\0<start line>\0<name>` → tsReturnedType's answer. */
+const TS_RETURNED_TYPES = new WeakMap<ResolutionContext, Map<string, TsTypeRead | null>>();
+
+/** How many functions' returns and pass-through calls one value's type is followed through. */
+const TS_VALUE_DEPTH = 12;
+
+/** Where the JS/TS expression a reading follows stops: the statement, an argument or a block ends, or a line no operator continues. */
+const JS_WHOLE_VALUE_END = /^[ \t]*(?:[;,)}]|\r?\n(?![ \t]*(?:[.(\[?:]|\?\?|\|\||&&|as\b|satisfies\b))|$)/;
+
+/**
+ * The type a TS project function returns, as the checker reads it, where
+ * that is exact: the type its signature writes, unless it is one of the
+ * function's own type parameters or a type predicate; with none written,
+ * the type of what the body's one `return` gives (tsValueType), when the
+ * function is generic in nothing. `walk.capped` is set when the depth ran
+ * out below, and such an answer is not kept: what a function returns
+ * doesn't depend on who asked first (#3215).
+ */
+function tsReturnedType(fn: Node, context: ResolutionContext, walk: { depth: number; capped: boolean }): TsTypeRead | null {
+  let memo = TS_RETURNED_TYPES.get(context);
+  if (!memo) TS_RETURNED_TYPES.set(context, (memo = new Map()));
+  const key = `${fn.filePath}\0${fn.startLine}\0${fn.name}`;
+  const known = memo.get(key);
+  if (known !== undefined) return known;
+  if (walk.depth >= TS_VALUE_DEPTH) {
+    walk.capped = true;
+    return null;
+  }
+  // A function that returns what it is reading returns nothing this reads.
+  memo.set(key, null);
+  const capped = walk.capped;
+  walk.capped = false;
+  walk.depth++;
+  const read = tsReturnedTypeOf(fn, context, walk);
+  walk.depth--;
+  if (walk.capped) memo.delete(key);
+  else {
+    if (memo.size >= PATTERN_MEMO_CAP) memo.delete(memo.keys().next().value!);
+    memo.set(key, read);
+  }
+  walk.capped = walk.capped || capped;
+  return read;
+}
+
+function tsReturnedTypeOf(fn: Node, context: ResolutionContext, walk: { depth: number; capped: boolean }): TsTypeRead | null {
+  const signature = stripCommentsForRegex(fn.signature ?? '', 'typescript').trim();
+  const close = signature.startsWith('(') ? jsCloseOf(signature, 0) : -1;
+  const typeParameters = close < 0 ? null : tsFunctionTypeParameterNames(fn, context);
+  if (!typeParameters) return null;
+  const annotation = /^\s*:\s*([\s\S]*\S)\s*$/.exec(signature.slice(close + 1))?.[1];
+  if (annotation !== undefined) {
+    // A type predicate (`x is T`, `asserts x`) says what a boolean means.
+    if (/^(?:asserts\b|(?:this|[A-Za-z_$][\w$]*)\s+is\b)/.test(annotation) || tsHidesMembers(annotation, context)) return null;
+    const raw = new RegExp(`^${TS_ANNOTATED_TYPE}`).exec(annotation)?.[1];
+    if (!raw || raw.endsWith(']') || !tsOneType(annotation, raw) || typeParameters.has(raw.split(/[.<\s]/)[0]!)) return null;
+    return { raw, file: fn.filePath, language: fn.language, line: fn.startLine, from: [fn.filePath] };
+  }
+  if (typeParameters.size > 0) return null;
+  // No type written: the body's one `return`, at the body's own level.
+  const file = jsScopeFile(fn.filePath, context);
+  if (!file) return null;
+  const { code } = file;
+  const listOpen = code.indexOf('(', (file.lineStarts[fn.startLine - 1] ?? code.length) + fn.startColumn);
+  const listClose = listOpen < 0 ? -1 : jsCloseOf(code, listOpen);
+  const brace = listClose < 0 ? null : /^\s*\{/.exec(code.slice(listClose + 1, listClose + 200));
+  if (!brace) return null;
+  const bodyOpen = listClose + brace[0].length;
+  const bodyClose = jsCloseOf(code, bodyOpen, 200_000);
+  if (bodyClose < 0) return null;
+  const body = code.slice(bodyOpen + 1, bodyClose);
+  const returns = [...body.matchAll(/(?<![\w$.])return\b/g)];
+  if (returns.length !== 1) return null;
+  const at = returns[0]!.index!;
+  let depth = 0;
+  for (let i = 0; i < at; i++) {
+    const c = body[i];
+    if (c === '{' || c === '(' || c === '[') depth++;
+    else if (c === '}' || c === ')' || c === ']') depth--;
+  }
+  if (depth !== 0) return null;
+  const where: UnresolvedRef = { fromNodeId: fn.id, referenceName: fn.name, referenceKind: 'calls', line: fn.startLine, column: fn.startColumn, filePath: fn.filePath, language: fn.language };
+  const read = tsValueType(file, bodyOpen + 1 + at + 'return'.length, where, context, walk, false);
+  return read && { ...read, from: [...read.from, fn.filePath] };
+}
+
+/**
+ * The type of the JS/TS value written at `at` in `file`, read the way the
+ * checker infers it, where that is exact: a call of one project function
+ * (jsCalledFunction) whose return type is read (tsReturnedType); a call of
+ * a method that returns its one argument (`disposables.add(x)`, its
+ * declaration `add<T>(o: T): T`, on a receiver its binding types) as that
+ * argument's; `new X()` of a class the file names. Each is the whole value.
+ * `where` locates `file` for its imports. A `new` is no answer at the top
+ * (`top`), where the declaration's own reader has it.
+ */
+function tsValueType(file: JsScopeFile, at: number, where: UnresolvedRef, context: ResolutionContext, walk: { depth: number; capped: boolean }, top: boolean): TsTypeRead | null {
+  const { code } = file;
+  const text = code.slice(at, at + 300);
+  const lead = /^\s*/.exec(text)![0].length;
+  const made = /^new\s+([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\(/.exec(text.slice(lead));
+  const called = /^([A-Za-z_$][\w$]*)(?:\s*\.\s*([A-Za-z_$][\w$]*))?\s*\(/.exec(text.slice(lead));
+  const match = made ?? called;
+  if (!match || (top && made)) return null;
+  const open = at + lead + match[0].length - 1;
+  const close = jsCloseOf(code, open);
+  if (close < 0 || !JS_WHOLE_VALUE_END.test(code.slice(close + 1, close + 200))) return null;
+  if (made) {
+    const raw = made[1]!.replace(/\s+/g, '');
+    // `new Backend(root)` of a parameter or a local names no class (jsDeclarationReading).
+    const bound = jsBindingAt(raw.split('.')[0]!, file, at);
+    if (bound && bound.kind !== 'function') return null;
+    return { raw, file: where.filePath, language: where.language, line: jsLineOf(file, at), from: [] };
+  }
+  const [, head, member] = called!;
+  if (JS_NOT_CALLEE.has(head!)) return null;
+  if (!member) {
+    const fn = jsCalledFunction(head!, open, file, where, context);
+    const read = fn ? tsReturnedType(fn, context, walk) : null;
+    return read && { ...read, from: [...read.from, fn!.filePath] };
+  }
+  // `recv.w(x)`: w's declaration returns its one argument, on the class recv's binding types.
+  if (head === 'this' || head === 'super') return null;
+  const site = jsBindingAt(head!, file, at);
+  const reading = site ? jsBindingReading(head!, site, file) : null;
+  const owner = reading ? tsNamedType(reading.raw.replace(/\s*<[\s\S]*$/, ''), { filePath: where.filePath, language: where.language, id: '' }, where, context) : null;
+  if (!owner || owner === 'outside' || owner.kind !== 'class') return null;
+  const methods = tsClassMethods(owner, member!, where, context, 0);
+  const args = tsTopLevelParts(code.slice(open + 1, close));
+  if (methods.length !== 1 || !tsReturnsItsArgument(methods[0]!, context) || !args || args.length !== 1) return null;
+  const inner = tsValueType(file, open + 1, where, context, walk, false);
+  return inner && { ...inner, from: [...inner.from, owner.filePath, methods[0]!.filePath] };
+}
+
+/**
+ * A JS/TS local a call's value initializes, `const editor =
+ * createCodeEditorWithBrackets(…)`, with no type written: the type the
+ * checker infers for it, what the called function returns (tsValueType).
+ * The type is the file's that writes it (`file`). A local `new` makes, or an
+ * awaited one, is the readers' before this one.
+ */
+function jsCallResultReading(
+  name: string, site: JsBindingSite, file: JsScopeFile, ref: UnresolvedRef, context: ResolutionContext,
+): { read: JsReadElsewhere; from: number } | null {
+  JS_DECLARATION_HEAD.lastIndex = site.at;
+  const head = JS_DECLARATION_HEAD.exec(file.code);
+  if (!head || head[1] !== name) return null;
+  const valueAt = site.at + head[0].length;
+  const read = tsValueType(file, valueAt, ref, context, { depth: 0, capped: false }, true);
+  const type = read ? normalizeInferredTypeName(read.raw) : null;
+  if (!read || !type) return null;
+  return {
+    read: {
+      type,
+      raw: read.raw,
+      line: read.line,
+      file: read.file,
+      language: read.language,
+      bound: jsLineOf(file, site.at),
+      from: [...new Set(read.from)].filter((f) => f !== ref.filePath),
+    },
+    from: valueAt,
+  };
+}
+
+/** A `const`/`let`/`var` of one name and its `=`, matched at the keyword: the head jsCallResultReading reads past. */
+const JS_DECLARATION_HEAD = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*/y;
+
+/** `if (!x.m())`, `if (x.m())`, `if (!f(x))`, `if (f(x))`: a type guard's whole condition, the name it tests and the guard captured. */
+const JS_GUARD_CONDITION = /\bif\s*\(\s*!?\s*(?:([A-Za-z_$][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)\s*\(\s*\)|([A-Za-z_$][\w$]*)\s*\(\s*([A-Za-z_$][\w$]*)\s*\))\s*\)/g;
+
+/** Per context and file: the names a guard's condition tests, each with the guards that test it (jsGuardedNames). */
+const JS_GUARDED_NAMES = new WeakMap<ResolutionContext, Map<string, Map<string, Set<string>>>>();
+
+/** Per context: whether a method or function of a name declares a type predicate (`): x is T`, `): this is T`). */
+const TS_TYPE_GUARD_NAMES = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+const TS_PREDICATE_SIGNATURE = /\)\s*:\s*(?:this|[A-Za-z_$][\w$]*)\s+is\s/;
+
+/**
+ * The names a JS/TS file tests in an `if` whose whole condition is a call of
+ * a type guard, read off the raw text, each with the guards' names: those a
+ * project method or function declares with a type predicate.
+ */
+function jsGuardedNames(filePath: string, context: ResolutionContext): Map<string, Set<string>> {
+  let files = JS_GUARDED_NAMES.get(context);
+  if (!files) JS_GUARDED_NAMES.set(context, (files = new Map()));
+  let names = files.get(filePath);
+  if (names) return names;
+  names = new Map();
+  let guards = TS_TYPE_GUARD_NAMES.get(context);
+  if (!guards) TS_TYPE_GUARD_NAMES.set(context, (guards = new Map()));
+  for (const m of jsReaderText(filePath, context).matchAll(JS_GUARD_CONDITION)) {
+    const tested = m[1] ?? m[4]!;
+    const guard = m[2] ?? m[3]!;
+    let isGuard = guards.get(guard);
+    if (isGuard === undefined) {
+      isGuard = context.getNodesByName(guard).some((n) => (n.kind === 'method' || n.kind === 'function') && TS_PREDICATE_SIGNATURE.test(n.signature ?? ''));
+      guards.set(guard, isGuard);
+    }
+    if (!isGuard) continue;
+    let set = names.get(tested);
+    if (!set) names.set(tested, (set = new Set()));
+    set.add(guard);
+  }
+  if (files.size >= 64) files.delete(files.keys().next().value!);
+  files.set(filePath, names);
+  return names;
+}
+
+/**
+ * An `if` that tests a name with a call that can be a type guard, in a
+ * JS/TS file's code: where it starts (`at`) and ends (`end`, past its
+ * then-branch), whether its condition is negated, the guard (`x.method()`
+ * or `fn(x)`, `fnAt` its `(`), the then-branch's extent, whether that
+ * branch only leaves (`return …;` or `throw …;`), and whether an `else`
+ * follows.
+ */
+interface JsGuard {
+  at: number; end: number; negated: boolean; method?: string; fn?: string; fnAt: number;
+  thenFrom: number; thenTo: number; exits: boolean; elseAfter: boolean;
+  /** What the guard narrows to, per declared type (jsGuardNarrows). */
+  resolved?: Map<string, JsReadElsewhere | null>;
+}
+
+/** A name's guards in a scope file, in order, read once per file and name (`file.guards`). */
+function jsGuardsOf(name: string, file: JsScopeFile): JsGuard[] {
+  const byName = (file.guards ??= new Map());
+  const known = byName.get(name);
+  if (known) return known;
+  const { code } = file;
+  const n = escapeRegExp(name);
+  const re = new RegExp(`\\bif\\s*\\(\\s*(!\\s*)?(?:(?<![\\w$.])${n}\\s*\\.\\s*([A-Za-z_$][\\w$]*)\\s*\\(\\s*\\)|([A-Za-z_$][\\w$]*)\\s*\\(\\s*${n}\\s*\\))\\s*\\)`, 'g');
+  const guards: JsGuard[] = [];
+  for (const m of code.matchAll(re)) {
+    let i = m.index! + m[0].length;
+    while (i < code.length && WHITESPACE.test(code[i]!)) i++;
+    let thenTo: number;
+    let body: string;
+    if (code[i] === '{') {
+      thenTo = jsCloseOf(code, i, 200_000);
+      if (thenTo < 0) continue;
+      body = code.slice(i + 1, thenTo);
+    } else {
+      let depth = 0;
+      for (thenTo = i; thenTo < code.length; thenTo++) {
+        const c = code[thenTo]!;
+        if (c === '(' || c === '[' || c === '{') depth++;
+        else if ((c === ')' || c === ']' || c === '}') && --depth < 0) break;
+        else if (c === ';' && depth === 0) break;
+      }
+      if (code[thenTo] !== ';') continue;
+      body = code.slice(i, thenTo);
+    }
+    const end = thenTo + 1;
+    guards.push({
+      at: m.index!, end, negated: !!m[1], method: m[2], fn: m[3],
+      fnAt: m[3] ? code.indexOf('(', m.index! + m[0].indexOf(m[3], 3)) : -1,
+      thenFrom: i, thenTo, exits: /^\s*(?:return\b[^;{}]*|throw\b[^;{}]*);?\s*$/.test(body),
+      elseAfter: /^\s*else\b/.test(code.slice(end, end + 40)),
+    });
+  }
+  byName.set(name, guards);
+  return guards;
+}
+
+/**
+ * Whether a function — an arrow, a `function`, a method's body — starts in
+ * `code[from..to)` and holds `to`, so a guard before it doesn't narrow there.
+ */
+function jsFunctionHolds(file: JsScopeFile, from: number, to: number): boolean {
+  const { code } = file;
+  const ends = (file.arrowEnds ??= new Map());
+  for (let a = code.indexOf('=>', from); a !== -1 && a < to; a = code.indexOf('=>', a + 2)) {
+    let end = ends.get(a);
+    if (end === undefined) ends.set(a, (end = jsBodyEnd(code, a + 2)));
+    if (end >= to) return true;
+  }
+  for (const m of code.slice(from, to).matchAll(/(?<![\w$.])function\b/g)) {
+    const brace = code.indexOf('{', from + m.index!);
+    if (brace >= 0 && brace < to && jsBlockEnd(code, brace + 1) >= to) return true;
+  }
+  // A block after a parameter list a name heads (`render() {`, `get x() {`), not a control-flow head's.
+  for (let s = jsScopeAt(file, to); s > 0 && file.scopes[s]!.start >= from; s = file.scopes[s]!.parent) {
+    const close = jsPrevNonSpace(code, file.scopes[s]!.start);
+    if (code[close] !== ')') continue;
+    let depth = 0;
+    let open = close;
+    for (; open >= 0; open--) {
+      if (code[open] === ')') depth++;
+      else if (code[open] === '(' && --depth === 0) break;
+    }
+    const head = jsWordEndingAt(code, jsPrevNonSpace(code, open)).word;
+    if (head !== '' && !/^(?:if|for|while|switch|catch|with)$/.test(head)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the binding `site` of `name` is assigned in `code[from..to)`: `=`,
+ * a compound `+=`, `++`/`--`, or a `for … of/in` head. The binding's
+ * assignments are found once, in its extent (`site.assigns`).
+ */
+function jsAssignedBetween(name: string, site: JsBindingSite, file: JsScopeFile, from: number, to: number): boolean {
+  if (!site.assigns) {
+    const n = escapeRegExp(name);
+    const re = new RegExp(`(?<![\\w$.])${n}\\s*(?:(?:[-+*/%&|^]|\\*\\*|<<|>>>?|&&|\\|\\||\\?\\?)?=(?![=>])|\\+\\+|--|\\s(?:of|in)\\b)|(?:\\+\\+|--)\\s*${n}(?![\\w$])`, 'g');
+    const start = Math.max(0, site.from);
+    site.assigns = Array.from(file.code.slice(start, site.to + 1).matchAll(re), (m) => start + m.index!);
+  }
+  return site.assigns.some((at) => at >= from && at < to);
+}
+
+/**
+ * Whether the TS/JS class or interface `sub` is `sup` or extends it, through
+ * the supertypes each one's head names as its file names them (tsNamedType).
+ */
+function tsIsSubtypeOf(sub: Node, sup: Node, at: UnresolvedRef, context: ResolutionContext): boolean {
+  const seen = new Set<string>();
+  const todo = [sub];
+  while (todo.length > 0 && seen.size < 64) {
+    const cls = todo.pop()!;
+    if (cls.id === sup.id) return true;
+    if (seen.has(cls.id)) continue;
+    seen.add(cls.id);
+    for (const written of tsHeadSupertypes(cls, context) ?? []) {
+      const base = tsNamedType(written, cls, at, context);
+      if (base && base !== 'outside') todo.push(base);
+    }
+  }
+  return false;
+}
+
+/** The class or interface `type` names as `at`'s file names it: its own declaration, or the one its import leads to. */
+function tsTypeNode(type: string, raw: string | undefined, at: UnresolvedRef, context: ResolutionContext): Node | null {
+  const file = tsImportedTypeFile(raw ?? type, at, context) ?? at.filePath;
+  const own = tsTypeDeclaredIn(file, type, context);
+  if (own) return own;
+  const named = tsNamedType((raw ?? type).replace(/\s*<[\s\S]*$/, ''), { filePath: at.filePath, language: at.language, id: '' }, at, context);
+  return named && named !== 'outside' ? named : null;
+}
+
+/**
+ * A TS/JS receiver a type guard narrows where the call is, as the checker
+ * narrows it: after `if (!editor.hasModel()) { return; }`, in the block
+ * that holds the call, `editor` is what `hasModel(): this is
+ * IActiveCodeEditor` says, and so inside `if (editor.hasModel()) { … }`;
+ * a guard function narrows its argument the same way, `if (isCodeEditor(x))`
+ * with `isCodeEditor(thing: unknown): thing is ICodeEditor`. Read only for
+ * those shapes, where the guard's call is the whole condition and the
+ * receiver's binding is the same at both, no assignment to it and no
+ * function boundary between them, and the guarded type is the receiver's
+ * declared one or narrower (`t0`, read for the binding in scope: by a reader
+ * of its own, `typedBinding`, or by the scan on the binding's line). A guard
+ * method is the one the receiver's type has (tsKnownTypeCall). Null for
+ * anything else; the receiver keeps its type.
+ */
+function jsNarrowedReading(
+  name: string, t0: string | null, t0Raw: string | undefined, t0Line: number | undefined, typedBinding: boolean,
+  at: UnresolvedRef, ref: UnresolvedRef, context: ResolutionContext,
+): JsReadElsewhere | null {
+  if (!jsGuardedNames(ref.filePath, context).has(name)) return null;
+  if (t0 && (t0.endsWith(']') || /[^\w$.]/.test(t0))) return null;
+  const file = jsScopeFile(ref.filePath, context);
+  if (!file) return null;
+  const { code } = file;
+  const callAt = (file.lineStarts[ref.line - 1] ?? code.length) + ref.column;
+  const site = jsBindingAt(name, file, callAt);
+  if (!site) return null;
+  if (t0 && !typedBinding && t0Line !== jsLineOf(file, site.at)) return null;
+  let guard: JsGuard | undefined;
+  for (const g of jsGuardsOf(name, file)) {
+    if (g.at >= callAt) break;
+    const scope = file.scopes[jsScopeAt(file, g.at)]!;
+    const applies = g.negated
+      ? g.exits && !g.elseAfter && callAt >= g.end && callAt <= scope.end
+      : callAt > g.thenFrom && callAt < g.thenTo;
+    if (applies) guard = g;
+  }
+  if (!guard || jsBindingAt(name, file, guard.at) !== site) return null;
+  if (jsAssignedBetween(name, site, file, guard.at, callAt) || jsFunctionHolds(file, guard.negated ? guard.end : guard.thenFrom, callAt)) return null;
+  // What the guard narrows the binding's type to, read once per guard and type.
+  const key = `${t0 ?? ''}\0${t0Raw ?? ''}\0${at.filePath}`;
+  const resolved = (guard.resolved ??= new Map());
+  let narrowedTo = resolved.get(key);
+  if (narrowedTo === undefined) {
+    narrowedTo = jsGuardNarrows(guard, t0, t0Raw, at, site, file, ref, context);
+    resolved.set(key, narrowedTo);
+  }
+  return narrowedTo;
+}
+
+/** The narrowing jsNarrowedReading reads for one guard of a binding whose declared type is `t0` (null: unknown). */
+function jsGuardNarrows(
+  guard: JsGuard, t0: string | null, t0Raw: string | undefined, at: UnresolvedRef, site: JsBindingSite, file: JsScopeFile,
+  ref: UnresolvedRef, context: ResolutionContext,
+): JsReadElsewhere | null {
+  // The guard's declaration, and the type its predicate names.
+  let declaration: Node | null | undefined;
+  let predicate: RegExpExecArray | null = null;
+  if (guard.method) {
+    if (!t0) return null;
+    const known = tsKnownTypeCall(t0, tsImportedTypeFile(t0Raw ?? t0, at, context) ?? at.filePath, guard.method, ref, at, context, 0.9, true);
+    declaration = known ? context.getNodeById?.(known.targetNodeId) : null;
+    if (!declaration || declaration.kind !== 'method') return null;
+    predicate = /^\(\s*\)\s*:\s*this\s+is\s+([\s\S]+)$/.exec(stripCommentsForRegex(declaration.signature ?? '', 'typescript').trim());
+  } else {
+    // A guard function generic in nothing, whose predicate names its first parameter, the one the receiver fills.
+    declaration = jsCalledFunction(guard.fn!, guard.fnAt, file, ref, context);
+    if (!declaration || tsFunctionTypeParameterNames(declaration, context)?.size !== 0) return null;
+    const signature = stripCommentsForRegex(declaration.signature ?? '', 'typescript').trim();
+    const close = signature.startsWith('(') ? jsCloseOf(signature, 0) : -1;
+    const first = close < 0 ? undefined : tsTopLevelParts(signature.slice(1, close))?.[0];
+    const param = first ? /^([A-Za-z_$][\w$]*)\s*\??\s*:/.exec(first)?.[1] : undefined;
+    if (!param || param === 'this') return null;
+    predicate = new RegExp(`^\\s*:\\s*${escapeRegExp(param)}\\s+is\\s+([\\s\\S]+)$`).exec(signature.slice(close + 1));
+  }
+  // The type the predicate names: one type (`IActiveCodeEditor`), or one with type arguments (`OkImpl<T>`), read by its
+  // name as a written annotation's is, since the arguments don't change which declaration a member call reaches.
+  const written = predicate?.[1]!.trim();
+  const raw = written && !tsHidesMembers(written, context)
+    ? new RegExp(`^${TS_ANNOTATED_TYPE}\\s*$`).exec(written)?.[1] ?? tsGenericTypeName(written)
+    : undefined;
+  const type = raw && !raw.endsWith(']') ? normalizeInferredTypeName(raw) : null;
+  if (!raw || !type || !declaration) return null;
+  const guardAt: UnresolvedRef = { ...ref, filePath: declaration.filePath, language: declaration.language };
+  const narrowed = tsTypeNode(type, raw, guardAt, context);
+  if (!narrowed) return null;
+  // Narrower than the receiver's declared type, or no narrowing the checker does.
+  if (t0) {
+    const declared = tsTypeNode(t0, t0Raw, at, context);
+    if (!declared || declared.id === narrowed.id || !tsIsSubtypeOf(narrowed, declared, guardAt, context)) return null;
+  }
+  return {
+    type,
+    raw,
+    line: declaration.startLine,
+    file: declaration.filePath,
+    language: declaration.language,
+    bound: jsLineOf(file, site.at),
+    from: declaration.filePath === ref.filePath ? [] : [declaration.filePath],
+  };
+}
+
+/**
+ * Whether a TS type as written is the one type its leading name `raw` names:
+ * `raw` alone or with its type arguments (`Result<T, E>`), beside at most
+ * `null` and `undefined` (`Foo | undefined`). A union of two types (`Foo |
+ * Bar`), an intersection or anything else after the name is no one type: the
+ * checker answers a call on it with each member's declaration, or another.
+ */
+function tsOneType(text: string, raw: string): boolean {
+  const members: string[] = [];
+  let depth = 0;
+  let from = 0;
+  for (let i = 0; i <= text.length; i++) {
+    const c = text[i];
+    if (c === '<' || c === '(' || c === '{' || c === '[') depth++;
+    else if ((c === '>' && text[i - 1] !== '=') || c === ')' || c === '}' || c === ']') depth--;
+    else if (i === text.length || (c === '|' && depth === 0)) {
+      const member = text.slice(from, i).trim();
+      if (member !== '') members.push(member);
+      from = i + 1;
+    }
+  }
+  const types = members.filter((m) => m !== 'null' && m !== 'undefined');
+  return types.length === 1 && (types[0] === raw || tsGenericTypeName(types[0]!) === raw);
+}
+
+/**
+ * The name of a TS type written as one named type with type arguments
+ * (`OkImpl<T>`, `Map<K, Array<V>>`) when that is all of `text`: no union,
+ * intersection or array around it. Undefined otherwise.
+ */
+function tsGenericTypeName(text: string): string | undefined {
+  const head = /^([A-Z][\w.$]*)\s*</.exec(text);
+  if (!head) return undefined;
+  let depth = 0;
+  for (let i = head[0].length - 1; i < text.length; i++) {
+    const c = text[i];
+    if (c === '<') depth++;
+    else if (c === '>' && text[i - 1] !== '=' && --depth === 0) return text.slice(i + 1).trim() === '' ? head[1] : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Whether a type read for a receiver has members this can't see: one with
+ * type arguments whose head is no class, interface or alias of the project,
+ * like the utility types `Pick<DisposableStore, 'add'>` and `Omit<…>`, which
+ * keep members of their argument that a lookup by the head (`Pick`) misses.
+ */
+function tsHidesMembers(raw: string, context: ResolutionContext): boolean {
+  const head = /^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*</.exec(raw)?.[1];
+  if (!head) return false;
+  const last = head.slice(head.lastIndexOf('.') + 1);
+  return !context.getNodesByName(last).some((n) => ESM_FAMILY.has(n.language) && (TS_MEMBER_OWNER_KINDS.has(n.kind) || n.kind === 'type_alias'));
+}
+
+/** `hit` carrying the files its receiver's type was read from besides the call's own (`typeFrom`), when there are any. */
+function withTypeFrom(hit: ResolvedRef | null, from: string[] | undefined): ResolvedRef | null {
+  if (!hit || !from || from.length === 0) return hit;
+  return { ...hit, metadata: { ...hit.metadata, typeFrom: [...new Set(from)].sort() } };
+}
+
+/**
  * Patterns that recover a PHP class property's declared type for a
  * `$this->prop` receiver. Deliberately NOT localReceiverTypePatterns: only
  * property-shaped declarations qualify —
@@ -24928,11 +25977,23 @@ function matchPythonElementCall(ref: UnresolvedRef, context: ResolutionContext):
 }
 
 /**
- * Try to resolve by method name on a class/object
+ * Try to resolve by method name on a class/object. A TS/JS call whose
+ * receiver a reader typed in another file, and which the guesses answer
+ * because that type had no such method, records that file too (`typeFrom`):
+ * what the guesses stood in for was read there.
  */
-export function matchMethodCall(
+export function matchMethodCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const read: { from?: string[] } = {};
+  const hit = matchMethodCallOn(ref, context, read);
+  return read.from ? withTypeFrom(hit, read.from) : hit;
+}
+
+/** `readers`: whether the TS/JS binding readers (jsReceiverReadElsewhere, jsNarrowedReading) type the receiver. */
+function matchMethodCallOn(
   ref: UnresolvedRef,
-  context: ResolutionContext
+  context: ResolutionContext,
+  read: { from?: string[] },
+  readers = true,
 ): ResolvedRef | null {
   if (ref.language === 'python' && ref.referenceKind === 'calls' && /\]\.\w+$/.test(ref.referenceName)) {
     return matchPythonElementCall(ref, context);
@@ -25250,6 +26311,36 @@ export function matchMethodCall(
       if (bound === null) return null;
       if (bound !== undefined) inferredType = bound;
     }
+    // A TS/JS receiver its binding types through another declaration's
+    // signature (jsReceiverReadElsewhere): a callback's parameter its
+    // function writes no type for has the type its callee gives it, and a
+    // local a call initializes what the called function returns. The names
+    // are the file's that writes the type (`typedAt`). The scan above reads
+    // the name's lines with no scope, so a type it read above the binding is
+    // another binding's, one this hides: a test file's `(editor) =>` below
+    // another helper's `editor: ICodeEditor`. One it read from the binding's
+    // line on, an assignment to it, is left to decide.
+    let typedAt: UnresolvedRef | undefined;
+    let typedFrom: string[] | undefined;
+    // A TS/JS receiver written as a plain name the file doesn't import: the
+    // one the binding readers below read. They name callees and types through
+    // the file's imports, so a context that keeps none (a bare test context)
+    // reads receivers as before.
+    const readersOn = readers && typeof context.getImportMappings === 'function';
+    const jsPlainReceiver = !!dotMatch && /^[A-Za-z_$][\w$]*$/.test(objectOrClass!) &&
+      (ref.language === 'typescript' || ref.language === 'tsx' || ref.language === 'javascript' || ref.language === 'jsx') &&
+      objectOrClass !== 'this' && objectOrClass !== 'super' && !isImportBinding(objectOrClass!, ref, context);
+    if (jsPlainReceiver && readersOn) {
+      const reading = nmTimedT('mc-jselsewhere', ref, () => jsReceiverReadElsewhere(objectOrClass!, ref, context));
+      if (reading && (!inferredType || decl.line === undefined || decl.line < reading.bound)) {
+        inferredType = reading.type;
+        decl.raw = reading.raw;
+        decl.line = reading.line;
+        decl.file = reading.file;
+        typedAt = { ...ref, filePath: reading.file, language: reading.language };
+        typedFrom = reading.from;
+      }
+    }
     const awaited = !inferredType && ESM_FAMILY.has(ref.language)
       ? inferEsmAwaitedCallType(objectOrClass!, ref, context) : null;
     if (awaited) {
@@ -25261,15 +26352,27 @@ export function matchMethodCall(
     // null`, a `let popupRoot: Root` in the function around the one calling,
     // or an outer function's typed parameter types it, as the calling
     // function's own declaration would.
-    if (!inferredType && !awaited && dotMatch && /^[A-Za-z_$][\w$]*$/.test(objectOrClass!) &&
-        (ref.language === 'typescript' || ref.language === 'tsx' || ref.language === 'javascript' || ref.language === 'jsx') &&
-        objectOrClass !== 'this' && objectOrClass !== 'super' && !isImportBinding(objectOrClass!, ref, context) &&
-        isLocallyBoundJsName(objectOrClass!, ref.filePath, context)) {
+    if (!inferredType && !awaited && jsPlainReceiver && isLocallyBoundJsName(objectOrClass!, ref.filePath, context)) {
       const reading = nmTimedT('mc-jsbinding', ref, () => jsReceiverBindingReading(objectOrClass!, ref, context));
       if (reading) {
         inferredType = reading.type;
         decl.raw = reading.raw;
         decl.line = reading.line;
+      }
+    }
+    // A TS/JS receiver a type guard narrows where the call is has the type
+    // the guard's predicate names (jsNarrowedReading): `editor: ICodeEditor`
+    // after `if (!editor.hasModel()) { return; }` is an `IActiveCodeEditor`.
+    if (!awaited && jsPlainReceiver && readersOn) {
+      const narrowed = nmTimedT('mc-jsnarrow', ref, () =>
+        jsNarrowedReading(objectOrClass!, inferredType, decl.raw, decl.line, typedAt !== undefined, typedAt ?? ref, ref, context));
+      if (narrowed) {
+        inferredType = narrowed.type;
+        decl.raw = narrowed.raw;
+        decl.line = narrowed.line;
+        decl.file = narrowed.file;
+        typedAt = { ...ref, filePath: narrowed.file, language: narrowed.language };
+        typedFrom = [...(typedFrom ?? []), ...narrowed.from];
       }
     }
     // A TS annotation with brackets after the type. An array of it (`items:
@@ -25357,15 +26460,17 @@ export function matchMethodCall(
           : ref.language === 'go'
             ? goDeclaredTypePackage(decl.raw, decl.file ?? ref.filePath, context)
             : ESM_FAMILY.has(ref.language) && !awaited
-              ? nmTimedT('mc-tsimport', ref, () => tsImportedTypeFile(decl.raw ?? inferredType!, ref, context))
+              ? nmTimedT('mc-tsimport', ref, () => tsImportedTypeFile(decl.raw ?? inferredType!, typedAt ?? ref, context))
               : undefined;
       // A TS/JS type the file imports from a package outside the project has
       // no project method, whatever project class shares its name, unless a
-      // project file declares the package (tsOutsideTypeDeclaration).
+      // project file declares the package (tsOutsideTypeDeclaration). A type
+      // read in another file is that file's to name, as a field's is
+      // (tsFieldCall).
       if (ESM_FAMILY.has(ref.language) && !awaited && importedFqn === undefined) {
-        const outside = nmTimedT('mc-tsoutside', ref, () => tsOutsideTypeDeclaration(decl.raw ?? inferredType!, inferredType!, ref, context));
+        const outside = nmTimedT('mc-tsoutside', ref, () => tsOutsideTypeDeclaration(decl.raw ?? inferredType!, inferredType!, typedAt ?? ref, context));
         if (outside === null) return null;
-        importedFqn = outside;
+        importedFqn = outside ?? typedAt?.filePath;
       }
       // The class the file names, through its own supertypes
       // (tsKnownTypeCall), before any same-named class elsewhere. Only a
@@ -25373,8 +26478,30 @@ export function matchMethodCall(
       // that can find another function's `agent: IAgent`, so one without
       // the method mustn't rule out what follows, as a field's does.
       if (ESM_FAMILY.has(ref.language) && !awaited) {
-        const known = tsKnownTypeCall(inferredType, importedFqn ?? ref.filePath, methodName!, ref, ref, context, 0.9);
-        if (known) return known;
+        const known = tsKnownTypeCall(inferredType, importedFqn ?? ref.filePath, methodName!, ref, typedAt ?? ref, context, 0.9, typedAt !== undefined);
+        if (known) return withTypeFrom(known, typedFrom);
+        // A type a reader gave (`typedAt`) with no method of the name up its
+        // chain. A lookup by the type's name counts only on the type the
+        // reading's file names, as a type alias's member does (outline's
+        // `Action`, `BaseAction & { perform: (…) => unknown }`): on another
+        // file's type of that name, as outline's `LazyComponent` interface,
+        // whose `preload` is a function-typed property, against the other
+        // `LazyComponent`'s, it is no answer, and the call is read as it was
+        // before the readers, the files the type was read from recorded for a
+        // sync. A built-in type, or one no class or interface of the project
+        // is named, has no project method at all.
+        if (typedAt) {
+          if (JS_BUILT_INS.has(inferredType) || TS_PRIMITIVE_TYPES.has(inferredType)) return null;
+          const named = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(inferredType!, methodName!, ref, context, 0.9, 'instance-method', importedFqn));
+          const target = named ? context.getNodeById?.(named.targetNodeId) : undefined;
+          const declaredIn = tsImportedTypeFile(decl.raw ?? inferredType, typedAt, context) ?? typedAt.filePath;
+          if (named && target && !target.isStatic && target.filePath === declaredIn && target.qualifiedName.startsWith(`${inferredType}::`)) {
+            return withTypeFrom(named, typedFrom);
+          }
+          if (isUndeclaredTypeName(inferredType.split('.').pop()!, ref, context)) return null;
+          if (typedFrom && typedFrom.length > 0) read.from = typedFrom;
+          return matchMethodCallOn(ref, context, read, false);
+        }
       }
       // A PHP type is the class its name means in the file, and its supertypes
       // are read from source: the first pass has no `extends` edges yet, so
@@ -25413,8 +26540,9 @@ export function matchMethodCall(
         // A Scala call never lands on another language's constructor here: a
         // `def f(): T = T.Inner(...)` return annotation reads as `T`'s type and
         // hands `Inner::Inner` over. Fall through to the Scala type lookup.
-        const target = ref.language === 'scala' ? context.getNodeById?.(typedMatch.targetNodeId) : null;
-        if (!target || !isOtherLanguageConstructor(target, ref.language)) return typedMatch;
+        const target = ref.language === 'scala' || typedAt ? context.getNodeById?.(typedMatch.targetNodeId) : null;
+        // An instance a reader typed (`typedAt`) calls no static method.
+        if (!(typedAt && target?.isStatic) && (!target || !isOtherLanguageConstructor(target, ref.language))) return withTypeFrom(typedMatch, typedFrom);
       }
       if (awaited) return null;
       // A known JS/TS builtin receiver is external when it has no project
@@ -25453,6 +26581,9 @@ export function matchMethodCall(
       // (Only a type name — `java.util.List`, not a call chain like Python's
       // `Device.objects.create(…)` the initializer pattern also captures.)
       if (isUndeclaredTypeName(inferredType.split('.').pop()!, ref, context)) return null;
+      // A type read in another file had no such method: the guesses below
+      // answer instead, and what they stand in for was read in that file.
+      if (typedFrom && typedFrom.length > 0) read.from = typedFrom;
     }
     if (cppDecl.aliased) {
       // A C++ receiver the calling function or its class declares through an
@@ -31304,10 +32435,12 @@ function tsNamedType(
  * or a property of that name (a function-typed field), leaves the answer
  * incomplete.
  */
-function tsMethodUpChain(cls: Node, name: string, at: UnresolvedRef, context: ResolutionContext, depth = 0): { method: Node | null; complete: boolean } {
+function tsMethodUpChain(cls: Node, name: string, at: UnresolvedRef, context: ResolutionContext, depth = 0, instanceOnly = false): { method: Node | null; complete: boolean } {
   const members = context.getNodesInFile(cls.filePath).filter((n) =>
     n.name === name && n.startLine >= cls.startLine && n.endLine <= cls.endLine &&
-    n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === cls.name);
+    n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === cls.name &&
+    // A call on an instance (`instanceOnly`) never reaches a static method: `edit.compose(other)` is the inherited one.
+    !(instanceOnly && n.isStatic));
   const own = members.find((n) => n.kind === 'method');
   if (own) return { method: own, complete: true };
   // A property of that name is what the call calls — bitwarden's `abstract
@@ -31325,7 +32458,7 @@ function tsMethodUpChain(cls: Node, name: string, at: UnresolvedRef, context: Re
       complete = false;
       continue;
     }
-    const up = tsMethodUpChain(base, name, at, context, depth + 1);
+    const up = tsMethodUpChain(base, name, at, context, depth + 1, instanceOnly);
     if (up.method) return up;
     if (!up.complete) complete = false;
   }
@@ -31423,6 +32556,8 @@ function tsKnownTypeCall(
   at: UnresolvedRef,
   context: ResolutionContext,
   confidence: number,
+  /** A call on an instance only: no static method answers it (tsMethodUpChain). */
+  instanceOnly = false,
 ): ResolvedRef | null | undefined {
   let known: Node | null | undefined = tsTypeDeclaredIn(file, typeName, context);
   if (!known) {
@@ -31431,7 +32566,7 @@ function tsKnownTypeCall(
     else if (!named) known = tsAliasedType(typeName, file, at, context);
   }
   if (!known) return undefined;
-  const up = nmTimedT('mc-tsknown', ref, () => tsMethodUpChain(known, methodName, at, context));
+  const up = nmTimedT('mc-tsknown', ref, () => tsMethodUpChain(known, methodName, at, context, 0, instanceOnly));
   if (up.method) return { original: ref, targetNodeId: up.method.id, confidence, resolvedBy: 'instance-method' };
   return up.complete ? null : undefined;
 }
