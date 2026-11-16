@@ -1322,6 +1322,27 @@ export class CodeGraph {
           }
         }
 
+        // Bash: a call resolves through the chain of files that source each
+        // other (resolution/bash-resolution.ts), so an edit to one script --
+        // a `source` line added or dropped, a function moved -- changes what
+        // calls in scripts it never touched reach. The sweep below re-resolves
+        // only the changed files, so re-open every Bash resolution and let it
+        // redo them, as a fresh index would: a reverse walk of the sourcing
+        // graph would miss a file removed or added in the middle of a chain.
+        // A call to a name no Bash function defines returns at once, so the
+        // redo is cheap. Nothing is re-opened when no Bash file moved.
+        {
+          const changedBash = (result.changedFilePaths ?? []).some((p) => this.queries.getFileByPath(p)?.language === 'bash');
+          const removedBash = (result.removedFilePaths ?? []).some(isShellScriptPath);
+          if (changedBash || removedBash) {
+            const tBash = Date.now();
+            const reopened = this.orchestrator.resurrectResolutionEdgesForLanguage('bash');
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+              console.error(`[phase-timing] sync-bash-sources: ${Date.now() - tBash}ms (${reopened} refs re-opened)`);
+            }
+          }
+        }
+
         // Workspace packages and path dependencies (#2456, #2502). A
         // package.json edit — a member's name, its `main` or `exports`, a
         // `file:` dependency — moves what an import of the package resolves to
@@ -3365,3 +3386,9 @@ export class CodeGraph {
 
 // Default export
 export default CodeGraph;
+
+/** A removed path that could have held a Bash script: `.sh`, `.bash`, `.bats`, or a name with no extension (a shebang script). */
+function isShellScriptPath(filePath: string): boolean {
+  const base = filePath.slice(filePath.lastIndexOf('/') + 1);
+  return /\.(?:sh|bash|bats)$/i.test(base) || (!base.includes('.') && base.length > 0);
+}

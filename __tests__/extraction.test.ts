@@ -371,14 +371,18 @@ deploy "$@"
     expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'target')).toBeDefined();
 
     const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
-    expect(calls).toContain('./scripts/build.sh');
+    // A script run by its path is an import of that file, not a call by name.
+    expect(calls).not.toContain('./scripts/build.sh');
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'imports' && r.referenceName === './scripts/build.sh')).toBe(true);
     expect(calls).toContain('bash');
     expect(calls).toContain('kubectl');
     expect(calls).toContain('log');
     expect(calls).toContain('deploy');
 
     const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
-    expect(imports).toEqual(['./env.sh', './scripts/build.sh', './scripts/migrate.sh']);
+    // An import node only for a file read into this shell; scripts that are
+    // run keep their file reference (below) but define nothing for the caller.
+    expect(imports).toEqual(['./env.sh']);
 
     const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
     expect(importRefs).toEqual(['./env.sh', './scripts/build.sh', './scripts/migrate.sh']);

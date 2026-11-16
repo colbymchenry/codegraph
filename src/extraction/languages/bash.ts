@@ -39,6 +39,7 @@ function isBatsFile(filePath: string): boolean {
   return /\.bats$/i.test(filePath);
 }
 
+
 function commandName(node: SyntaxNode, source: string): string | null {
   const nameNode = getChildByField(node, 'name') || node.namedChildren.find((c) => c.type === 'command_name');
   if (!nameNode) return null;
@@ -170,9 +171,15 @@ function isScriptPathCommand(name: string): boolean {
  * reference the resolver follows: a literal `./x` as written (it depends on
  * the working directory), a script-anchored path already made project-relative.
  */
-function emitImport(ctx: ExtractorContext, anchor: SyntaxNode, written: string, target: string): void {
-  const signature = getNodeText(anchor, ctx.source).trim();
-  ctx.createNode('import', written, anchor, { signature });
+function emitImport(ctx: ExtractorContext, anchor: SyntaxNode, written: string, target: string, sourced: boolean): void {
+  // An `import` node only for a file read into this shell (`source`, `.`,
+  // Bats `load`): the resolver follows those nodes for the functions a call
+  // can reach (resolution/bash-resolution.ts), and a script that is run
+  // defines nothing for its caller. The qualified name is the file reference.
+  if (sourced) {
+    const signature = getNodeText(anchor, ctx.source).trim();
+    ctx.createNode('import', written, anchor, { signature, qualifiedName: target });
+  }
 
   const fromNodeId = ctx.nodeStack[ctx.nodeStack.length - 1];
   if (!fromNodeId) return;
@@ -187,15 +194,15 @@ function emitImport(ctx: ExtractorContext, anchor: SyntaxNode, written: string, 
 }
 
 /** The file a command's path argument names — a static `./x`, or one anchored to the script's directory. */
-function emitPathImport(ctx: ExtractorContext, anchor: SyntaxNode, arg: SyntaxNode | undefined): void {
+function emitPathImport(ctx: ExtractorContext, anchor: SyntaxNode, arg: SyntaxNode | undefined, sourced: boolean): void {
   if (!arg) return;
   const literal = staticShellWord(arg, ctx.source);
   if (literal !== null) {
-    if (isStaticProjectPath(literal)) emitImport(ctx, anchor, literal, literal);
+    if (isStaticProjectPath(literal)) emitImport(ctx, anchor, literal, literal, sourced);
     return;
   }
   const anchored = scriptRelativePath(arg, ctx);
-  if (anchored) emitImport(ctx, anchor, unquote(getNodeText(arg, ctx.source)), anchored);
+  if (anchored) emitImport(ctx, anchor, unquote(getNodeText(arg, ctx.source)), anchored, sourced);
 }
 
 /** A shell word without the quotes around the whole of it, as a path reads. */
@@ -257,8 +264,11 @@ function visitBatsProgram(program: SyntaxNode, ctx: ExtractorContext): void {
       continue;
     }
     const end = statements[close]!;
+    // Marked `@test`: a test is run by Bats, never called by its name, so the
+    // resolver never takes it for a function a command could reach.
     const test = ctx.createNode('function', name, statement, {
       signature: '()',
+      decorators: ['@test'],
       endLine: end.endPosition.row + 1,
       endColumn: end.endPosition.column,
     });
@@ -288,7 +298,7 @@ function handleCommand(node: SyntaxNode, ctx: ExtractorContext): void {
   if (!name) {
     // `"$DIR/build.sh" args` runs a script anchored to this one's directory.
     const nameNode = getChildByField(node, 'name') || node.namedChildren.find((c) => c.type === 'command_name');
-    emitPathImport(ctx, node, nameNode?.namedChildren[0]);
+    emitPathImport(ctx, node, nameNode?.namedChildren[0], false);
     visitCommandChildren(node, ctx);
     return;
   }
@@ -296,14 +306,14 @@ function handleCommand(node: SyntaxNode, ctx: ExtractorContext): void {
   const args = commandArguments(node);
 
   if (SHELL_SOURCE_COMMANDS.has(name)) {
-    emitPathImport(ctx, node, args[0]);
+    emitPathImport(ctx, node, args[0], true);
     visitCommandChildren(node, ctx);
     return;
   }
 
   if (name === 'load' && isBatsFile(ctx.filePath)) {
     const target = args[0] && batsLoadPath(args[0], ctx);
-    if (target) emitImport(ctx, node, unquote(getNodeText(args[0]!, ctx.source)), target);
+    if (target) emitImport(ctx, node, unquote(getNodeText(args[0]!, ctx.source)), target, true);
     visitCommandChildren(node, ctx);
     return;
   }
@@ -311,10 +321,13 @@ function handleCommand(node: SyntaxNode, ctx: ExtractorContext): void {
   // `bash ./script.sh`, `sh ../lib/tool`, and wrapper forms such as
   // `exec ./script.sh` are file dependencies as well as command invocations.
   if (SHELL_INTERPRETERS.has(name) || SHELL_WRAPPER_COMMANDS.has(name)) {
-    emitPathImport(ctx, node, args[0]);
+    emitPathImport(ctx, node, args[0], false);
   }
   if (isScriptPathCommand(name)) {
-    emitImport(ctx, node, name, name);
+    // `./build.sh` runs a file: the import edge says so; no function is named that.
+    emitImport(ctx, node, name, name, false);
+    visitCommandChildren(node, ctx);
+    return;
   }
 
   emitCall(ctx, node, name);
@@ -325,6 +338,12 @@ function visitCommandChildren(node: SyntaxNode, ctx: ExtractorContext): void {
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
     if (!child || child.type === 'command_name') continue;
+    if (child.type === 'variable_assignment') {
+      // `FOO=1 make` sets FOO for that command only: not a variable of the
+      // script. A `$(…)` in the value still runs, so its calls are kept.
+      for (const part of child.namedChildren) if (part.type !== 'variable_name') ctx.visitNode(part);
+      continue;
+    }
     ctx.visitNode(child);
   }
 }

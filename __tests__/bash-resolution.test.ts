@@ -192,7 +192,9 @@ describe('Bats test files', () => {
       ['rollback restores the release', 12, 14],
     ]);
     expect(callees(graph, 'deploy succeeds')).toEqual(['test/test_helper.bash::assert_success']);
-    expect(callees(graph, 'rollback restores the release')).toEqual(['lib/deploy.sh::rollback']);
+    // lib/deploy.sh is never loaded by this test file, so its `rollback` is
+    // not what the shell would run: the call stays unresolved.
+    expect(callees(graph, 'rollback restores the release')).toEqual([]);
     expect(importsOf(graph, 'test/deploy.bats')).toEqual(['test/test_helper.bash']);
   });
 
