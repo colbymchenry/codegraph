@@ -29815,12 +29815,17 @@ function matchRustPinnedCall(receiver: string, name: string, ref: UnresolvedRef,
 
 /**
  * Rust's lookup through a `Pin` (rustThroughWrapper) for `name`, on the type
- * it pins. A type parameter's own methods are its bound's, which the call
- * doesn't name: tokio's `read.poll_read(…)` on `read: Pin<&mut R>` went to
- * its `impl AsyncRead for Pin<P>`.
+ * it pins. A type parameter's own methods are its bounds', which no project
+ * impl on `Pin` stands for: tokio's `read.poll_read(…)` on `read: Pin<&mut R>`
+ * went to its `impl AsyncRead for Pin<P>`, and is `AsyncRead::poll_read` for
+ * an `R: AsyncRead`, as for a call on the parameter's own path
+ * (matchRustGenericPath). `BufWriter`'s `me.inner.as_mut().start_seek(pos)`,
+ * on a `#[pin] inner: W` under `impl<W: AsyncWrite + AsyncSeek>`, is
+ * `AsyncSeek::start_seek`.
  */
 function rustPinnedCallOn(pointee: string | null, name: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
-  const inner = pointee !== null && !isRustTypeParam(pointee, ref, context) ? pointee : null;
+  const param = pointee !== null && isRustTypeParam(pointee, ref, context);
+  const inner = pointee !== null && !param ? pointee : null;
   const own = inner === null ? [] : context.getNodesByName(name).filter((n) => n.language === 'rust' && n.kind === 'method' &&
     (n.qualifiedName === `${inner}::${name}` || n.qualifiedName.endsWith(`::${inner}::${name}`)));
   const through = rustThroughWrapper('Pin', name, own, inner, ref, context);
@@ -29829,7 +29834,8 @@ function rustPinnedCallOn(pointee: string | null, name: string, ref: UnresolvedR
     const inherent = through.filter((n) => !isRustTraitImplMethod(n, context));
     target = preferCallSiteFile(inherent.length > 0 ? inherent : through, ref.filePath)[0] ?? null;
   }
-  return target ? { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'instance-method' } : null;
+  if (target) return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'instance-method' };
+  return param ? matchRustGenericPath(pointee!, name, ref, context) ?? null : null;
 }
 
 /**
