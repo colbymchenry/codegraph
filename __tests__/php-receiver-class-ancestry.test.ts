@@ -253,6 +253,10 @@ use Illuminate\\Database\\Eloquent\\Collection;
 
 final class Comments extends Collection
 {
+}
+
+final class CommentReport
+{
     public function firstId($comments)
     {
         return $comments->pluck('id');
@@ -359,6 +363,18 @@ class PostTest
     public function testOtherClass()
     {
         $post = Str::find('x');
+        return $post->tags();
+    }
+
+    public function testCreateOrFirst()
+    {
+        $post = PostStringPrimaryKey::createOrFirst(['id' => 'a']);
+        return $post->tags();
+    }
+
+    public function testTapped()
+    {
+        $post = tap(PostStringPrimaryKey::create(['id' => 'b']), fn ($model) => $model->delete());
         return $post->tags();
     }
 }
@@ -597,7 +613,7 @@ describe('a PHP receiver named after a class', () => {
   });
 
   it('reads a parent through the name the file imports', () => {
-    expect(callees('Illuminate\\Types\\Model::Comments::firstId', 'comments.pluck')).toEqual(['Illuminate\\Database\\Eloquent::Collection::pluck']);
+    expect(callees('Illuminate\\Types\\Model::CommentReport::firstId', 'comments.pluck')).toEqual(['Illuminate\\Database\\Eloquent::Collection::pluck']);
   });
 
   it('reaches the parent of the one class of the name, even one the file cannot name', () => {
@@ -645,6 +661,11 @@ describe('a local a static call gives', () => {
   it('holds the model an Eloquent factory makes', () => {
     expect(callees('App\\Models::PostTest::testStringKey', 'post.tags')).toEqual(['App\\Models::PostStringPrimaryKey::tags']);
     expect(callees('App\\Models::PostTest::testNumericKey', 'post.tags')).toEqual(['App\\Models::Post::tags']);
+  });
+
+  it('holds the model the other static calls of Eloquent make, and what tap() hands back', () => {
+    expect(callees('App\\Models::PostTest::testCreateOrFirst', 'post.tags')).toEqual(['App\\Models::PostStringPrimaryKey::tags']);
+    expect(callees('App\\Models::PostTest::testTapped', 'post.tags')).toEqual(['App\\Models::PostStringPrimaryKey::tags']);
   });
 
   it('is typed by no class that is not a model', () => {

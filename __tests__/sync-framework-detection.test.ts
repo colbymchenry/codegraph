@@ -18,6 +18,7 @@ import * as path from 'path';
 import { CodeGraph } from '../src';
 import { detectFrameworks } from '../src/resolution/frameworks';
 import { clearDeclaredDependencies, declaredDependencies } from '../src/resolution/frameworks/package-deps';
+import { readBoundedSourceSync } from '../src/file-limits';
 import type { ResolutionContext } from '../src/resolution/types';
 
 // Pass-through wrappers, so a test can count framework detections and see the git commands run.
@@ -28,6 +29,11 @@ vi.mock('child_process', async (importOriginal) => {
 vi.mock('../src/resolution/frameworks', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/resolution/frameworks')>();
   return { ...actual, detectFrameworks: vi.fn(actual.detectFrameworks) };
+});
+// And one to see which files a detection reads from disk.
+vi.mock('../src/file-limits', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/file-limits')>();
+  return { ...actual, readBoundedSourceSync: vi.fn(actual.readBoundedSourceSync) };
 });
 
 const EXPRESS = JSON.stringify({ dependencies: { express: '^4.18.0' } });
@@ -168,6 +174,82 @@ describe('a scoped sync in a fresh process keeps off the full scan (#2516)', () 
     expect(scans()).toEqual([]);
     expect(vi.mocked(detectFrameworks)).toHaveBeenCalledTimes(1);
     expect(cg.getNodesInFile('src/routes.js').filter((n) => n.kind === 'route').map((n) => n.name)).toEqual(['GET /hello']);
+  });
+});
+
+describe('what framework detection read is kept only by a graph that watches (#2516)', () => {
+  // A one-off sync detects once. Keeping every file a detector read (Spring's
+  // reads every `.java` file of a project without Spring) only raised the
+  // sync's peak memory; a watching graph detects again, so it keeps them.
+  let root: string;
+  let cg: CodeGraph | undefined;
+  const write = (rel: string, body: string) => {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), body);
+  };
+  type Reads = Map<string, { content?: string | null }>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const orchestrator = () => (cg as any).orchestrator as { detectionReads: Reads; keepDetectionContents: boolean };
+  // The files whose text is kept (a probe of a missing file keeps null).
+  const kept = () => [...orchestrator().detectionReads].filter(([, read]) => typeof read.content === 'string').map(([rel]) => rel).sort();
+
+  beforeEach(() => {
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-sync-detect-keep-')));
+    write('src/Main.java', 'class Main { void run() {} }\n');
+    write('src/Util.java', 'class Util { int one() { return 1; } }\n');
+  });
+
+  afterEach(() => {
+    cg?.close();
+    cg = undefined;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('keeps none of the files a detection read in a graph that does not watch', async () => {
+    cg = CodeGraph.initSync(root);
+    await cg.indexAll();
+    expect(orchestrator().detectionReads.size).toBeGreaterThan(0);
+    expect(kept()).toEqual([]);
+    write('src/Util.java', 'class Util { int two() { return 2; } }\n');
+    await cg.sync({ paths: ['src/Util.java'] });
+    expect(kept()).toEqual([]);
+    // The signatures stay, so a later sync still knows whether to detect again.
+    expect([...orchestrator().detectionReads.keys()]).toContain('src/Main.java');
+  });
+
+  it('keeps them while it watches, so detecting again reads only what changed, and lets them go after', async () => {
+    cg = CodeGraph.initSync(root);
+    await cg.indexAll();
+    expect(cg.watch({ debounceMs: 600_000 })).toBe(true);
+    expect(orchestrator().keepDetectionContents).toBe(true);
+    write('src/Util.java', 'class Util { int two() { return 2; } }\n');
+    await cg.sync({ paths: ['src/Util.java'] });
+    expect(kept()).toEqual(['src/Main.java', 'src/Util.java']);
+
+    // The files a detection reads, by name, while it runs.
+    const detect = vi.mocked(detectFrameworks).getMockImplementation()!;
+    const read = vi.mocked(readBoundedSourceSync).getMockImplementation()!;
+    let detecting = false;
+    const readWhileDetecting: string[] = [];
+    vi.mocked(detectFrameworks).mockImplementation((ctx) => { detecting = true; try { return detect(ctx); } finally { detecting = false; } });
+    vi.mocked(readBoundedSourceSync).mockImplementation((file, ...rest) => {
+      if (detecting) readWhileDetecting.push(path.basename(String(file)));
+      return read(file, ...rest);
+    });
+    try {
+      write('src/Util.java', 'class Util { int three() { return 3; } }\n');
+      vi.mocked(detectFrameworks).mockClear();
+      await cg.sync({ paths: ['src/Util.java'] });
+      expect(vi.mocked(detectFrameworks)).toHaveBeenCalledTimes(1);
+      expect(readWhileDetecting).toEqual(['Util.java']);
+    } finally {
+      vi.mocked(detectFrameworks).mockImplementation(detect);
+      vi.mocked(readBoundedSourceSync).mockImplementation(read);
+    }
+    expect(kept()).toEqual(['src/Main.java', 'src/Util.java']);
+    cg.unwatch();
+    expect(orchestrator().keepDetectionContents).toBe(false);
+    expect(kept()).toEqual([]);
   });
 });
 
