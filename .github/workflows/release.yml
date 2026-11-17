@@ -44,7 +44,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             targets: aarch64-apple-darwin x86_64-apple-darwin
           - runner: ubuntu-22.04 # oldest glibc runner → widest compatibility
             targets: x86_64-unknown-linux-gnu
@@ -274,17 +274,25 @@ jobs:
         run: |
           V="${{ steps.ver.outputs.version }}"
           # npm publish can print success without persisting; confirm against the
-          # registry (with retries for propagation) so green means really shipped.
-          # Up to 5 minutes per package: 1.6.1's packages all published fine but
-          # took longer than the old 60 s to appear, which failed the run.
+          # registry so green means really shipped. npm can take a while to show
+          # a version it has accepted: 1.6.1's packages took longer than the old
+          # 60 s, and 1.6.3's darwin-arm64 and win32-arm64 packages took about
+          # 13 minutes ("Your package is being processed"), which failed the old
+          # 5-minute wait although every package had shipped. So the whole step
+          # shares one 30-minute deadline, and each check uses --prefer-online
+          # so a copy in npm's local cache can't hide a version that's there.
+          start=$(date +%s)
+          deadline=$(( start + 30 * 60 ))
           for dir in release/npm/codegraph-* release/npm/main; do
             name=$(node -p "require('./$dir/package.json').name")
-            ok=
-            for i in $(seq 1 30); do
-              if npm view "$name@$V" version >/dev/null 2>&1; then ok=1; break; fi
-              echo "waiting for $name@$V to appear ($i)…"; sleep 10
+            until npm view "$name@$V" version --prefer-online >/dev/null 2>&1; do
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::error::$name@$V never appeared on the registry (waited 30 minutes)"
+                exit 1
+              fi
+              echo "waiting for $name@$V to appear ($(( $(date +%s) - start ))s)…"
+              sleep 15
             done
-            [ -n "$ok" ] || { echo "::error::$name@$V never appeared on the registry"; exit 1; }
             echo "verified $name@$V"
           done
 
