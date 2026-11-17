@@ -27880,6 +27880,28 @@ export function isPythonFromImportModule(ref: UnresolvedRef, context: Resolution
 }
 
 /**
+ * A module a Python `import …` statement names — `import time`, `import os.path
+ * as p`, either of `import a, b` — which the extractor refs where the module's
+ * name starts. Like a from-import's module, it names a module or package, never
+ * a function, class or variable: `import time` is the standard library's module,
+ * not a project function that happens to be named `time` (#3239). The names a
+ * `from X import a` takes are not this: those may be any symbol.
+ */
+export function isPythonImportStatementModule(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'python' || ref.referenceKind !== 'imports') return false;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  const line = lines?.[ref.line - 1];
+  if (line === undefined) return false;
+  let before = line.slice(0, ref.column);
+  // `import os, \` continues the statement on the next line.
+  for (let above = ref.line - 2; above >= 0 && above >= ref.line - 4 && /\\\s*$/.test(lines![above] ?? ''); above--) {
+    before = lines![above]!.replace(/\\\s*$/, ' ') + before;
+  }
+  // The statement starts the line, or follows `;` or a compound statement's `:`.
+  return /(?:^|[;:])\s*import\s+(?:[\w.]+(?:\s+as\s+\w+)?\s*,\s*)*$/.test(before);
+}
+
+/**
  * A Go call made through a type assertion — `srv.(KVServer).Range(ctx, in)`,
  * `c.Reader.(*pipe).Close()`, `v.(storage.Store).Fetch(k)` — calls a method of
  * the asserted type: its own, the one its interface declares, or one embedding
