@@ -4476,6 +4476,15 @@ export function isPythonSelfCall(ref: UnresolvedRef, context: ResolutionContext)
   return ref.language === 'python' && bareCallReceiver(ref, context)?.receiver === 'self';
 }
 
+/**
+ * Whether a JS/TS call recorded by its bare name was written on the instance,
+ * `this.findAll(q)` (or `super.…`). The extractor drops the `this.`, so the
+ * file's `import { findAll }` would otherwise claim the method call (#2954).
+ */
+export function isJsThisCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return JS_FAMILY.has(ref.language) && bareCallReceiver(ref, context)?.receiver === 'self';
+}
+
 /** Whether a call recorded by its bare name is written on something other than the caller's own object. */
 function isCollapsedNonRecursion(ref: UnresolvedRef, context: ResolutionContext): boolean {
   const written = bareCallReceiver(ref, context);
@@ -14529,17 +14538,42 @@ function jsForStatementOpenAtEnd(code: string, at: number): boolean {
  * function's whole text — too coarse for an import, whose link is usually right.
  */
 export function isImportShadowedByJsBinding(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  if (!JS_FAMILY.has(ref.language) || !JS_LOCAL_REF_KINDS.has(ref.referenceKind) || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return false;
+  if (!JS_FAMILY.has(ref.language) || !JS_LOCAL_REF_KINDS.has(ref.referenceKind)) return false;
+  // A member call, `stream.onAbort()`, is answered through the import of its
+  // receiver, which is read where the call is written as a bare name is (#2953).
+  const head = /^([A-Za-z_$][\w$]*)(\.[A-Za-z_$][\w$]*)*$/.exec(ref.referenceName);
+  if (!head) return false;
+  const name = head[1]!;
+  const member = name.length < ref.referenceName.length;
+  if (member && ref.referenceKind !== 'calls') return false;
   const target = context.getNodeById?.(result.targetNodeId);
   // (A parameter or local is a value: it hides no interface or type alias, `let coords: Bounds`.)
-  if (!target || target.name !== ref.referenceName || target.kind === 'interface' || target.kind === 'type_alias') return false;
-  const fn = context.getNodeById?.(ref.fromNodeId);
-  if (!fn || (fn.kind !== 'function' && fn.kind !== 'method') || fn.startLine > ref.line || fn.endLine < ref.line) return false;
-  if (target.filePath === ref.filePath && target.startLine >= fn.startLine && target.startLine <= fn.endLine) return false;
+  if (!target || (!member && target.name !== name) || target.kind === 'interface' || target.kind === 'type_alias') return false;
+  if (member && context.getImportMappings?.(ref.filePath, ref.language)?.some((m) => m.localName === name) !== true) return false;
   // No function binds a name its file never does (read once per file and name).
-  if (!isLocallyBoundJsName(ref.referenceName, ref.filePath, context)) return false;
-  if (ref.referenceKind === 'calls' && bareCallReceiver(ref, context) !== null) return false;
-  return jsBindingEnclosesReference(ref.referenceName, fn, ref, context);
+  if (!isLocallyBoundJsName(name, ref.filePath, context)) return false;
+  if (!member && ref.referenceKind === 'calls' && bareCallReceiver(ref, context) !== null) return false;
+  return jsBindingAroundReference(name, ref, context, target);
+}
+
+/**
+ * Whether a binding of `name` holds at a JS/TS reference in the function it is
+ * made in or in any function around that one (#2949: `skipValue`'s call of the
+ * `skipString` its enclosing function declares), read innermost first, each
+ * through jsBindingEnclosesReference. A function holding `target`, the
+ * declaration the import resolved to, ends the walk: what it binds is that.
+ */
+function jsBindingAroundReference(name: string, ref: UnresolvedRef, context: ResolutionContext, target?: Node): boolean {
+  const scopes = context.getNodesInFile(ref.filePath)
+    .filter((n) => (n.kind === 'function' || n.kind === 'method') &&
+      (n.startLine < ref.line || (n.startLine === ref.line && (n.startColumn ?? 0) <= ref.column)) &&
+      (n.endLine > ref.line || (n.endLine === ref.line && (n.endColumn ?? Infinity) >= ref.column)))
+    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine) || b.startLine - a.startLine);
+  for (const fn of scopes) {
+    if (target && target.filePath === ref.filePath && target.startLine >= fn.startLine && target.startLine <= fn.endLine) return false;
+    if (jsBindingEnclosesReference(name, fn, ref, context)) return true;
+  }
+  return false;
 }
 
 /**
@@ -26971,7 +27005,8 @@ function matchMethodCallOn(
   // import resolver placed what it could, and a method picked by name alone is
   // wrong: zod's `z.string()` (`import * as z from "zod/v4"`) bound 3,207 calls
   // to a test helper's `string` getter, trpc's `z.record()` another class's.
-  if (ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language) && isImportedModuleReceiver(objectOrClass!, ref, context)) {
+  if (ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language) &&
+      (isImportedModuleReceiver(objectOrClass!, ref, context) || isImportedFunctionReceiver(objectOrClass!, ref, context))) {
     return null;
   }
 
@@ -27443,10 +27478,31 @@ function isThisCallInOwnFile(n: Node, ref: UnresolvedRef, context: ResolutionCon
   return new RegExp(String.raw`\bthis\s*\??\.\s*${escapeRegExp(n.name)}\s*\(`).test(line);
 }
 
-/** Is the root of a member call's receiver (`CameraManager` in `CameraManager.x`) one of the file's imports? */
+/**
+ * Is the root of a member call's receiver (`CameraManager` in
+ * `CameraManager.x`) one of the file's imports where the call is written? A
+ * parameter or a local of that name in scope there is the receiver instead:
+ * hono's `stream(c, async (stream) => { stream.write(…) })` (#2953).
+ */
 function isImportBinding(receiver: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const root = receiver.split('.')[0]!;
-  return context.getImportMappings?.(ref.filePath, ref.language)?.some((m) => m.localName === root) === true;
+  if (context.getImportMappings?.(ref.filePath, ref.language)?.some((m) => m.localName === root) !== true) return false;
+  return !(JS_FAMILY.has(ref.language) && isLocallyBoundJsName(root, ref.filePath, context) && jsBindingAroundReference(root, ref, context));
+}
+
+/**
+ * Is a member call's receiver a plain name the file imports by name from a
+ * project module, bound to a FUNCTION there, where the call is written? A
+ * member of a function object is no method of any class: `(stream as
+ * any).onAbort()` is not `StreamApi.onAbort`, whatever the one `onAbort` is
+ * (#2953). The import resolver links `fn.call(…)` and `fn.apply(…)`.
+ */
+function isImportedFunctionReceiver(receiver: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!/^[A-Za-z_$][\w$]*$/.test(receiver) || !isImportBinding(receiver, ref, context)) return false;
+  const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === receiver);
+  if (!binding || binding.isNamespace || binding.isDefault || context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true) return false;
+  const bound = context.resolveImport?.({ ...ref, referenceName: receiver });
+  return !!bound && context.getNodeById?.(bound.targetNodeId)?.kind === 'function';
 }
 
 /**
