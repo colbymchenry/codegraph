@@ -223,6 +223,51 @@ fn report(g: Option<&Graph>, v: Vec<u32>, mut h: Holder) {
     ]);
   });
 
+  it('calls and variant paths in expression macros, in both extractors (#3251)', () => {
+    const source = `
+impl Code {
+    fn is_known(self) -> bool { matches!(self, Code::Bad | Code::Good(_) | m::Code::Odd { .. }) }
+}
+fn shapes(f: &mut Formatter, v: &Vis, x: Option<u8>) {
+    write!(f, "{} {}", self.code.as_str(), v.a.b().c.d());
+    let _ = "ü"; println!("{e} {}", label(), crate::util::take::<u8>(3), ::std::mem::take(&mut y));
+    assert_eq!(Foo::new().a().b(), u8::max(1, 2), "{}", (j).k());
+    let _ = vec![false; size()]; let _ = vec![a(), b.c()];
+    let _ = serde_json::json!({"k": v(), "n": [w(), x?.y()], "z": Mode::A});
+    assert!(matches!(x, Some(n) if n.ok()), "{}", format!("{}", inner()).len());
+    debug_assert!(v.get::<u8>(1).put(2) && z.await.h() && "s".len() > 0 && 1.5.s() == 0.0);
+    dsl!(hidden() => other()); println!("{}", dsl!(hidden2()));
+    let _ = format!("{}", |q| q.r(), );
+    let _ = format!("{:?}", Foo { a: t(), ..Default::default() });
+    let _ = format!("{:?} {:?} {:?}", a.union(b), x.default(), gen());
+}
+`;
+    assertParity('macros.rs', source);
+    assertParity('macros.rs', source.replace(/\n/g, '\r\n'));
+
+    // Not vacuous: the kernel itself reads the macros' arguments, the
+    // expression macros' only, each where its expression starts.
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    delete process.env.CODEGRAPH_KERNEL;
+    const viaKernel = tryKernelExtract('macros.rs', source, 'rust')!;
+    const lines = source.split('\n');
+    const got = viaKernel.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls' || r.referenceKind === 'references')
+      .map((r) => `${r.referenceKind === 'calls' ? 'C' : 'R'} ${r.referenceName}@${lines[r.line - 1]!.slice(r.column).match(/^(?:::)?\w+/)?.[0]}`);
+    for (const ref of [
+      'R Code@Code', 'C self.code.as_str@self', 'C v.a.b().c.d@v', 'C label@label', 'C crate::util::take@crate',
+      'C ::std::mem::take@::std', 'C Foo::new().a@Foo', 'C b@Foo', 'C u8::max@u8', 'C size@size', 'C a@a', 'C b.c@b',
+      'C v@v', 'C w@w', 'C y@x', 'R Mode@Mode', 'C n.ok@n', 'C inner@inner', 'C len@format', 'C v.get@v',
+      'C v.get().put@v', 'C h@z', 'C q.r@q', 'C t@t', 'C Default::default@Default', 'C a.union@a', 'C x.default@x',
+      'C gen@gen',
+    ]) {
+      expect(got, ref).toContain(ref);
+    }
+    for (const ref of ['C hidden@hidden', 'C other@other', 'C hidden2@hidden2', 'C Some@Some', 'C len@undefined', 'C s@1']) {
+      expect(got, ref).not.toContain(ref);
+    }
+  });
+
   it('torture fixture: impl/trait quirks, use bindings, chains, fn-refs, value-refs, route macros', () => {
     const file = path.join(FIXTURE_DIR, 'torture.rs');
     assertParity('fixtures/torture.rs', fs.readFileSync(file, 'utf8'), 20);

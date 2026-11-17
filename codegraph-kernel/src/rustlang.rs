@@ -1058,6 +1058,26 @@ impl<'t> Walker<'t> {
         }
     }
 
+    /// extractRustMacroCalls (#3251): the calls and variant paths in the
+    /// arguments of an expression macro (`format!`, `assert_eq!`, `vec!`,
+    /// `write!`, `matches!`, `json!`), read from its token tree as the call
+    /// extractor names them (rust_macro_arg_refs). Mirrors
+    /// rust-macro-calls.ts byte-for-byte — change both.
+    fn extract_rust_macro_refs(&mut self, node: Node<'t>) {
+        if self.stack.is_empty() {
+            return;
+        }
+        let refs = rust_macro_arg_refs(node, self.src);
+        if refs.is_empty() {
+            return;
+        }
+        let from = self.top_row();
+        for r in refs {
+            let kind = edge_kind_index(r.kind).unwrap();
+            self.push_ref_at(from, &r.name, kind, r.at);
+        }
+    }
+
     /// extractRustRouteMacro — body-walker-only; bare `routes`/`catchers`
     /// identifiers only (`rocket::routes![…]` is skipped); identifier runs in
     /// the token tree join with `::`, flushed on `,` and at end.
@@ -1244,6 +1264,7 @@ impl<'t> Walker<'t> {
         // Rocket route macros: handler paths live in a raw token tree.
         if kind == "macro_invocation" {
             self.extract_rust_route_macro(node);
+            self.extract_rust_macro_refs(node);
         }
 
         if kind == "call_expression" {
@@ -1822,4 +1843,401 @@ fn opt_str(arena: &mut Arena, s: Option<&str>) -> StrRef {
         Some(s) => arena.put(s),
         None => NONE_STR,
     }
+}
+
+// --- expression macros (#3251) ----------------------------------------------
+//
+// rust-macro-calls.ts, mirrored byte-for-byte — change both.
+
+/// Macros whose arguments are Rust expressions (RUST_EXPRESSION_MACROS).
+const RUST_EXPRESSION_MACROS: &[&str] = &[
+    "format", "format_args", "print", "println", "eprint", "eprintln", "write", "writeln", "panic",
+    "assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne",
+    "vec", "matches", "dbg", "todo", "unimplemented", "unreachable", "json",
+];
+
+/// Keywords a token tree writes as an `identifier` (KEYWORDS).
+const MACRO_ARG_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "box", "break", "const", "continue", "dyn", "else", "enum", "extern", "false", "fn",
+    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "static",
+    "struct", "trait", "true", "type", "unsafe", "use", "where", "while", "yield",
+];
+
+/// Contextual keywords a token tree writes as tokens of their own (CONTEXTUAL_NAMES).
+const MACRO_ARG_CONTEXTUAL: &[&str] = &["default", "union", "gen"];
+
+/// isName: an identifier that is no keyword, or a contextual keyword's token.
+fn macro_is_name(t: Option<&Node>, src: &str) -> bool {
+    match t {
+        None => false,
+        Some(t) => {
+            if t.kind() == "identifier" {
+                !MACRO_ARG_KEYWORDS.contains(&macro_tok_text(*t, src))
+            } else {
+                MACRO_ARG_CONTEXTUAL.contains(&t.kind())
+            }
+        }
+    }
+}
+
+/// Literal tokens (LITERALS).
+const MACRO_ARG_LITERALS: &[&str] =
+    &["string_literal", "raw_string_literal", "char_literal", "integer_literal", "float_literal", "boolean_literal"];
+
+/// One reference a macro's arguments make (RustMacroRef).
+struct MacroRef<'t> {
+    name: String,
+    kind: &'static str,
+    at: Node<'t>,
+}
+
+/// The expression shapes the scan tells apart (Expr).
+enum MExpr {
+    Lit,
+    Name(String),
+    SelfE,
+    Path(String),
+    Call(Box<MExpr>),
+    Field(Box<MExpr>, String),
+    Method(Box<MExpr>, String),
+    Other,
+}
+
+fn macro_tok_text<'s>(t: Node, src: &'s str) -> &'s str {
+    &src[t.byte_range()]
+}
+
+/// `/^(?:[A-Za-z_]\w*|\d+)$/`.
+fn is_field_text(s: &str) -> bool {
+    is_rust_ident(s) || (!s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// `/^[A-Z][A-Za-z0-9_]*$/`.
+fn is_type_name_text(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_uppercase()) && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// receiverChain.
+fn macro_receiver_chain(e: &MExpr) -> Option<String> {
+    let mut links: Vec<String> = Vec::new();
+    let mut cur = e;
+    while links.len() <= RECEIVER_CHAIN_MAX_LINKS {
+        match cur {
+            MExpr::SelfE | MExpr::Name(_) => {
+                let root = match cur {
+                    MExpr::Name(n) => n.as_str(),
+                    _ => "self",
+                };
+                if links.is_empty() || !is_rust_ident(root) {
+                    return None;
+                }
+                links.reverse();
+                let mut s = root.to_string();
+                for l in links {
+                    s.push('.');
+                    s.push_str(&l);
+                }
+                return Some(s);
+            }
+            MExpr::Method(b, n) => {
+                if !is_rust_ident(n) {
+                    return None;
+                }
+                links.push(format!("{n}()"));
+                cur = &**b;
+            }
+            MExpr::Field(b, n) => {
+                if !is_field_text(n) {
+                    return None;
+                }
+                links.push(n.clone());
+                cur = &**b;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// methodCallName.
+fn macro_method_call_name(base: &MExpr, method: &str) -> Option<String> {
+    match base {
+        MExpr::Lit => return None,
+        MExpr::Name(n) => {
+            return Some(if n == "this" || n == "cls" || n == "super" { method.to_string() } else { format!("{n}.{method}") });
+        }
+        MExpr::SelfE => return Some(format!("self.{method}")),
+        MExpr::Field(b, n) => {
+            if matches!(**b, MExpr::SelfE) && is_rust_ident(n) {
+                return Some(format!("self.{n}.{method}"));
+            }
+        }
+        MExpr::Call(c) => {
+            if let MExpr::Path(t) = &**c {
+                return Some(format!("{t}().{method}"));
+            }
+        }
+        MExpr::Method(..) => {}
+        _ => return Some(method.to_string()),
+    }
+    Some(match macro_receiver_chain(base) {
+        Some(chain) => format!("{chain}.{method}"),
+        None => method.to_string(),
+    })
+}
+
+/// rustMacroArgRefs: none unless `mac` is one of RUST_EXPRESSION_MACROS.
+fn rust_macro_arg_refs<'t>(mac: Node<'t>, src: &'t str) -> Vec<MacroRef<'t>> {
+    let mut out = Vec::new();
+    let name_node = mac.named_child(0);
+    let tree = (0..mac.named_child_count()).filter_map(|i| mac.named_child(i)).find(|c| c.kind() == "token_tree");
+    let (Some(name_node), Some(tree)) = (name_node, tree) else { return out };
+    let full = macro_tok_text(name_node, src);
+    let name = full.rsplit("::").next().unwrap_or(full).trim();
+    if RUST_EXPRESSION_MACROS.contains(&name) {
+        macro_scan_group(tree, name == "matches", false, src, &mut out);
+    }
+    out
+}
+
+/// groupTokens: a group's tokens, its delimiters left out.
+fn macro_group_tokens<'t>(group: Node<'t>) -> Vec<Node<'t>> {
+    let n = group.child_count();
+    let mut tokens = Vec::new();
+    let mut i = 1;
+    while i + 1 < n {
+        if let Some(t) = group.child(i) {
+            tokens.push(t);
+        }
+        i += 1;
+    }
+    tokens
+}
+
+/// delimiter: `(`, `[` or `{`.
+fn macro_group_delim(group: Node) -> &'static str {
+    group.child(0).map(|c| c.kind()).unwrap_or("")
+}
+
+/// scanGroup.
+fn macro_scan_group<'t>(group: Node<'t>, matches_args: bool, pattern: bool, src: &'t str, out: &mut Vec<MacroRef<'t>>) {
+    stack_guard!();
+    let tokens = macro_group_tokens(group);
+    let mut in_pattern = pattern;
+    let mut comma_seen = false;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if matches_args && t.kind() == "," && !comma_seen {
+            comma_seen = true;
+            in_pattern = true;
+            i += 1;
+            continue;
+        }
+        if in_pattern && t.kind() == "if" {
+            in_pattern = false;
+            i += 1;
+            continue;
+        }
+        let next = macro_parse_chain(&tokens, i, in_pattern, src, out);
+        i = if next > i { next } else { i + 1 };
+    }
+}
+
+/// startsExpr.
+fn macro_starts_expr(tokens: &[Node], i: usize, src: &str) -> bool {
+    let t = tokens[i];
+    match t.kind() {
+        "self" | "crate" | "super" | "::" | "token_tree" => true,
+        "primitive_type" => tokens.get(i + 1).map(|n| n.kind() == "::").unwrap_or(false),
+        k => macro_is_name(Some(&t), src) || MACRO_ARG_LITERALS.contains(&k),
+    }
+}
+
+/// skipAngles: past a turbofish's `<…>` that starts at `i`, or None.
+fn macro_skip_angles(tokens: &[Node], i: usize) -> Option<usize> {
+    let mut depth: i32 = 0;
+    for (j, t) in tokens.iter().enumerate().skip(i) {
+        let ty = t.kind();
+        if ty == "<" {
+            depth += 1;
+        } else if ty == "<<" {
+            depth += 2;
+        } else if ty == ">" {
+            depth -= 1;
+        } else if ty == ">>" {
+            depth -= 2;
+        } else if ty == ";" || (ty == "token_tree" && macro_group_delim(*t) == "{") {
+            return None;
+        }
+        if depth <= 0 {
+            return if depth == 0 { Some(j + 1) } else { None };
+        }
+    }
+    None
+}
+
+/// isSegment.
+fn macro_is_segment(t: Option<&Node>, src: &str) -> bool {
+    match t {
+        None => false,
+        Some(n) => macro_is_name(t, src) || matches!(n.kind(), "self" | "super" | "crate" | "primitive_type"),
+    }
+}
+
+/// parseChain: the expression that starts at `i`; returns the index past it.
+fn macro_parse_chain<'t>(tokens: &[Node<'t>], mut i: usize, in_pattern: bool, src: &'t str, out: &mut Vec<MacroRef<'t>>) -> usize {
+    stack_guard!();
+    if !macro_starts_expr(tokens, i, src) {
+        return i;
+    }
+    let start = tokens[i];
+    let mut expr: MExpr;
+    let mut segs: Vec<(&'t str, Node<'t>)> = Vec::new();
+    if MACRO_ARG_LITERALS.contains(&start.kind()) {
+        expr = MExpr::Lit;
+        i += 1;
+    } else if start.kind() == "token_tree" {
+        macro_scan_group(start, false, in_pattern, src, out);
+        expr = MExpr::Other;
+        i += 1;
+    } else {
+        let leading = start.kind() == "::";
+        if leading {
+            i += 1;
+        }
+        if !macro_is_segment(tokens.get(i), src) {
+            return i;
+        }
+        loop {
+            segs.push((macro_tok_text(tokens[i], src), tokens[i]));
+            i += 1;
+            if tokens.get(i).map(|t| t.kind()) != Some("::") {
+                break;
+            }
+            if tokens.get(i + 1).map(|t| t.kind()) == Some("<") {
+                let Some(past) = macro_skip_angles(tokens, i + 1) else { break };
+                i = past;
+                if tokens.get(i).map(|t| t.kind()) == Some("::") && macro_is_segment(tokens.get(i + 1), src) {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            if !macro_is_segment(tokens.get(i + 1), src) {
+                break;
+            }
+            i += 1;
+        }
+        if tokens.get(i).map(|t| t.kind()) == Some("!") && tokens.get(i + 1).map(|t| t.kind()) == Some("token_tree") {
+            let name = segs[segs.len() - 1].0;
+            if RUST_EXPRESSION_MACROS.contains(&name) {
+                macro_scan_group(tokens[i + 1], name == "matches", false, src, out);
+            }
+            expr = MExpr::Other;
+            i += 2;
+        } else if segs.len() == 1 && !leading {
+            let only = segs[0].0;
+            expr = if only == "self" {
+                MExpr::SelfE
+            } else if macro_is_name(Some(&start), src) {
+                MExpr::Name(only.to_string())
+            } else {
+                MExpr::Other
+            };
+        } else {
+            let joined: Vec<&str> = segs.iter().map(|s| s.0).collect();
+            expr = MExpr::Path(format!("{}{}", if leading { "::" } else { "" }, joined.join("::")));
+        }
+    }
+    if matches!(expr, MExpr::Path(_)) {
+        let following = tokens.get(i);
+        let is_struct = following.map(|f| f.kind() == "token_tree" && macro_group_delim(*f) == "{").unwrap_or(false);
+        let called = following.map(|f| f.kind() == "token_tree" && macro_group_delim(*f) == "(").unwrap_or(false);
+        if (in_pattern || (!called && !is_struct)) && segs.len() >= 2 {
+            let member = segs[segs.len() - 1].0;
+            let (recv_text, recv_node) = segs[segs.len() - 2];
+            if member.starts_with(|c: char| c.is_ascii_uppercase())
+                && recv_text != "Self"
+                && is_type_name_text(recv_text)
+                && recv_node.kind() == "identifier"
+            {
+                out.push(MacroRef { name: recv_text.to_string(), kind: "references", at: recv_node });
+            }
+        }
+    }
+    loop {
+        let Some(&t) = tokens.get(i) else { break };
+        if t.kind() == "token_tree" && macro_group_delim(t) == "(" {
+            if !in_pattern {
+                match &expr {
+                    MExpr::Name(n) => out.push(MacroRef { name: n.clone(), kind: "calls", at: start }),
+                    MExpr::Path(p) => out.push(MacroRef { name: p.clone(), kind: "calls", at: start }),
+                    _ => {}
+                }
+            }
+            macro_scan_group(t, false, in_pattern, src, out);
+            expr = MExpr::Call(Box::new(std::mem::replace(&mut expr, MExpr::Other)));
+            i += 1;
+            continue;
+        }
+        if t.kind() == "token_tree" && macro_group_delim(t) == "[" {
+            macro_scan_group(t, false, false, src, out);
+            expr = MExpr::Other;
+            i += 1;
+            continue;
+        }
+        if t.kind() == "token_tree" && macro_group_delim(t) == "{" {
+            macro_scan_group(t, false, in_pattern, src, out);
+            expr = MExpr::Other;
+            i += 1;
+            continue;
+        }
+        if t.kind() == "?" {
+            expr = MExpr::Other;
+            i += 1;
+            continue;
+        }
+        if t.kind() != "." {
+            break;
+        }
+        let Some(&n) = tokens.get(i + 1) else { break };
+        if n.kind() == "await" {
+            expr = MExpr::Other;
+            i += 2;
+            continue;
+        }
+        if n.kind() == "integer_literal" {
+            let name = macro_tok_text(n, src).to_string();
+            expr = MExpr::Field(Box::new(std::mem::replace(&mut expr, MExpr::Other)), name);
+            i += 2;
+            continue;
+        }
+        if n.kind() != "identifier" && !MACRO_ARG_CONTEXTUAL.contains(&n.kind()) {
+            break;
+        }
+        let member = macro_tok_text(n, src);
+        let mut j = i + 2;
+        if tokens.get(j).map(|t| t.kind()) == Some("::") && tokens.get(j + 1).map(|t| t.kind()) == Some("<") {
+            let Some(past) = macro_skip_angles(tokens, j + 1) else { break };
+            j = past;
+        }
+        if let Some(&args) = tokens.get(j) {
+            if args.kind() == "token_tree" && macro_group_delim(args) == "(" {
+                if !in_pattern {
+                    if let Some(name) = macro_method_call_name(&expr, member) {
+                        out.push(MacroRef { name, kind: "calls", at: start });
+                    }
+                }
+                macro_scan_group(args, false, false, src, out);
+                expr = MExpr::Method(Box::new(std::mem::replace(&mut expr, MExpr::Other)), member.to_string());
+                i = j + 1;
+                continue;
+            }
+        }
+        expr = MExpr::Field(Box::new(std::mem::replace(&mut expr, MExpr::Other)), member.to_string());
+        i = j;
+    }
+    i
 }

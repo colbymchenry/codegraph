@@ -312,6 +312,15 @@ fn mount() {
     let skipped = rocket::routes![a::x];
 }
 
+// Calls in an expression macro's arguments (#3251); another macro's are not read.
+fn macro_calls(v: &Vis, x: Option<u8>) {
+    println!("{} {}", label(), v.a.b());
+    assert_eq!(count(), m::size::<u8>(2), "{}", Mode::A.flip());
+    let _ = vec![make(); 3];
+    let _ = matches!(x, Some(n) if n.is_power_of_two());
+    other_macro!(not_read(), at_all());
+}
+
 routes![top_level_h];
 
 // Initializer walks attributed to the declared symbol (#693).
