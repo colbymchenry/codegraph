@@ -23389,6 +23389,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   JS_READER_TEXT.delete(context);
   JS_FUNCTION_WRITTEN_TWICE.delete(context);
   TS_RETURNED_TYPES.delete(context);
+  JS_FILE_NAMES_TYPE.delete(context);
   JS_GUARDED_NAMES.delete(context);
   TS_TYPE_GUARD_NAMES.delete(context);
   REACT_LIFECYCLE_MEMO.delete(context);
@@ -24924,6 +24925,11 @@ function jsDeclarationReading(name: string, site: JsBindingSite, file: JsScopeFi
     const type = normalizeInferredTypeName(m[1]);
     return type ? { type, raw: m[1], line } : null;
   }
+  const cast = jsCastValueType(rest);
+  if (cast) {
+    const type = normalizeInferredTypeName(cast);
+    return type ? { type, raw: cast, line } : null;
+  }
   const made = /^\s*=\s*new\s+([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*(?:<[^;(){}]*>\s*)?\(/.exec(rest);
   if (!made) return null;
   const className = made[1]!.replace(/\s+/g, '');
@@ -25274,11 +25280,12 @@ const JS_RECEIVER_CANDIDATES = new WeakMap<ResolutionContext, Map<string, { para
 
 /**
  * A `const`/`let`/`var` of a name whose value is a bare call (`x = f(`) or a
- * member call around a call or a `new` (`x = store.add(f(`) on a receiver
- * other than `this` or `super`, the shapes jsCallResultReading reads,
- * matched at a declaration's keyword.
+ * member call (`x = store.add(f(`, `x = Db.initialize(`, `x =
+ * net.createServer(`) on a receiver other than `this` or `super`, the shapes
+ * jsCallResultReading and jsOutsideCallValue read, matched at a declaration's
+ * keyword.
  */
-const JS_CALL_DECLARATION = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:([A-Za-z_$][\w$]*)\s*\(|(?!(?:this|super)\s*\.)[A-Za-z_$][\w$]*\s*\.\s*[A-Za-z_$][\w$]*\s*\(\s*(?:new\s+)?[A-Za-z_$][\w$]*\s*(?:\.\s*[A-Za-z_$][\w$]*\s*)?\()/y;
+const JS_CALL_DECLARATION = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:([A-Za-z_$][\w$]*)\s*\(|(?!(?:this|super)\s*\.)[A-Za-z_$][\w$]*\s*\.\s*[A-Za-z_$][\w$]*\s*\()/y;
 
 /** Bare calls whose value no project function's signature gives. */
 const JS_NOT_TYPED_CALLEE = new Set(['require', 'import', 'await', 'typeof', 'new', 'function', 'async', 'super']);
@@ -25641,6 +25648,14 @@ function tsValueType(file: JsScopeFile, at: number, where: UnresolvedRef, contex
   // `recv.w(x)`: w's declaration returns its one argument, on the class recv's binding types.
   if (head === 'this' || head === 'super') return null;
   const site = jsBindingAt(head!, file, at);
+  // `Class.factory(x)`, with nothing in scope binding the class's name: what
+  // the class's one static method of the name says it returns (#2946).
+  if (!site && /^[A-Z]/.test(head!)) {
+    const cls = tsNamedType(head!, { filePath: where.filePath, language: where.language, id: '' }, where, context);
+    if (!cls || cls === 'outside' || cls.kind !== 'class') return null;
+    const read = tsStaticReturnedType(cls, member!, where, context);
+    return read && { ...read, from: [...read.from, cls.filePath] };
+  }
   const reading = site ? jsBindingReading(head!, site, file) : null;
   const owner = reading ? tsNamedType(reading.raw.replace(/\s*<[\s\S]*$/, ''), { filePath: where.filePath, language: where.language, id: '' }, where, context) : null;
   if (!owner || owner === 'outside' || owner.kind !== 'class') return null;
@@ -25684,6 +25699,132 @@ function jsCallResultReading(
 
 /** A `const`/`let`/`var` of one name and its `=`, matched at the keyword: the head jsCallResultReading reads past. */
 const JS_DECLARATION_HEAD = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*/y;
+
+/**
+ * The type a TS class's static method `name` says it returns, read where that
+ * is exact (#2946): the class (or a class it extends) declares one static
+ * method of the name, not generic, written once, with a return type that is
+ * one type — not a type predicate, an array, a union of two types, a type
+ * parameter of the class or `this`. Null for anything else, and the call
+ * reads as before.
+ */
+function tsStaticReturnedType(cls: Node, name: string, at: UnresolvedRef, context: ResolutionContext): TsTypeRead | null {
+  const methods = tsClassMethods(cls, name, at, context, 0);
+  const method = methods.length === 1 && methods[0]!.isStatic ? methods[0]! : null;
+  if (!method) return null;
+  const lines = context.getFileLines?.(method.filePath) ?? context.readFile(method.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(method.startLine - 1, method.startLine + 2).join('\n');
+  const written = head.match(new RegExp(`(?<![\\w$.])${escapeRegExp(name)}\\s*([<(])`, 'g')) ?? [];
+  if (written.length !== 1 || written[0]!.endsWith('<')) return null;
+  const signature = stripCommentsForRegex(method.signature ?? '', 'typescript').trim();
+  const close = signature.startsWith('(') ? jsCloseOf(signature, 0) : -1;
+  const annotation = close < 0 ? undefined : /^\s*:\s*([\s\S]*\S)\s*$/.exec(signature.slice(close + 1))?.[1];
+  if (annotation === undefined || /^(?:asserts\b|(?:this|[A-Za-z_$][\w$]*)\s+is\b)/.test(annotation) || tsHidesMembers(annotation, context)) return null;
+  const raw = new RegExp(`^${TS_ANNOTATED_TYPE}`).exec(annotation)?.[1];
+  if (!raw || raw.endsWith(']') || !tsOneType(annotation, raw) || raw === 'this') return null;
+  const owner = context.getNodesInFile(method.filePath).find((n) => n.kind === 'class' && n.startLine <= method.startLine && n.endLine >= method.endLine);
+  if (owner && tsClassTypeParameter(owner, raw.split(/[.<\s]/)[0]!, context)) return null;
+  return { raw, file: method.filePath, language: method.language, line: method.startLine, from: [method.filePath] };
+}
+
+/**
+ * Whether the JS/TS value written at `at` is a call whose result is a value
+ * from outside the project, so no project method is a method of it (#2947):
+ * - a function the file imports from a package (`createRoot(el)` from
+ *   react-dom, `createServer()` from `net`);
+ * - a member of a module or value the file imports from one
+ *   (`net.createServer()`);
+ * - a method of a parameter or local written with a type no project file
+ *   declares, with no type arguments (`canvas.getContext('2d')` on an
+ *   `HTMLCanvasElement`), past a non-null `!`.
+ * The whole value is the call; a generic call (`get<Svc>(…)`), a JS built-in
+ * container's method and anything else is not read.
+ */
+function jsOutsideCallValue(file: JsScopeFile, at: number, where: UnresolvedRef, context: ResolutionContext): boolean {
+  const { code } = file;
+  const text = code.slice(at, at + 300);
+  const lead = /^\s*/.exec(text)![0].length;
+  const called = /^([A-Za-z_$][\w$]*)(?:\s*\.\s*([A-Za-z_$][\w$]*))?\s*\(/.exec(text.slice(lead));
+  if (!called) return false;
+  const open = at + lead + called[0].length - 1;
+  const close = jsCloseOf(code, open);
+  if (close < 0 || !JS_WHOLE_VALUE_END.test(code.slice(close + 1, close + 200).replace(/^\s*!/, ''))) return false;
+  const [, head, member] = called;
+  if (JS_NOT_CALLEE.has(head!) || head === 'this' || head === 'super') return false;
+  // A call handed something of the project's may hand it back: a container's
+  // lookup of a class (`moduleRef.get(Service)`, `TestBed.inject(Service)`,
+  // `accessor.get(IEditorService)`), a context (`useContext(StoreContext)`),
+  // or a hook's callback whose result it returns (`useMemo(() => new Store(),
+  // [])`). Such a call is read as before.
+  const argText = code.slice(open + 1, close);
+  if (/^use[A-Z]/.test(member ?? head!) && /=>|\bfunction\b/.test(argText)) return false;
+  const args: string[] = [];
+  for (let depth = 0, from = 0, i = 0; i <= argText.length; i++) {
+    const c = argText[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    else if ((c === ',' && depth === 0) || i === argText.length) {
+      args.push(argText.slice(from, i));
+      from = i + 1;
+    }
+  }
+  if (args.some((a) => /^\s*[A-Z][\w$]*\s*$/.test(a) &&
+      context.getNodesByName(a.trim()).some((n) => n.qualifiedName === n.name && n.kind !== 'import' && n.kind !== 'file'))) return false;
+  const local = jsBindingAt(head!, file, at);
+  if (!local) return isOutOfRepoBinding(head!, where, context);
+  if (!member) return false;
+  const reading = jsBindingReading(head!, local, file);
+  const raw = reading?.raw.trim();
+  if (!raw || !/^[A-Za-z_$][\w$]*$/.test(raw) || JS_BUILT_INS.has(raw) || TS_PRIMITIVE_TYPES.has(raw)) return false;
+  // A type written with type arguments (`ReadonlyMap<Language, Rules>`) may hand one back: read as before.
+  if (new RegExp(`(?:\\bnew\\s+|:\\s*)${escapeRegExp(raw)}\\s*<`).test(code.slice(local.at, local.at + 300))) return false;
+  return tsImportedTypeFile(raw, where, context) === undefined && isUndeclaredTypeName(raw, where, context);
+}
+
+/**
+ * A JS/TS receiver whose binding in scope at the call is a `const`/`let`/`var`
+ * with no type written that a call of a value from outside the project
+ * initializes (jsOutsideCallValue): the line of that binding, or null.
+ */
+function jsOutsideValueBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): number | null {
+  if (!jsReceiverCandidates(ref.filePath, ref.language, context).calls.has(name)) return null;
+  const file = jsScopeFile(ref.filePath, context);
+  if (!file) return null;
+  const site = jsBindingAt(name, file, (file.lineStarts[ref.line - 1] ?? file.code.length) + ref.column);
+  if (!site || site.kind !== 'declaration') return null;
+  JS_DECLARATION_HEAD.lastIndex = site.at;
+  const head = JS_DECLARATION_HEAD.exec(file.code);
+  if (!head || head[1] !== name) return null;
+  return jsOutsideCallValue(file, site.at + head[0].length, ref, context) ? jsLineOf(file, site.at) : null;
+}
+
+/**
+ * The type a declaration's whole value is cast to on its line, `= fn as
+ * Matcher;` (`rest` starting at the `=`), as the checker reads it (#3035): a
+ * plain type name, no type arguments. Null for anything else.
+ */
+function jsCastValueType(rest: string): string | null {
+  return /^\s*=\s*[^;\n]*?\sas\s+([A-Z][\w.$]*)\s*;?[ \t]*(?:\r?\n|$)/.exec(rest)?.[1] ?? null;
+}
+
+/**
+ * A TS local cast where it is declared, `const matcher = fn as Matcher;`,
+ * with no type written: the type it is cast to, read at its binding in scope
+ * at the call (#3035). Null for anything else.
+ */
+function jsCastLocalReading(name: string, ref: UnresolvedRef, context: ResolutionContext): JsBindingReading | null {
+  const file = jsScopeFile(ref.filePath, context);
+  if (!file) return null;
+  const site = jsBindingAt(name, file, (file.lineStarts[ref.line - 1] ?? file.code.length) + ref.column);
+  if (!site || site.kind !== 'declaration') return null;
+  JS_DECLARATION_HEAD.lastIndex = site.at;
+  const head = JS_DECLARATION_HEAD.exec(file.code);
+  if (!head || head[1] !== name) return null;
+  const eq = site.at + head[0].lastIndexOf('=');
+  const raw = jsCastValueType(file.code.slice(eq, eq + 400));
+  const type = raw ? normalizeInferredTypeName(raw) : null;
+  return raw && type ? { type, raw, line: jsLineOf(file, site.at) } : null;
+}
 
 /** `if (!x.m())`, `if (x.m())`, `if (!f(x))`, `if (f(x))`: a type guard's whole condition, the name it tests and the guard captured. */
 const JS_GUARD_CONDITION = /\bif\s*\(\s*!?\s*(?:([A-Za-z_$][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)\s*\(\s*\)|([A-Za-z_$][\w$]*)\s*\(\s*([A-Za-z_$][\w$]*)\s*\))\s*\)/g;
@@ -26343,6 +26484,10 @@ function matchMethodCallOn(
   let javaDeclared: ReturnType<typeof javaReceiverDeclaredType> | undefined;
   // A declaration read for the receiver, so its name names no class (Strategy 2).
   let declaredReceiver = false;
+  // The TS/JS type the receiver is declared with, when its member of the
+  // method's name is a property (tsPropertyOwner): Strategy 3 guesses only
+  // among the classes that extend or implement it.
+  let propertyOwner: Node | null = null;
   // A C# keyword type: an extension method is the only project method it has.
   let csharpBuiltInReceiver = false;
   if (inferableReceiver) {
@@ -26492,6 +26637,22 @@ function matchMethodCallOn(
         typedFrom = reading.from;
       }
     }
+    // A local a library call initializes holds the library's value (#2947):
+    // `createRoot(el)` from react-dom, `net.createServer()`,
+    // `canvas.getContext('2d')!` on an `HTMLCanvasElement`. No project method
+    // is the call's, whatever shares its name.
+    if (jsPlainReceiver && readersOn && typedAt === undefined) {
+      const outside = nmTimedT('mc-jsoutside', ref, () => jsOutsideValueBinding(objectOrClass!, ref, context));
+      if (outside !== null && (!inferredType || decl.line === undefined || decl.line < outside)) return null;
+      // A local cast where it is declared, `const matcher = fn as Matcher;`,
+      // has the type it is cast to (#3035).
+      const cast = inferredType ? null : jsCastLocalReading(objectOrClass!, ref, context);
+      if (cast) {
+        inferredType = cast.type;
+        decl.raw = cast.raw;
+        decl.line = cast.line;
+      }
+    }
     const awaited = !inferredType && ESM_FAMILY.has(ref.language)
       ? inferEsmAwaitedCallType(objectOrClass!, ref, context) : null;
     if (awaited) {
@@ -26631,6 +26792,10 @@ function matchMethodCallOn(
       if (ESM_FAMILY.has(ref.language) && !awaited) {
         const known = tsKnownTypeCall(inferredType, importedFqn ?? ref.filePath, methodName!, ref, typedAt ?? ref, context, 0.9, typedAt !== undefined);
         if (known) return withTypeFrom(known, typedFrom);
+        // A type whose member of the name is a property (`snapshot?: () =>
+        // …`) is called through that property, or through a class that
+        // extends or implements it, never another class's method (#3035).
+        if (known === undefined) propertyOwner = tsPropertyOwner(inferredType, importedFqn ?? ref.filePath, methodName!, typedAt ?? ref, context);
         // A type a reader gave (`typedAt`) with no method of the name up its
         // chain. A lookup by the type's name counts only on the type the
         // reading's file names, as a type alias's member does (outline's
@@ -27263,6 +27428,19 @@ function matchMethodCallOn(
       const kept = targetMethods.filter((m) => m.language !== 'ruby' || visible(m));
       rubySuiteNarrowed = kept.length !== targetMethods.length;
       targetMethods = kept;
+    }
+    // A receiver declared with a type whose member of the name is a property
+    // calls a class that extends or implements that type, or one whose file
+    // names it — excalidraw's `Collab` builds the `CollabAPI` object out of
+    // its own methods — or none (#3035). A lone subtype is the call's as a
+    // lone method of the name is; ruling others out leaves no lone class that
+    // merely names the type to take that way.
+    if (propertyOwner) {
+      const owner = propertyOwner;
+      const subtypes = targetMethods.filter((m) => tsMethodOwnerIsSubtype(m, owner, ref, context));
+      const naming = targetMethods.filter((m) => !subtypes.includes(m) && jsFileNamesType(m.filePath, owner, context));
+      narrowed ||= naming.length > 0 && subtypes.length + naming.length !== targetMethods.length;
+      targetMethods = [...subtypes, ...naming];
     }
     // Nor is it a method of a class another function declares: Django's
     // `file.write(…)` in one test is not the `File` a serializer test
@@ -32664,6 +32842,76 @@ function tsMethodUpChain(cls: Node, name: string, at: UnresolvedRef, context: Re
     if (!up.complete) complete = false;
   }
   return { method: null, complete };
+}
+
+/**
+ * The class or interface, `typeName` or one up its chain (as tsMethodUpChain
+ * walks it), whose member `name` is a property rather than a method:
+ * `Matcher`'s `snapshot?: () => …`, bitwarden's `abstract getAuthStatus: (…)
+ * => Promise<…>` (#3035). A call through it is the property's, or a method of
+ * a class that extends or implements that type: never an unrelated class's
+ * method of the name. Null when the type isn't found or has a method of the
+ * name.
+ */
+function tsPropertyOwner(typeName: string, file: string, name: string, at: UnresolvedRef, context: ResolutionContext): Node | null {
+  let known: Node | null | undefined = tsTypeDeclaredIn(file, typeName, context);
+  if (!known) {
+    const named = tsNamedType(typeName, { filePath: at.filePath, language: at.language, id: '' }, at, context);
+    known = named && named !== 'outside' ? named : !named ? tsAliasedType(typeName, file, at, context) : null;
+  }
+  return known ? tsPropertyUpChain(known, name, at, context, 0) : null;
+}
+
+function tsPropertyUpChain(cls: Node, name: string, at: UnresolvedRef, context: ResolutionContext, depth: number): Node | null {
+  const members = context.getNodesInFile(cls.filePath).filter((n) =>
+    n.name === name && n.startLine >= cls.startLine && n.endLine <= cls.endLine &&
+    n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === cls.name);
+  if (members.some((n) => n.kind === 'method')) return null;
+  if (members.some((n) => n.kind === 'property' || n.kind === 'field')) return cls;
+  if (depth >= TS_BASE_WALK_DEPTH) return null;
+  for (const written of tsHeadSupertypes(cls, context) ?? []) {
+    const base = tsNamedType(written, cls, at, context);
+    if (!base || base === 'outside' || base.id === cls.id) continue;
+    const found = tsPropertyUpChain(base, name, at, context, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Per context: `<file>\0<type name>` → whether the file's code writes the name. */
+const JS_FILE_NAMES_TYPE = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** Whether `file` is the one declaring `type`, or its code writes `type`'s name (comments and strings blanked). */
+function jsFileNamesType(file: string, type: Node, context: ResolutionContext): boolean {
+  if (file === type.filePath) return true;
+  let memo = JS_FILE_NAMES_TYPE.get(context);
+  if (!memo) JS_FILE_NAMES_TYPE.set(context, (memo = new Map()));
+  const key = `${file}\0${type.name}`;
+  let hit = memo.get(key);
+  if (hit === undefined) {
+    const code = jsScopeFile(file, context)?.code ?? '';
+    hit = new RegExp(`(?<![\\w$.])${escapeRegExp(type.name)}(?![\\w$])`).test(code);
+    if (memo.size >= PATTERN_MEMO_CAP) memo.delete(memo.keys().next().value!);
+    memo.set(key, hit);
+  }
+  return hit;
+}
+
+/** Whether the class or interface declaring `method` is `type` or extends or implements it, read up the heads as tsMethodUpChain does. */
+function tsMethodOwnerIsSubtype(method: Node, type: Node, at: UnresolvedRef, context: ResolutionContext): boolean {
+  const ownerName = method.qualifiedName.slice(0, Math.max(0, method.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop();
+  const owner = context.getNodesInFile(method.filePath).find((n) =>
+    TS_MEMBER_OWNER_KINDS.has(n.kind) && n.name === ownerName && n.startLine <= method.startLine && n.endLine >= method.endLine);
+  const walk = (cls: Node, depth: number): boolean => {
+    if (cls.id === type.id) return true;
+    if (depth >= TS_BASE_WALK_DEPTH) return false;
+    for (const written of tsHeadSupertypes(cls, context) ?? []) {
+      const base = tsNamedType(written, cls, at, context);
+      if (base && base !== 'outside' && base.id !== cls.id && walk(base, depth + 1)) return true;
+    }
+    return false;
+  };
+  return !!owner && walk(owner, 0);
 }
 
 /**
