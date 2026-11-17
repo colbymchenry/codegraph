@@ -4929,12 +4929,19 @@ function pythonCallShape(ref: UnresolvedRef, context: ResolutionContext): Python
 function fitsPythonCallShape(n: Node, shape: PythonCallShape, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (shape.kind === 'bare') {
     if (n.kind === 'method') return false;
-    if (n.filePath === ref.filePath) return true;
     // `from django.shortcuts import render`: the call is the package's.
-    if (isPythonNameImportedFromOutside(ref.referenceName, ref, context)) return false;
-    // `view = UserView.as_view()` … `view(request)`: the file's own value —
-    // unless it is a pytest fixture, which a test takes as a parameter of that name.
-    return isFixtureInReach(n, ref.filePath, context) || !isPythonLocallyBound(ref.referenceName, ref, context);
+    if (n.filePath !== ref.filePath && isPythonNameImportedFromOutside(ref.referenceName, ref, context)) return false;
+    // A pytest fixture is what a test's parameter of its name receives.
+    if (isFixtureInReach(n, ref.filePath, context)) return true;
+    // A name the code around the call binds itself — a parameter or a local of
+    // the calling function or of a function enclosing it, a loop target, the
+    // call's own comprehension variable or lambda parameter — is that value,
+    // never a module-level namesake, the file's own included (#3037, #3230,
+    // #3231). A def nested where the call can see it is that binding.
+    if (!n.qualifiedName.includes('::') && isPythonBoundAroundCall(ref, context)) return false;
+    if (n.filePath === ref.filePath) return true;
+    // `view = UserView.as_view()` … `view(request)`: the file's own value.
+    return !isPythonLocallyBound(ref.referenceName, ref, context);
   }
   // A member of what the chain names: a method of a class of that name, or a
   // function / class in a module of that name (`helpers.slugify()`).
@@ -5066,6 +5073,24 @@ const PY_LOCAL_BINDS = new WeakMap<ResolutionContext, Map<string, number>>();
 const PY_LOCAL_FILE = new WeakMap<ResolutionContext, { filePath: string; lines: string[]; module: Map<string, boolean> }>();
 /** The ref isPythonLocallyBound last answered, and the answer. */
 const PY_LOCAL_LAST = new WeakMap<ResolutionContext, { ref: UnresolvedRef; name: string; bound: boolean }>();
+/** The ref isPythonBoundAroundCall last answered, and the answer. */
+const PY_BOUND_AROUND_LAST = new WeakMap<ResolutionContext, { ref: UnresolvedRef; bound: boolean }>();
+
+/**
+ * Whether a bare Python call's name is bound by the code around it rather than
+ * by the module (pythonReceiverBinding): the calling function or one enclosing
+ * it binds it (a parameter, an assignment, a `for`/`with`/`except` target, a
+ * nested `def`), or the call sits in a lambda or comprehension that does. Class
+ * bodies in between bind nothing a method can see. Asked once per call, since
+ * fitsPythonCallShape asks it of every same-named candidate.
+ */
+function isPythonBoundAroundCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const last = PY_BOUND_AROUND_LAST.get(context);
+  if (last?.ref === ref) return last.bound;
+  const bound = pythonReceiverBinding(ref.referenceName, ref, context) === 'local';
+  PY_BOUND_AROUND_LAST.set(context, { ref, bound });
+  return bound;
+}
 
 /**
  * Whether the function around a Python call — or its module, at top level —
@@ -23814,6 +23839,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PY_LOCAL_BINDS.delete(context);
   PY_LOCAL_FILE.delete(context);
   PY_LOCAL_LAST.delete(context);
+  PY_BOUND_AROUND_LAST.delete(context);
   OVERLOAD_SETS.delete(context);
   SWIFT_PARAMETERS.delete(context);
   PHP_FILE_SCOPES.delete(context);
