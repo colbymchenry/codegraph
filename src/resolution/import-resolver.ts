@@ -2226,6 +2226,12 @@ function extractJSImports(content: string): ImportMapping[] {
   const requireRegex = /(?:\b(?:const|let|var)\s+|,\s*)(?:([A-Za-z_$][\w$]*)|{([^}]+)})\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)(?:\s*\.\s*([A-Za-z_$][\w$]*))?/g;
   while ((match = requireRegex.exec(content)) !== null) {
     const [, defaultName, destructured, source, member] = match;
+    // `const app = require('./app')(opts)` holds what the module's export
+    // returns, not the module: a member of it is no export of the module's
+    // (the call's type, when known, is read where the local is declared). A
+    // package's call result stays bound to the package, which keeps a name
+    // match off it, as before.
+    if (source!.startsWith('.') && /^\s*\(/.test(content.slice(requireRegex.lastIndex, requireRegex.lastIndex + 40))) continue;
 
     if (defaultName) {
       mappings.push({

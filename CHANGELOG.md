@@ -74,6 +74,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A `fetch` or HTTP-client call to another company's API, like `fetch('https://api.github.com/users/…')`, no longer links to your own server's route with the same path; a call to localhost, to a host your code fills in, or through a client's base URL still links. Thanks @inth3shadows for the report and @johnhldiver-beep. (#2974)
 - In JavaScript and TypeScript, a call or `new` of a global, like `parseInt(…)`, `new Response(…)` or `new URL(…)`, in a module that doesn't import that name no longer links to a same-named export of another file in your project. Thanks @inth3shadows for the report. (#3238)
 - In JavaScript, a `require()` of a folder by a relative path, like `require('..')` from a package's tests, now loads the file the folder's `package.json` names as `main`, as Node does, so calls through it link to the function that file exports. Before, a folder without an `index.js` wasn't followed, and the call linked to the variable holding the `require()` result; on fastify, every test's `Fastify()` linked to its own test file. Thanks @inth3shadows for the report. (#2964)
+- In JavaScript, a variable that holds what a required module's function returns, like `const app = require('./app')()`, no longer counts as the module itself, so a call like `app.listen()` no longer links to the module's factory function, and links to the method of the class the factory returns when that is known. Thanks @inth3shadows for the report. (#2964)
 
 ## [1.6.3] - 2026-11-17
 

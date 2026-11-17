@@ -15342,7 +15342,12 @@ const LOCAL_BINDING_PATTERNS = new Map<string, LocalBindingPatterns>();
 const LOCAL_BINDING_PATTERNS_CAP = 4096;
 const JS_BINDING_NAME = /^[\w$]+$/;
 const ARROW_HEAD_CHAR = /[\w$.]/;
-const IMPORT_BINDING_VALUE = /^\s*(?:await\s+)?(?:require|import)\s*\(/;
+/**
+ * A declaration's value that binds an import: `require('./m')`, `await
+ * import('./m')`. Not a required module's export called on the spot,
+ * `require('./app')(opts)`: that is a local holding the call's result.
+ */
+const IMPORT_BINDING_VALUE = /^\s*(?:await\s+)?(?:import\s*\(|require\s*\((?!\s*(['"])[^'"\n]*\1\s*\)\s*\())/;
 
 // The balanced groups a parameter's type or default can hold, two levels deep.
 const PARAM_PAREN = '\\((?:[^()]|\\([^()]*\\))*\\)';
@@ -26375,6 +26380,26 @@ const JS_CALL_DECLARATION = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:([A
 /** Bare calls whose value no project function's signature gives. */
 const JS_NOT_TYPED_CALLEE = new Set(['require', 'import', 'await', 'typeof', 'new', 'function', 'async', 'super']);
 
+/** `require('./app')(` opening a value: a project module's export, called. Group 2 is the specifier. */
+const JS_CALLED_REQUIRE = /^require\s*\(\s*(['"])(\.[^'"]*)\1\s*\)\s*\(/;
+
+/**
+ * The function a project module exports as the whole module or its default
+ * (`module.exports = create`, `export default function create`), which
+ * `require('./m')(…)` calls; null unless the index holds one function of the
+ * name there.
+ */
+function requiredModuleFunction(specifier: string, where: UnresolvedRef, context: ResolutionContext): Node | null {
+  const file = context.resolveModuleFile?.(specifier, where.filePath, where.language);
+  if (!file) return null;
+  const source = context.readFile(file) ?? '';
+  const name = /(?:^|[^\w$.])module\.exports\s*=\s*(?:(?:async\s+)?function\s*\*?\s*)?([A-Za-z_$][\w$]*)\s*[;(\r\n]/m.exec(source)?.[1] ??
+    /^[ \t]*export\s+default\s+(?:(?:async\s+)?function\s*\*?\s*)?([A-Za-z_$][\w$]*)/m.exec(source)?.[1];
+  if (!name) return null;
+  const fns = (context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file)).filter((n) => n.kind === 'function' && n.name === name);
+  return fns.length === 1 && fns[0]!.signature && ESM_FAMILY.has(fns[0]!.language) ? fns[0]! : null;
+}
+
 /**
  * The names a JS/TS file may type from another declaration's signature
  * (jsReceiverReadElsewhere), read off the raw text at the file's arrows,
@@ -26409,7 +26434,10 @@ function jsReceiverCandidates(filePath: string, language: Language, context: Res
   for (const at of sites.varDecls) {
     JS_CALL_DECLARATION.lastIndex = at;
     const m = JS_CALL_DECLARATION.exec(source);
-    if (m && !(m[2] && (JS_NOT_TYPED_CALLEE.has(m[2]) || !callees.has(m[2])))) calls.add(m[1]!);
+    // `require('./app')(opts)`: what the module's function returns (tsValueType).
+    const calledRequire = m?.[2] === 'require' &&
+      JS_CALLED_REQUIRE.test(source.slice(at + m[0].lastIndexOf('require'), at + m[0].length + 300));
+    if (m && (calledRequire || !(m[2] && (JS_NOT_TYPED_CALLEE.has(m[2]) || !callees.has(m[2]))))) calls.add(m[1]!);
   }
   // A function at `fnStart` with parameters in source[open..close], when a
   // call by a bare name the file imports or declares takes it: its untyped
@@ -26715,7 +26743,18 @@ function tsValueType(file: JsScopeFile, at: number, where: UnresolvedRef, contex
   if (!match || (top && made)) return null;
   const open = at + lead + match[0].length - 1;
   const close = jsCloseOf(code, open);
-  if (close < 0 || !JS_WHOLE_VALUE_END.test(code.slice(close + 1, close + 200))) return null;
+  if (close < 0) return null;
+  // `require('./app')(opts)`: what the function the module exports returns.
+  if (!made && called![1] === 'require' && !called![2]) {
+    const required = JS_CALLED_REQUIRE.exec((context.readFile(where.filePath) ?? '').slice(at + lead, at + lead + 300));
+    const callOpen = required ? at + lead + required[0].length - 1 : -1;
+    const callClose = callOpen < 0 ? -1 : jsCloseOf(code, callOpen);
+    if (callClose < 0 || !JS_WHOLE_VALUE_END.test(code.slice(callClose + 1, callClose + 200))) return null;
+    const fn = requiredModuleFunction(required![2]!, where, context);
+    const read = fn ? tsReturnedType(fn, context, walk) : null;
+    return read && { ...read, from: [...read.from, fn!.filePath] };
+  }
+  if (!JS_WHOLE_VALUE_END.test(code.slice(close + 1, close + 200))) return null;
   if (made) {
     const raw = made[1]!.replace(/\s+/g, '');
     // `new Backend(root)` of a parameter or a local names no class (jsDeclarationReading).
