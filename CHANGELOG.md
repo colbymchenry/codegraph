@@ -36,6 +36,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph init` in a project whose last index run was killed or failed partway now says the index is incomplete and to run `codegraph index`, instead of "Already initialized", which read like a working setup. Thanks @maxmilian for the report and @LuisAlbertoMK. (#3228)
 - `codegraph callers`, `callees` and `impact` now warn when a file in the answer changed on disk after it was last indexed, as `codegraph node` and `explore` already did, so a shifted line number no longer reads as a current one. With `--json` the warning goes to stderr and the answer lists those files under `changedOnDisk`. Thanks @arifpambudi242 for the report and @mohitdixit02. (#3260)
 - In JavaScript and TypeScript, a `workspaces` entry that points outside the project, like `"../shared"` in `package.json` or `pnpm-workspace.yaml`, no longer makes that folder's package count as part of the project, so a call through an import of it is no longer linked to an unrelated function of yours with the same name. Thanks @bompus for the report and @johnhldiver-beep. (#3093)
+- `codegraph status` now reports edits, new files and deletions in gitignored source that `codegraph.json` `include` brings into the index, instead of calling the index up to date until a sync picked them up. Thanks @mixxer for the report and the pull request. (#3086)
 
 ## [1.6.3] - 2026-11-17
 
