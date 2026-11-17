@@ -20,13 +20,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { QueryBuilder } from '../db/queries';
-import type { Edge, Language, UnresolvedReference } from '../types';
+import type { Edge, Language, Node, UnresolvedReference } from '../types';
 import type { ImportMapping, ReExport } from './types';
 import { extractImportMappings, extractReExports, pythonModulePath, REEXPORT_MAX_DEPTH } from './import-resolver';
 import { resurrectRefFromDroppedEdge } from './resurrect-ref';
 import { defaultExportBinding, extractLocalExportAliases } from './alias-binding';
 import { isDeclarationFile, scanAmbientModules } from './ambient-modules';
 import { moduleReferenceKeys } from '../db/reference-tail';
+import { objectLiteralMembers } from './name-matcher';
 
 /**
  * Languages whose import bindings name what their references are written as:
@@ -341,6 +342,108 @@ export function reopenNameMatchedImports(
 
 /** The languages a barrel a lazy route reads through is written in: the ES-module family. */
 const BARREL_LANGUAGES = new Set<Language>(['typescript', 'tsx', 'javascript', 'jsx']);
+
+/**
+ * Re-open, for the sync's sweep, the references through an object literal
+ * an edit changed the members of (#3015). `api.bar()` after `import { api }
+ * from './api'`, with `export const api = { foo, bar }`, binds to the member
+ * the literal names, and to the object itself when it names none. The
+ * caller's file is unchanged, and an edit that adds, drops or rebinds a
+ * member declares no name (`{ foo }` to `{ foo, bar }`, or `{ bar: baz }`),
+ * so neither the rebind nor the passes above re-open the call: it kept the
+ * old answer until the caller's file changed or the project was indexed again.
+ *
+ * Each object literal `files` export (a constant or variable another file
+ * imports) is read from its new text, and the references its importers make
+ * through it go back only where that text disagrees with where they landed:
+ *  - on the object, though the literal now has the member;
+ *  - on anything else, though it has the member no more;
+ *  - on another name than the identifier the member now names;
+ *  - outside the literal, though the member is now written inline.
+ * An edit that leaves the members alone re-opens nothing, and a file with no
+ * imported literal costs its text read once. A literal whose members a spread
+ * or a computed key hides is left as it was. Returns the number re-opened.
+ */
+export function reopenReferencesThroughObjectMembers(
+  queries: QueryBuilder,
+  reader: ImportReader,
+  files: ReadonlyArray<{ path: string; language: Language }>,
+  readLines: (filePath: string) => string[] | null,
+): number {
+  const stale: Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> = [];
+  for (const file of files) {
+    if (!BARREL_LANGUAGES.has(file.language)) continue;
+    let lines: string[] | null | undefined;
+    // What an identifier a member names may resolve to under its own name:
+    // `{ fetchUser }` after `import { getUser as fetchUser }` lands on `getUser`.
+    let declaredAs: Map<string, Set<string>> | undefined;
+    for (const holder of queries.getNodesByFile(file.path)) {
+      if (holder.kind !== 'constant' && holder.kind !== 'variable') continue;
+      lines ??= readLines(file.path);
+      if (!lines) break;
+      const members = objectLiteralMembers(holder, lines);
+      if (!members) continue;
+      declaredAs ??= importedNames(reader.mappings(file.path, file.language));
+      const names = new Map<string, Set<string>>();
+      for (const i of queries.getImportsInto(holder.id, holder.filePath)) {
+        if (i.refName === null || !BARREL_LANGUAGES.has(i.language)) continue;
+        const set = names.get(i.filePath) ?? new Set<string>();
+        set.add(i.refName);
+        names.set(i.filePath, set);
+      }
+      for (const [importer, bound] of names) {
+        for (const e of queries.getResolutionEdgesThrough(importer, [...bound])) {
+          const refName = e.metadata?.refName;
+          if (typeof refName !== 'string') continue;
+          const dot = refName.indexOf('.');
+          if (dot <= 0 || !bound.has(refName.slice(0, dot))) continue;
+          // The member a chain goes through first, as the resolver reads it.
+          const member = refName.slice(dot + 1).split('.')[0]!;
+          if (memberEdgeIsStale(queries, e, holder, members, member, declaredAs)) stale.push(e);
+        }
+      }
+    }
+  }
+  return reopenEdgeList(queries, stale);
+}
+
+/** Each local name a file's imports bind, with the names it is declared under where it comes from. */
+function importedNames(mappings: readonly ImportMapping[]): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  for (const m of mappings) {
+    if (m.isNamespace || m.isDefault) continue;
+    const set = out.get(m.localName) ?? new Set<string>();
+    set.add(m.exportedName);
+    out.set(m.localName, set);
+  }
+  return out;
+}
+
+/** Whether an edge through `holder`'s `member` landed where the literal's text no longer sends it (see reopenReferencesThroughObjectMembers). */
+function memberEdgeIsStale(
+  queries: QueryBuilder,
+  edge: Edge,
+  holder: Node,
+  members: ReadonlyMap<string, string | null>,
+  member: string,
+  declaredAs: ReadonlyMap<string, ReadonlySet<string>>,
+): boolean {
+  if (!members.has(member)) return edge.target !== holder.id;
+  if (edge.target === holder.id) return true;
+  const target = queries.getNodeById(edge.target);
+  if (!target) return true;
+  const binding = members.get(member)!;
+  if (binding !== null) return target.name !== binding && !declaredAs.get(binding)?.has(target.name);
+  // Written inline: the answer is a node inside the literal.
+  return target.filePath !== holder.filePath || !nodeWithin(target, holder);
+}
+
+/** Whether `inner`'s range lies within `outer`'s. */
+function nodeWithin(inner: Node, outer: Node): boolean {
+  const starts = inner.startLine > outer.startLine || (inner.startLine === outer.startLine && inner.startColumn >= outer.startColumn);
+  const ends = inner.endLine < outer.endLine || (inner.endLine === outer.endLine && inner.endColumn <= outer.endColumn);
+  return starts && ends;
+}
 
 /**
  * Re-open, for the sync's sweep, the references that reach a module through a
