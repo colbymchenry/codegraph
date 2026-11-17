@@ -19,6 +19,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CodeGraph no longer takes git's index lock while it checks your repository for changes, so a `git add` in a pre-commit hook, a commit or a checkout that runs while CodeGraph syncs no longer fails with "index.lock: File exists". Thanks @iamclaudia-ai for the report. (#3295)
 - `codegraph impact` and `codegraph_impact` are as fast as they were in 1.6.2 again, with the same results: 1.6.3 read each symbol's dependents in a way that slowed down every step of the walk. Thanks @inth3shadows for the report and the fix, and @Marcos-199-GitHub for #3285. (#3248)
 - When the CodeGraph server's catch-up sync on a large project is stopped because the tool calls it is serving keep its write-ahead log from shrinking, it now waits before trying again, a little longer each time, instead of starting over every second while you keep working. Thanks @kiliman for the report. (#3273)
+- A CodeGraph MCP server started in a folder with no index no longer starts its separate hang-watchdog process until the session first calls a tool or opens a project, so sessions that only list the tools, as many hosts open them, use less memory. Thanks @AiurArtanis for the report and @johnhldiver-beep for #3257. (#3250)
 
 ## [1.6.3] - 2026-11-17
 

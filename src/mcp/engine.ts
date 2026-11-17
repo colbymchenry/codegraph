@@ -71,6 +71,13 @@ export interface MCPEngineOptions {
    * not just the later file watcher.
    */
   writerLockRoot?: string;
+  /**
+   * Called once, the first time this engine starts work that can hold the
+   * main thread: opening a project, or serving a tool call. A direct session
+   * arms its liveness watchdog here rather than at startup, so a session that
+   * only lists the tools never starts a watchdog process (#3250).
+   */
+  onWorkBegins?: () => void;
 }
 
 /**
@@ -100,15 +107,18 @@ export class MCPEngine {
   // Retained synchronization ownership for each cached explicit project.
   private explicitProjects = new Map<CodeGraph, ProjectLease>();
   private defaultLease: ProjectLease | null = null;
-  private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot' | 'queryPoolDefaultMax'>> & Pick<MCPEngineOptions, 'queryPoolDefaultMax'>;
+  private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot' | 'queryPoolDefaultMax' | 'onWorkBegins'>> & Pick<MCPEngineOptions, 'queryPoolDefaultMax'>;
   private closed = false;
   private stopPromise: Promise<void> | null = null;
   // Off-loop read-tool pool. Workers each hold their own WAL read connections;
   // sessions without a default index open projects lazily via projectPath.
   private queryPool: QueryPool | null = null;
+  /** {@link MCPEngineOptions.onWorkBegins}, cleared once it has been called. */
+  private onWorkBegins: (() => void) | null;
 
   constructor(opts: MCPEngineOptions = {}) {
     this.opts = { readOnly: opts.readOnly ?? false, watch: opts.watch ?? true, queryPool: opts.queryPool ?? false, queryPoolDefaultMax: opts.queryPoolDefaultMax };
+    this.onWorkBegins = opts.onWorkBegins ?? null;
     this.toolHandler = new ToolHandler(null);
     this.toolHandler.setProjectLifecycle({
       open: (root, open) => {
@@ -203,6 +213,22 @@ export class MCPEngine {
   }
 
   /**
+   * A session is about to serve a tool call: work begins, whether or not a
+   * project is open yet (#3250).
+   */
+  noteToolCall(): void {
+    this.workBegins();
+  }
+
+  /** Call {@link MCPEngineOptions.onWorkBegins} the first time only. */
+  private workBegins(): void {
+    const begins = this.onWorkBegins;
+    if (!begins || this.closed) return;
+    this.onWorkBegins = null;
+    begins();
+  }
+
+  /**
    * Walk up from `searchFrom` to find the nearest `.codegraph/` and open it.
    * Idempotent: concurrent callers share one in-flight init; subsequent
    * callers after success are no-ops.
@@ -255,6 +281,8 @@ export class MCPEngine {
     const resolvedRoot = res.root;
     if (!resolvedRoot) return;
     if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
+    // Opening a project, and the catch-up after it, is work (#3250).
+    this.workBegins();
     try {
       // Close any previously failed instance to avoid leaking resources.
       if (this.cg) {
@@ -402,6 +430,8 @@ export class MCPEngine {
     if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
 
     this.projectPath = resolvedRoot;
+    // Opening a project, and the catch-up after it, is work (#3250).
+    this.workBegins();
     try {
       assertNoRebuild(resolvedRoot);
       const opened = await loadCodeGraph().open(resolvedRoot, { readOnly: this.opts.readOnly });
