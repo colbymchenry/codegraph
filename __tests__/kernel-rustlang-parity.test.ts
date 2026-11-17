@@ -189,6 +189,40 @@ impl Svc {
     }
   });
 
+  it('a function passed through its path is a function_ref, in both extractors (#3254)', () => {
+    const source = `
+pub struct Graph { n: u32 }
+impl Graph {
+    pub fn counts(&self) -> u32 { self.n }
+    fn all(v: Vec<u32>) -> Vec<u32> { v.into_iter().map(Self::double).collect() }
+    fn double(x: u32) -> u32 { x * 2 }
+}
+fn report(g: Option<&Graph>, v: Vec<u32>, mut h: Holder) {
+    let _ = g.map(Graph::counts); let _ = v.iter().map(crate::util::helper);
+    register(m::helper2); h.cb = other::handler; let s = Holder { cb: r#mod::r#fn };
+    let arr = [m::cb_a, m::cb_b]; let _ = "ü"; let _ = g.map(m ::  spaced);
+    let _ = v.iter().map(Kind::Wrap); let _ = v.iter().map(Limits::MAX);
+    let _ = v.iter().map(Vec::<u8>::new); let _ = v.iter().map(m::/* c */commented);
+    let _ = Graph::counts(&Graph { n: 1 });
+}
+`;
+    assertParity('path-values.rs', source);
+    assertParity('path-values.rs', source.replace(/\n/g, '\r\n'));
+
+    // Not vacuous: the kernel itself emits each path value, at its last segment.
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    delete process.env.CODEGRAPH_KERNEL;
+    const viaKernel = tryKernelExtract('path-values.rs', source, 'rust')!;
+    const lines = source.split('\n');
+    const values = viaKernel.unresolvedReferences
+      .filter((r) => r.referenceKind === 'function_ref' && r.referenceName.includes('::'))
+      .map((r) => `${r.referenceName}@${lines[r.line - 1]!.slice(r.column).match(/^\w+/)?.[0]}`);
+    expect(values.sort()).toEqual([
+      'Graph::counts@counts', 'Self::double@double', 'crate::util::helper@helper', 'm::cb_a@cb_a', 'm::cb_b@cb_b',
+      'm::helper2@helper2', 'm::spaced@spaced', 'other::handler@handler', 'r#mod::r#fn@r',
+    ]);
+  });
+
   it('torture fixture: impl/trait quirks, use bindings, chains, fn-refs, value-refs, route macros', () => {
     const file = path.join(FIXTURE_DIR, 'torture.rs');
     assertParity('fixtures/torture.rs', fs.readFileSync(file, 'utf8'), 20);

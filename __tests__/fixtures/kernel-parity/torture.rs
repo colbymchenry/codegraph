@@ -269,6 +269,19 @@ fn wiring(mut o: Holder) {
     let (t1, t2) = (cb_a, cb_b);
     invoke_all(arr);
     invoke(foo_single);
+    // Functions passed through their path (#3254); a variant, a constant, a
+    // generic path and one with a comment in it are none.
+    let _ = opt.map(Graph::counts);
+    let _ = v.iter().map(crate::util::helper);
+    register(m::helper2);
+    let p = Self::helper;
+    let q = [m::cb_c, r#mod::r#fn];
+    let s = Holder { cb: other::handler };
+    let _ = zs.map(m ::  spaced);
+    let _ = xs.map(Kind::Wrap);
+    let _ = ys.map(Limits::MAX);
+    let _ = ws.map(Vec::<u8>::new);
+    let _ = us.map(m::/* c */commented);
 }
 
 static CB: fn() = handler;
