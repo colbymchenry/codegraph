@@ -240,9 +240,7 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
     parser
         .set_language(&grammar)
         .map_err(|e| format!("set_language({language}) failed: {e}"))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| "parser returned null tree".to_string())?;
+    let tree = crate::parse_budget::parse(&mut parser, source)?;
 
     // Files with parse ERRORS defer to the wasm extractor (the `defer:` prefix
     // tells the TS side this is expected routing, not a malfunction). Reason:

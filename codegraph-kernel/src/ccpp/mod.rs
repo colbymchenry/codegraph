@@ -410,9 +410,7 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
     parser
         .set_language(&grammar)
         .map_err(|e| format!("set_language({language}) failed: {e}"))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| "parser returned null tree".to_string())?;
+    let tree = crate::parse_budget::parse(&mut parser, source)?;
     // Measurement hatch (parity sweeps only — never set in production): skip
     // the defer so the sweep can QUANTIFY how often UTF-8 vs UTF-16 error
     // recovery actually diverges on this language's erroring files.
