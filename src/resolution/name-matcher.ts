@@ -10146,6 +10146,76 @@ function phpTypeMethod(qn: string, name: string, context: ResolutionContext): { 
 
 const PHP_TYPE_METHODS = new WeakMap<ResolutionContext, Map<string, { method: Node | null } | undefined>>();
 
+/** The index of the `)` closing the `(` at `open` in PHP code, quoted strings skipped; -1 when it doesn't close. */
+function phpClosingParen(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '"' || c === "'") {
+      for (i++; i < text.length && text[i] !== c; i++) if (text[i] === '\\') i++;
+    } else if (c === '(') depth++;
+    else if (c === ')' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * `(new Foo(…)).bar`, `(new \A\Foo).bar`, `(new static).bar`, the way the
+ * extractor records `(new Foo(…))->bar()`: the class as written and the
+ * method. Null for any other shape, such as a call further down a chain,
+ * `(new Foo())->a().b`, or an anonymous class.
+ */
+function phpNewReceiverShape(name: string): { written: string; method: string } | null {
+  if (!/^\(\s*new\s/i.test(name)) return null;
+  const close = phpClosingParen(name, 0);
+  if (close < 0) return null;
+  const method = /^\.(\w+)$/.exec(name.slice(close + 1))?.[1];
+  if (!method) return null;
+  const inner = name.slice(1, close);
+  const head = /^\s*new\s+(\\?[A-Za-z_]\w*(?:\\[A-Za-z_]\w*)*)\s*/i.exec(inner);
+  if (!head || /^class$/i.test(head[1]!)) return null;
+  // After the class name, only its argument list: `(new Foo($a) . 'x')` builds nothing to call.
+  const args = inner.slice(head[0].length).trimEnd();
+  if (args !== '' && !(args.startsWith('(') && phpClosingParen(args, 0) === args.length - 1)) return null;
+  return { written: head[1]!, method };
+}
+
+/**
+ * A PHP call on a freshly built object, `(new SettingClient())->getSet(1)`
+ * (#3244): the method of the class the written name means where the call is
+ * written — through the file's namespace and `use` imports, or the class
+ * around the call for `new self` / `new static` — its own or one it inherits,
+ * as for a variable holding that object. A class the project doesn't declare
+ * has no project method to link: `(new \ReflectionFunction($f))->getParameters()`.
+ * Undefined for any other shape, and inside an anonymous class.
+ */
+function matchPhpNewReceiverCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const shape = phpNewReceiverShape(ref.referenceName);
+  if (!shape) return undefined;
+  let qn: string;
+  if (/^(?:self|static|parent)$/i.test(shape.written)) {
+    if (phpAnonymousClassAt(ref, context)) return undefined;
+    const enclosing = context
+      .getNodesInFile(ref.filePath)
+      .filter((n) => PHP_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
+      .sort((a, b) => b.startLine - a.startLine)[0];
+    if (!enclosing) return null;
+    if (/^parent$/i.test(shape.written)) {
+      // The class it extends: its supertypes past the traits it uses.
+      const parent = phpSupertypeQns(enclosing, context).find((qn) =>
+        context.getNodesByQualifiedName(qn).some((d) => d.language === 'php' && d.kind === 'class'));
+      if (!parent) return null;
+      qn = parent;
+    } else {
+      qn = enclosing.qualifiedName;
+    }
+  } else {
+    qn = phpTypeQn(shape.written, ref.filePath, context);
+  }
+  const method = phpTypeMethod(qn, shape.method, context)?.method;
+  return method ? { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'instance-method' } : null;
+}
+
 /**
  * Eloquent's static methods that hand back a model of the class they are
  * called on, through Laravel's `tap(…)`, which hands back what it is given.
@@ -34978,6 +35048,9 @@ function matchReferenceInner(
   if (ref.language === 'php' && ref.referenceKind === 'calls') {
     const anonymous = matchPhpAnonymousClassCall(ref, context);
     if (anonymous !== undefined) return anonymous;
+    // `(new Foo())->bar()`: a method of the class built there, or nothing.
+    const constructed = matchPhpNewReceiverCall(ref, context);
+    if (constructed !== undefined) return constructed;
   }
 
   // A python name imported from a module the project does not provide — `from

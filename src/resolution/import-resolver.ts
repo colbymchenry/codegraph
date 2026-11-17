@@ -2908,6 +2908,9 @@ export function resolvePhpQualifiedClassRef(
   let name = ref.referenceName;
   let member: string | null = null;
   if (ref.referenceKind === 'calls') {
+    // `(new Ns\Foo())->bar()` calls the object built, which the name matcher
+    // reads (matchPhpNewReceiverCall), not a static method of a class.
+    if (/^\(\s*new\s/i.test(name)) return undefined;
     // A static call on the class: `Field\FirstName::make()` is written `Field\FirstName.make`.
     const call = /^(.*\\[^\\.:]+)(?:\.|::)(\w+)$/.exec(name);
     if (!call) return undefined;
