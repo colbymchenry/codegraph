@@ -167,53 +167,93 @@ describe('a Rust method passed as a value through its path', () => {
     expect(outOf(graph, 'labels').filter((e) => e.startsWith('references') && e.includes('from'))).toEqual([]);
   });
 
-  it('references a project trait\'s method on a std type, and a macro-declared type\'s method', async () => {
+  it('references a macro-declared type\'s inherent method and a trait\'s own method', async () => {
     const graph = await index({
       'src/main.rs': [
-        'use std::path::{Path, PathBuf};',
-        'pub trait PathExt { fn normalize(&self) -> PathBuf; }',
-        'impl PathExt for Path {',
-        '    fn normalize(&self) -> PathBuf { self.to_path_buf() }',
-        '}',
-        'pub trait Ext { fn make(&self) -> usize; }',
-        'impl Ext for String {',
-        '    fn make(&self) -> usize { self.len() }',
-        '}',
         'macro_rules! mk { ($n:ident) => { pub struct $n { n: u32 } }; }',
         'mk!(Graph);',
         'impl Graph { pub fn counts(&self) -> u32 { self.n } }',
-        'pub fn paths(v: Vec<&Path>) -> Vec<PathBuf> { v.into_iter().map(Path::normalize).collect() }',
-        'pub fn sizes(v: Vec<String>) -> Vec<usize> { v.iter().map(String::make).collect() }',
+        'pub trait Shape {',
+        '    fn area(&self) -> u32;',
+        '}',
         'pub fn report(g: Option<&Graph>) -> Option<u32> { g.map(Graph::counts) }',
+        'pub fn areas(v: Vec<Box<dyn Shape>>) -> Vec<u32> { v.iter().map(Shape::area).collect() }',
         '',
         'fn main() {}',
         '',
       ].join('\n'),
     });
-    expect(outOf(graph, 'paths')).toContain('references src/main.rs:Path::normalize');
-    expect(outOf(graph, 'sizes')).toContain('references src/main.rs:String::make');
     expect(outOf(graph, 'report')).toContain('references src/main.rs:Graph::counts');
+    expect(outOf(graph, 'areas')).toContain('references src/main.rs:Shape::area');
   });
 
-  it('references a project type\'s one From impl, and nothing when the argument would pick among several', async () => {
+  // Which impl Rust picks for a value is past what the index can tell: one it
+  // doesn't hold (derived, macro-written), the one the argument's type would
+  // choose, or the type's own method of the name.
+  it('references no method of an impl Trait for T block', async () => {
     const graph = await index({
       'src/main.rs': [
+        'use std::path::{Path, PathBuf};',
+        'pub trait Probe {',
+        '    fn exists(&self) -> bool;',
+        '}',
+        'impl Probe for Path {',
+        '    fn exists(&self) -> bool { true }',
+        '}',
+        'pub trait PathExt {',
+        '    fn normalize(&self) -> PathBuf;',
+        '}',
+        'impl PathExt for Path {',
+        '    fn normalize(&self) -> PathBuf { self.to_path_buf() }',
+        '}',
+        '#[derive(Default)]',
+        'pub struct SignalInfo { n: u32 }',
+        'pub struct EventInfo { n: u32 }',
+        'impl Default for EventInfo {',
+        '    fn default() -> Self { EventInfo { n: 0 } }',
+        '}',
         'pub struct ParseErr;',
-        'pub struct IoErr;',
         'pub struct One { code: u32 }',
-        'impl From<ParseErr> for One { fn from(_e: ParseErr) -> Self { One { code: 1 } } }',
-        'pub struct Two { code: u32 }',
-        'impl From<ParseErr> for Two { fn from(_e: ParseErr) -> Self { Two { code: 1 } } }',
-        'impl From<IoErr> for Two { fn from(_e: IoErr) -> Self { Two { code: 2 } } }',
+        'impl From<ParseErr> for One {',
+        '    fn from(_e: ParseErr) -> Self { One { code: 1 } }',
+        '}',
+        'pub struct V(u32);',
+        'impl std::ops::Add for V {',
+        '    type Output = V;',
+        '    fn add(self, o: V) -> V { V(self.0 + o.0) }',
+        '}',
+        'pub struct E;',
+        'pub struct A;',
+        'impl E { pub fn new() -> E { E } } impl From<A> for E { fn from(_x: A) -> Self { E } }',
+        'pub fn present(v: Vec<&Path>) -> bool { v.into_iter().any(Path::exists) }',
+        'pub fn paths(v: Vec<&Path>) -> Vec<PathBuf> { v.into_iter().map(Path::normalize).collect() }',
+        'pub fn infos() -> Vec<SignalInfo> { std::iter::repeat_with(SignalInfo::default).take(3).collect() }',
         'pub fn single(r: Result<u32, ParseErr>) -> Result<u32, One> { r.map_err(One::from) }',
-        'pub fn either(r: Result<u32, IoErr>) -> Result<u32, Two> { r.map_err(Two::from) }',
+        'pub fn total(v: Vec<V>) -> Option<V> { v.into_iter().reduce(V::add) }',
+        'pub fn conv(r: Result<u32, A>) -> Result<u32, E> { r.map_err(E::from) }',
         '',
         'fn main() {}',
         '',
       ].join('\n'),
     });
-    expect(outOf(graph, 'single')).toContain('references src/main.rs:One::from');
-    expect(outOf(graph, 'either').filter((e) => e.startsWith('references') && e.includes('from'))).toEqual([]);
+    for (const fn of ['present', 'paths', 'infos', 'single', 'total', 'conv']) {
+      expect(outOf(graph, fn).filter((e) => e.startsWith('references') && e.includes('::')), fn).toEqual([]);
+    }
+  });
+
+  it('references an inherent method written on one line before a trait impl', async () => {
+    const graph = await index({
+      'src/main.rs': [
+        'pub struct E;',
+        'pub struct A;',
+        'impl E { pub fn new() -> E { E } } impl From<A> for E { fn from(_x: A) -> Self { E } }',
+        'pub fn ctor() -> Option<E> { let f = E::new; Some(f()) }',
+        '',
+        'fn main() {}',
+        '',
+      ].join('\n'),
+    });
+    expect(outOf(graph, 'ctor')).toContain('references src/main.rs:E::new');
   });
 
   it('adds no reference to a path that is called', async () => {
