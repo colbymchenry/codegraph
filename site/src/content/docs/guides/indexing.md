@@ -15,16 +15,28 @@ codegraph init      # creates .codegraph/ and builds the full graph — one step
 ## Full vs. incremental
 
 ```bash
-codegraph index           # full index of the whole project
-codegraph index --force   # re-index from scratch
-codegraph sync            # incremental — only changed files
+codegraph index   # full rebuild of the whole project
+codegraph sync    # incremental — only changed files
 ```
 
 `sync` is fast because it only reparses what changed — it's what the file watcher runs for you on every edit (see [Stay fresh automatically](#stay-fresh-automatically)). You rarely need to run it by hand.
 
+## After an upgrade
+
+A new CodeGraph release often reads code better than the last, and an index built by the older engine misses what the new one adds. `codegraph upgrade` reminds you to rebuild, and `codegraph status` tells you when an index predates the engine you're running, naming the version that built it. Your agent is told too: in each session, the first answer CodeGraph gives it for such a project opens with a one-time warning like this one:
+
+```
+⚠️ This project's CodeGraph index predates the running extraction engine. It was built
+with CodeGraph v1.6.2 (extraction 27); the running engine is CodeGraph v1.6.3 (extraction 28).
+Answers can miss symbols and relationships this engine adds. Indexing is the user's decision:
+they can run `codegraph index` in the project to rebuild it.
+```
+
+Run `codegraph index` to rebuild. Only a full index picks up the new engine's improvements: `sync` leaves files that didn't change as the older engine read them, and says so when it finishes.
+
 ## Stay fresh automatically
 
-**You don't need to run `codegraph sync` by hand during an agent session.** When your agent (Claude Code, Cursor, Codex, opencode, Hermes, Gemini, Antigravity, Kiro, GitHub Copilot) launches `codegraph serve --mcp`, three layers cooperate to keep the index in step with your code — and to never give the agent a quiet wrong answer in the small window between an edit and the next sync.
+**You don't need to run `codegraph sync` by hand during an agent session.** When your agent (Claude Code, Cursor, Codex, opencode, Hermes, Gemini, Antigravity, Kiro, GitHub Copilot, IBM Bob, Factory Droid, Windsurf, Qwen Code, DeepSeek Harness, Grok Build, Kimi Code, Qoder CLI, Pi) launches `codegraph serve --mcp`, three layers cooperate to keep the index in step with your code — and to never give the agent a quiet wrong answer in the small window between an edit and the next sync.
 
 ### 1. File watcher with debounced auto-sync (always on)
 
@@ -39,6 +51,8 @@ agent writes src/Widget.ts
 ```
 
 **Tunable**: `CODEGRAPH_WATCH_DEBOUNCE_MS` overrides the default 2000ms, clamped to `[100ms, 60s]`. Useful when a build step or formatter writes many files in a tight burst — bump it to `5000` or `10000` so the watcher coalesces them into one sync.
+
+**Tunable for large projects**: some of the graph's links are rebuilt across the whole project rather than file by file — the hops through callbacks, events and other dynamic dispatch that static parsing can't see. On a large TypeScript or Vue repository nearly every sync rebuilds them. `CODEGRAPH_SYNTH_MIN_INTERVAL_MS` sets the least time, in milliseconds, between two of those rebuilds in a running server: from `1000` (one second) to `86400000` (24 hours). A rebuild that comes due sooner is put off, not dropped: a later sync runs it once the interval is up, or a timer does if no edit follows. A full `codegraph index` is never held back. Unset, or outside that range, every sync rebuilds them as before. The cost: until a put-off rebuild runs, those callback and event links can be up to the interval behind your code, and tool output doesn't say so.
 
 ### 2. Per-file staleness banner — covers the debounce window
 
@@ -65,17 +79,21 @@ When your editor / agent (re)connects to the MCP server, codegraph runs a fast f
 
 ### Verify what the watcher sees
 
-`codegraph_status` exposes the pending set first-class — useful for an agent asking "is the index caught up?" in one call:
+`codegraph_status` exposes the pending set first-class — useful for an agent asking "is the index caught up?" in one call. It also shows which CodeGraph built the index and which one is running, so the agent can see when an index predates the engine ([After an upgrade](#after-an-upgrade)):
 
 ```
 codegraph_status →
-  ## CodeGraph Status
+  **CodeGraph Status**
   …
-  ### Pending sync:
-  - src/Widget.ts (edited 1200ms ago)
+  **Index built with:** CodeGraph v1.6.3 (extraction 28)
+  **Running CodeGraph:** v1.6.3 (extraction 28)
+  **Re-index recommended:** no
+  …
+  **Pending sync:**
+  - src/Widget.ts (edited 1200ms ago, pending sync)
 ```
 
-If `### Pending sync:` isn't in the response, nothing is in flight.
+If **Pending sync:** isn't in the response, nothing is in flight.
 
 ### When manual `codegraph sync` makes sense
 
@@ -94,7 +112,7 @@ Otherwise: just use it. The watcher + banner + connect-sync covers the AI-assist
 codegraph status
 ```
 
-Reports node/edge/file counts, the active SQLite backend, and the journal mode. In an agent session, the MCP-side `codegraph_status` additionally surfaces the `### Pending sync:` block described above.
+Reports node/edge/file counts, the active SQLite backend, and the journal mode. It also says when something needs attention: indexed files that are missing their symbols, named with what to run; a language none of whose files yielded a symbol; a `codegraph index` rebuilding the project in another process, which makes the numbers a snapshot of the rebuild; or an index built by an older CodeGraph. See the [CLI reference](/codegraph/reference/cli/#status) for the details and `--strict`. In an agent session, the MCP-side `codegraph_status` additionally surfaces the **Pending sync:** block described above.
 
 ## What gets indexed
 
