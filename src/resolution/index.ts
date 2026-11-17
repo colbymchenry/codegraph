@@ -26,6 +26,7 @@ import { isPythonImportStatementModule } from './name-matcher';
 import { isJsThisCall } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
+import { isRefusedDeepThisTarget } from './name-matcher';
 import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
@@ -1649,6 +1650,9 @@ export class ReferenceResolver {
     // scope at the reference is that binding even when the file imports the
     // name, which the import resolver answers before the matcher's own check.
     if (resolved && resolved.resolvedBy === 'import' && isImportShadowedByJsBinding(resolved, ref, this.context)) return null;
+    // A call two or more fields deep from `this` is matched by its name alone:
+    // never a property, a field or an import, nor a built-in method name (#2948).
+    if (resolved && isRefusedDeepThisTarget(resolved, ref, this.context)) return null;
     // A declaration of a declaration file's `declare module 'x'` is reached
     // through an import of `x`, never by its bare name from a file that
     // reaches no `x` (see reachesAmbientModule).

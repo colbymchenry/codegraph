@@ -4515,6 +4515,41 @@ function isBareJsCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
 }
 
 /**
+ * Whether `result` is no answer for a JS/TS call written two or more fields
+ * deep from `this` or `super` — `this.cache.list.push(1)`,
+ * `this.extractor.functionTypes.includes(t)` — which the extractor records by
+ * its method's bare name, keeping no receiver anything could type (#2948). It
+ * is matched by that name alone, so a property, a field or an enum member is
+ * no call's target, a method of one of JavaScript's own method names (`push`,
+ * `includes`, `has`, `set`) is the built-in's, as for `o.data.push()` on a
+ * parameter, and the file's import of the name is no member of anything.
+ */
+export function isRefusedDeepThisTarget(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!JS_FAMILY.has(ref.language) || ref.referenceKind !== 'calls' || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return false;
+  const links = bareCallReceiver(ref, context)?.links ?? [];
+  if (links.length < 2) return false;
+  if (result.resolvedBy === 'import') return true;
+  const target = context.getNodeById?.(result.targetNodeId);
+  if (!target) return false;
+  // The field the call is made on naming the method's class, as excalidraw's
+  // `this.app.cursor.set(…)` names `AppCursor`'s `set`, is evidence enough.
+  if (JS_BUILTIN_METHODS.has(ref.referenceName) && !(target.kind === 'method' && receiverNamesOwner(links[links.length - 1]!, target, context))) return true;
+  return target.kind === 'enum_member' || ((target.kind === 'property' || target.kind === 'field') && !tsMayBeCallable(target));
+}
+
+/**
+ * Whether a TS property or field may hold something callable, as its declared
+ * type reads on the node (`Event<IScrollEvent> onDidScrollChange`, `() => void
+ * dispose`): anything but an array, a primitive or a built-in collection,
+ * whose member a call can't be (`string[] includes`).
+ */
+function tsMayBeCallable(n: Node): boolean {
+  const type = (n.signature ?? '').trim().slice(0, Math.max(0, (n.signature ?? '').trim().length - n.name.length)).trim();
+  if (type === '') return true;
+  return !/(?:\[\]|^(?:string|number|boolean|bigint|symbol|undefined|null|(?:Readonly)?(?:Array|Map|Set|WeakMap|WeakSet)<.*>))$/.test(type);
+}
+
+/**
  * Whether a Go `calls` ref is receiver-less — `relogin(ctx)`, not
  * `l.relogin(ctx)`. A Go method is only reachable through a value or a method
  * expression, so a bare call (a func parameter, a local func value, a
