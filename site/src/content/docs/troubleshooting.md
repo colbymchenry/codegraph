@@ -24,7 +24,7 @@ Your agent starts the server itself, so you don't launch it by hand. Make sure t
 
 ## Missing symbols
 
-The MCP server auto-syncs on save (wait a couple of seconds). Run `codegraph sync` manually if needed. Check that the file's language is [supported](/codegraph/reference/languages/) and isn't inside a `.gitignore`d or default-excluded directory (e.g. `node_modules`, `dist`).
+The MCP server auto-syncs on save (wait a couple of seconds). Run `codegraph sync` manually if needed. Check that the file's language is [supported](/codegraph/reference/languages/) and isn't inside a `.gitignore`d or default-excluded directory (e.g. `node_modules`, `dist`). `codegraph status` names indexed files whose symbols are missing, with what to run, and `codegraph files --json` shows the error for a file that couldn't be parsed. After an upgrade, an index built by the older version can lack what the new one finds: run `codegraph index` ([After an upgrade](/codegraph/guides/indexing/#after-an-upgrade)).
 
 ## Sharing one checkout between Windows and WSL
 

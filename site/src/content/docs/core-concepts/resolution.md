@@ -15,7 +15,7 @@ After parsing, CodeGraph resolves:
 
 ## Framework awareness
 
-CodeGraph recognizes web-framework routing files and emits `route` nodes linked by `references` edges to their handler classes or functions — so querying the callers of a view or controller surfaces the URL pattern that binds it. See [Framework Routes](/codegraph/guides/framework-routes/) for the full list of recognized frameworks.
+CodeGraph recognizes web-framework routing files and emits `route` nodes linked by `references` edges to their handler classes or functions — so querying the callers of a view or controller surfaces the URL pattern that binds it. See [Framework Routes](/codegraph/guides/framework-routes/) for the full list of recognized frameworks, and [Beyond routes](/codegraph/guides/framework-routes/#beyond-routes) for the framework wiring CodeGraph follows that isn't a URL, from MediatR handlers to Tauri commands.
 
 ## Dynamic-dispatch coverage
 
@@ -26,5 +26,8 @@ Static parsing misses computed and indirect calls, so flows can break at dynamic
 - React re-render (`setState` → `render`)
 - JSX child (`render` → child component)
 - Interface → implementation dispatch
+- MediatR `Send` / `Publish` → the handler for what is sent (C#)
+- Tauri `invoke` → the Rust `#[tauri::command]` that answers it, and Tauri events in both directions
+- A Next.js route → the `proxy.ts` or `middleware.ts` that runs before it
 
 Every synthesized edge is marked `provenance: 'heuristic'` with the site that wired it, and is shown inline wherever a path crosses it.

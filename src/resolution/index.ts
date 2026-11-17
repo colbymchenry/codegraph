@@ -22,6 +22,7 @@ import {
   CPP_DEFINE_SIGNATURE,
 } from './types';
 import { cargoManifestFields, isPythonSelfCall, isSelfCallOnForeignName, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
+import { isPythonImportStatementModule } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -58,7 +59,7 @@ import { MAX_SOURCE_FILE_SIZE_BYTES, readSourceText } from '../file-limits';
 import { createHash } from 'crypto';
 import { aliasConfigFields, loadProjectAliases, type AliasMap } from './path-aliases';
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
-import { loadWorkspacePackages, workspaceFingerprint, workspacePackageDirOf, type WorkspacePackages } from './workspace-packages';
+import { loadWorkspacePackagesAndManifests, workspaceFingerprint, workspacePackageDirOf, type ManifestDiscovery, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import { stripCommentsForRegex } from './strip-comments';
 import { lexicalPathWithinRoot } from '../utils';
@@ -476,6 +477,9 @@ export class ReferenceResolver {
   private goPackageDirs = new Map<string, string | null>();
   // Monorepo workspace member packages. Same lazy/immutable convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
+  // The walk that found the manifests the map above was read from, or null
+  // when it was read from a list a sync knew (see refreshWorkspacePackages).
+  private workspaceDiscovery: ManifestDiscovery | null = null;
   // The tsconfig / jsconfig files (their `extends` chains included) and go.mod
   // files the maps above were read from, as absolute paths. A sync compares
   // what they say now with what the index was resolved by (#2977).
@@ -515,6 +519,7 @@ export class ReferenceResolver {
     // A full index resolves by the package.json files on disk now, as the
     // fingerprint it stamps says, even in a process that read them earlier.
     this.workspacePackages = undefined;
+    this.workspaceDiscovery = null;
     this.cargoCrates = undefined;
     this.compileDbIncludeDirs = undefined;
     this.layoutIncludeDirs = undefined;
@@ -1233,7 +1238,9 @@ export class ReferenceResolver {
 
       getWorkspacePackages: () => {
         if (this.workspacePackages === undefined) {
-          this.workspacePackages = loadWorkspacePackages(this.projectRoot);
+          const { packages, discovery } = loadWorkspacePackagesAndManifests(this.projectRoot);
+          this.workspacePackages = packages;
+          this.workspaceDiscovery = discovery;
         }
         return this.workspacePackages;
       },
@@ -1560,8 +1567,13 @@ export class ReferenceResolver {
     const unviewed = this.classExpressionFreeBases.get(outer) ?? outer;
     const base = unviewed === this.mocklessContext && this.mocklessBase ? this.mocklessBase : unviewed;
     const mockless = this.mocklessContextFor(ref, base) ?? base;
-    return this.resolveOneWith(this.classExpressionFreeContextFor(ref, mockless) ?? mockless, ref);
+    const context = this.classExpressionFreeContextFor(ref, mockless) ?? mockless;
+    this.lastResolved = { ref, context };
+    return this.resolveOneWith(context, ref);
   }
+
+  /** The reference resolveOne read last and the context it read it through, for parkable. */
+  private lastResolved: { ref: UnresolvedRef; context: ResolutionContext } | null = null;
 
   /** resolveOneIn with every strategy reading the graph through `context`. */
   private resolveOneWith(context: ResolutionContext, ref: UnresolvedRef): ResolvedRef | null {
@@ -1616,7 +1628,8 @@ export class ReferenceResolver {
     // names itself: a self-edge that says nothing (#2327).
     if (resolved && ref.language === 'dart' && ref.referenceKind === 'references' &&
         resolved.targetNodeId === ref.fromNodeId) return null;
-    if (resolved && isPythonFromImportModule(ref, this.context)) {
+    // The module an import statement names is a module, never a symbol (#2584, #3239).
+    if (resolved && (isPythonFromImportModule(ref, this.context) || isPythonImportStatementModule(ref, this.context))) {
       const module = this.nodeById(resolved.targetNodeId);
       if (module && module.kind !== 'file' && module.kind !== 'module') return null;
     }
@@ -2268,10 +2281,13 @@ export class ReferenceResolver {
    * that is not the one its name gives: a reference through an import
    * binding the module doesn't declare by that name waits for the module
    * (see importBindingTail). Decided here, where the file's import mappings
-   * are still cached from the attempt — in a resolver-pool worker too.
+   * are still cached from the attempt — in a resolver-pool worker too. A
+   * receiver's type is read through the context the attempt read it in,
+   * whose readings it reuses.
    */
   private parkable(ref: UnresolvedRef): UnresolvedRef {
-    const tail = importBindingTail(ref, this.context);
+    const read = this.lastResolved?.ref === ref ? this.lastResolved.context : this.context;
+    const tail = importBindingTail(ref, this.context, read);
     if (tail) ref.nameTail = tail;
     return ref;
   }
@@ -3291,14 +3307,23 @@ export class ReferenceResolver {
    * resolver takes the new one and drops every memo resolved through the old
    * one, and the caller re-opens what was linked by it.
    */
-  refreshWorkspacePackages(): string {
-    const fresh = loadWorkspacePackages(this.projectRoot);
+  refreshWorkspacePackages(knownManifests?: readonly string[]): string {
+    // `knownManifests`: where the manifests are, when the caller can tell that
+    // a walk would find the ones it found last time (see trustedManifestList).
+    // Each is read again all the same, so an edit to one is seen.
+    const { packages: fresh, discovery } = loadWorkspacePackagesAndManifests(this.projectRoot, knownManifests);
+    if (discovery) this.workspaceDiscovery = discovery;
     const fingerprint = workspaceFingerprint(fresh);
     if (this.workspacePackages === undefined || workspaceFingerprint(this.workspacePackages) !== fingerprint) {
       this.workspacePackages = fresh;
       this.clearCaches();
     }
     return fingerprint;
+  }
+
+  /** The walk the workspace map was last read by (see ManifestDiscovery), or null before any. */
+  getWorkspaceDiscovery(): ManifestDiscovery | null {
+    return this.workspaceDiscovery;
   }
 
   /**
