@@ -10161,6 +10161,12 @@ interface RustUses {
   pathMods: Set<string>;
   /** Modules it declares out of line with no `#[path]` (`mod name;`): the files the regular rules name. */
   mods: Set<string>;
+  /**
+   * Every module it declares, inline or not, by the inline module it is
+   * declared in (`${block's open | -1}\0${name}`) → whether it is `pub` (of
+   * any reach): what a glob of that module passes on.
+   */
+  modDecls: Map<string, boolean>;
   /** Whether it starts a binary of its own: a top-level `fn main` or `#![no_main]` (a trybuild case, a fuzz target). */
   main: boolean;
   /** Whether every brace closes, so `blocks` can be trusted to say what is inside them. */
@@ -10442,7 +10448,7 @@ function rustUsesOf(filePath: string, context: ResolutionContext): RustUses {
   if (hit) return hit;
   const uses: RustUses = {
     names: new Set(), globs: new Set(), external: new Set(), bound: new Set(), boundFrom: new Map(),
-    paths: new Map(), stdPaths: new Map(), globPaths: [], blocks: [], pathMods: new Set(), mods: new Set(), main: false, balanced: true, lineStarts: [],
+    paths: new Map(), stdPaths: new Map(), globPaths: [], blocks: [], pathMods: new Set(), mods: new Set(), modDecls: new Map(), main: false, balanced: true, lineStarts: [],
   };
   const leaves = (tree: string): string[] => [
     ...[...tree.matchAll(/([A-Za-z_]\w*)\s*(?=[,}]|$|\s+as\b)|\bas\s+([A-Za-z_]\w*)/g)]
@@ -10517,6 +10523,12 @@ function rustUsesOf(filePath: string, context: ResolutionContext): RustUses {
   // `mod name;` with no `#[path]` of its own.
   for (const m of text.matchAll(/\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*;/g)) {
     if (!pathModAt.has(m.index!)) uses.mods.add(m[1]!);
+  }
+  // Every module declaration, `mod name;` or `mod name {`, by the inline module it is in, and whether it is `pub`.
+  for (const m of text.matchAll(/\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*[;{]/g)) {
+    const key = `${rustBlockAt(layout.blocks, m.index!)?.open ?? -1}\0${m[1]!}`;
+    const pub = /\bpub(?:\s*\([^()]*\))?\s*$/.test(text.slice(Math.max(0, m.index! - 48), m.index!));
+    uses.modDecls.set(key, pub || uses.modDecls.get(key) === true);
   }
   uses.main = /^(?:pub\s+)?(?:async\s+)?fn\s+main\s*\(|^[ \t]*#!\[\s*no_main\s*\]/m.test(text);
   for (let at = 0; at !== -1; at = text.indexOf('\n', at) + 1 || -1) uses.lineStarts.push(at);
@@ -11057,12 +11069,17 @@ function rustLibModule(crateDir: string, context: ResolutionContext): RustModule
  * else loads that file too (a helper several tests load is each test's);
  * cfg alternatives that name a file each (tokio's `process::imp` is
  * `unix/mod.rs` or `windows.rs`) are all of them (rustCfgChoiceItems); null
- * when a `cfg_attr` sets the path, as for one with no file.
+ * when a `cfg_attr` sets the path, as for one with no file. `publicOnly` is a
+ * glob's view of `m` from outside it: only a module `m` declares `pub`, or
+ * passes on with a `pub use`.
  */
-function rustSubmodule(m: RustModule, name: string, context: ResolutionContext, depth = 0): RustModule | null {
-  if (m.choices) return rustCfgChoice(m.choices.map((c) => rustSubmodule(c, name, context, depth)).filter((c) => c !== null));
+function rustSubmodule(m: RustModule, name: string, context: ResolutionContext, depth = 0, publicOnly = false): RustModule | null {
+  if (m.choices) return rustCfgChoice(m.choices.map((c) => rustSubmodule(c, name, context, depth, publicOnly)).filter((c) => c !== null));
   const dir = rustJoin(m.dir, name);
   const layout = rustUsesOf(m.file, context);
+  // A `mod name;` without `pub` keeps the name to `m` and the modules in it.
+  const declared = layout.modDecls.get(`${m.block?.open ?? -1}\0${name}`);
+  if (publicOnly && declared === false) return null;
   if (layout.pathMods.has(name)) {
     const decls = rustPathDeclsIn(m.file, context).filter((d) => d.name === name && rustBlockAt(layout.blocks, d.at) === m.block);
     const files = new Set<string>();
@@ -11074,14 +11091,54 @@ function rustSubmodule(m: RustModule, name: string, context: ResolutionContext, 
   }
   const block = layout.blocks.find((b) => b.name === name && b.parent === m.block);
   if (block) return { file: m.file, dir, block, root: false };
-  for (const file of [`${dir}.rs`, `${dir}/mod.rs`]) {
+  // (From outside, a file is the module only when `m` declares it.)
+  for (const file of !publicOnly || declared ? [`${dir}.rs`, `${dir}/mod.rs`] : []) {
     if (context.fileExists(file)) return { file, dir, block: null, root: false };
   }
   if (depth >= 8) return null;
   for (const p of layout.paths.get(name) ?? []) {
-    if (p.scope || rustBlockAt(layout.blocks, p.at) !== m.block) continue;
+    if (p.scope || (publicOnly && !p.pub) || rustBlockAt(layout.blocks, p.at) !== m.block) continue;
     const passed = rustWalkModules(p.segs, m, context, depth + 1);
     if (passed !== null && passed !== 'outside') return passed;
+  }
+  return null;
+}
+
+/**
+ * The module `name` that a glob `m` writes at its own level brings in, as Rust
+ * looks a name up past a module's own items and `use`s (#3253): a test's
+ * `use super::*` sees its parent's `mod gzip;`, `pub` or not, and a glob of
+ * any other module only the modules that one makes public — through its own
+ * globs too, when they are `pub use …::*`. A glob's path is walked without
+ * globs, so modules that glob each other end the walk, as `seen` (the lookups
+ * under way) does for a module reached twice.
+ */
+function rustGlobbedSubmodule(
+  m: RustModule,
+  name: string,
+  context: ResolutionContext,
+  depth: number,
+  publicOnly: boolean,
+  seen: Set<string>,
+): RustModule | null {
+  if (m.choices) {
+    return rustCfgChoice(m.choices.map((c) => rustGlobbedSubmodule(c, name, context, depth, publicOnly, seen)).filter((c) => c !== null));
+  }
+  if (depth >= 8) return null;
+  const layout = rustUsesOf(m.file, context);
+  if (layout.globPaths.length === 0) return null;
+  const key = `${m.file}\0${m.block?.open ?? -1}\0${name}\0${publicOnly ? 1 : 0}`;
+  if (seen.has(key)) return null;
+  seen.add(key);
+  for (const g of layout.globPaths) {
+    if (g.scope || (publicOnly && !g.pub) || rustBlockAt(layout.blocks, g.at) !== m.block) continue;
+    const globbed = rustWalkModules(g.segs, m, context, depth + 1, false);
+    if (globbed === null || globbed === 'outside') continue;
+    // What a glob brings in is what its module lets `m` see: all of it from inside.
+    const outside = !rustModuleWithin(m, globbed, context);
+    const found = rustSubmodule(globbed, name, context, depth + 1, outside) ??
+      rustGlobbedSubmodule(globbed, name, context, depth + 1, outside, seen);
+    if (found) return found;
   }
   return null;
 }
@@ -11117,9 +11174,10 @@ function rustSuperModule(m: RustModule, context: ResolutionContext): RustModule 
  * module `from` declares (2018 paths start from the current module); a project
  * crate by the name its manifest gives the file's crate, or by its own.
  * 'outside' for the standard library and every other crate; null when a step
- * finds no module the project holds.
+ * finds no module the project holds. Without `globs`, a first segment that
+ * only a glob of `from` brings in is none.
  */
-function rustWalkModules(segs: readonly string[], from: RustModule, context: ResolutionContext, depth = 0): RustModule | 'outside' | null {
+function rustWalkModules(segs: readonly string[], from: RustModule, context: ResolutionContext, depth = 0, globs = true): RustModule | 'outside' | null {
   const [first, ...rest] = segs;
   if (first === undefined) return from;
   let at: RustModule | null;
@@ -11129,6 +11187,8 @@ function rustWalkModules(segs: readonly string[], from: RustModule, context: Res
   else if (RUST_STD_ROOTS.has(first)) return 'outside';
   else {
     at = rustSubmodule(from, first, context, depth);
+    // One a glob of `from` brings in: `gzip::write()` under `use super::*` (#3253).
+    if (at === null && globs) at = rustGlobbedSubmodule(from, first, context, depth, false, new Set());
     if (at === null) {
       const graph = rustCrateGraph(context);
       const own = rustCrateDirOf(from.file, graph);
@@ -11808,7 +11868,8 @@ const RUST_PATH_TARGETS = new WeakMap<ResolutionContext, Map<string, string | nu
 /**
  * The item a Rust path written in `ref`'s file names — `crate::util::take`,
  * `super::Item` (from an inline `mod tests { }` too), `util::take` through a
- * module a `use` binds, a project crate's by its name — walking the modules as
+ * module a `use` binds (one in the function first) or a glob brings in
+ * (`use super::*`), a project crate's by its name — walking the modules as
  * Rust does from the one the path is written in (rustWalkModules), else, as a
  * 2015 path, from its crate's root, to what the last module declares, passes
  * on (`pub use`) or globs in (rustModuleItems): a function, a type, a trait —
@@ -11835,15 +11896,20 @@ export function rustPathTarget(ref: UnresolvedRef, context: ResolutionContext): 
   const from = rustModuleAt(ref.filePath, offset, context);
   const head = segs[0]!;
   const bare = head !== 'crate' && head !== 'self' && head !== 'super';
+  // A `use` in the function, or in a block of it, binds the head there alone,
+  // ahead of the module's own: `fn f() { use crate::store::gzip; gzip::write() }`.
+  let headUse: RustVisibleUse | undefined;
   if (bare) {
     const bound = rustVisibleUse(head, ref.filePath, offset, context);
     if (bound && bound.std.length > 0 && bound.paths.length === 0) return null;
+    if (bound && bound.block >= 0 && bound.paths.length > 0) headUse = bound;
   }
   let memo = RUST_PATH_TARGETS.get(context);
   if (!memo) RUST_PATH_TARGETS.set(context, (memo = new Map()));
-  // (A type a `use` binds is that `use`'s, wherever it is written.)
+  // (A type a `use` binds is that `use`'s, wherever it is written; so is a head.)
   const scope = ownerUse ? `${ownerUse.block}\0${ownerUse.paths[0]!.at}` : '';
-  const key = `${ref.filePath}\0${from.block?.open ?? -1}\0${variants ? 1 : 0}\0${scope}\0${segs.join('::')}`;
+  const headScope = headUse ? `${headUse.block}\0${headUse.paths[0]!.at}` : '';
+  const key = `${ref.filePath}\0${from.block?.open ?? -1}\0${variants ? 1 : 0}\0${scope}\0${headScope}\0${segs.join('::')}`;
   const hit = memo.get(key);
   if (hit !== undefined) return hit === null ? null : context.getNodeById?.(hit) ?? null;
   // The items the path's segments name — up to its type's, for a typed one.
@@ -11852,6 +11918,16 @@ export function rustPathTarget(ref: UnresolvedRef, context: ResolutionContext): 
     if (path.length === 1) {
       const ids = rustUseItemsAt(path[0]!, ref, context);
       return ids === null ? null : [...ids].map((id) => context.getNodeById?.(id)).filter((n): n is Node => !!n);
+    }
+    // A head a `use` in the function binds: the path through that `use`'s, from where it is written.
+    if (headUse) {
+      const found: Node[] = [];
+      for (const p of headUse.paths) {
+        const items = rustUsePathItems([...p.segs, ...path.slice(1)], rustModuleAt(ref.filePath, p.at, context), context, new Set());
+        if (items === null) return null;
+        found.push(...items);
+      }
+      return found;
     }
     let items = rustUsePathItems(path, from, context, new Set());
     // As a 2015 path, from the crate's root — unless the module declares the
