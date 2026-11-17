@@ -19,6 +19,12 @@
  *   `./lib.sh` that `resolveShellPath` can't place never falls back to some
  *   other `lib.sh` by name.
  *
+ * - A script reached through PATH is linked only where the project says PATH
+ *   holds it: a script that puts its own directory first on PATH
+ *   (`PATH="$SELF_DIR:$PATH"`) lets the scripts in that directory run one
+ *   another by bare name, and `"$VAR/x"` reaches `x` in the directory a
+ *   script exports as `VAR`. `exec X` and `command X` look on PATH only.
+ *   A builtin (`set`, `test`) is never a script.
  * - A path built from `$0` (`$(dirname "$0")/lib.sh`, kept as `$0/lib.sh`)
  *   is relative to the script the shell was started with. In a file nothing
  *   sources, that is the file itself; in a sourced file it is the script at the
@@ -35,7 +41,89 @@ import * as path from 'path';
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 import { resolveImportPath } from './import-resolver';
-import { SCRIPT_ZERO_PREFIX } from '../extraction/languages/bash';
+import { ON_PATH_DECORATOR, PATH_PROGRAM_PREFIX, SCRIPT_DIR_DECORATOR, SCRIPT_ZERO_PREFIX } from '../extraction/languages/bash';
+
+/**
+ * Bash builtins and keywords: the shell runs these itself, whatever PATH holds,
+ * so a script that shares the name (dokku's `set` subcommand) is never it.
+ */
+const SHELL_BUILTINS = new Set([
+  '.', ':', '[', 'alias', 'bg', 'bind', 'break', 'builtin', 'caller', 'cd', 'command', 'compgen', 'complete',
+  'compopt', 'continue', 'declare', 'dirs', 'disown', 'echo', 'enable', 'eval', 'exec', 'exit', 'export',
+  'false', 'fc', 'fg', 'getopts', 'hash', 'help', 'history', 'jobs', 'kill', 'let', 'local', 'logout',
+  'mapfile', 'popd', 'printf', 'pushd', 'pwd', 'read', 'readarray', 'readonly', 'return', 'set', 'shift',
+  'shopt', 'source', 'suspend', 'test', 'times', 'trap', 'true', 'type', 'typeset', 'ulimit', 'umask',
+  'unalias', 'unset', 'wait',
+]);
+
+/** A call edge to a script that is run, or null. */
+function runResult(ref: UnresolvedRef, file: string | null, context: ResolutionContext): ResolvedRef | null {
+  const node = file ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
+  return node ? { original: ref, targetNodeId: node.id, confidence: 0.85, resolvedBy: 'import' } : null;
+}
+
+/**
+ * The script a bare command runs from PATH, or null. Only a directory some
+ * script in it puts first on PATH (`PATH="$SELF_DIR:$PATH"`, bats-core's
+ * libexec) is known to be there, and only for the scripts in that directory,
+ * which the PATH-setting script starts. Never a builtin, never the caller.
+ */
+function onPathScript(name: string, fromFile: string, memo: BashMemo, context: ResolutionContext): string | null {
+  if (SHELL_BUILTINS.has(name) || !/^[\w.+][\w.+-]*$/.test(name)) return null;
+  const dir = path.posix.dirname(fromFile.replace(/\\/g, '/'));
+  if (!pathDirsOf(memo, context).has(dir)) return null;
+  const target = dir === '.' ? name : `${dir}/${name}`;
+  return target !== fromFile && isBashFile(target, context) ? target : null;
+}
+
+/**
+ * `"$VAR/x"` where a script exports `VAR` as its own directory: that
+ * directory's `x`, when every such script agrees on the directory.
+ */
+function exportedDirectoryScript(variable: string, rest: string, fromFile: string, memo: BashMemo, context: ResolutionContext): string | null {
+  const dirs = scriptDirsOf(memo, context).get(variable);
+  if (!dirs || dirs.size !== 1) return null;
+  const target = path.posix.normalize(path.posix.join([...dirs][0]!, rest));
+  if (target === '..' || target.startsWith('../') || target === fromFile) return null;
+  return isBashFile(target, context) ? target : null;
+}
+
+function isBashFile(file: string, context: ResolutionContext): boolean {
+  return context.fileExists(file) && context.getNodesInFile(file).some((n) => n.kind === 'file' && n.language === 'bash');
+}
+
+/** Directories a script puts first on PATH (from `PATH` variable nodes the extractor marked). */
+function pathDirsOf(memo: BashMemo, context: ResolutionContext): Set<string> {
+  if (memo.pathDirs) return memo.pathDirs;
+  const dirs = new Set<string>();
+  for (const kind of ['variable', 'constant'] as const) {
+    for (const v of context.getNodesByKind(kind)) {
+      if (v.language !== 'bash' || v.name !== 'PATH') continue;
+      for (const d of v.decorators ?? []) if (d.startsWith(ON_PATH_DECORATOR)) dirs.add(d.slice(ON_PATH_DECORATOR.length));
+    }
+  }
+  memo.pathDirs = dirs;
+  return dirs;
+}
+
+/** Each exported variable to the script directories it is assigned. */
+function scriptDirsOf(memo: BashMemo, context: ResolutionContext): Map<string, Set<string>> {
+  if (memo.scriptDirs) return memo.scriptDirs;
+  const map = new Map<string, Set<string>>();
+  for (const kind of ['variable', 'constant'] as const) {
+    for (const v of context.getNodesByKind(kind)) {
+      if (v.language !== 'bash') continue;
+      for (const d of v.decorators ?? []) {
+        if (!d.startsWith(SCRIPT_DIR_DECORATOR)) continue;
+        let set = map.get(v.name);
+        if (!set) map.set(v.name, (set = new Set()));
+        set.add(d.slice(SCRIPT_DIR_DECORATOR.length));
+      }
+    }
+  }
+  memo.scriptDirs = map;
+  return map;
+}
 
 /** Whether `ref` is a Bash reference this module answers (calls and file imports). */
 export function isBashRef(ref: UnresolvedRef): boolean {
@@ -50,6 +138,18 @@ export function resolveBashRef(ref: UnresolvedRef, context: ResolutionContext): 
     const node = file ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
     return node ? { original: ref, targetNodeId: node.id, confidence: 0.95, resolvedBy: 'import' } : null;
   }
+  const name = ref.referenceName;
+  if (name.startsWith(PATH_PROGRAM_PREFIX)) return runResult(ref, onPathScript(name.slice(PATH_PROGRAM_PREFIX.length), ref.filePath, memo, context), context);
+  const viaVariable = /^\$([A-Za-z_]\w*)\/(.+)$/.exec(name);
+  if (viaVariable) return runResult(ref, exportedDirectoryScript(viaVariable[1]!, viaVariable[2]!, ref.filePath, memo, context), context);
+  const fn = resolveFunctionCall(ref, memo, context);
+  if (fn) return fn;
+  // No function answers: a script of that name in a directory on PATH may.
+  return runResult(ref, onPathScript(name, ref.filePath, memo, context), context);
+}
+
+/** A call to the function the shell would run, or null. */
+function resolveFunctionCall(ref: UnresolvedRef, memo: BashMemo, context: ResolutionContext): ResolvedRef | null {
   if (!isBashFunctionName(ref.referenceName, memo, context)) return null; // `echo`, `grep`, …: no lookup needed
   const pos: Pos = [ref.line ?? Number.MAX_SAFE_INTEGER, ref.column ?? 0];
   // Inside any function body, a Bats test included: it runs after the whole
@@ -103,6 +203,8 @@ interface BashMemo {
   sourcedBy: Map<string, Set<string>> | null;
   /** Each file to the scripts `$0` can name while it runs; empty when unknown. */
   starters: Map<string, Set<string>>;
+  pathDirs: Set<string> | null;
+  scriptDirs: Map<string, Set<string>> | null;
 }
 
 const memos = new WeakMap<ResolutionContext, BashMemo>();
@@ -110,7 +212,7 @@ const memos = new WeakMap<ResolutionContext, BashMemo>();
 function memoFor(context: ResolutionContext): BashMemo {
   let memo = memos.get(context);
   if (!memo) {
-    memo = { names: null, sources: new Map(), defs: new Map(), ends: new Map(), reading: new Set(), sourcedBy: null, starters: new Map() };
+    memo = { names: null, sources: new Map(), defs: new Map(), ends: new Map(), reading: new Set(), sourcedBy: null, starters: new Map(), pathDirs: null, scriptDirs: null };
     memos.set(context, memo);
   }
   return memo;

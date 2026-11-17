@@ -5505,7 +5505,13 @@ export class ToolHandler {
     // The Flow section labels each hop with its branch conditions; that read
     // is synchronous, so the grammars it needs are loaded here, once.
     await warmBranchGuardGrammars();
-    const flow = this.buildFlowFromNamedSymbols(cg, matchQuery);
+    // A shell script the query names is pinned as a file AND is a step of the
+    // flow: bats-core's `bats-exec-file` is the program `bats-exec-suite` runs.
+    // Pinning strips its name from `matchQuery`, so it is handed back here.
+    const pinnedScripts = pinnedFiles
+      .filter((p) => cg.getNodesInFile(p).some((n) => n.kind === 'file' && n.language === 'bash'))
+      .map((p) => p.slice(p.lastIndexOf('/') + 1));
+    const flow = this.buildFlowFromNamedSymbols(cg, [matchQuery, ...pinnedScripts].join(' '));
 
     // The symbols the question is about: exact targets, the named ones, the spine.
     const questionIds = new Set([...exactNodeIds, ...flow.pathNodeIds, ...flow.namedNodeIds]);

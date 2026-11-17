@@ -15,7 +15,9 @@ const SKIP_CALL_COMMANDS = new Set([':', '[', '[[', ']', ']]']);
  * the file sits in the repository.
  */
 const SCRIPT_REF = String.raw`(?:\$0|\$\{0\}|\$BASH_SOURCE|\$\{BASH_SOURCE(?:\[0\])?(?::-\$(?:0|\{0\}))?\})`;
-const SCRIPT_PATH = String.raw`(?:${SCRIPT_REF}|\$\((?:readlink-[fe]|realpath)${SCRIPT_REF}\))`;
+// `readlink -f`, `realpath`, or a project's own portable stand-in for them
+// (bats-core's `bats_readlinkf`), named for what it does.
+const SCRIPT_PATH = String.raw`(?:${SCRIPT_REF}|\$\((?:readlink-[fe]|realpath|[A-Za-z_]\w*(?:readlink|realpath)\w*)${SCRIPT_REF}\))`;
 /** `$(dirname "$0")`, `${BASH_SOURCE%/*}`, `${0%/*}`. */
 const SCRIPT_DIR = String.raw`(?:\$\(dirname${SCRIPT_PATH}\)|\$\{(?:BASH_SOURCE(?:\[0\])?|0)%/\*\})`;
 
@@ -38,6 +40,18 @@ const SCRIPT_DIR_FORMS: readonly RegExp[] = [
  * resolver, which places it (resolution/bash-resolution.ts).
  */
 export const SCRIPT_ZERO_PREFIX = '$0/';
+
+/**
+ * Marks a call that only a program on PATH can answer, never a function:
+ * `exec X` and `command X` (`$PATH/X`). A run through a variable, `"$VAR/x"`,
+ * is kept as `$VAR/x`. Both are placed by the resolver.
+ */
+export const PATH_PROGRAM_PREFIX = '$PATH/';
+
+/** On a `PATH` variable node: the project directory the assignment puts first on PATH. */
+export const ON_PATH_DECORATOR = '@on-path:';
+/** On a variable node: the exported variable holds this project directory, its script's own. */
+export const SCRIPT_DIR_DECORATOR = '@script-dir:';
 
 /** Bats sets this to the directory of the test file being run. */
 const BATS_TEST_DIRNAME = 'BATS_TEST_DIRNAME';
@@ -92,6 +106,12 @@ function staticShellWord(node: SyntaxNode, source: string): string | null {
  */
 function compactExpression(text: string): string {
   return text
+    // A newline between commands is a `;`: `$(\n  cd "…"\n  pwd\n)`.
+    .replace(/\s*\n\s*/g, ';')
+    .replace(/(&&|\|\||\|);+/g, '$1')
+    .replace(/\$\(;+/g, '$(')
+    .replace(/;+\)/g, ')')
+    .replace(/^;+|;+$/g, '')
     .replace(/"/g, '')
     .replace(/(^|\s)--(?=\s)/g, '$1')
     .replace(/\s*(?:[12]|&)?>>?\s*\/dev\/null/g, '')
@@ -179,6 +199,94 @@ function scriptRelativePath(arg: SyntaxNode, ctx: ExtractorContext): string | nu
   return target === '..' || target.startsWith('../') ? null : target;
 }
 
+/**
+ * The project directory a script-directory expression names — written out, or
+ * through a variable assigned one at the top level — or null.
+ */
+function projectDirectoryOf(text: string, anchor: SyntaxNode, ctx: ExtractorContext): string | null {
+  let compact = compactExpression(text);
+  const variable = /^\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})$/.exec(compact);
+  if (variable) {
+    const value = topLevelValueAt(variable[1] ?? variable[2]!, anchor, ctx);
+    if (value === null) return null;
+    compact = compactExpression(value);
+  }
+  const dir = matchScriptDirectory(compact);
+  if (!dir) return null;
+  const target = path.posix.join(path.posix.dirname(ctx.filePath.replace(/\\/g, '/')), `.${dir.up}`);
+  return target === '..' || target.startsWith('../') ? null : target;
+}
+
+/** The first `:`-separated entry of a PATH value, not splitting inside `$(…)` or `${…}`. */
+function firstPathEntry(value: string): string {
+  let depth = 0;
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i];
+    if (c === '(' || c === '{') depth++;
+    else if ((c === ')' || c === '}') && depth > 0) depth--;
+    else if (c === ':' && depth === 0) return value.slice(0, i);
+  }
+  return value;
+}
+
+/** Whether a statement sits at the top level of the script (bare, or under export/readonly/declare). */
+function isTopLevelAssignment(assignment: SyntaxNode): boolean {
+  const statement = assignment.parent?.type === 'declaration_command' ? assignment.parent : assignment;
+  return statement.parent?.type === 'program';
+}
+
+/** Whether a top-level `export NAME` (no value) appears in the script. */
+function isExportedByName(name: string, from: SyntaxNode, source: string): boolean {
+  let root = from;
+  while (root.parent) root = root.parent;
+  return root.namedChildren.some((statement) =>
+    statement.type === 'declaration_command' &&
+    /^export\b/.test(getNodeText(statement, source)) &&
+    statement.namedChildren.some((c) => c.type === 'variable_name' && getNodeText(c, source) === name));
+}
+
+/**
+ * What a top-level assignment tells the resolver about PATH (see
+ * resolution/bash-resolution.ts):
+ * - `PATH="<this script's directory>:$PATH"` puts that directory on PATH, so
+ *   the scripts in it reach one another by bare name (bats-core's libexec);
+ * - an exported variable holding the script's own directory lets the scripts
+ *   it starts run `"$VAR/x"` (bats-core's `BATS_LIBEXEC`).
+ */
+function assignmentDecorators(assignment: SyntaxNode, name: string, exported: boolean, ctx: ExtractorContext): string[] | undefined {
+  if (!isTopLevelAssignment(assignment)) return undefined;
+  const value = assignmentValue(assignment);
+  if (!value) return undefined;
+  const text = getNodeText(value, ctx.source);
+  if (name === 'PATH') {
+    const dir = projectDirectoryOf(firstPathEntry(unquote(text.trim())), assignment, ctx);
+    return dir ? [`${ON_PATH_DECORATOR}${dir}`] : undefined;
+  }
+  if (!exported && !isExportedByName(name, assignment, ctx.source)) return undefined;
+  const dir = projectDirectoryOf(text, assignment, ctx);
+  return dir ? [`${SCRIPT_DIR_DECORATOR}${dir}`] : undefined;
+}
+
+/**
+ * `"$VAR/x"` run as a command, where this script never assigns `VAR`: the
+ * value comes from whatever started it, so it is kept as `$VAR/x` for the
+ * resolver to match against a script that exports `VAR` as its directory.
+ */
+function emitVariableDirectoryRun(ctx: ExtractorContext, anchor: SyntaxNode, arg: SyntaxNode | undefined): void {
+  if (!arg || (arg.type !== 'string' && arg.type !== 'concatenation')) return;
+  const head = arg.namedChildren[0];
+  if (!head || (head.type !== 'simple_expansion' && head.type !== 'expansion')) return;
+  const variable = /^\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})$/.exec(getNodeText(head, ctx.source));
+  if (!variable) return;
+  const name = variable[1] ?? variable[2]!;
+  const rest = ctx.source.slice(head.endIndex, arg.endIndex).replace(/"/g, '');
+  if (name === 'PATH' || !/^(?:\/[\w.+-]+)+$/.test(rest)) return;
+  let root = arg;
+  while (root.parent) root = root.parent;
+  if (root.descendantsOfType('variable_assignment').some((a) => a && assignmentName(a, ctx.source) === name)) return;
+  emitCall(ctx, anchor, `$${name}${rest}`);
+}
+
 function isStaticProjectPath(value: string): boolean {
   return (
     (value.startsWith('./') || value.startsWith('../')) &&
@@ -218,15 +326,18 @@ function emitImport(ctx: ExtractorContext, anchor: SyntaxNode, written: string, 
 }
 
 /** The file a command's path argument names — a static `./x`, or one anchored to the script's directory. */
-function emitPathImport(ctx: ExtractorContext, anchor: SyntaxNode, arg: SyntaxNode | undefined, sourced: boolean): void {
-  if (!arg) return;
+function emitPathImport(ctx: ExtractorContext, anchor: SyntaxNode, arg: SyntaxNode | undefined, sourced: boolean): boolean {
+  if (!arg) return false;
   const literal = staticShellWord(arg, ctx.source);
   if (literal !== null) {
-    if (isStaticProjectPath(literal)) emitImport(ctx, anchor, literal, literal, sourced);
-    return;
+    if (!isStaticProjectPath(literal)) return false;
+    emitImport(ctx, anchor, literal, literal, sourced);
+    return true;
   }
   const anchored = scriptRelativePath(arg, ctx);
-  if (anchored) emitImport(ctx, anchor, unquote(getNodeText(arg, ctx.source)), anchored, sourced);
+  if (!anchored) return false;
+  emitImport(ctx, anchor, unquote(getNodeText(arg, ctx.source)), anchored, sourced);
+  return true;
 }
 
 /** A shell word without the quotes around the whole of it, as a path reads. */
@@ -360,7 +471,8 @@ function handleCommand(node: SyntaxNode, ctx: ExtractorContext): void {
   if (!name) {
     // `"$DIR/build.sh" args` runs a script anchored to this one's directory.
     const nameNode = getChildByField(node, 'name') || node.namedChildren.find((c) => c.type === 'command_name');
-    emitPathImport(ctx, node, nameNode?.namedChildren[0], false);
+    const head = nameNode?.namedChildren[0];
+    if (!emitPathImport(ctx, node, head, false)) emitVariableDirectoryRun(ctx, node, head);
     visitCommandChildren(node, ctx);
     return;
   }
@@ -383,7 +495,13 @@ function handleCommand(node: SyntaxNode, ctx: ExtractorContext): void {
   // `bash ./script.sh`, `sh ../lib/tool`, and wrapper forms such as
   // `exec ./script.sh` are file dependencies as well as command invocations.
   if (SHELL_INTERPRETERS.has(name) || SHELL_WRAPPER_COMMANDS.has(name)) {
-    emitPathImport(ctx, node, args[0], false);
+    const ran = emitPathImport(ctx, node, args[0], false);
+    // `exec X` / `command X` run a program, never a function: only PATH can answer.
+    if (!ran && SHELL_WRAPPER_COMMANDS.has(name) && args[0]) {
+      const word = staticShellWord(args[0], ctx.source);
+      if (word !== null && /^[\w.+][\w.+-]*$/.test(word)) emitCall(ctx, node, `${PATH_PROGRAM_PREFIX}${word}`);
+      else if (word === null) emitVariableDirectoryRun(ctx, node, args[0]);
+    }
   }
   if (isScriptPathCommand(name)) {
     // `./build.sh` runs a file: the import edge says so; no function is named that.
@@ -444,8 +562,9 @@ function createAssignmentNode(
   const value = assignmentValue(assignment);
   const initValue = value ? getNodeText(value, ctx.source).slice(0, 100) : undefined;
   const signature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
+  const decorators = assignmentDecorators(assignment, name, isExported, ctx);
 
-  ctx.createNode(kind, name, assignment, { signature, isExported });
+  ctx.createNode(kind, name, assignment, { signature, isExported, ...(decorators ? { decorators } : {}) });
 
   if (value) ctx.visitNode(value);
 }
