@@ -3490,8 +3490,9 @@ include_once("io.php");
     });
 
     it('should skip dynamic include/require with no static path (#660)', () => {
+      // `__DIR__ . '/x.php'` names a file: see php-dir-includes.test.ts (#3298).
       const code = `<?php
-require_once(__DIR__ . '/dyn.php');
+require_once($_SERVER['DOCUMENT_ROOT'] . '/dyn.php');
 include $file;
 include "tpl/{$name}.php";
 `;
