@@ -634,8 +634,16 @@ function pythonStatementStarts(filePath: string, context: ResolutionContext): bo
   return starts;
 }
 
-/** Line indexes that belong to `scope` itself (null: the module), not to a def or class nested in it. */
+/**
+ * Line indexes that belong to `scope` itself (null: the module), not to a def
+ * or class nested in it. Read once per scope: every name a def's calls are
+ * typed by asks it again (pythonScopeBindings).
+ */
 function pythonOwnLines(scope: Node | null, filePath: string, context: ResolutionContext): number[] {
+  return pythonNameScan(context, `ownlines\0${filePath}\0${scope?.id ?? ''}`, () => pythonOwnLinesUncached(scope, filePath, context));
+}
+
+function pythonOwnLinesUncached(scope: Node | null, filePath: string, context: ResolutionContext): number[] {
   const count = pythonMemberLines(filePath, context).length;
   const from = scope ? scope.startLine : 1;
   const to = scope ? Math.min(scope.endLine, count) : count;
@@ -27108,6 +27116,17 @@ function matchMethodCallOn(
     // `subprocess.run(…)` after `import subprocess`: a function of a module
     // from outside the project, not a same-named project method (#2599).
     if (!inferredType && ref.language === 'python' && dotMatch && isPythonOutsideModuleReceiver(objectOrClass!, ref, context)) return null;
+    // A local or parameter the calling def binds, which no pattern above typed:
+    // the class every binding of it gives (pythonLocalClass), read from a
+    // factory's or another local's method's `-> T` too (`made = make(q)`, `s =
+    // store.stage()`). A builtin or a class from outside the project has no
+    // project method; unknown or contested, the strategies below guess as
+    // before (#3038, #3240).
+    if (!inferredType && ref.language === 'python' && dotMatch && /^[A-Za-z_]\w*$/.test(objectOrClass!) &&
+        objectOrClass !== 'self' && objectOrClass !== 'cls') {
+      const typed = matchPythonLocalClassCall(objectOrClass!, methodName!, ref, context);
+      if (typed !== undefined) return typed;
+    }
     // A module-level instance of this file — `_svc = SceneService()` — called
     // from a function: the method its class has or inherits (#2582), as for a
     // method value through the same global (#2074). Otherwise the call goes on
@@ -30775,6 +30794,8 @@ function pythonConditionalArms(raw: string): [string, string] | null {
  */
 function pythonValueEvidence(raw: string, signature: string | null): PythonAttrEvidence {
   let v = raw.trim();
+  // `(a if c else b)`, a value wrapped over lines: the shape reads it as a tuple.
+  for (let inner = pythonParenthesized(v); inner !== null; inner = pythonParenthesized(v)) v = inner;
   const arms = pythonConditionalArms(v);
   if (arms) {
     const [a, b] = arms.map((arm) => pythonValueEvidence(arm, signature));
@@ -30829,11 +30850,26 @@ function pythonJoinedValue(lines: string[], ln: number, first: string, lastLine:
  * wrong.
  */
 function pythonValueCallees(value: string): string[] {
-  const arms = pythonConditionalArms(value.trim());
+  let v = value.trim();
+  for (let inner = pythonParenthesized(v); inner !== null; inner = pythonParenthesized(v)) v = inner;
+  const arms = pythonConditionalArms(v);
   if (arms) return arms.flatMap(pythonValueCallees);
-  const shape = pythonExprShape(value.trim().replace(/^await\s+/, ''));
+  const shape = pythonExprShape(v.replace(/^await\s+/, ''));
   const call = shape && /^([A-Za-z_][\w.]*) ?\(\)$/.exec(shape);
   return call ? [call[1]!] : [];
+}
+
+/**
+ * The expression a pair of parentheses wraps whole — `(a if c else b)`, or a
+ * value wrapped over lines — or null for anything else: `()`, a tuple, a
+ * generator expression, a call on what the parentheses hold.
+ */
+function pythonParenthesized(v: string): string | null {
+  if (!v.startsWith('(') || !v.endsWith(')') || pythonExprShape(v) !== '()') return null;
+  const inner = v.slice(1, -1).trim();
+  if (!inner || pythonTopLevelParts(inner).length > 1) return null;
+  const shape = pythonExprShape(inner);
+  return shape === null || /(?:^|\s)for\s/.test(shape) ? null : inner;
 }
 
 /**
@@ -31413,7 +31449,10 @@ function pythonFactoryTypeUncached(
     if (ann === 'runtime') return 'runtime';
     if (!ann || !('type' in ann)) return null;
     if (/^(?:typing(?:_extensions)?\.)?Self$/.test(ann.type)) return receiver;
-    return pythonClassNamed(ann.type, fn.filePath, context);
+    // `-> Path` after `from pathlib import Path`: a class from outside the
+    // project, which no project method belongs to (#3038).
+    return pythonClassNamed(ann.type, fn.filePath, context) ??
+      (isPythonOutsideModuleName(ann.type.split('.')[0]!, fn.filePath, context) ? 'runtime' : null);
   }
 
   // No annotation: every `return` in the body, outside nested defs/classes.
@@ -31676,6 +31715,27 @@ export function matchPythonTypedLocalCall(ref: UnresolvedRef, context: Resolutio
   return read.size > 0 ? { ...hit, metadata: { typeFrom: [...read].sort() } } : hit;
 }
 
+/**
+ * A method call on a Python local or parameter, typed by what the def that
+ * binds it gives it everywhere (pythonLocalClass): that class's method, its
+ * own or a base's, else the one subclass that defines it. Null when the local
+ * holds a builtin or a class from outside the project, or a project class with
+ * no such method; undefined when its class is unknown or contested, and the
+ * name strategies decide as before.
+ */
+function matchPythonLocalClassCall(receiver: string, methodName: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const scope = pythonBindingScope(receiver, ref, context);
+  if (!scope) return undefined;
+  const read = new Set<string>();
+  const cls = pythonLocalClass(scope, receiver, ref, context, read);
+  if (cls === null) return undefined;
+  if (cls === 'runtime') return null;
+  const hit = pythonMethodOnClass(cls, methodName, ref, context, read) ?? pythonSubclassMethod(cls, methodName, ref, context);
+  if (!hit) return null;
+  read.delete(ref.filePath);
+  return read.size > 0 ? { ...hit, metadata: { typeFrom: [...read].sort() } } : hit;
+}
+
 /** Per context: a python file's functions and methods, the latest-starting first, for the defs around a call. */
 const PY_FILE_DEFS = new WeakMap<ResolutionContext, Map<string, Node[]>>();
 
@@ -31842,10 +31902,13 @@ function pythonLocalClassUncached(
   ref: UnresolvedRef,
   context: ResolutionContext,
   read: Set<string>,
+  viaLocalCalls = true,
 ): PythonTypeAnswer {
   const filePath = scope.filePath;
   const { param, bindings } = pythonScopeBindings(scope, name, context);
   const evidence: PythonEvidence[] = [];
+  // Answers read through another local's method (`s = store.stage()`), already classes.
+  const made: PythonTypeAnswer[] = [];
   if (param !== undefined) {
     const ev = param === null ? null : pythonAnnotationEvidence(param);
     if (!ev) return null;
@@ -31868,6 +31931,15 @@ function pythonLocalClassUncached(
       ev = pythonAnnotationEvidence(copied.param);
     } else {
       const at: UnresolvedRef = { ...ref, line: b.line + 1 };
+      // `s = store.stage()` on a local `store`: what `stage` returns on the
+      // class the local holds (#3240).
+      const call = viaLocalCalls ? pythonLocalMethodCall(b.value) : null;
+      if (call && call.head !== name && pythonBindsLocally(call.head, at, context, false)) {
+        const result = pythonLocalMethodResult(call, at, context, read);
+        if (result === null) return null;
+        made.push(result);
+        continue;
+      }
       if (pythonValueCallees(b.value).some((c) => pythonBindsLocally(c.split('.')[0]!, at, context, false))) return null;
       ev = pythonValueEvidence(b.value, null);
     }
@@ -31875,7 +31947,9 @@ function pythonLocalClassUncached(
     evidence.push(ev);
   }
   // Nothing here can be a project class: a builtin, or no evidence.
-  if (!evidence.some((ev) => ev !== 'runtime')) return evidence.length > 0 ? 'runtime' : null;
+  if (!evidence.some((ev) => ev !== 'runtime') && !made.some((m) => m !== 'runtime')) {
+    return evidence.length + made.length > 0 ? 'runtime' : null;
+  }
 
   // A def or class of the name nested in the scope binds it there, a def
   // nested in it can rebind the scope's own through `nonlocal`, and `with … as
@@ -31892,7 +31966,36 @@ function pythonLocalClassUncached(
     const line = lines[i]!;
     if (line.includes(name) && (nonlocal.test(line) || asTuple.test(line))) return null;
   }
-  return pythonAgree(evidence.map((ev) => pythonEvidenceClass(ev, filePath, context, read, 0, null)));
+  return pythonAgree([...evidence.map((ev) => pythonEvidenceClass(ev, filePath, context, read, 0, null)), ...made]);
+}
+
+/** A whole value `head.method(…)` (awaited or not) on a plain name other than `self` / `cls`. */
+function pythonLocalMethodCall(value: string): { head: string; method: string; awaited: boolean } | null {
+  let v = value.trim();
+  const awaited = /^await\s/.test(v);
+  if (awaited) v = v.replace(/^await\s+/, '');
+  const shape = pythonExprShape(v);
+  const m = shape ? /^([A-Za-z_]\w*)\.([A-Za-z_]\w*) ?\(\)$/.exec(shape) : null;
+  return m && m[1] !== 'self' && m[1] !== 'cls' ? { head: m[1]!, method: m[2]!, awaited } : null;
+}
+
+/**
+ * What `head.method(…)` returns, `head` a local of a project class: the
+ * method's (own or a base's) `-> T`, or the class its returns agree on
+ * (pythonFactoryType). The local's own class is read without going through
+ * another local's method, so a chain of them stops after one link.
+ */
+function pythonLocalMethodResult(
+  call: { head: string; method: string; awaited: boolean },
+  at: UnresolvedRef,
+  context: ResolutionContext,
+  read: Set<string>,
+): PythonTypeAnswer {
+  const scope = pythonBindingScope(call.head, at, context);
+  if (!scope) return null;
+  const owner = pythonLocalClassUncached(scope, call.head, at, context, read, false);
+  if (!owner || owner === 'runtime') return null;
+  return pythonFactoryType(`${owner.name}.${call.method}`, call.awaited, owner.filePath, context, read);
 }
 
 /**
