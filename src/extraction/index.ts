@@ -24,7 +24,7 @@ import { ParseWorkerPool, parseWindowSize, resolveParsePoolSize, resolveParseTim
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure, isPotentialBashShebangPath, isPlayRoutesFile, newShebangReadBudget, SHEBANG_READ_LIMIT, ShebangReadBudget } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -1009,7 +1009,10 @@ export function preloadLanguagesForFiles(
   overrides?: Record<string, Language>,
   rootDir?: string
 ): Language[] {
-  const languages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides, rootDir)))];
+  // An extensionless file in the set is a script the scan already read the
+  // shebang of (Play's `conf/routes` aside): Bash, without a second read.
+  const languages = [...new Set(files.map((f) =>
+    isPotentialBashShebangPath(f) && !isPlayRoutesFile(f) ? 'bash' : detectLanguage(f, undefined, overrides, rootDir)))];
   // A Flow-typed `.js` is read with the TSX grammar (see detectLanguage).
   if ((languages.includes('javascript') || languages.includes('jsx')) && !languages.includes('tsx')) languages.push('tsx');
   if (languages.includes('c')) {
@@ -1770,15 +1773,17 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
   // filtered by exactly the rules a working-tree change is (#766, #999, #1829).
   const classify = (statusCode: string, rel: string): void => {
     const filePath = normalizePath(prefix + rel);
-    if (!isSource(filePath)) return;
 
     if (statusCode.includes('D')) {
       // Deletions stay unfiltered: getChangedFiles acts on one only when the
       // path is already tracked in the DB, where removal is always correct — and
       // that lets a newly-excluded dir's stale rows clean themselves up. (#766)
-      out.deleted.push(filePath);
+      // A deleted extensionless script has no shebang left to read, so its
+      // path alone lets it through.
+      if (isSource(filePath) || isPotentialBashShebangPath(filePath)) out.deleted.push(filePath);
       return;
     }
+    if (!isSource(filePath)) return;
 
     // Added (`??`) / modified files inside an excluded dir must not enter the
     // index — match against the `repoDir`-relative path, same as the full scan. (#766)
@@ -1848,6 +1853,17 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
   }
 }
 
+/** Say when a scan left extensionless files unread for a shebang (`SHEBANG_READ_LIMIT`). */
+function warnIfShebangLimitReached(budget: ShebangReadBudget, rootDir: string): void {
+  if (budget.skipped === 0) return;
+  logWarn(
+    `Read ${SHEBANG_READ_LIMIT} extensionless files for a shell shebang and stopped: ` +
+    `${budget.skipped} more were not checked, so any shell scripts among them are not indexed. ` +
+    `Add the folders that hold them to "exclude" in codegraph.json.`,
+    { rootDir, skipped: budget.skipped },
+  );
+}
+
 /**
  * Recursively scan a directory for source files.
  *
@@ -1867,13 +1883,15 @@ export function scanDirectory(
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
+    const shebangBudget = newShebangReadBudget();
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath, overrides, rootDir)) {
+      if (isSourceFile(filePath, overrides, rootDir, shebangBudget)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
       }
     }
+    warnIfShebangLimitReached(shebangBudget, rootDir);
     return files;
   }
 
@@ -1920,8 +1938,9 @@ export async function scanDirectoryAsync(
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
+    const shebangBudget = newShebangReadBudget();
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath, overrides, rootDir)) {
+      if (isSourceFile(filePath, overrides, rootDir, shebangBudget)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1933,6 +1952,7 @@ export async function scanDirectoryAsync(
         tallySkip(stats, filePath);
       }
     }
+    warnIfShebangLimitReached(shebangBudget, rootDir);
     return files;
   }
 
@@ -1952,6 +1972,7 @@ function scanDirectoryWalk(
   const visitedDirs = new Set<string>();
   // Custom extension → language overrides from the project's codegraph.json.
   const overrides = loadExtensionOverrides(rootDir);
+  const shebangBudget = newShebangReadBudget();
 
   // A .gitignore matcher scoped to the directory that declared it. Patterns in
   // a nested .gitignore are relative to that directory, so we keep the dir
@@ -2029,7 +2050,7 @@ function scanDirectoryWalk(
             }
           } else if (stat.isFile()) {
             if (!isIgnored(fullPath, false, active)) {
-              if (isSourceFile(relativePath, overrides, rootDir)) {
+              if (isSourceFile(relativePath, overrides, rootDir, shebangBudget)) {
                 files.push(relativePath);
                 count++;
                 onProgress?.(count, relativePath);
@@ -2050,7 +2071,7 @@ function scanDirectoryWalk(
         }
       } else if (entry.isFile()) {
         if (!isIgnored(fullPath, false, active)) {
-          if (isSourceFile(relativePath, overrides, rootDir)) {
+          if (isSourceFile(relativePath, overrides, rootDir, shebangBudget)) {
             files.push(relativePath);
             count++;
             onProgress?.(count, relativePath);
@@ -2071,6 +2092,7 @@ function scanDirectoryWalk(
   const exclude = loadExcludeMatcher(rootDir);
   if (exclude) baseMatchers.push({ dir: rootDir, ig: exclude });
   walk(rootDir, baseMatchers);
+  warnIfShebangLimitReached(shebangBudget, rootDir);
 
   // Force-include first-party source whitelisted in `codegraph.json` `include`
   // — the walk above honours `.gitignore`, so anything gitignored was dropped;

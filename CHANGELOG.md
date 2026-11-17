@@ -62,6 +62,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CodeIgniter 3 projects are now understood: controller methods and `routes.php` entries become routes, HMVC modules included, and calls through what `$this->load` loads link to the method they reach. Thanks @darkspock.
 - In Drupal, services from `*.services.yml`, plugin definitions and `#[Hook]` methods are now in the graph, and a call through `\Drupal::service('x')` reaches the method on that service's class. Thanks @mikedamoiseau and @marcelovani.
 - In Next.js, a route now links to the `proxy.ts` or `middleware.ts` that runs before it, following `config.matcher`, so impact, callers and `codegraph_explore` show which routes a change to it reaches. Thanks @RIGOandre.
+- CodeGraph now indexes **Bash** and shell scripts — `.sh`, `.bash`, `.bats` and extensionless scripts whose first line names `bash` or `sh` — with their functions, variables, calls between scripts, the files they `source` or run (including paths built from the script's own directory, like `"$(dirname "$0")/lib.sh"`), and each Bats `@test` as its own symbol with the helpers it `load`s. Thanks @Omar-Elwazeery, @Adam0120 and @danielmevit. (#1203, #1217)
 
 ### Fixes
 

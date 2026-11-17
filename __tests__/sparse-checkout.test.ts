@@ -53,7 +53,9 @@ describe('validatePathWithinRoot on a missing path', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(path.join(root, 'linked'), { force: true }); // the link itself, before the folder
+    // The link itself, before the folder. unlink, not rm: Node 24 on Windows
+    // refuses `rmSync` on a junction ("Path is a directory").
+    try { fs.unlinkSync(path.join(root, 'linked')); } catch { /* no link made */ }
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(outside, { recursive: true, force: true });
   });

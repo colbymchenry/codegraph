@@ -271,9 +271,27 @@ export function flowTokens(query: string): string[] {
         .split(/[\s,()[\]]+/)
         .map((t) => t.replace(FILE_EXT, '').trim())
         .flatMap(splitAtCjkSwitches)
-        .filter(isQueryNameToken)
+        .filter((t) => isQueryNameToken(t) || KEBAB_NAME.test(t))
     ),
   ].slice(0, MAX_TOKENS);
+}
+
+/**
+ * A hyphenated name, which shell code is full of: dokku's `cmd-git-hook`, the
+ * `bats-exec-file` script bats-core runs by name. A word like that which names
+ * nothing in the graph finds nothing, so taking it costs one lookup.
+ */
+const KEBAB_NAME = /^[A-Za-z_][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)+$/;
+
+/**
+ * Whether a node can be a named stop on a flow. A shell script's file is the
+ * program the shell runs when another script starts it by name, so its
+ * top-level code is a step of its own: bats-core's `bats` → `bats-exec-suite`
+ * → `bats-exec-file` is file to file. Other languages' files are modules,
+ * never called, so they stay out.
+ */
+function isFlowCallable(n: Node): boolean {
+  return FLOW_CALLABLE_KINDS.has(n.kind) || (n.kind === 'file' && n.language === 'bash');
 }
 
 /**
@@ -316,7 +334,7 @@ export function resolveNamedTokens(
 
   for (const t of tokens) {
     const hits = findAllSymbols(cg, t).nodes;
-    const cands = hits.filter((n) => FLOW_CALLABLE_KINDS.has(n.kind));
+    const cands = hits.filter(isFlowCallable);
     out.tokenFamily.set(t, cands);
     // A qualified or otherwise-specific name (<=3 hits) keeps all of them.
     const specific = cands.length <= 3;
@@ -350,7 +368,7 @@ export function resolveNamedTokens(
     if (out.dynNamed.size < 12) {
       let tokenDyn = 0;
       for (const n of hits) {
-        if (FLOW_CALLABLE_KINDS.has(n.kind) || !DYN_KINDS.has(n.kind) || out.dynNamed.has(n.id)) {
+        if (isFlowCallable(n) || !DYN_KINDS.has(n.kind) || out.dynNamed.has(n.id)) {
           continue;
         }
         if (hasHeuristicEdge(n.id)) {
