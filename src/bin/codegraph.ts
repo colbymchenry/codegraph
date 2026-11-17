@@ -406,6 +406,25 @@ async function openIndexToRead(projectPath: string): Promise<import('../index').
   return cg;
 }
 
+/**
+ * Say which files of an answer changed on disk after they were last indexed
+ * (#3260). A CLI answer comes straight from the index with no watcher behind
+ * it, so the line numbers of an edited file can point at other code; `node`
+ * and `explore` already flag such a file, and `callers`, `callees` and
+ * `impact` say it too. Under `--json` the warning goes to stderr, as the
+ * rebuild notice does, so stdout stays parseable; the answer lists the files
+ * as `changedOnDisk`.
+ */
+function warnChangedOnDisk(changed: string[], json: boolean | undefined): void {
+  if (changed.length === 0) return;
+  const named = changed.slice(0, 5).join(', ') + (changed.length > 5 ? ` and ${changed.length - 5} more` : '');
+  const message = changed.length === 1
+    ? `${named} changed on disk after it was last indexed, so line numbers from it may be off. Run "codegraph sync" to update the index.`
+    : `${changed.length} files changed on disk after they were last indexed (${named}), so line numbers from them may be off. Run "codegraph sync" to update the index.`;
+  if (json) console.error(`${chalk.yellow(getGlyphs().warn)} ${message}`);
+  else warn(message);
+}
+
 /** "not found" (+ optional did-you-mean) when no exact symbol matches. */
 function formatSymbolNotFound(symbol: string, fuzzyNames: string[]): string {
   const suggestions = [...new Set(fuzzyNames.filter((n) => n !== symbol))].slice(0, 3);
@@ -2615,6 +2634,14 @@ for (const direction of ['callers', 'callees'] as const) {
             lines: callSiteLines(ownEdges(node, edges)),
             recursive,
           });
+          // The files whose lines this answer prints: each definition's and each
+          // neighbour's shown.
+          const { filesChangedSinceIndexed } = await import('../graph/file-drift');
+          const changedOnDisk = filesChangedSinceIndexed(cg, [
+            ...groups.flat().map((node) => node.filePath),
+            ...collected.flatMap(({ nodes }) => nodes.slice(0, limit).map((node) => node.filePath)),
+          ]);
+          warnChangedOnDisk(changedOnDisk, options.json);
           if (options.json) {
             const definitions = collected.map(({ group, nodes, edges, recursive }) => {
               const limited = nodes.slice(0, limit);
@@ -2642,6 +2669,7 @@ for (const direction of ['callers', 'callees'] as const) {
               file: options.file,
               filteredOut,
               note,
+              ...(changedOnDisk.length > 0 ? { changedOnDisk } : {}),
               definitions,
               [direction]: [...union.values()].slice(0, limit).map((node) =>
                 row(node, allEdges, collected.some((entry) => entry.recursive.has(node.id)))),
@@ -2736,6 +2764,12 @@ program
           return { group, nodes, edges, truncated };
         });
         const truncated = collected.some((c) => c.truncated);
+        const { filesChangedSinceIndexed } = await import('../graph/file-drift');
+        const changedOnDisk = filesChangedSinceIndexed(cg, [
+          ...groups.flat().map((node) => node.filePath),
+          ...collected.flatMap(({ nodes }) => [...nodes.values()].map((node) => node.filePath)),
+        ]);
+        warnChangedOnDisk(changedOnDisk, options.json);
 
         if (options.json) {
           const unionNodes = new Map<string, Node>();
@@ -2761,6 +2795,7 @@ program
             file: options.file,
             filteredOut,
             note,
+            ...(changedOnDisk.length > 0 ? { changedOnDisk } : {}),
             definitions,
             nodeCount: unionNodes.size,
             edgeCount: unionEdges.size,
