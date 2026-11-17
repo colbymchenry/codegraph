@@ -1686,6 +1686,25 @@ export function getGitHeadSha(rootDir: string): string | null {
 }
 
 /**
+ * The environment for the git commands change detection runs, which only read.
+ *
+ * With git's "optional locks" on, `git status` writes the stat info it
+ * refreshed back to the index, and to do that it takes `.git/index.lock` right
+ * after the refresh and holds it through the diff and the whole untracked scan.
+ * Change detection runs on every sync — the watcher's, `codegraph sync` and
+ * `codegraph status`, and the MCP tools' freshness checks — and the watcher
+ * wakes exactly when a commit, a checkout or a hook churns files, so the user's
+ * `git add` or `git checkout` started inside that window failed at once with
+ * "index.lock: File exists" (#3295). `GIT_OPTIONAL_LOCKS=0` skips only that
+ * write-back: the output is the same, and the user's next git command refreshes
+ * the index itself. An environment variable rather than `--no-optional-locks`,
+ * which a git older than 2.15 would reject.
+ */
+function readOnlyGitEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, GIT_OPTIONAL_LOCKS: '0' };
+}
+
+/**
  * NUL-delimited status/path pairs for every path committed
  * between `sinceCommit` and HEAD. Empty when the stamp IS HEAD, which is the
  * common case — one cheap git call on the hot path.
@@ -1695,6 +1714,7 @@ function gitCommittedChangesSince(repoDir: string, sinceCommit: string): string[
   // Let command failures reach getGitChangedFiles: [] would falsely mean clean.
   const out = execFileSync('git', ['diff', '--relative', '--name-status', '--no-renames', '-z', sinceCommit, 'HEAD', '--', '.'], {
     cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    env: readOnlyGitEnv(),
   });
   return out.split('\0');
 }
@@ -1751,7 +1771,8 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
     repoPrefix
       ? ['status', '--porcelain', '--no-renames', '-z', '-uall', '--', '.']
       : ['status', '--porcelain', '--no-renames', '-z', '-uall'],
-    { cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+    // Read-only: never take `.git/index.lock` from under the user's git (#3295).
+    { cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: readOnlyGitEnv() }
   );
 
   // This repo's own ignore rules — built-in defaults (#407) plus its .gitignore.
