@@ -61,6 +61,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In PHP, a method called in a different letter case than its declaration, like `PriceConverter::CalcBasePrice(1)` or `$c->GetRate()` for `calcBasePrice` and `getRate`, now links to that method, as PHP reads method names without regard to case, so those calls show up in `callers` and impact. Thanks @artisanya for the report and @johnhldiver-beep. (#3297)
 - In PHP code written for PHP 7 and older, a string offset in braces, like `$code{0}`, no longer makes the function or class around it disappear from the index with its calls credited to the file; it now reads like `$code[0]`. Thanks @artisanya for the report. (#3299)
 - In PHP, a `require` or `include` of a file inside a function or method now counts as that function depending on the file, so `callers` and impact follow code in the included file back to the function and its callers. Thanks @artisanya for the report. (#3296)
+- In Swift, a type no longer picks up the inheritance of a type nested inside it, which linked a name used in the type to an unrelated type's nested type and put it in the wrong impact results. Thanks @bob-codedaptive for the report and @remote-controlled-man. (#3213)
 
 ## [1.6.3] - 2026-11-17
 

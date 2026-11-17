@@ -83,8 +83,69 @@ export function declaresExtension(lines: readonly string[], node: Pick<Node, 'st
   return DECLARATION_KEYWORD.exec(head)?.[1] === 'extension';
 }
 
-/** A declaration's inheritance clause: `struct HomeView: View, Sendable {` → `View, Sendable`. */
-const INHERITANCE_CLAUSE = /\b(?:class|struct|enum|actor|protocol|extension)\s+[A-Za-z_][\w.]*\s*(?:<[^{}]*?>)?\s*:\s*([^{]*?)\s*(?:\bwhere\b[^{]*)?\{/;
+/**
+ * A declaration's header, from its keyword to the brace that opens its body,
+ * with its inheritance clause if it has one: `struct HomeView: View, Sendable {`
+ * → `View, Sendable`. Matched from the declaration's own keyword only: the
+ * first lines of a type with no clause hold its members, and a nested type's
+ * clause there (`struct User { enum CodingKeys: String, CodingKey {`) is not
+ * the outer type's (#3213).
+ */
+const INHERITANCE_CLAUSE = /^(?:class|struct|enum|actor|protocol|extension)\s+[A-Za-z_][\w.]*\s*(?:<[^{}]*?>)?\s*(?::\s*([^{]*?))?\s*(?:\bwhere\b[^{]*)?\{/;
+
+/**
+ * `text` with its Swift comments and string literals blanked, newlines kept:
+ * line comments, block comments (which nest), `"…"`, multi-line `"""…"""` and
+ * raw `#"…"#` strings. A keyword, colon or brace written in a comment or in an
+ * attribute's message is no part of a declaration's header.
+ */
+function blankSwiftCommentsAndStrings(text: string): string {
+  const out = text.split('');
+  const blank = (from: number, to: number): void => {
+    for (let k = from; k < to; k++) if (out[k] !== '\n' && out[k] !== '\r') out[k] = ' ';
+  };
+  let i = 0;
+  while (i < text.length) {
+    if (text.startsWith('//', i)) {
+      const end = text.indexOf('\n', i);
+      const stop = end < 0 ? text.length : end;
+      blank(i, stop);
+      i = stop;
+      continue;
+    }
+    if (text.startsWith('/*', i)) {
+      let depth = 0;
+      let j = i;
+      do {
+        if (text.startsWith('/*', j)) { depth++; j += 2; }
+        else if (text.startsWith('*/', j)) { depth--; j += 2; }
+        else j++;
+      } while (depth > 0 && j < text.length);
+      blank(i, j);
+      i = j;
+      continue;
+    }
+    let hashes = 0;
+    while (text[i + hashes] === '#') hashes++;
+    if (text[i + hashes] !== '"') {
+      i += Math.max(hashes, 1);
+      continue;
+    }
+    // A raw string (`#"…"#`) ends only at its own count of `#`s, and its
+    // backslashes escape nothing.
+    const multiline = text.startsWith('"""', i + hashes);
+    const close = (multiline ? '"""' : '"') + '#'.repeat(hashes);
+    let j = i + hashes + (multiline ? 3 : 1);
+    while (j < text.length && !text.startsWith(close, j)) {
+      if (!multiline && text[j] === '\n') break;
+      j += hashes === 0 && text[j] === '\\' ? 2 : 1;
+    }
+    j = text.startsWith(close, j) ? j + close.length : Math.min(j, text.length);
+    blank(i, j);
+    i = j;
+  }
+  return out.join('');
+}
 
 /** The supertypes a Swift type node's own declaration names: `View`, `Sendable` for `struct HomeView: View, Sendable {`. */
 function declaredSupertypes(node: Node, context: ResolutionContext): string[] {
@@ -94,8 +155,12 @@ function declaredSupertypes(node: Node, context: ResolutionContext): string[] {
   let names: string[] = [];
   const lines = linesOf(node.filePath, context);
   if (lines) {
-    const head = [(lines[node.startLine - 1] ?? '').slice(node.startColumn), ...lines.slice(node.startLine, Math.min(node.endLine, node.startLine + 6))].join(' ');
-    const clause = INHERITANCE_CLAUSE.exec(head.replace(/"(?:[^"\\\n]|\\.)*"/g, '""'))?.[1];
+    const head = blankSwiftCommentsAndStrings(
+      [(lines[node.startLine - 1] ?? '').slice(node.startColumn), ...lines.slice(node.startLine, Math.min(node.endLine, node.startLine + 6))].join('\n'),
+    ).replace(/\s+/g, ' ');
+    // The declaration's keyword comes after its attributes and modifiers.
+    const keyword = DECLARATION_KEYWORD.exec(head);
+    const clause = keyword ? INHERITANCE_CLAUSE.exec(head.slice(keyword.index))?.[1] : undefined;
     if (clause) {
       names = clause
         .split(',')
