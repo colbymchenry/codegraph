@@ -44,7 +44,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             targets: aarch64-apple-darwin x86_64-apple-darwin
           - runner: ubuntu-22.04 # oldest glibc runner → widest compatibility
             targets: x86_64-unknown-linux-gnu
