@@ -37,6 +37,7 @@ import {
 } from './pascal-scope';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
+import { preferPythonImplementation, clearPythonOverloadMemos } from './python-overloads';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { adoptProjectScans, readProjectScans, type ProjectScans } from './project-scans';
 import { clearCppIncluderMemos } from './cpp-includers';
@@ -781,6 +782,7 @@ export class ReferenceResolver {
       clearCMacroRenames(this.context);
       clearCFeatureVariantMemos(this.context);
       clearAmbientModuleMemos(this.context);
+      clearPythonOverloadMemos(this.context);
       clearDeclaredDependencies(this.context);
     }
   }
@@ -1628,10 +1630,11 @@ export class ReferenceResolver {
     const scoped = this.gateRustScope(candidate, ref);
     // A Go name its package defines once per build target is the definition
     // the reference's file builds with (see preferGoBuildTwin).
-    const resolved = preferGoBuildTwin(this.gateSuperSelfCall(
+    // A Python name declared with typing.overload runs the def below its stubs (#2963).
+    const resolved = preferPythonImplementation(preferGoBuildTwin(this.gateSuperSelfCall(
       scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),
       ref,
-    ), ref, this.context);
+    ), ref, this.context), ref, this.context);
     // A Dart class whose field holds its own type (`class Node { Node? next; }`)
     // names itself: a self-edge that says nothing (#2327).
     if (resolved && ref.language === 'dart' && ref.referenceKind === 'references' &&
