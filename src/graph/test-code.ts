@@ -45,7 +45,9 @@ export function inCfgTestFile(filePath: string, readSource: SourceReader, depth 
   const base = parts.pop()!;
   if (base === 'lib.rs' || base === 'main.rs') return false;
   const name = base === 'mod.rs' ? parts.pop() : base.slice(0, -3);
-  if (!name || parts.length === 0) return false;
+  // Only a name Rust can declare is a module (`odd(name.rs` never is), and
+  // only such a name is ever written into the declaration's pattern.
+  if (!name || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || parts.length === 0) return false;
   const dir = parts.join('/');
   for (const owner of [`${dir}.rs`, `${dir}/mod.rs`, `${dir}/lib.rs`, `${dir}/main.rs`]) {
     const source = readSource(owner);
@@ -59,7 +61,8 @@ export function inCfgTestFile(filePath: string, readSource: SourceReader, depth 
 
 /** How `source` declares the out-of-line module `name` at its top level: under a test `cfg`, plainly, or not at all. */
 function rustModDeclaration(source: string, name: string): 'cfg-test' | 'plain' | undefined {
-  const decl = new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?mod\\s+${name}\\s*;`);
+  // `name` is an identifier (inCfgTestFile); `mod r#type;` loads `type.rs`.
+  const decl = new RegExp(`^(?:pub(?:\\([^)]*\\))?\\s+)?mod\\s+(?:r#)?${name}\\s*;`);
   let armed = false;
   let found: 'plain' | undefined;
   for (const raw of blankRustCode(source).split('\n')) {
