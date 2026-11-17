@@ -14,7 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- In Rust, a method passed as a value through its path, like `g.map(Graph::counts)` or `.map(Self::helper)`, now counts in that method's callers and impact the way a function passed by name already did, reaching what the same path reaches as a call, so `std::io::Error::other` never lands on a project type named `Error`. (#3254)
+- In Rust, a function or method passed as a value through its path, like `g.map(Graph::counts)` or `.map(Self::helper)`, now counts in its callers and impact the way a function passed by name already did, linked only when the path names it for certain: never another type's method of the same name, and never a method of a trait implementation, since which one Rust uses there depends on the type of the argument. (#3254)
 
 ## [1.6.3] - 2026-11-17
 

@@ -1683,13 +1683,19 @@ export class ReferenceResolver {
    * call's module, `use` and `Self` rules decide, and a std type that only
    * shares a project type's name reaches nothing. Only a function, an
    * inherent method or a trait's own method counts, never one in an `impl
-   * Trait for T` block (isRustTraitImplMember).
+   * Trait for T` block (isRustTraitImplMember), and a method only of the type
+   * the path names.
    */
   private resolveRustPathValue(ref: UnresolvedRef): ResolvedRef | null {
     const asCall = this.resolveOneIn({ ...ref, referenceKind: 'calls' });
     const target = asCall ? this.nodeById(asCall.targetNodeId) : undefined;
     if (!asCall || !target || (target.kind !== 'function' && target.kind !== 'method')) return null;
     if (isRustTraitImplMember(target, this.context)) return null;
+    // `S::new` names S's `new`: a call that reached another type's (S's own
+    // derived or macro-written, which the index doesn't hold) is not it.
+    const segments = ref.referenceName.split('::');
+    const type = segments[segments.length - 2]!.replace(/^r#/, '');
+    if (target.kind === 'method' && type !== 'Self' && target.qualifiedName.split('::').slice(-2, -1)[0] !== type) return null;
     return { original: ref, targetNodeId: target.id, confidence: asCall.confidence, resolvedBy: 'function-ref' };
   }
 

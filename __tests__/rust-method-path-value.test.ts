@@ -4,7 +4,9 @@
  * (#3254). The path names what the same path written as a call names: its
  * module, the file's `use` lines and `Self` decide, so a std type that only
  * shares a project type's name (`std::io::Error::other`) and another module's
- * type of the same name never take the edge. Variants and constants take none.
+ * type of the same name never take the edge. Variants and constants take none,
+ * nor does a method of an `impl Trait for T` block (which impl Rust picks for
+ * a value is past what the index can tell) or another type's method.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
@@ -254,6 +256,85 @@ describe('a Rust method passed as a value through its path', () => {
       ].join('\n'),
     });
     expect(outOf(graph, 'ctor')).toContain('references src/main.rs:E::new');
+  });
+
+  it('references no trait impl method however its impl is written', async () => {
+    const graph = await index({
+      'src/main.rs': [
+        'use std::path::Path;',
+        'pub trait Probe { fn exists(&self) -> bool; }',
+        'impl Probe',
+        '    for Path',
+        '{',
+        '    fn exists(&self) -> bool { true }',
+        '}',
+        'pub struct A;',
+        'pub struct B;',
+        'pub struct W(u8);',
+        'pub trait Conv<X> { fn conv(x: X) -> Self; }',
+        'impl Conv<A> for W {',
+        '    fn prep() { struct L; impl L { fn z() {} } }',
+        '    fn conv(_x: A) -> Self { W(0) }',
+        '}',
+        'impl Conv<B> for W { fn prep2(_v: impl Copy) {} fn conv(_x: B) -> Self { W(1) } }',
+        '#[derive(Default)]',
+        'pub struct SignalInfo { n: u32 }',
+        'pub struct EventInfo { n: u32 }',
+        '#[cfg(unix)] impl Default for EventInfo {',
+        '    fn default() -> Self { EventInfo { n: 0 } }',
+        '}',
+        'pub fn present(v: Vec<&Path>) -> bool { v.into_iter().any(Path::exists) }',
+        'pub fn convs(v: Vec<B>) -> Vec<W> { v.into_iter().map(W::conv).collect() }',
+        'pub fn infos() -> Vec<SignalInfo> { std::iter::repeat_with(SignalInfo::default).take(3).collect() }',
+        '',
+        'fn main() {}',
+        '',
+      ].join('\n'),
+    });
+    for (const fn of ['present', 'convs', 'infos']) {
+      expect(outOf(graph, fn).filter((e) => e.startsWith('references') && e.includes('::')), fn).toEqual([]);
+    }
+  });
+
+  it('references no other type\'s method of the name', async () => {
+    const graph = await index({
+      'src/main.rs': [
+        'pub struct S;',
+        'pub struct T;',
+        'impl T { pub fn new() -> T { T } }',
+        'pub fn many() -> Vec<S> { std::iter::repeat_with(S::new).take(3).collect() }',
+        '',
+        'fn main() {}',
+        '',
+      ].join('\n'),
+    });
+    expect(outOf(graph, 'many').filter((e) => e.startsWith('references') && e.includes('::'))).toEqual([]);
+  });
+
+  it('references a trait\'s own method after a trait impl, and an inherent method after a for loop', async () => {
+    const graph = await index({
+      'src/main.rs': [
+        'pub struct A;',
+        'pub struct G;',
+        'mod m {',
+        '    pub trait U { fn u(&self); }',
+        '    impl U for super::A { fn u(&self) {} }',
+        '    pub trait Shape { fn area(&self) -> u8 { 3 } }',
+        '    pub fn areas(v: Vec<Box<dyn Shape>>) -> Vec<u8> { v.iter().map(Shape::area).collect() }',
+        '}',
+        'impl m::U for G { fn u(&self) {} }',
+        'pub unsafe trait Sized2 { fn size(&self) -> u8 { 1 } }',
+        'pub fn sizes(v: Vec<Box<dyn Sized2>>) -> Vec<u8> { v.iter().map(Sized2::size).collect() }',
+        'impl G { fn a(&self) { for _i in 0..1 {} } pub fn counts(&self) -> u32 { 0 } }',
+        'pub fn report(g: Option<&G>) -> Option<u32> { g.map(G::counts) }',
+        '',
+        'fn main() {}',
+        '',
+      ].join('\n'),
+    });
+    expect(outOf(graph, 'areas')).toContain('references src/main.rs:Shape::area');
+    expect(outOf(graph, 'sizes')).toContain('references src/main.rs:Sized2::size');
+    expect(outOf(graph, 'report')).toContain('references src/main.rs:G::counts');
   });
 
   it('adds no reference to a path that is called', async () => {

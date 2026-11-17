@@ -12220,16 +12220,32 @@ export function isRustForeignImplCallable(target: Node, ref: UnresolvedRef, cont
  * (`#[derive(Default)]`, thiserror's `#[from]`), another impl the argument's
  * type would choose (`From<A>` beside `From<B>`, std's own `From<&str> for
  * String`), or the type's own method of the name (`Path::exists` beside a
- * project trait's). A one-line `impl Default for A { fn default() … }` is
- * read up to the method's column.
+ * project trait's). The block is the innermost `impl` or `trait` around the
+ * method in the file's code, comments and strings blanked, its header read
+ * whole: `for` on a later line, an attribute before it, a one-line impl.
  */
 export function isRustTraitImplMember(method: Node, context: ResolutionContext): boolean {
   if (method.language !== 'rust' || method.kind !== 'method') return false;
-  const own = (context.getFileLines?.(method.filePath) ?? context.readFile(method.filePath)?.split(/\r?\n/))?.[method.startLine - 1] ?? '';
-  const before = own.slice(0, Math.max(0, method.startColumn));
-  const impls = [...before.matchAll(/\bimpl\b/g)];
-  if (impls.length > 0) return /\sfor\s/.test(before.slice(impls[impls.length - 1]!.index));
-  return isRustTraitImplMethod(method, context);
+  const scopes = rustScopesOf(method.filePath, context);
+  const start = scopes?.lineStarts[method.startLine - 1];
+  if (!scopes || start === undefined) return isRustTraitImplMethod(method, context);
+  const block = rustImplAt(scopes, start + Math.max(0, method.startColumn));
+  if (!block) return isRustTraitImplMethod(method, context);
+  if (block.kind === 'trait') return false;
+  // `impl<G> Trait<A> for T where … {`: past the generics, a `for` outside
+  // the brackets before `where` or the body (`->` closes none).
+  let p = block.at + 4;
+  while (/\s/.test(scopes.code[p] ?? '')) p++;
+  if (scopes.code[p] === '<') p += block.generics.length + 2;
+  const head = scopes.code.slice(p, block.from).replace(/\bwhere\b[\s\S]*$/, '');
+  let depth = 0;
+  for (let i = 0; i < head.length; i++) {
+    const c = head[i]!;
+    if (c === '<' || c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']' || (c === '>' && head[i - 1] !== '-')) depth--;
+    else if (depth === 0 && c === 'f' && /^for\b/.test(head.slice(i, i + 4)) && !/\w/.test(head[i - 1] ?? '')) return true;
+  }
+  return false;
 }
 
 /**
