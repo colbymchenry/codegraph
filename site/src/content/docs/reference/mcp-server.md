@@ -9,6 +9,8 @@ CodeGraph runs as a [Model Context Protocol](https://modelcontextprotocol.io/) s
 codegraph serve --mcp
 ```
 
+The server introduces itself with a display name, CodeGraph, and its logo, so an agent or editor that shows them, like the Codex app, lists it by name and logo.
+
 When a `.codegraph/` index exists, the agent gets the tool below. It's listed in a workspace with **no** index of its own too: a call can name any indexed project — a service inside a monorepo, say — with its `projectPath` argument, and for a project that isn't indexed, CodeGraph tells the agent to carry on with its built-in tools. Indexing stays your decision.
 
 ## One tool by default: `codegraph_explore`
