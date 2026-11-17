@@ -19,4 +19,5 @@ export {
   reopenReferencesThroughDeclaredPackages,
   reopenReferencesThroughRetargetedModules,
 } from './resolution/module-importers';
+export { manifestStamp, parseManifestStamp, trustedManifestList } from './resolution/workspace-packages';
 export { FileWatcher } from './sync/watcher';

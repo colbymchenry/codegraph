@@ -125,7 +125,26 @@ export interface WorkspaceImportTargets {
  * this function itself touches the filesystem, so the resolver memoises it
  * the same way it does {@link loadProjectAliases} / {@link loadGoModule}.
  */
-export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | null {
+export function loadWorkspacePackages(projectRoot: string, knownManifests?: readonly string[]): WorkspacePackages | null {
+  return loadWorkspacePackagesAndManifests(projectRoot, knownManifests).packages;
+}
+
+/**
+ * {@link loadWorkspacePackages}, and the walk that found the manifests it read
+ * (see ManifestDiscovery). With `knownManifests`, the manifests a walk found
+ * earlier, in its order, nothing is walked: they are read again, each as the
+ * walk would read it, and `discovery` is null. A sync passes them when nothing
+ * the walk sees can have changed since (see `trustedManifestList`).
+ */
+export function loadWorkspacePackagesAndManifests(
+  projectRoot: string,
+  knownManifests?: readonly string[]
+): { packages: WorkspacePackages | null; discovery: ManifestDiscovery | null } {
+  const discovery = knownManifests ? null : discoverManifests(projectRoot);
+  return { packages: loadWithManifests(projectRoot, knownManifests ?? discovery!.manifests), discovery };
+}
+
+function loadWithManifests(projectRoot: string, manifests: readonly string[]): WorkspacePackages | null {
   const byName = new Map<string, string>();
 
   const patterns = readWorkspaceGlobs(projectRoot);
@@ -148,7 +167,7 @@ export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | 
   // (`import { CartRepository } from "data"`). Same monorepo problem as npm
   // workspaces, different manifest. An npm package does the same with
   // `"acme-shared": "file:../common"` and no root `workspaces` (#2456).
-  const { ohpm, npm, workspaceRoots } = collectPathDeps(projectRoot);
+  const { ohpm, npm, workspaceRoots } = collectPathDeps(projectRoot, manifests);
   const entryByName = new Map<string, string>();
   for (const [name, dir] of ohpm) {
     if (byName.has(name)) continue;
@@ -306,7 +325,9 @@ function readOhpmMain(projectRoot: string, dirRel: string): string | null {
  * tarball or a path into installed packages maps nothing.
  *
  * The walk is bounded (depth + directory budget) and prunes build/dependency
- * dirs; a manifest is parsed only where the walk finds one.
+ * dirs; a manifest is parsed only where the walk finds one. Finding them
+ * ({@link discoverManifests}) and reading them (here) are apart, so a sync that
+ * knows where they are reads them without walking the tree again.
  */
 const OHPM_MANIFEST = 'oh-package.json5';
 const NPM_MANIFEST = 'package.json';
@@ -317,26 +338,37 @@ const OHPM_SKIP_DIRS = new Set([
   'build', 'dist', 'out', 'oh-package-lock.json5',
 ]);
 
-function collectPathDeps(projectRoot: string): { ohpm: Map<string, string>; npm: Map<string, Map<string, string>>; workspaceRoots: string[] } {
-  const ohpm = new Map<string, string>();
-  const ambiguous = new Set<string>();
-  const npm = new Map<string, Map<string, string>>();
-  const workspaceRoots: string[] = [];
+/**
+ * What the manifest walk found: every `package.json` and `oh-package.json5`
+ * as a projectRoot-relative posix path, in the order the walk met them (the
+ * order {@link collectPathDeps} reads them in), how many folders it read, and
+ * whether it stopped at its folder budget before reading them all.
+ */
+export interface ManifestDiscovery {
+  manifests: string[];
+  visited: number;
+  truncated: boolean;
+}
 
+/** Walk the project for manifests: breadth-first, bounded and pruned as described above. */
+export function discoverManifests(projectRoot: string): ManifestDiscovery {
+  const manifests: string[] = [];
   const queue: Array<{ rel: string; depth: number }> = [{ rel: '', depth: 0 }];
   let visited = 0;
+  let truncated = false;
   while (queue.length > 0) {
     const { rel, depth } = queue.shift()!;
-    if (++visited > OHPM_WALK_DIR_BUDGET) break;
-    const abs = path.join(projectRoot, rel);
-
+    if (++visited > OHPM_WALK_DIR_BUDGET) {
+      truncated = true;
+      visited = OHPM_WALK_DIR_BUDGET;
+      break;
+    }
     let entries: fs.Dirent[];
     try {
-      entries = fs.readdirSync(abs, { withFileTypes: true });
+      entries = fs.readdirSync(path.join(projectRoot, rel), { withFileTypes: true });
     } catch {
       continue;
     }
-
     for (const e of entries) {
       if (e.isDirectory()) {
         if (depth >= OHPM_WALK_MAX_DEPTH) continue;
@@ -344,33 +376,262 @@ function collectPathDeps(projectRoot: string): { ohpm: Map<string, string>; npm:
         queue.push({ rel: rel ? `${rel}/${e.name}` : e.name, depth: depth + 1 });
         continue;
       }
-      if (e.name === NPM_MANIFEST) {
-        if (rel !== '' && readWorkspaceGlobs(abs).length > 0) workspaceRoots.push(rel);
-        const deps = new Map<string, string>();
-        for (const [name, target] of readNpmPathDeps(path.join(abs, e.name))) {
-          const targetAbs = path.resolve(abs, target);
-          const targetRel = path.relative(projectRoot, targetAbs).replace(/\\/g, '/');
-          if (targetRel === '' || targetRel.startsWith('..') || path.isAbsolute(targetRel)) continue;
-          if (/(?:^|\/)node_modules(?:\/|$)/.test(targetRel) || !isDirectory(targetAbs)) continue;
-          deps.set(name, targetRel);
-        }
-        if (deps.size > 0) npm.set(rel, deps);
+      if (e.name === NPM_MANIFEST || e.name === OHPM_MANIFEST) manifests.push(rel ? `${rel}/${e.name}` : e.name);
+    }
+  }
+  return { manifests, visited, truncated };
+}
+
+/**
+ * Whether the manifest walk reaches a path: a manifest name, under folders it
+ * enters (none a dot-folder or one of OHPM_SKIP_DIRS), at most its depth down.
+ * `rel` is projectRoot-relative posix.
+ */
+export function manifestWalkReaches(rel: string): boolean {
+  // Nearly every path a listing holds is no manifest: tell from its end first.
+  if (!rel.endsWith(NPM_MANIFEST) && !rel.endsWith(OHPM_MANIFEST)) return false;
+  const parts = rel.split('/');
+  const name = parts.pop()!;
+  if (name !== NPM_MANIFEST && name !== OHPM_MANIFEST) return false;
+  return walkEnters(parts);
+}
+
+/** Whether the walk enters every folder of `dirs` (projectRoot-relative segments, outermost first). */
+function walkEnters(dirs: readonly string[]): boolean {
+  if (dirs.length > OHPM_WALK_MAX_DEPTH) return false;
+  for (const dir of dirs) {
+    if (dir === '' || dir.startsWith('.') || OHPM_SKIP_DIRS.has(dir)) return false;
+  }
+  return true;
+}
+
+/**
+ * What a git repository's own listings say about the manifests the walk would
+ * find, read from the lists a full scan makes anyway, so a sync whose answer
+ * cannot have moved needs no walk (see {@link trustedManifestList}).
+ *
+ * Git lists every file the walk could meet except two kinds: what it ignores,
+ * which `git ls-files --others --ignored --directory` names folder by folder,
+ * and empty folders, which hold no manifest and only count toward the walk's
+ * folder budget. Embedded repositories and submodules keep their untracked
+ * files to themselves, so a project with one gets no evidence.
+ */
+export interface ManifestEvidence {
+  /** The manifests the walk reaches among the files git lists, tracked or untracked and not ignored, that are on disk. */
+  listed: string[];
+  /** The ignored entries the walk reaches: folders with a trailing slash, and manifests. */
+  ignored: string[];
+  /** The folders the walk enters that hold a file git lists, the root included (see countWalkedFolders). */
+  listedFolders: number;
+  /** False when git's listings leave out files the walk reads: embedded repositories, submodules. */
+  complete: boolean;
+}
+
+/**
+ * {@link ManifestEvidence} from a scan's lists: `files`, every path git lists
+ * (projectRoot-relative posix, as `git ls-files` orders them), and
+ * `ignoredEntries`, what git ignores (folders with their trailing slash).
+ */
+export function manifestEvidence(projectRoot: string, files: Iterable<string>, ignoredEntries: readonly string[], complete: boolean): ManifestEvidence {
+  const listed: string[] = [];
+  for (const file of files) {
+    // A tracked file deleted from disk is still in git's index.
+    if (manifestWalkReaches(file) && fs.existsSync(path.join(projectRoot, file))) listed.push(file);
+  }
+  const ignored = ignoredEntries.filter((entry) =>
+    entry.endsWith('/') ? walkEnters(entry.slice(0, -1).split('/')) : manifestWalkReaches(entry));
+  return { listed, ignored, listedFolders: countWalkedFolders(files), complete };
+}
+
+/**
+ * How many folders the walk enters to reach `files`: every folder above a
+ * file, down to the walk's depth and none it prunes, plus the root. One pass,
+ * no set: in git's sorted order the files under a folder sit together, so a
+ * folder is new exactly where a file's path parts from the one before it.
+ * Out of order (git lists untracked files after tracked ones) a folder may be
+ * counted twice, never missed.
+ */
+export function countWalkedFolders(files: Iterable<string>): number {
+  let count = 1;
+  let prev = '';
+  for (const file of files) {
+    // Folder by folder, while the path is still the previous one's: only the
+    // walk's first levels are read, and a folder name is cut out only when its
+    // length is one of the pruned names'.
+    let shared = true;
+    let start = 0;
+    for (let depth = 1; depth <= OHPM_WALK_MAX_DEPTH; depth++) {
+      const slash = file.indexOf('/', start);
+      if (slash < 0) break;
+      const length = slash - start;
+      if (length === 0 || file.charCodeAt(start) === 46 /* . */ ||
+        (SKIP_DIR_LENGTHS.has(length) && OHPM_SKIP_DIRS.has(file.slice(start, slash)))) break;
+      if (shared) {
+        if (prev.length <= slash || prev.charCodeAt(slash) !== 47 /* / */) shared = false;
+        else for (let i = start; i < slash; i++) if (prev.charCodeAt(i) !== file.charCodeAt(i)) { shared = false; break; }
+      }
+      if (!shared) count++;
+      start = slash + 1;
+    }
+    prev = file;
+  }
+  return count;
+}
+const SKIP_DIR_LENGTHS = new Set([...OHPM_SKIP_DIRS].map((dir) => dir.length));
+
+/**
+ * What the index records of the walk the workspace map was last read by, to
+ * tell a later sync where the manifests are: those the walk found, sorted and
+ * in its own order, how many folders it read, and how many of those git
+ * listed a file in then.
+ */
+export interface ManifestStamp {
+  v: 1;
+  manifests: string[];
+  walk: string[];
+  visited: number;
+  listedFolders: number;
+}
+
+/**
+ * The walk reads few enough folders below this that walking costs less than
+ * checking. Above half its folder budget a sync walks too: the folders git
+ * cannot see (empty ones) count toward the budget, so only that much room
+ * keeps a walk from stopping short of manifests it found before.
+ */
+const MANIFEST_STAMP_MIN_FOLDERS = 64;
+const MANIFEST_STAMP_MAX_FOLDERS = OHPM_WALK_DIR_BUDGET / 2;
+
+/** The entries of `evidence.ignored` that are folders, without their trailing slash, and that are manifests. */
+function ignoredParts(evidence: ManifestEvidence): { dirs: string[]; files: Set<string> } {
+  const dirs: string[] = [];
+  const files = new Set<string>();
+  for (const entry of evidence.ignored) {
+    if (entry.endsWith('/')) dirs.push(entry.slice(0, -1));
+    else files.add(entry);
+  }
+  return { dirs, files };
+}
+
+/**
+ * The stamp to record for a walk, or null when a later sync should walk
+ * again whatever it sees: no complete evidence, a walk too small to be worth
+ * skipping or too near its budget, or evidence that does not account for
+ * exactly the manifests the walk found outside what git ignores (a file
+ * that came or went between the scan and the walk, say).
+ */
+export function manifestStamp(evidence: ManifestEvidence | null, discovery: ManifestDiscovery): ManifestStamp | null {
+  if (!evidence || !evidence.complete || discovery.truncated) return null;
+  if (discovery.visited < MANIFEST_STAMP_MIN_FOLDERS || discovery.visited > MANIFEST_STAMP_MAX_FOLDERS) return null;
+  const { dirs, files } = ignoredParts(evidence);
+  const isIgnored = (manifest: string): boolean => files.has(manifest) || dirs.some((dir) => manifest.startsWith(dir + '/'));
+  const listed = new Set(evidence.listed);
+  const found = new Set(discovery.manifests);
+  for (const manifest of discovery.manifests) if (!isIgnored(manifest) && !listed.has(manifest)) return null;
+  for (const manifest of listed) if (!found.has(manifest)) return null;
+  return {
+    v: 1,
+    manifests: [...found].sort(),
+    walk: discovery.manifests.slice(),
+    visited: discovery.visited,
+    listedFolders: evidence.listedFolders,
+  };
+}
+
+/** A stamp read back from the index, or null when absent or not one this engine writes. */
+export function parseManifestStamp(raw: string | null): ManifestStamp | null {
+  if (!raw) return null;
+  try {
+    const stamp = JSON.parse(raw) as ManifestStamp;
+    if (stamp?.v !== 1 || !Array.isArray(stamp.manifests) || !Array.isArray(stamp.walk) ||
+      typeof stamp.visited !== 'number' || typeof stamp.listedFolders !== 'number') return null;
+    return stamp;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The manifests the stamped walk found, in its order, when the tree can hold
+ * no other: git lists the same ones it listed then, the folders it ignores
+ * hold the same ones (read again here, folder by folder, by the walk's own
+ * rules), and the walk could not have reached its budget. Otherwise null,
+ * and the sync walks. A manifest's content is no part of this: the caller
+ * reads every one of them again either way.
+ */
+export function trustedManifestList(projectRoot: string, stamp: ManifestStamp | null, evidence: ManifestEvidence | null): string[] | null {
+  if (!stamp || !evidence || !evidence.complete) return null;
+  const { dirs, files } = ignoredParts(evidence);
+  const room = MANIFEST_STAMP_MAX_FOLDERS - stamp.visited - Math.max(0, evidence.listedFolders - stamp.listedFolders);
+  if (room < 0) return null;
+  const now = new Set(evidence.listed);
+  for (const file of files) now.add(file);
+  // The ignored folders, walked as the walk would walk them.
+  let read = 0;
+  for (const dir of dirs) {
+    const queue: Array<{ rel: string; depth: number }> = [{ rel: dir, depth: dir.split('/').length }];
+    while (queue.length > 0) {
+      const { rel, depth } = queue.shift()!;
+      if (++read > room) return null;
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(path.join(projectRoot, rel), { withFileTypes: true });
+      } catch {
         continue;
       }
-      if (e.name !== OHPM_MANIFEST) continue;
+      for (const e of entries) {
+        if (e.isDirectory()) {
+          if (depth >= OHPM_WALK_MAX_DEPTH) continue;
+          if (e.name.startsWith('.') || OHPM_SKIP_DIRS.has(e.name)) continue;
+          queue.push({ rel: `${rel}/${e.name}`, depth: depth + 1 });
+          continue;
+        }
+        if (e.name === NPM_MANIFEST || e.name === OHPM_MANIFEST) now.add(`${rel}/${e.name}`);
+      }
+    }
+  }
+  if (now.size !== stamp.manifests.length) return null;
+  for (const manifest of stamp.manifests) if (!now.has(manifest)) return null;
+  return stamp.walk;
+}
 
-      const deps = readOhpmFileDeps(path.join(abs, e.name));
-      for (const [name, target] of deps) {
+function collectPathDeps(projectRoot: string, manifests: readonly string[]): { ohpm: Map<string, string>; npm: Map<string, Map<string, string>>; workspaceRoots: string[] } {
+  const ohpm = new Map<string, string>();
+  const ambiguous = new Set<string>();
+  const npm = new Map<string, Map<string, string>>();
+  const workspaceRoots: string[] = [];
+
+  for (const manifest of manifests) {
+    const slash = manifest.lastIndexOf('/');
+    const rel = slash < 0 ? '' : manifest.slice(0, slash);
+    const file = manifest.slice(slash + 1);
+    const abs = path.join(projectRoot, rel);
+    if (file === NPM_MANIFEST) {
+      if (rel !== '' && readWorkspaceGlobs(abs).length > 0) workspaceRoots.push(rel);
+      const deps = new Map<string, string>();
+      for (const [name, target] of readNpmPathDeps(path.join(abs, NPM_MANIFEST))) {
         const targetAbs = path.resolve(abs, target);
         const targetRel = path.relative(projectRoot, targetAbs).replace(/\\/g, '/');
-        if (targetRel.startsWith('..')) continue; // escapes the project
-        const existing = ohpm.get(name);
-        if (existing === undefined) {
-          if (!ambiguous.has(name)) ohpm.set(name, targetRel);
-        } else if (existing !== targetRel) {
-          ohpm.delete(name);
-          ambiguous.add(name);
-        }
+        if (targetRel === '' || targetRel.startsWith('..') || path.isAbsolute(targetRel)) continue;
+        if (/(?:^|\/)node_modules(?:\/|$)/.test(targetRel) || !isDirectory(targetAbs)) continue;
+        deps.set(name, targetRel);
+      }
+      if (deps.size > 0) npm.set(rel, deps);
+      continue;
+    }
+    if (file !== OHPM_MANIFEST) continue;
+
+    const deps = readOhpmFileDeps(path.join(abs, OHPM_MANIFEST));
+    for (const [name, target] of deps) {
+      const targetAbs = path.resolve(abs, target);
+      const targetRel = path.relative(projectRoot, targetAbs).replace(/\\/g, '/');
+      if (targetRel.startsWith('..')) continue; // escapes the project
+      const existing = ohpm.get(name);
+      if (existing === undefined) {
+        if (!ambiguous.has(name)) ohpm.set(name, targetRel);
+      } else if (existing !== targetRel) {
+        ohpm.delete(name);
+        ambiguous.add(name);
       }
     }
   }

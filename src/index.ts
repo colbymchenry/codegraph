@@ -145,6 +145,8 @@ export interface IndexOptions {
 const PYTHON_ROOTS_METADATA_KEY = 'python_root_fingerprint';
 /** Metadata key: the digest of the workspace packages and path dependencies the index was resolved by. */
 const WORKSPACE_METADATA_KEY = 'js_workspace_fingerprint';
+/** Metadata key: where the walk that read those packages found their manifests (see ManifestStamp); '' for none. */
+const WORKSPACE_MANIFESTS_METADATA_KEY = 'js_workspace_manifests';
 /** The tsconfig / jsconfig and go.mod files the index was resolved by, with a digest of each (#2977). */
 const MODULE_CONFIG_METADATA_KEY = 'module_config_snapshot';
 /** Metadata key: the frameworks (sorted JSON names) the last full index extracted every file with. */
@@ -320,7 +322,12 @@ export class CodeGraph {
   private builtResolver: ReferenceResolver | null = null;
 
   private get orchestrator(): ExtractionOrchestrator {
-    return (this.builtOrchestrator ??= new (engine().ExtractionOrchestrator)(this.projectRoot, this.queries));
+    if (!this.builtOrchestrator) {
+      this.builtOrchestrator = new (engine().ExtractionOrchestrator)(this.projectRoot, this.queries);
+      // A graph that watches detects again as files change (see watch()).
+      if (this.watcher) this.builtOrchestrator.setKeepDetectionContents(true);
+    }
+    return this.builtOrchestrator;
   }
 
   private get resolver(): ReferenceResolver {
@@ -887,6 +894,7 @@ export class CodeGraph {
         // extraction stamp (the bulk would still be stale). See extraction-version.ts.
         if (result.success) this.stampPythonRootFingerprint();
         if (result.success) this.stampWorkspaceFingerprint();
+        if (result.success) this.stampWorkspaceManifests(this.orchestrator.takeManifestEvidence());
         if (result.success) this.stampModuleConfigSnapshot();
         if (result.success) this.stampIndexedFrameworks();
 
@@ -1030,6 +1038,20 @@ export class CodeGraph {
     } catch { /* metadata is advisory */ }
   }
 
+  /**
+   * Record where the last walk found the package manifests, with what git's
+   * listings said then (see ManifestStamp), so a sync that sees the same can
+   * read them without walking the tree. '' when there is nothing to trust.
+   */
+  private stampWorkspaceManifests(evidence: ReturnType<ExtractionOrchestrator['takeManifestEvidence']>): void {
+    try {
+      const discovery = this.resolver.getWorkspaceDiscovery();
+      const stamp = discovery ? engine().manifestStamp(evidence, discovery) : null;
+      const value = stamp ? JSON.stringify(stamp) : '';
+      if (this.queries.getMetadata(WORKSPACE_MANIFESTS_METADATA_KEY) !== value) this.queries.setMetadata(WORKSPACE_MANIFESTS_METADATA_KEY, value);
+    } catch { /* metadata is advisory */ }
+  }
+
   /** Record the frameworks a full index extracted every file with; none has come or gone since. */
   private stampIndexedFrameworks(): void {
     const names = this.orchestrator.getDetectedFrameworkNames();
@@ -1117,6 +1139,7 @@ export class CodeGraph {
       hasSynthesisPattern,
       isJsxChildCandidate,
       moduleConfigLanguages,
+      parseManifestStamp,
       parseModuleConfigSnapshot,
       reopenNameMatchedImports,
       reopenReferencesThroughAddedFiles,
@@ -1124,6 +1147,7 @@ export class CodeGraph {
       reopenReferencesThroughChangedDefaults,
       reopenReferencesThroughDeclaredPackages,
       reopenReferencesThroughRetargetedModules,
+      trustedManifestList,
     } = engine();
     return this.indexMutex.withLock(async () => {
       const startedAt = Date.now();
@@ -1340,10 +1364,22 @@ export class CodeGraph {
           }
         }
 
+        // Finding the manifests takes a walk of the tree. Git's listings, which
+        // this sync's scan made anyway, tell whether the walk could find any
+        // but those it found last time; when not, they are read where they
+        // are, each one again, so an edit to one is seen all the same.
         if (fullReconcile) {
           const tWorkspace = Date.now();
           const before = this.queries.getMetadata(WORKSPACE_METADATA_KEY);
-          const now = this.resolver.refreshWorkspacePackages();
+          const evidence = this.orchestrator.takeManifestEvidence();
+          const known = before === null ? null : trustedManifestList(
+            this.projectRoot, parseManifestStamp(this.queries.getMetadata(WORKSPACE_MANIFESTS_METADATA_KEY)), evidence
+          );
+          const now = this.resolver.refreshWorkspacePackages(known ?? undefined);
+          if (!known) this.stampWorkspaceManifests(evidence);
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+            console.error(`[phase-timing] sync-workspace-manifests: ${Date.now() - tWorkspace}ms (${known ? `${known.length} read where the last walk found them` : 'walked'})`);
+          }
           if (before !== null && before !== now) {
             let reopened = 0;
             for (const language of ESM_IMPORT_LANGUAGES) reopened += this.orchestrator.resurrectResolutionEdgesForLanguage(language);
@@ -1767,22 +1803,23 @@ export class CodeGraph {
           result.pendingRefsUnresolved = recovery.stats.unresolved;
         }
 
-        // Python attribute types read from OTHER files — a factory's return, a
-        // base class's `__init__` — change with a body-only edit the definition
+        // Types read from OTHER files — a Python factory's return, a base
+        // class's `__init__`, the type a TS/JS callee's signature gives its
+        // callback's parameter — change with a body-only edit the definition
         // delta above cannot see. Re-open the edges whose answer was read from a
-        // touched file, and retry the failed attribute calls in files that
-        // import one; both resolve right here. After the orphan sweep, so the
-        // import edges this sync created (a caller whose `from f import make`
-        // only now resolves) are there to find the importers by.
+        // touched file, and retry the failed Python attribute calls in files
+        // that import one; both resolve right here. After the orphan sweep, so
+        // the import edges this sync created (a caller whose `from f import
+        // make` only now resolves) are there to find the importers by.
         if (process.env.CODEGRAPH_NO_REBIND !== '1') {
           const touched = [...(result.changedFilePaths ?? []), ...(result.removedFilePaths ?? [])];
           const touchedPy = touched.filter((p) => /\.pyi?$/.test(p));
-          if (touchedPy.length > 0) {
+          if (touched.length > 0) {
             const tTypes = Date.now();
-            const reopenedFiles = this.orchestrator.resurrectTypeDependentEdges(touchedPy, result.changedFilePaths ?? []);
+            const reopenedFiles = this.orchestrator.resurrectTypeDependentEdges(touched, result.changedFilePaths ?? []);
             // CODEGRAPH_PY_ATTR_RETRY_CEILING overrides the candidate ceiling (tests).
             const ceiling = Number(process.env.CODEGRAPH_PY_ATTR_RETRY_CEILING ?? '') || 2000;
-            const failed = this.resolver.pythonAttrRetryCandidates(touchedPy, ceiling);
+            const failed = touchedPy.length > 0 ? this.resolver.pythonAttrRetryCandidates(touchedPy, ceiling) : [];
             const retry = [...this.queries.getUnresolvedReferencesByFiles(reopenedFiles), ...(failed ?? [])];
             if (retry.length > 0) await this.resolver.resolveAndPersistListYielding(retry);
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
@@ -2038,7 +2075,12 @@ export class CodeGraph {
         : undefined
     );
 
-    return this.watcher.start();
+    // A watching graph detects frameworks again as files change: keep what
+    // detection reads, so that reads only what changed (#2516).
+    this.orchestrator.setKeepDetectionContents(true);
+    const started = this.watcher.start();
+    if (!started) this.orchestrator.setKeepDetectionContents(false);
+    return started;
   }
 
   /**
@@ -2049,6 +2091,7 @@ export class CodeGraph {
       this.watcher.stop();
       this.watcher = null;
     }
+    if (this.builtOrchestrator) this.builtOrchestrator.setKeepDetectionContents(false);
   }
 
   /**

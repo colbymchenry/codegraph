@@ -12,6 +12,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In Python, `import time` no longer links the importing file to a project function that happens to be named `time`, so such a function stops listing every file that imports the standard library module among its callers and in its impact. The same goes for `json`, `copy`, `random`, `logging` and any other module, and for a fallback variable like `brotli = None` beside a guarded `import brotli`. Thanks @inth3shadows for the report. (#3239)
+- In Python, a local built from a class through its module, like `client = httpx.AsyncClient()`, or bound by `with` or `async with … as client` from a class whose `__enter__` returns itself, now has that class, so `client.get()` links to `AsyncClient.get` instead of the method of a class named like the variable, such as `Client.get`. The class is the one the module path names (`pkg.b.Runner`, or `pkg.Public` re-exported from `Impl`), and a local `with` binds to something else gets no edge rather than that guess or an older binding's class. (#2957)
+- In Rust, a call through a module that a glob `use` brings in, like `gzip::write()` in a test module with `use super::*`, or that a `use` inside the function names, now links to that module's function again. Thanks @Egrn for the report and @mohitdixit02. (#3253)
+
+## [1.6.3] - 2026-11-17
+
 ### Highlights
 
 - **Nine more agents and editors.** `codegraph install` now sets up IBM Bob, Factory Droid, Windsurf, Qwen Code, DeepSeek Harness, Grok Build, Kimi Code, the Qoder CLI and Pi.
@@ -213,6 +221,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In JavaScript and TypeScript, `codegraph sync` and the file watcher now update a barrel's importers when an edit moves, removes or narrows one of its re-exports. Thanks @inth3shadows and @danusha2345. (#2978)
 - In TypeScript and JavaScript, an array method call like `items.find(…)` on a variable or parameter annotated as an array of a class (`items: Item[]`) no longer links to the class's method of the same name.
 - In TypeScript and JavaScript, a call on a value annotated as a type's property, like `editor: IChatWidget['inputEditor']`, now links only to a method of that property's declared type.
+- In TypeScript and JavaScript, a call on a callback's untyped parameter, on a variable set from a function's result, or on a value a type guard like `if (!editor.hasModel()) return;` narrows now links to the method of the type the code gives it, not a namesake on a base type.
 - In JavaScript and TypeScript, a file that re-exports a module, like an `index.ts` with `export * from './button'`, now counts as importing it, so `codegraph affected` includes the barrels that re-export it.
 - `codegraph sync` and the file watcher now also update the files that import through an `index.ts` re-exporting another barrel, like `export * from './dropdown-menu'`, when that inner barrel is deleted or added.
 - An import in a Vue, Svelte or Astro component now links the component to the file it imports, as in a script, and so does an import of a scoped package that a `tsconfig` path or workspace maps to a project file.
@@ -317,7 +326,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Python calls through an attribute, like `self.sink.stop()`, now reach the method of the class your code gives that attribute instead of one matched by name alone. Thanks @inth3shadows. (#1704)
 - A Python call through an attribute set by a factory or a base class's `__init__`, or straight on a factory's result, like `Client.from_env().send()`, now reaches the right method. Thanks @inth3shadows. (#1704, #750)
 - Python imports now resolve from your package roots, like `src/` layouts and each `pyproject.toml`, so `import requests` no longer links to a same-named file in a test fixture or vendored copy. (#1704)
-- In Python, a local built from a class through its module, like `client = httpx.AsyncClient()`, or bound by `with` or `async with … as client` from a class whose `__enter__` returns itself, now has that class, so `client.get()` links to `AsyncClient.get` instead of the method of a class named like the variable, such as `Client.get`. The class is the one the module path names (`pkg.b.Runner`, or `pkg.Public` re-exported from `Impl`), and a local `with` binds to something else gets no edge rather than that guess or an older binding's class. (#2957)
 
 #### Java, Kotlin and Scala
 
@@ -485,7 +493,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Rust, a call through a generic type parameter, like `Key::get(…)`, now links to the method its trait bound declares, and `T::default()` under `T: Default` no longer links to one of your types' `default` functions.
 - In Rust, `String::from("…")` no longer links to your own `impl From<YourType> for String` unless it passes a `YourType`, and `files.iter()` links to your trait's implementation only where the trait is imported.
 - In Rust, a method called through `self: Pin<&mut Self>`, `self: Box<Self>`, `self: Rc<Self>` or `self: Arc<Self>` now links the way Rust looks it up, to the type's own method before a trait's of the same name.
-- In Rust, a method called on what `.as_mut()` or `.as_ref()` hands back now links by the type its receiver is declared with, and one on an `Option` or a generic type no longer links to an unrelated project method.
+- In Rust, a method called on what `.as_mut()` or `.as_ref()` hands back now links by the type its receiver is declared with, or for a generic type to the method of the trait that bounds it, and one on an `Option` no longer links to an unrelated project method.
 - In Rust, an item declared without `pub` now links only from its own module and those inside it, and a name a `use` brings in from a workspace crate links only to that crate or one it depends on.
 - In Rust, a name a `use` brings in, like `use crate::sync::watch::Receiver`, now links to the item in the module its path leads to, found the way Rust finds it, not to any item of that name in the crate.
 - In Rust, a name brought in only by a glob `use`, like dioxus's `use dioxus::prelude::*`, now links to the item that module passes on, following its re-exports, and only to what the module makes public.
@@ -535,7 +543,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Ruby, a call on a class written with its namespace, like `Billing::ChargeCard.call(…)`, now links the caller to that class and to the class method it calls. Thanks @james-jang and @drakeo338. (#2503)
 - In Ruby, a call to a method ending in `!` or `?` now links when its receiver's class is known, and so does a method called straight on a new object, like `CacheWriter.new(key).write_cache`. Thanks @ricobl.
 - In Ruby, a call on an instance variable, like `@writer.flush`, now links to the method of the class the variable holds when the class's `initialize` sets it to a new object of one class.
-- In Ruby, a call now follows a class's real ancestors in the order Ruby looks a method up, and a call on a class reaches the methods it `extend`s and the `ClassMethods` of the concerns it includes.
+- In Ruby, a call now follows a class's real ancestors in the order Ruby looks a method up, as the calling file's test suite loads them, and a call on a class reaches what it `extend`s and what the concerns it includes add to it.
+- In Ruby, a class name like `Topic` now links to the class Ruby's constant lookup finds where the name is written, and a call with no receiver to the method Ruby runs first, so classes of one name in different test suites or namespaces are no longer mixed up.
 - In Ruby, a call on a method's parameter now links to the right class when every call of that method in the project passes a value of one class.
 - In Ruby, a class method, `def self.build` or a `def` inside `class << self`, is now told apart from an instance method of the same name, so a call on the class or on an instance links to the right one.
 - JSON files in a `templates` or `sections` folder are now read as Shopify Liquid only inside a Shopify theme, so a .NET project template's `template.json` no longer shows up as an empty Liquid file.
@@ -550,6 +559,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In CFML, `<cfinclude template="formlistshared.cfm">` and its script forms now link the component, function or template they are in to the file they include. Thanks @HarryMuc for the report. (#2651)
 - In PHP, a class written through a namespace alias in a different case than its `use` statement now links to that class, since PHP reads namespace names without regard to case. Thanks @danusha2345. (#2369)
 - In PHP, a call on a variable now reaches the method its class really has, found through the file's namespace and `use` imports, and a Laravel facade's static call reaches the class its `getFacadeAccessor()` names.
+- In PHP, `parent::`, `self::` and `$this->` inside an anonymous class, like `new class extends ArrayStore { … }`, now reach what that class extends and the traits it uses, not those of the class whose method creates it.
 - In Drupal, an import of a class whose short name another class shares, like `use Drupal\commerce_price\Price`, no longer also links to that other class.
 - In Erlang, a comment inside an argument or parameter list no longer counts as an argument, so the call links to the function of its real arity. Thanks @Dshuishui. (#1619)
 - In COBOL, asking `codegraph_explore` about a copybook by name, like `CVACT01Y`, now answers with its source and every `COPY` or `EXEC SQL INCLUDE` that includes it, instead of "No relevant code found". Thanks @popolusiak. (#2342)
@@ -1858,3 +1868,4 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [1.6.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.0
 [1.6.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.1
 [1.6.2]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.2
+[1.6.3]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.3
