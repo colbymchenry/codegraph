@@ -246,6 +246,9 @@ const RUST_SPEC: FnRefSpec = {
     ['static_item', { mode: 'varinit', field: 'value' }],
     ['let_declaration', { mode: 'varinit', field: 'value' }],
   ]),
+  // `g.map(Graph::counts)`, `map(Self::helper)`, `or_else(fs::default_sep)`:
+  // a function passed through its path (#3254), resolved as that path's call.
+  special: new Set(['scoped_identifier']),
 };
 
 const JAVA_SPEC: FnRefSpec = {
@@ -667,6 +670,19 @@ function normalizeSpecial(
         return m === 'new' ? [] : [{ name: `${recv[1]}::${m}`, node: last }];
       }
       return [];
+    }
+
+    // Rust `Graph::counts`, `crate::graph::Graph::counts`, `Self::helper`
+    // (#3254): a function named through its path. The whole path is kept;
+    // resolution reads it as the same path written as a call would be, so the
+    // module, `use` and `Self` rules of a call decide what it names. Only a
+    // function-like last segment qualifies (a capitalized one is a variant or
+    // a constant); a generic path (`Vec::<u8>::new`) is left alone.
+    case 'scoped_identifier': {
+      const name = getChildByField(node, 'name');
+      if (!name || name.type !== 'identifier' || !/^(?:r#)?[a-z_]/.test(getNodeText(name, source))) return [];
+      const text = getNodeText(node, source).replace(/\s+/g, '');
+      return /^[A-Za-z_][\w:#]*$/.test(text) ? [{ name: text, node: name }] : [];
     }
 
     // Kotlin `::targetCb` (one part) / `OtherClass::handle` (two parts —
