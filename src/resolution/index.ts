@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustTraitImplMember, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
+import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustTraitImplMember, isRustOtherTypesMethod, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -1683,19 +1683,16 @@ export class ReferenceResolver {
    * call's module, `use` and `Self` rules decide, and a std type that only
    * shares a project type's name reaches nothing. Only a function, an
    * inherent method or a trait's own method counts, never one in an `impl
-   * Trait for T` block (isRustTraitImplMember), and a method only of the type
-   * the path names.
+   * Trait for T` block (isRustTraitImplMember), nor another project type's
+   * inherent method (isRustOtherTypesMethod).
    */
   private resolveRustPathValue(ref: UnresolvedRef): ResolvedRef | null {
     const asCall = this.resolveOneIn({ ...ref, referenceKind: 'calls' });
     const target = asCall ? this.nodeById(asCall.targetNodeId) : undefined;
     if (!asCall || !target || (target.kind !== 'function' && target.kind !== 'method')) return null;
     if (isRustTraitImplMember(target, this.context)) return null;
-    // `S::new` names S's `new`: a call that reached another type's (S's own
-    // derived or macro-written, which the index doesn't hold) is not it.
     const segments = ref.referenceName.split('::');
-    const type = segments[segments.length - 2]!.replace(/^r#/, '');
-    if (target.kind === 'method' && type !== 'Self' && target.qualifiedName.split('::').slice(-2, -1)[0] !== type) return null;
+    if (isRustOtherTypesMethod(target, segments[segments.length - 2]!.replace(/^r#/, ''), this.context)) return null;
     return { original: ref, targetNodeId: target.id, confidence: asCall.confidence, resolvedBy: 'function-ref' };
   }
 

@@ -337,6 +337,52 @@ describe('a Rust method passed as a value through its path', () => {
     expect(outOf(graph, 'report')).toContain('references src/main.rs:G::counts');
   });
 
+  it('references the method through a renamed import, a type alias and a generic bound', async () => {
+    const graph = await index({
+      'src/main.rs': [
+        'mod graph;',
+        'use crate::graph::Graph as G;',
+        'use crate::graph::Shape;',
+        'pub type Gr = crate::graph::Graph;',
+        'pub fn renamed(g: Option<&G>) -> Option<u32> { g.map(G::counts) }',
+        'pub fn aliased(g: Option<&Gr>) -> Option<u32> { g.map(Gr::counts) }',
+        'pub fn bound<T: Shape>(v: Vec<T>) -> Vec<u32> { v.iter().map(T::area).collect() }',
+        '',
+        'fn main() {}',
+        '',
+      ].join('\n'),
+      'src/graph.rs': [
+        'pub struct Graph { n: u32 }',
+        'impl Graph {',
+        '    pub fn counts(&self) -> u32 { self.n }',
+        '}',
+        'pub trait Shape {',
+        '    fn area(&self) -> u32 { 0 }',
+        '}',
+        'impl Shape for Graph {}',
+        '',
+      ].join('\n'),
+    });
+    expect(outOf(graph, 'renamed')).toContain('references src/graph.rs:Graph::counts');
+    expect(outOf(graph, 'aliased')).toContain('references src/graph.rs:Graph::counts');
+    expect(outOf(graph, 'bound')).toContain('references src/graph.rs:Shape::area');
+  });
+
+  it('references no method of a one-line trait impl with a braced const argument', async () => {
+    const graph = await index({
+      'src/main.rs': [
+        'pub trait Tr2 { fn c2() -> u8; }',
+        'pub struct C2<const N: usize>;',
+        'impl<const N: usize> Tr2 for C2<{ N }> { fn c2() -> u8 { 1 } }',
+        'pub fn vals(v: Vec<()>) -> Vec<u8> { v.into_iter().map(|_| ()).map(|()| 0).collect::<Vec<u8>>().into_iter().chain(std::iter::once_with(C2::c2)).collect() }',
+        '',
+        'fn main() {}',
+        '',
+      ].join('\n'),
+    });
+    expect(outOf(graph, 'vals').filter((e) => e.startsWith('references') && e.includes('::'))).toEqual([]);
+  });
+
   it('adds no reference to a path that is called', async () => {
     const graph = await index({
       'src/main.rs': `${GRAPH}\nfn run(g: &Graph) -> u32 { Graph::counts(g) }\n\nfn main() {}\n`,
