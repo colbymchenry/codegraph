@@ -12,6 +12,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In Rust, a method passed as a value through its path, like `g.map(Graph::counts)` or `.map(Self::helper)`, now counts in that method's callers and impact the way a function passed by name already did, reaching what the same path reaches as a call, so `std::io::Error::other` never lands on a project type named `Error`. (#3254)
+
+## [1.6.3] - 2026-11-17
+
 ### Highlights
 
 - **Nine more agents and editors.** `codegraph install` now sets up IBM Bob, Factory Droid, Windsurf, Qwen Code, DeepSeek Harness, Grok Build, Kimi Code, the Qoder CLI and Pi.
@@ -449,7 +455,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Go, a comment directive above a declaration, like `//go:embed static`, is no longer part of its documentation, as `go doc` shows it.
 - In Go, a constant in a `const ( … )` group now keeps the doc comment written above it, instead of the group's comment, so searching for what a constant means can find it.
 - In Go, variables declared in a `var ( … )` block, like gin's `binding.JSON` or prometheus's metric counters, are now indexed with their doc comments, so the calls and types in their values are recorded.
-- In Rust, a method passed as a value through its path, like `g.map(Graph::counts)` or `.map(Self::helper)`, now counts in that method's callers and impact the way a function passed by name already did, reaching what the same path reaches as a call, so `std::io::Error::other` never lands on a project type named `Error`. (#3254)
 - In Rust, code that uses an enum only through its variants, like a `Mode::B =>` match arm, now counts in that enum's callers and impact, linked to the enum declaring the variant. Thanks @mg-mg-mg and @danusha2345. (#2328)
 - In Rust, a call through a module path, like `crate::util::take(3)`, and a `use` of a function now link to the function that module declares, not a same-named method or nested function. Thanks @danusha2345. (#2308)
 - In Rust, a renamed `use`, a `use` inside a function and a path through a `pub use` now reach the item they name, and a call to a local or parameter named like a function no longer links to it. Thanks @danusha2345. (#2308)
@@ -1861,3 +1866,4 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [1.6.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.0
 [1.6.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.1
 [1.6.2]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.2
+[1.6.3]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.3
