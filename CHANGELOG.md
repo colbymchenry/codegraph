@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+
+## [1.6.3] - 2026-11-17
+
 ### Highlights
 
 - **Nine more agents and editors.** `codegraph install` now sets up IBM Bob, Factory Droid, Windsurf, Qwen Code, DeepSeek Harness, Grok Build, Kimi Code, the Qoder CLI and Pi.
@@ -1861,3 +1864,4 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [1.6.0]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.0
 [1.6.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.1
 [1.6.2]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.2
+[1.6.3]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.3
