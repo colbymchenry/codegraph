@@ -144,13 +144,15 @@ describe('PHP includes built from the including file\'s directory', () => {
         "require dirname(__FILE__, 01) . '/zero.php';",
         "require dirname(__DIR__, 0) . '/zero.php';",
         "require dirname(__FILE__, 2,) . '/two.php';",
+        "require dirname(__FILE__,) . '/here.php';",
         '',
       ].join('\n'),
       'app/web/zero.php': fn('zero_fn'),
       'app/zero.php': fn('zero_up_fn'),
       'app/two.php': fn('two_fn'),
+      'app/web/here.php': fn('here_fn'),
     });
-    expect(importsOf(graph, 'app/web/index.php')).toEqual(['app/two.php']);
+    expect(importsOf(graph, 'app/web/index.php')).toEqual(['app/two.php', 'app/web/here.php']);
   });
 
   it('leaves an unqualified dirname alone where the file declares or imports one of its own', async () => {
@@ -158,12 +160,14 @@ describe('PHP includes built from the including file\'s directory', () => {
       'app/declared.php': "<?php\nnamespace App;\nfunction dirname($p) { return '/srv/shared'; }\nrequire dirname(__FILE__) . '/d.php';\nrequire \\dirname(__FILE__) . '/e.php';\n",
       'app/imported.php': "<?php\nnamespace App;\nuse function Foo\\{dirname};\nrequire dirname(__FILE__) . '/d.php';\n",
       'app/listed.php': "<?php\nnamespace App;\nuse function Foo\\bar, Foo\\dirname;\nrequire dirname(__FILE__) . '/d.php';\n",
+      'app/mixed.php': "<?php\nnamespace App;\nuse Foo\\ { Bar, function dirname };\nrequire dirname(__FILE__) . '/d.php';\n",
       'app/d.php': fn('d_fn'),
       'app/e.php': fn('e_fn'),
     });
     expect(importsOf(graph, 'app/declared.php')).toEqual(['app/e.php']);
     expect(importsOf(graph, 'app/imported.php')).toEqual([]);
     expect(importsOf(graph, 'app/listed.php')).toEqual([]);
+    expect(importsOf(graph, 'app/mixed.php')).toEqual([]);
   });
 
   it('still takes the built-in dirname past a method, a comment, an alias or a global import of that name', async () => {
@@ -177,6 +181,17 @@ describe('PHP includes built from the including file\'s directory', () => {
     });
     for (const f of ['method', 'comment', 'alias']) expect(importsOf(graph, `app/${f}.php`), f).toEqual(['app/d.php']);
     expect(importsOf(graph, 'app/global.php')).toEqual(['up.php']);
+  });
+
+  it('loads a plain ./ or ../ literal exactly as written too, as PHP does', async () => {
+    // main guessed `.php` onto these; PHP loads a file literally named `config`.
+    const graph = await index({
+      'app/index.php': "<?php\nrequire './config';\ninclude '../lib/helpers';\ninclude 'inc/setup';\n",
+      'app/config.php': fn('config_fn'),
+      'lib/helpers.php': fn('helpers_fn'),
+      'app/inc/setup.php': fn('setup_fn'),
+    });
+    expect(importsOf(graph, 'app/index.php')).toEqual(['app/inc/setup.php']);
   });
 
   it('does not take a same-named file elsewhere for one the path does not reach', async () => {

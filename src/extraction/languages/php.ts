@@ -67,7 +67,7 @@ function phpConcatParts(expr: SyntaxNode, source: string, out: SyntaxNode[] = []
   return out;
 }
 
-const PHP_DIRNAME_SHADOWED = new WeakMap<SyntaxNode, boolean>();
+const PHP_DIRNAME_SHADOWED = new WeakMap<object, boolean>();
 
 /**
  * Whether an unqualified `dirname(...)` in this file reaches a function other
@@ -79,17 +79,25 @@ const PHP_DIRNAME_SHADOWED = new WeakMap<SyntaxNode, boolean>();
  * neither. Read once per file.
  */
 function phpShadowsDirname(node: SyntaxNode, source: string): boolean {
+  // Keyed on the tree: each read of `tree.rootNode` hands back a new wrapper.
   const root = node.tree.rootNode;
-  const cached = PHP_DIRNAME_SHADOWED.get(root);
+  const cached = PHP_DIRNAME_SHADOWED.get(node.tree);
   if (cached !== undefined) return cached;
   let shadowed = false;
   for (const use of root.descendantsOfType('namespace_use_declaration')) {
-    const text = getNodeText(use, source).replace(/\s+/g, ' ').trim();
-    const m = /^use function (.*?);?$/i.exec(text);
+    const text = getNodeText(use, source).replace(/\s+/g, ' ').replace(/\s*([\\{},])\s*/g, '$1').trim();
+    // `use function A\b;` imports functions throughout; a group `use A\{B,
+    // function c}` marks each function clause on its own.
+    const m = /^use (function )?(.*?);?$/i.exec(text);
     if (!m) continue;
-    const group = /^([\w\\]*)\\?\{(.*)\}$/.exec(m[1]!.trim());
+    const allFunctions = m[1] !== undefined;
+    const group = /^([\w\\]*)\{(.*)\}$/.exec(m[2]!.trim());
+    if (!allFunctions && !group) continue;
     const prefix = group ? group[1]!.replace(/\\$/, '') : '';
-    for (const clause of (group ? group[2]! : m[1]!).split(',')) {
+    for (const raw of (group ? group[2]! : m[2]!).split(',')) {
+      const fn = /^function /i.exec(raw.trim());
+      if (!allFunctions && !fn) continue;
+      const clause = fn ? raw.trim().slice(fn[0].length) : raw;
       const [name = '', alias] = clause.trim().split(/\s+as\s+/i);
       const fqn = (prefix ? `${prefix}\\${name}` : name).replace(/^\\/, '');
       const local = alias ?? fqn.split('\\').pop()!;
@@ -102,7 +110,7 @@ function phpShadowsDirname(node: SyntaxNode, source: string): boolean {
       return !!name && getNodeText(name, source).toLowerCase() === 'dirname';
     });
   }
-  PHP_DIRNAME_SHADOWED.set(root, shadowed);
+  PHP_DIRNAME_SHADOWED.set(node.tree, shadowed);
   return shadowed;
 }
 
