@@ -26,6 +26,7 @@ import {
   normalizeInferredTypeName,
   goRefQualifier,
   inferLocalReceiverType,
+  jsReceiverTypeFile,
   arrayElementType,
   tsImportedTypeFile,
   reExportSource,
@@ -1732,7 +1733,7 @@ export const CPP_COMPILE_DB_FILES = [
 export function loadCppIncludeDirsFromCompileDB(projectRoot: string): string[] | null {
   for (const file of CPP_COMPILE_DB_FILES) {
     const dbPath = path.join(projectRoot, file);
-    if (fs.existsSync(dbPath)) return readCompileDbIncludeDirs(dbPath, projectRoot);
+    if (fs.statSync(dbPath, { throwIfNoEntry: false })?.isFile()) return readCompileDbIncludeDirs(dbPath, projectRoot);
   }
   return null;
 }
@@ -4646,9 +4647,9 @@ export function isBoundToOutOfRepoImport(
  * (`baseUrl`, a catch-all `"*"`) maps it to a file the index holds and no
  * package the app declares goes by it. Undefined for every other reference.
  * A Python reference is {@link pythonImportBindingTail}'s, by its whole name
- * only.
+ * only. `readContext` is the one the attempt to resolve `ref` read it in.
  */
-export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext, readContext: ResolutionContext = context): string | undefined {
   if (ref.language === 'python') return pythonImportBindingTail(ref, context);
   if (!ESM_IMPORT_LANGUAGES.has(ref.language)) return undefined;
   // An import's dotted name is a path, not a member.
@@ -4656,8 +4657,15 @@ export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext
   const name = receiver ?? ref.referenceName;
   if (!receiver && !IDENTIFIER.test(name)) return undefined;
   const mappings = context.getImportMappings(ref.filePath, ref.language);
-  const binding = mappings.find((m) => m.localName === name) ??
-    (receiver && ref.referenceKind === 'calls' ? localTypeBinding(receiver, ref, context, mappings) : undefined);
+  let binding = mappings.find((m) => m.localName === name);
+  if (!binding && receiver && ref.referenceKind === 'calls') {
+    // A receiver typed through another file's signature — a callback's
+    // parameter, a call's result — waits for that file, whose edit may
+    // give it a project type (jsReceiverTypeFile), read as the attempt read it.
+    const typeFile = jsReceiverTypeFile(receiver, ref, readContext);
+    if (typeFile) return moduleTail(typeFile) || undefined;
+    binding = localTypeBinding(receiver, ref, context, mappings);
+  }
   if (!binding) return undefined;
   if (isExternalImport(binding.source, ref.language, context, { fromFile: ref.filePath }) &&
       // A monorepo app's own tsconfig alias (`#/views/…`): isExternalImport reads the root's only.

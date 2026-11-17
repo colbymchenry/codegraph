@@ -38,12 +38,12 @@ export function indexedHashInput(size: number, content: () => string): string {
  * quarter of the read. O_NONBLOCK keeps a FIFO with no writer from parking the
  * open itself. Throws what a failed open or read throws.
  */
-export function readSourceText(file: string): string | null {
+export function readSourceText(file: string, encoding: BufferEncoding = 'utf-8'): string | null {
   const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
   try {
     const stats = fs.fstatSync(fd);
     if (!stats.isFile() || stats.size > MAX_SOURCE_FILE_SIZE_BYTES) return null;
-    return fs.readFileSync(fd, 'utf-8');
+    return fs.readFileSync(fd, encoding);
   } finally {
     fs.closeSync(fd);
   }
