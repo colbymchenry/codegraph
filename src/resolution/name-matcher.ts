@@ -12463,6 +12463,57 @@ export function isRustForeignImplCallable(target: Node, ref: UnresolvedRef, cont
 }
 
 /**
+ * Whether a Rust path value `S::m` (#3254) reached an inherent method of
+ * another type than the project's `S` names: `S::new` resolved to `T::new`
+ * when `S`'s own `new` is derived or macro-written. A trait's own method
+ * (`F::fold_x` with `F: Fold`) and a path through a renamed import or an
+ * alias (`G::counts`, `use … as G`) name no project type of their own.
+ */
+export function isRustOtherTypesMethod(target: Node, type: string, context: ResolutionContext): boolean {
+  if (target.language !== 'rust' || target.kind !== 'method' || type === 'Self') return false;
+  if (target.qualifiedName.split('::').slice(-2, -1)[0] === type || rustTraitOf(target, context) !== null) return false;
+  return context.getNodesByName(type).some((n) => n.language === 'rust' && (n.kind === 'struct' || n.kind === 'enum' || n.kind === 'union'));
+}
+
+/**
+ * Whether a Rust method passed as a value through its path (`map(T::m)`,
+ * #3254) sits in an `impl Trait for T` block, where the index can't say it is
+ * the one Rust picks: a derived or macro-written impl it doesn't hold
+ * (`#[derive(Default)]`, thiserror's `#[from]`), another impl the argument's
+ * type would choose (`From<A>` beside `From<B>`, std's own `From<&str> for
+ * String`), or the type's own method of the name (`Path::exists` beside a
+ * project trait's). The block is the innermost `impl` or `trait` around the
+ * method in the file's code, comments and strings blanked, its header read
+ * whole: `for` on a later line, an attribute before it, a one-line impl.
+ */
+export function isRustTraitImplMember(method: Node, context: ResolutionContext): boolean {
+  if (method.language !== 'rust' || method.kind !== 'method') return false;
+  const scopes = rustScopesOf(method.filePath, context);
+  const start = scopes?.lineStarts[method.startLine - 1];
+  if (!scopes || start === undefined) return isRustTraitImplMethod(method, context);
+  // No block around a method: its header was misread (a `{ N }` const
+  // argument taken for the body). Which impl it is can't be said.
+  const block = rustImplAt(scopes, start + Math.max(0, method.startColumn));
+  if (!block) return true;
+  if (block.kind === 'trait') return false;
+  // `impl<G> Trait<A> for T where … {`: past the generics, a `for` outside
+  // the brackets before `where` or the body (`->` closes none).
+  let p = block.at + 4;
+  while (/\s/.test(scopes.code[p] ?? '')) p++;
+  if (scopes.code[p] === '<') p += block.generics.length + 2;
+  const head = scopes.code.slice(p, block.from).replace(/\bwhere\b[\s\S]*$/, '');
+  let depth = 0;
+  for (let i = 0; i < head.length; i++) {
+    const c = head[i]!;
+    if (c === '<' || c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']' || (c === '>' && head[i - 1] !== '-')) depth--;
+    // `impl dyn for<'a> Tr<'a>` is a bound's `for`, not a trait impl's.
+    else if (depth === 0 && c === 'f' && /^for\b(?!\s*<)/.test(head.slice(i)) && !/\w/.test(head[i - 1] ?? '')) return true;
+  }
+  return false;
+}
+
+/**
  * Whether a Rust call through a type's path can mean `target` (#2614). A
  * type the path names from std or a dependency — through the file's `use`
  * (`J::from(i)` under `use serde_json::Value as J`, `Value::default()` under

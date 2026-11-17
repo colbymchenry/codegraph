@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
+import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustTraitImplMember, isRustOtherTypesMethod, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isPythonImportStatementModule } from './name-matcher';
 import { isJsThisCall } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
@@ -1593,6 +1593,9 @@ export class ReferenceResolver {
   }
 
   private resolveOneIn(ref: UnresolvedRef): ResolvedRef | null {
+    if (ref.referenceKind === 'function_ref' && ref.language === 'rust' && ref.referenceName.includes('::')) {
+      return this.resolveRustPathValue(ref);
+    }
     // A Rust call kept with its receiver chain — `self.services.store.put`,
     // `self.store().put` (#2836) — resolves as the call by its method's name
     // did before the extractor kept the chain: every strategy and gate reads
@@ -1682,6 +1685,25 @@ export class ReferenceResolver {
       targetNodeId: forwarded.id,
       confidence: Math.min(call.confidence, 0.85),
     }, ref);
+  }
+
+  /**
+   * A Rust function passed through its path (`map(Graph::counts)`, #3254)
+   * names what the same path written as a call names, gates included: the
+   * call's module, `use` and `Self` rules decide, and a std type that only
+   * shares a project type's name reaches nothing. Only a function, an
+   * inherent method or a trait's own method counts, never one in an `impl
+   * Trait for T` block (isRustTraitImplMember), nor another project type's
+   * inherent method (isRustOtherTypesMethod).
+   */
+  private resolveRustPathValue(ref: UnresolvedRef): ResolvedRef | null {
+    const asCall = this.resolveOneIn({ ...ref, referenceKind: 'calls' });
+    const target = asCall ? this.nodeById(asCall.targetNodeId) : undefined;
+    if (!asCall || !target || (target.kind !== 'function' && target.kind !== 'method')) return null;
+    if (isRustTraitImplMember(target, this.context)) return null;
+    const segments = ref.referenceName.split('::');
+    if (isRustOtherTypesMethod(target, segments[segments.length - 2]!.replace(/^r#/, ''), this.context)) return null;
+    return { original: ref, targetNodeId: target.id, confidence: asCall.confidence, resolvedBy: 'function-ref' };
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
