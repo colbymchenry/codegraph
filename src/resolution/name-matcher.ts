@@ -12514,6 +12514,74 @@ export function isRustTraitImplMember(method: Node, context: ResolutionContext):
 }
 
 /**
+ * Whether a Rust method takes `self` in any form — `self`, `&self`, `&'a mut
+ * self`, `mut self`, `self: Pin<&mut Self>` — read off its signature; true
+ * when there is no signature to read.
+ */
+function rustTakesSelf(method: Node): boolean {
+  const signature = method.signature ?? '';
+  return !signature.startsWith('(') || /^\(\s*(?:&\s*(?:'\w+\s+)?)?(?:mut\s+)?self\b/.test(signature);
+}
+
+/** Kinds a Rust type the project declares with methods of its own is extracted as. */
+const RUST_OWNER_TYPE_KINDS = new Set(['struct', 'enum', 'union']);
+
+/**
+ * The trait the `impl Trait for T` block around a Rust method implements, by
+ * the last segment of its path (`fmt::Display` → `Display`); '' for an
+ * inherent impl, a trait's own body or no block. Read from the innermost
+ * `impl` around the method in the file's code (rustImplAt), so a local `impl
+ * Drop for Guard` in an earlier method's body is no part of it, and a header
+ * that rustfmt wraps is read whole.
+ */
+function rustImplTraitOf(method: Node, context: ResolutionContext): string {
+  const scopes = rustScopesOf(method.filePath, context);
+  const block = scopes ? rustImplAt(scopes, rustNodeOffset(method, context)) : undefined;
+  if (!scopes || !block || block.kind !== 'impl') return '';
+  return parseRustImplHeader(scopes.code.slice(block.at, block.from))?.trait ?? '';
+}
+
+/**
+ * Whether a Rust call can't mean `target`, a project method, in a way the
+ * name alone shows (#3252):
+ * - an associated function without `self` (`Graph::build(n)`) is called only
+ *   through its path, never as `x.build()` (an outside builder's chain) or a
+ *   bare `build()`;
+ * - a guess by the name (`guessed`: no type was read for the receiver) never
+ *   takes a method of an `impl Trait for T` whose trait is not the project's
+ *   (`impl Write for Log`), unless the receiver is named after `T`
+ *   (`log.flush()`): std's `Write`, `Default` or `Iterator` is implemented by
+ *   types outside the project too, so `enc.finish()?.flush()`, a std
+ *   builder's `.write(true)` or `stdout.flush()` on an outside crate's value
+ *   says nothing of `Log`;
+ * - a guess for `Type::m` where `Type` is a project struct, enum or union
+ *   never takes another type's own method: its `m` comes from a derive or a
+ *   macro (`Rules::default()` on a `#[derive(Default)] struct Rules`).
+ */
+export function isRustCallUnreachable(target: Node, ref: UnresolvedRef, guessed: boolean, context: ResolutionContext): boolean {
+  if (target.language !== 'rust' || target.kind !== 'method' || ref.referenceKind !== 'calls') return false;
+  const path = ref.referenceName.includes('::');
+  if (!path && !rustTakesSelf(target)) return true;
+  if (!guessed) return false;
+  const cut = target.qualifiedName.lastIndexOf('::');
+  const owner = cut < 0 ? '' : target.qualifiedName.slice(0, cut).split('::').pop()!;
+  if (path) {
+    const segments = ref.referenceName.split('::');
+    const named = segments[segments.length - 2]!;
+    return /^[A-Z]/.test(named) && named !== 'Self' && named !== owner && rustTraitOf(target, context) === null &&
+      isRustProjectNamed(named, RUST_OWNER_TYPE_KINDS, context);
+  }
+  const trait = rustImplTraitOf(target, context);
+  if (trait === '' || isRustProjectNamed(trait, RUST_TRAIT_KIND, context)) return false;
+  // The receiver: the last link of a kept chain, else the one written before the name.
+  const chain = RUST_CHAINED_CALLS.get(ref);
+  const dot = ref.referenceName.lastIndexOf('.');
+  const receiver = chain ? chain[chain.length - 1]!.replace(/\(\)$/, '') : dot > 0 ? receiverLink(ref.referenceName.slice(0, dot)) : '';
+  // (`self` is the impl's own type, which the self strategies read.)
+  return receiver !== 'self' && (receiver === '' || !sharesReceiverWord(receiver, target));
+}
+
+/**
  * Whether a Rust call through a type's path can mean `target` (#2614). A
  * type the path names from std or a dependency — through the file's `use`
  * (`J::from(i)` under `use serde_json::Value as J`, `Value::default()` under
