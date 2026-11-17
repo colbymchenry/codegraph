@@ -1952,7 +1952,9 @@ export function isLuaRequireRef(ref: UnresolvedRef): boolean {
  *
  * PHP resolves includes relative to the including file's directory (the
  * common case for procedural codebases); php.ini `include_path` is not
- * modeled. Callers pass an already-extracted static literal path.
+ * modeled. Callers pass an already-extracted static path: a literal, or one
+ * appended to `__DIR__` / `dirname(__FILE__)`, which the extractor writes as
+ * `./x.php` or `../x.php` relative to the including file (#3298).
  */
 function resolvePhpIncludePath(
   includePath: string,
@@ -1964,6 +1966,10 @@ function resolvePhpIncludePath(
   const basePath = path.resolve(fromDir, includePath);
   const relativePath = path.relative(projectRoot, basePath).replace(/\\/g, '/');
   if (context.fileExists(relativePath)) return relativePath;
+  // A path anchored to the file's own directory (`./x`, `../x`, as the
+  // extractor writes `__DIR__ . '/x'`) is loaded exactly as written: PHP adds
+  // no extension, so `__DIR__ . '/settings.local'` is never settings.local.php.
+  if (includePath.startsWith('./') || includePath.startsWith('../')) return null;
   // The literal may omit the .php extension (e.g. include "config").
   for (const ext of EXTENSION_RESOLUTION.php ?? []) {
     if (context.fileExists(relativePath + ext)) return relativePath + ext;
