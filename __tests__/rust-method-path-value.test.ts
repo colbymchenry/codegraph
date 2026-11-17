@@ -152,6 +152,70 @@ describe('a Rust method passed as a value through its path', () => {
     for (const fn of ['convert', 'biggest']) expect(outOf(graph, fn).filter((e) => e.includes('Name')), fn).toEqual([]);
   });
 
+  it('references nothing for String::from when a project type is also named String', async () => {
+    const graph = await index({
+      'src/main.rs': [
+        'mod s { pub struct String; }',
+        'pub enum Idi { Install }',
+        'impl From<Idi> for String { fn from(_e: Idi) -> Self { String::new() } }',
+        'pub fn labels(v: Vec<&str>) -> Vec<String> { v.into_iter().map(String::from).collect() }',
+        '',
+        'fn main() {}',
+        '',
+      ].join('\n'),
+    });
+    expect(outOf(graph, 'labels').filter((e) => e.startsWith('references') && e.includes('from'))).toEqual([]);
+  });
+
+  it('references a project trait\'s method on a std type, and a macro-declared type\'s method', async () => {
+    const graph = await index({
+      'src/main.rs': [
+        'use std::path::{Path, PathBuf};',
+        'pub trait PathExt { fn normalize(&self) -> PathBuf; }',
+        'impl PathExt for Path {',
+        '    fn normalize(&self) -> PathBuf { self.to_path_buf() }',
+        '}',
+        'pub trait Ext { fn make(&self) -> usize; }',
+        'impl Ext for String {',
+        '    fn make(&self) -> usize { self.len() }',
+        '}',
+        'macro_rules! mk { ($n:ident) => { pub struct $n { n: u32 } }; }',
+        'mk!(Graph);',
+        'impl Graph { pub fn counts(&self) -> u32 { self.n } }',
+        'pub fn paths(v: Vec<&Path>) -> Vec<PathBuf> { v.into_iter().map(Path::normalize).collect() }',
+        'pub fn sizes(v: Vec<String>) -> Vec<usize> { v.iter().map(String::make).collect() }',
+        'pub fn report(g: Option<&Graph>) -> Option<u32> { g.map(Graph::counts) }',
+        '',
+        'fn main() {}',
+        '',
+      ].join('\n'),
+    });
+    expect(outOf(graph, 'paths')).toContain('references src/main.rs:Path::normalize');
+    expect(outOf(graph, 'sizes')).toContain('references src/main.rs:String::make');
+    expect(outOf(graph, 'report')).toContain('references src/main.rs:Graph::counts');
+  });
+
+  it('references a project type\'s one From impl, and nothing when the argument would pick among several', async () => {
+    const graph = await index({
+      'src/main.rs': [
+        'pub struct ParseErr;',
+        'pub struct IoErr;',
+        'pub struct One { code: u32 }',
+        'impl From<ParseErr> for One { fn from(_e: ParseErr) -> Self { One { code: 1 } } }',
+        'pub struct Two { code: u32 }',
+        'impl From<ParseErr> for Two { fn from(_e: ParseErr) -> Self { Two { code: 1 } } }',
+        'impl From<IoErr> for Two { fn from(_e: IoErr) -> Self { Two { code: 2 } } }',
+        'pub fn single(r: Result<u32, ParseErr>) -> Result<u32, One> { r.map_err(One::from) }',
+        'pub fn either(r: Result<u32, IoErr>) -> Result<u32, Two> { r.map_err(Two::from) }',
+        '',
+        'fn main() {}',
+        '',
+      ].join('\n'),
+    });
+    expect(outOf(graph, 'single')).toContain('references src/main.rs:One::from');
+    expect(outOf(graph, 'either').filter((e) => e.startsWith('references') && e.includes('from'))).toEqual([]);
+  });
+
   it('adds no reference to a path that is called', async () => {
     const graph = await index({
       'src/main.rs': `${GRAPH}\nfn run(g: &Graph) -> u32 { Graph::counts(g) }\n\nfn main() {}\n`,

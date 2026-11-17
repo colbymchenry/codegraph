@@ -12213,6 +12213,33 @@ export function isRustForeignImplCallable(target: Node, ref: UnresolvedRef, cont
   return local === undefined || rustFirstArgIs(local, ref, context);
 }
 
+/** rustTraitImplHeader, or the header of a one-line `impl From<A> for B { fn from(…) … }` the method sits on. */
+function rustValueImplHeader(method: Node, context: ResolutionContext): RustImplHeader | null {
+  const own = (context.getFileLines?.(method.filePath) ?? context.readFile(method.filePath)?.split(/\r?\n/))?.[method.startLine - 1] ?? '';
+  return /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?impl\b/.test(own) ? parseRustImplHeader(own.replace(/\/\/.*$/, '')) : rustTraitImplHeader(method, context);
+}
+
+/**
+ * Whether a Rust method passed as a value through its path (`map(T::from)`,
+ * #3254) is one the argument's type picks: a method of a generic trait's impl
+ * (`impl From<ParseErr> for T`) on a type from outside the project, which has
+ * impls of its own the index doesn't hold (std's `From<&str> for String`), or
+ * on a type with more than one impl of that trait. A call reads its argument
+ * to choose; a value has none, so no impl is it.
+ */
+export function isRustImplPickedByArgument(target: Node, context: ResolutionContext): boolean {
+  if (target.language !== 'rust' || target.kind !== 'method') return false;
+  const impl = rustValueImplHeader(target, context);
+  if (!impl || impl.trait === '' || impl.traitArgs.length === 0) return false;
+  const at: UnresolvedRef = { fromNodeId: target.id, referenceName: target.name, referenceKind: 'calls', filePath: target.filePath, line: target.startLine, column: 0, language: 'rust' };
+  const self = rustSelfType(at, context);
+  if (!self || RUST_STD_TYPES.has(impl.self) || isRustOutsideSelf(self, at, context)) return true;
+  return context.getNodesByName(target.name).filter((n) => n.language === 'rust' && n.kind === 'method' && (() => {
+    const other = rustValueImplHeader(n, context);
+    return other !== null && other.trait === impl.trait && other.self === impl.self;
+  })()).length > 1;
+}
+
 /**
  * Whether a Rust call through a type's path can mean `target` (#2614). A
  * type the path names from std or a dependency — through the file's `use`

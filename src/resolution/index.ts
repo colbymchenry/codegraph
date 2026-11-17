@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
+import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustImplPickedByArgument, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -1682,21 +1682,15 @@ export class ReferenceResolver {
    * names what the same path written as a call names, gates included: the
    * call's module, `use` and `Self` rules decide, and a std type that only
    * shares a project type's name reaches nothing. Only a function or method
-   * counts, and not a method of a type the project doesn't declare (a project
-   * `impl From<Local> for String`): which impl that is depends on the
-   * argument's type, and a value has no argument to read.
+   * counts, and not a generic trait impl's method the argument's type would
+   * choose (`String::from` with a project `impl From<Local> for String`): a
+   * value has no argument to read.
    */
   private resolveRustPathValue(ref: UnresolvedRef): ResolvedRef | null {
     const asCall = this.resolveOneIn({ ...ref, referenceKind: 'calls' });
     const target = asCall ? this.nodeById(asCall.targetNodeId) : undefined;
     if (!asCall || !target || (target.kind !== 'function' && target.kind !== 'method')) return null;
-    if (target.kind === 'method') {
-      const cut = target.qualifiedName.lastIndexOf('::');
-      const owner = cut > 0 ? target.qualifiedName.slice(0, cut).split('::').pop()! : '';
-      const declared = this.context.getNodesByName(owner).some((n) => n.language === 'rust' &&
-        (n.kind === 'struct' || n.kind === 'enum' || n.kind === 'union' || n.kind === 'trait' || n.kind === 'type_alias' || n.kind === 'class'));
-      if (!declared) return null;
-    }
+    if (isRustImplPickedByArgument(target, this.context)) return null;
     return { original: ref, targetNodeId: target.id, confidence: asCall.confidence, resolvedBy: 'function-ref' };
   }
 
