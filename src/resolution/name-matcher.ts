@@ -2480,6 +2480,9 @@ export function isJavaOutsideImport(name: string, ref: UnresolvedRef, context: R
  * `Modifier::pad` — that the call site can see (its file, its package, an
  * import of it by name or `.*`) and whose own file imports the same type.
  * Compose's own `Modifier.fillMaxSize()` matches none and stays unlinked.
+ * Either file may name the type through an import alias (#3084): `fun
+ * DeclAlias.pad()`, indexed as `DeclAlias::pad`, extends the type its file
+ * imports as `DeclAlias`, whatever the calling file calls it.
  */
 function kotlinExtensionOnImportedType(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const call = /^(\w+)\.(\w+)$/.exec(ref.referenceName);
@@ -2487,8 +2490,13 @@ function kotlinExtensionOnImportedType(ref: UnresolvedRef, context: ResolutionCo
   const binding = context.getImportMappings(ref.filePath, ref.language).find((m) => m.localName === call[1]);
   if (!binding) return null;
   const pkg = binding.source.slice(0, binding.source.lastIndexOf('.'));
-  const extensions = context.getNodesByQualifiedName(`${binding.exportedName}::${call[2]}`).filter((n) => {
-    if (n.kind !== 'method' || n.language !== 'kotlin' || !isKotlinTopLevelVisible(n, ref, context)) return false;
+  const extensions = context.getNodesByName(call[2]!).filter((n) => {
+    if (n.kind !== 'method' || n.language !== 'kotlin') return false;
+    const receiver = n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::')));
+    const alias = context.getImportMappings(n.filePath, 'kotlin').find((m) => m.localName === receiver && m.localName !== m.exportedName);
+    if (alias ? alias.source !== binding.source : receiver !== binding.exportedName) return false;
+    if (!isKotlinTopLevelVisible(n, ref, context)) return false;
+    if (alias) return true;
     const scope = kotlinFileScope(n.filePath, context);
     return scope.imports.has(binding.source) || scope.stars.has(pkg);
   });
