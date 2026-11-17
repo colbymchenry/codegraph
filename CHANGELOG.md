@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In Python, `import time` no longer links the importing file to a project function that happens to be named `time`, so such a function stops listing every file that imports the standard library module among its callers and in its impact. The same goes for `json`, `copy`, `random`, `logging` and any other module, and for a fallback variable like `brotli = None` beside a guarded `import brotli`. Thanks @inth3shadows for the report. (#3239)
 - In Rust, a function or method passed as a value through its path, like `g.map(Graph::counts)` or `.map(Self::helper)`, now counts in its callers and impact the way a function passed by name already did, linked only when the path names it for certain: never another type's method of the same name, and never a method of a trait implementation, since which one Rust uses there depends on the type of the argument. (#3254)
 
 ## [1.6.3] - 2026-11-17
