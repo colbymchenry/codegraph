@@ -23767,9 +23767,23 @@ function fileMethodsNamed(file: string, name: string, context: ResolutionContext
       const named = methods.get(n.name);
       if (named) named.push(n);
       else methods.set(n.name, [n]);
+      // PHP and the other case-insensitive languages resolve a method
+      // without regard to case (#3297): index the lowercase spelling too,
+      // so a call that spells the method differently still finds it.
+      if (CASE_INSENSITIVE_LANGUAGES.has(n.language)) {
+        const lower = n.name.toLowerCase();
+        if (lower !== n.name) {
+          const byLower = methods.get(lower);
+          if (byLower) byLower.push(n);
+          else methods.set(lower, [n]);
+        }
+      }
     }
   }
-  return methods.get(name) ?? [];
+  const exact = methods.get(name);
+  if (exact) return exact;
+  const lower = methods.get(name.toLowerCase());
+  return lower?.filter((n) => CASE_INSENSITIVE_LANGUAGES.has(n.language)) ?? [];
 }
 
 function findInheritedClassMethod(classes: Node[], name: string, context: ResolutionContext, kind?: RubyMethodKind): Node | null {
@@ -27045,7 +27059,13 @@ function matchMethodCallOn(
   // names like permissionEngine → PermissionRuleEngine.
   if (methodName) {
     const strat3 = nmTimedT('mc-byname', ref, (): ResolvedRef | null => {
-    const methodCandidates = context.getNodesByName(methodName!);
+    // Case-insensitive languages resolve a method without regard to case
+    // (#3297): look the candidates up by lowercase name, as the bare-name
+    // fallback does, so a differently-cased spelling still reaches the
+    // filter below.
+    const methodCandidates = CASE_INSENSITIVE_LANGUAGES.has(ref.language)
+      ? context.getNodesByLowerName(methodName!.toLowerCase())
+      : context.getNodesByName(methodName!);
     // Ubiquitous-method ceiling (#999): a method name re-declared across a
     // vendored theme/SDK (Metronic's `init`/`update`/… on every widget) yields
     // K candidates that receiver-word overlap can't reliably disambiguate —
@@ -27059,7 +27079,7 @@ function matchMethodCallOn(
     // another package with neither it nor its package imported, is no
     // candidate at all: as if no method had its name there.
     const methods = methodCandidates.filter(
-      (n) => n.kind === 'method' && n.name === methodName &&
+      (n) => n.kind === 'method' && (CASE_INSENSITIVE_LANGUAGES.has(ref.language) ? n.name.toLowerCase() === methodName.toLowerCase() : n.name === methodName) &&
         !(ref.language === 'kotlin' && !isKotlinExtensionInScope(n, ref, context))
     );
 
@@ -32939,9 +32959,20 @@ function tsFieldCall(
  * and `def m`, which share one qualified name (rubyMethodsOfKindFirst).
  */
 function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string, kind?: RubyMethodKind): Node | undefined {
-  const methods = rubyMethodsOfKindFirst(nodesInFile.filter((n) => n.kind === 'method' && n.name === methodName), kind);
+  const methods = rubyMethodsOfKindFirst(nodesInFile.filter((n) => n.kind === 'method' && (CASE_INSENSITIVE_LANGUAGES.has(n.language) ? n.name.toLowerCase() === methodName.toLowerCase() : n.name === methodName)), kind);
   const exact = `${classNode.qualifiedName}::${methodName}`;
   const byName = `${classNode.name}::${methodName}`;
+  if (CASE_INSENSITIVE_LANGUAGES.has(classNode.language)) {
+    const lowerExact = exact.toLowerCase();
+    const lowerByName = byName.toLowerCase();
+    return (
+      methods.find((n) => n.qualifiedName.toLowerCase() === lowerExact) ??
+      methods.find((n) => {
+        const q = n.qualifiedName.toLowerCase();
+        return q === lowerByName || q.endsWith(`::${lowerByName}`);
+      })
+    );
+  }
   return (
     methods.find((n) => n.qualifiedName === exact) ??
     methods.find((n) => n.qualifiedName === byName || n.qualifiedName.endsWith(`::${byName}`))

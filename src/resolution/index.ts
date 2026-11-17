@@ -939,12 +939,18 @@ export class ReferenceResolver {
         const key = `${language} ${typeName}::${methodName}`;
         const cached = this.methodMatchCache.get(key);
         if (cached !== undefined) return cached;
-        let candidates = this.nameCache.get(methodName);
+        // Case-insensitive languages (PHP, ...) resolve a method without
+        // regard to case (#3297): look the candidates up by lowercase name
+        // and compare qualified names lowercased.
+        const ci = CASE_INSENSITIVE_LANGUAGES.has(language);
+        const lookupName = ci ? methodName.toLowerCase() : methodName;
+        let candidates = ci ? this.lowerNameCache.get(lookupName) : this.nameCache.get(methodName);
         if (candidates === undefined) {
-          candidates = this.queries.getNodesByName(methodName);
-          this.nameCache.set(methodName, candidates);
+          candidates = ci ? this.queries.getNodesByLowerName(lookupName) : this.queries.getNodesByName(methodName);
+          if (ci) this.lowerNameCache.set(lookupName, candidates);
+          else this.nameCache.set(methodName, candidates);
         }
-        const want = `${typeName}::${methodName}`;
+        const want = ci ? `${typeName}::${methodName}`.toLowerCase() : `${typeName}::${methodName}`;
         let matches: Node[];
         if (typeName.includes('::') || methodName.includes(':')) {
           // Legacy linear filter for the shapes the owner index below can't
@@ -956,7 +962,7 @@ export class ReferenceResolver {
           for (const m of candidates) {
             if (m.kind !== 'method') continue;
             if (!sameLanguageFamily(m.language, language)) continue;
-            const qn = m.qualifiedName;
+            const qn = ci ? m.qualifiedName.toLowerCase() : m.qualifiedName;
             if (qn === want || qn.endsWith(`::${want}`)) matches.push(m);
           }
         } else {
@@ -972,7 +978,7 @@ export class ReferenceResolver {
           // segment-clean typeName — then every query is a map lookup.
           // Bucket insertion follows candidate order, so each bucket is
           // byte-identical to what the linear filter produced.
-          const idxKey = `${language} ${methodName}`;
+          const idxKey = `${language} ${lookupName}`;
           let ownerIndex = this.methodOwnerIndexCache.get(idxKey);
           if (!ownerIndex) {
             ownerIndex = new Map<string, Node[]>();
@@ -984,9 +990,9 @@ export class ReferenceResolver {
               if (i2 < 0) continue; // single-segment qn can never match `T::m`
               const i1 = qn.lastIndexOf('::', i2 - 1);
               const bucketKey = i1 < 0 ? qn : qn.slice(i1 + 2);
-              const bucket = ownerIndex.get(bucketKey);
+              const bucket = ownerIndex.get(ci ? bucketKey.toLowerCase() : bucketKey);
               if (bucket) bucket.push(m);
-              else ownerIndex.set(bucketKey, [m]);
+              else ownerIndex.set(ci ? bucketKey.toLowerCase() : bucketKey, [m]);
             }
             this.methodOwnerIndexCache.set(idxKey, ownerIndex);
           }

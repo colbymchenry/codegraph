@@ -552,6 +552,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In PHP, a class written through a namespace alias in a different case than its `use` statement now links to that class, since PHP reads namespace names without regard to case. Thanks @danusha2345. (#2369)
 - In PHP, a call on a variable now reaches the method its class really has, found through the file's namespace and `use` imports, and a Laravel facade's static call reaches the class its `getFacadeAccessor()` names.
 - In PHP, `parent::`, `self::` and `$this->` inside an anonymous class, like `new class extends ArrayStore { … }`, now reach what that class extends and the traits it uses, not those of the class whose method creates it.
+- In PHP, a method called in a different case than its declaration, like `PriceConverter::CalcBasePrice` or `$c->GetRate()` for `calcBasePrice` and `getRate`, now links to that method, so every call site shows up in `callers` and `impact`. (#3297)
 - In Drupal, an import of a class whose short name another class shares, like `use Drupal\commerce_price\Price`, no longer also links to that other class.
 - In Erlang, a comment inside an argument or parameter list no longer counts as an argument, so the call links to the function of its real arity. Thanks @Dshuishui. (#1619)
 - In COBOL, asking `codegraph_explore` about a copybook by name, like `CVACT01Y`, now answers with its source and every `COPY` or `EXEC SQL INCLUDE` that includes it, instead of "No relevant code found". Thanks @popolusiak. (#2342)
