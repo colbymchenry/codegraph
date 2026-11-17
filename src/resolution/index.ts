@@ -1587,6 +1587,9 @@ export class ReferenceResolver {
   }
 
   private resolveOneIn(ref: UnresolvedRef): ResolvedRef | null {
+    if (ref.referenceKind === 'function_ref' && ref.language === 'rust' && ref.referenceName.includes('::')) {
+      return this.resolveRustPathValue(ref);
+    }
     // A Rust call kept with its receiver chain — `self.services.store.put`,
     // `self.store().put` (#2836) — resolves as the call by its method's name
     // did before the extractor kept the chain: every strategy and gate reads
@@ -1672,6 +1675,29 @@ export class ReferenceResolver {
       targetNodeId: forwarded.id,
       confidence: Math.min(call.confidence, 0.85),
     }, ref);
+  }
+
+  /**
+   * A Rust function passed through its path (`map(Graph::counts)`, #3254)
+   * names what the same path written as a call names, gates included: the
+   * call's module, `use` and `Self` rules decide, and a std type that only
+   * shares a project type's name reaches nothing. Only a function or method
+   * counts, and not a method of a type the project doesn't declare (a project
+   * `impl From<Local> for String`): which impl that is depends on the
+   * argument's type, and a value has no argument to read.
+   */
+  private resolveRustPathValue(ref: UnresolvedRef): ResolvedRef | null {
+    const asCall = this.resolveOneIn({ ...ref, referenceKind: 'calls' });
+    const target = asCall ? this.nodeById(asCall.targetNodeId) : undefined;
+    if (!asCall || !target || (target.kind !== 'function' && target.kind !== 'method')) return null;
+    if (target.kind === 'method') {
+      const cut = target.qualifiedName.lastIndexOf('::');
+      const owner = cut > 0 ? target.qualifiedName.slice(0, cut).split('::').pop()! : '';
+      const declared = this.context.getNodesByName(owner).some((n) => n.language === 'rust' &&
+        (n.kind === 'struct' || n.kind === 'enum' || n.kind === 'union' || n.kind === 'trait' || n.kind === 'type_alias' || n.kind === 'class'));
+      if (!declared) return null;
+    }
+    return { original: ref, targetNodeId: target.id, confidence: asCall.confidence, resolvedBy: 'function-ref' };
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {

@@ -1264,7 +1264,8 @@ export class TreeSitterExtractor {
       //    strictly class-scoped (own members or the validated supertype
       //    pass), so nothing fuzzy can leak.
       //  - `Scope::member` (C++ member-pointers, Java/Kotlin type-qualified
-      //    method refs, PHP `'Cls::m'`): ALWAYS flush — the explicit-ref
+      //    method refs, PHP `'Cls::m'`, Rust paths, which resolve as the same
+      //    path's call does, gates included): ALWAYS flush — the explicit-ref
       //    syntax is self-selecting, the referenced type often needs NO
       //    import (Java/Kotlin same-package, Kotlin companions), and
       //    resolution is scope-suffix-anchored + unique-or-drop, so a
