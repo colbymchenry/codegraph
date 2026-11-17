@@ -106,3 +106,83 @@ describe('codegraph install --init / init --yes (#1578)', () => {
     expect(runCodegraph(['install', '--help'], tempDir).stdout).toMatch(/-i, --init\b/);
   });
 });
+
+/**
+ * A first index that stops partway (killed, out of memory, an error while
+ * resolving) leaves `.codegraph/` behind, so a second `init` used to answer
+ * "Already initialized" and point at `sync`, as if the setup worked (#3228).
+ * It now says how the last run ended, with the words `status` uses, and tells
+ * an interrupted run from one another process is running right now.
+ */
+describe('codegraph init on an index whose last run did not finish (#3228)', () => {
+  let tempDir: string;
+  const USUAL_HINT = 'Use "codegraph index" to re-index or "codegraph sync" to update';
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-init-unfinished-'));
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export function a() { return b(); }\nexport function b() { return 1; }\n');
+    expect(runCodegraph(['init', '--yes'], tempDir).status).toBe(0);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  /** The marker a run leaves in the index when it dies or ends badly. */
+  function setIndexState(state: string): void {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    try {
+      db.prepare(
+        "INSERT INTO project_metadata (key, value, updated_at) VALUES ('index_state', ?, 0) " +
+          'ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+      ).run(state);
+    } finally {
+      db.close();
+    }
+  }
+
+  it.each([
+    ['indexing', 'The last index run never finished'],
+    ['partial', 'The last index run silently dropped files'],
+    ['failed', 'The last index run failed'],
+  ])('says an index left %s is incomplete, and how to rebuild it', (state, words) => {
+    setIndexState(state);
+    for (const args of [['init', '--yes'], ['install', '--yes', '--target', 'none', '--init']]) {
+      const r = runCodegraph(args, tempDir);
+      expect(r.status, r.stdout + r.stderr).toBe(0);
+      expect(r.stdout).toContain('its index is incomplete');
+      expect(r.stdout).toContain(words);
+      expect(r.stdout).toContain('Re-run "codegraph index"');
+      expect(r.stdout).not.toContain('Already initialized');
+      expect(r.stdout).not.toContain(USUAL_HINT);
+    }
+  });
+
+  it('keeps the usual answer for a complete index', () => {
+    const r = runCodegraph(['init', '--yes'], tempDir);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(r.stdout).toContain('Already initialized');
+    expect(r.stdout).toContain(USUAL_HINT);
+    expect(r.stdout).not.toContain('incomplete');
+  });
+
+  it('tells a rebuild running in another process from a run that died', () => {
+    // What `codegraph index` holds while it rebuilds: its `indexing` marker and
+    // the rebuild lock, here naming this (live) test process.
+    setIndexState('indexing');
+    const lock = JSON.stringify({ pid: process.pid, mode: 'rebuild', startedAt: Date.now(), ready: false });
+    fs.writeFileSync(path.join(tempDir, '.codegraph', 'rebuild.pid'), lock);
+    const r = runCodegraph(['init', '--yes'], tempDir);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(r.stdout).toContain('Already initialized');
+    expect(r.stdout).toContain('An index rebuild ("codegraph index") is running in another process');
+    expect(r.stdout).not.toContain('never finished');
+
+    // The same lock left by a process that is gone is no rebuild.
+    fs.writeFileSync(path.join(tempDir, '.codegraph', 'rebuild.pid'), JSON.stringify({ pid: 2_147_483_000, mode: 'rebuild', startedAt: 0, ready: false }));
+    const dead = runCodegraph(['init', '--yes'], tempDir);
+    expect(dead.stdout).toContain('The last index run never finished');
+  });
+});

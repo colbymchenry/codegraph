@@ -726,6 +726,47 @@ function applyLocalOnlyGitignore(
 }
 
 /**
+ * What `status` and `init` say about an index whose last run didn't end well:
+ * null for a complete index, and for one another process is rebuilding right
+ * now, whose `indexing` is that run's own, not an interrupted one's.
+ */
+function unfinishedIndexWarning(indexState: string | null, rebuildInProgress: boolean): string | null {
+  if (rebuildInProgress) return null;
+  switch (indexState) {
+    case 'indexing':
+      return 'The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".';
+    case 'partial':
+      return 'The last index run silently dropped files — the index is partial. Re-run "codegraph index".';
+    case 'failed':
+      return 'The last index run failed — results may be incomplete. Re-run "codegraph index".';
+    default:
+      return null;
+  }
+}
+
+/**
+ * How the last index run of an initialized project ended, read the way
+ * `status` reads it: read-only, and with a rebuild running in another process
+ * told apart from a run that died. An index that can't be opened reads as
+ * finished, so `init` says what it always said.
+ */
+async function readLastIndexRun(projectPath: string): Promise<{ unfinished: string | null; rebuildInProgress: boolean }> {
+  const { isRebuildInProgress } = await import('../mcp/writer-lock');
+  const rebuildInProgress = isRebuildInProgress(projectPath);
+  let indexState: string | null = null;
+  try {
+    const { default: CodeGraph } = await loadCodeGraph();
+    const cg = await CodeGraph.open(projectPath, { readOnly: true });
+    try {
+      indexState = cg.getIndexState();
+    } finally {
+      cg.destroy();
+    }
+  } catch { /* unreadable index: nothing to add */ }
+  return { unfinished: unfinishedIndexWarning(indexState, rebuildInProgress), rebuildInProgress };
+}
+
+/**
  * The `init` flow — shared by `codegraph init` and `codegraph install --init`
  * (#1578): refuse an unsafe root, create `.codegraph/`, build the initial
  * index under supervision, then the post-index offers. `yes` makes every
@@ -755,8 +796,20 @@ async function runInit(
     }
 
     if (isInitialized(projectPath)) {
-      clack.log.warn(`Already initialized in ${projectPath}`);
-      clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
+      // `.codegraph/` alone isn't a working index: a first run that was killed
+      // or failed partway leaves it behind, and "Already initialized" then reads
+      // like a setup that only needs a sync (#3228). Say how the last run ended,
+      // as `status` does.
+      const { unfinished, rebuildInProgress } = await readLastIndexRun(projectPath);
+      if (unfinished) {
+        clack.log.warn(`Initialized in ${projectPath}, but its index is incomplete.`);
+        clack.log.warn(unfinished);
+      } else {
+        clack.log.warn(`Already initialized in ${projectPath}`);
+        clack.log.info(rebuildInProgress
+          ? 'An index rebuild ("codegraph index") is running in another process.'
+          : 'Use "codegraph index" to re-index or "codegraph sync" to update');
+      }
       if (options.localOnly) applyLocalOnlyGitignore(clack, projectPath);
       try {
         const { offerWatchFallback } = await import('../installer');
@@ -1310,14 +1363,11 @@ program
       if (worktreeMismatch) {
         warn(worktreeMismatchWarning(worktreeMismatch));
       }
+      const unfinished = unfinishedIndexWarning(indexState, rebuildInProgress);
       if (rebuildInProgress) {
         warn('An index rebuild ("codegraph index") is running in another process — the statistics below are a snapshot of it.');
-      } else if (indexState === 'indexing') {
-        warn('The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".');
-      } else if (indexState === 'partial') {
-        warn('The last index run silently dropped files — the index is partial. Re-run "codegraph index".');
-      } else if (indexState === 'failed') {
-        warn('The last index run failed — results may be incomplete. Re-run "codegraph index".');
+      } else if (unfinished) {
+        warn(unfinished);
       }
       // A running rebuild's references are its own work in progress, not an
       // interrupted run's.
