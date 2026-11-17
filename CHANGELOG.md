@@ -38,6 +38,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In JavaScript and TypeScript, a `workspaces` entry that points outside the project, like `"../shared"` in `package.json` or `pnpm-workspace.yaml`, no longer makes that folder's package count as part of the project, so a call through an import of it is no longer linked to an unrelated function of yours with the same name. Thanks @bompus for the report and @johnhldiver-beep. (#3093)
 - `codegraph status` now reports edits, new files and deletions in gitignored source that `codegraph.json` `include` brings into the index, instead of calling the index up to date until a sync picked them up. Thanks @mixxer for the report and the pull request. (#3086)
 - On Linux and macOS, when the system kills CodeGraph with a signal, such as when it runs out of memory during `codegraph init` or `codegraph index`, the command now says which signal and exits as a shell would (137 for SIGKILL), instead of exiting 1 with no message. Thanks @inth3shadows for the report and @johnhldiver-beep. (#3277)
+- A Spring or Laravel test's request is now linked only to a route of its own app, not to a JavaScript or TypeScript server's route that happens to match the path, so `codegraph affected` no longer selects Java or PHP tests for a change to your web code. Thanks @jotder for the report. (#3320)
 
 ## [1.6.3] - 2026-11-17
 
