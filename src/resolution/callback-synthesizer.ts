@@ -10,16 +10,16 @@
  *      scene.onUpdate(this.triggerRender)                  // registration
  *      → synthesize triggerUpdate → triggerRender
  *
- *  (2) String-keyed EventEmitter (Phase 2):
+ *  (2) String-keyed EventEmitter (Phase 2, ./event-emitter-synthesizer):
  *      this.on('mount', function onmount(){...})           // registration
  *      fn.emit('mount', this)                              // dispatch
  *      → synthesize (method containing emit('mount')) → onmount
  *
  * Whole-graph pass after base resolution. High-precision/low-recall by design:
  * named callbacks only; field channels paired by file+field; EventEmitter
- * channels capped by event fan-out (generic names like 'error' skipped — they
- * need receiver-type matching, deferred to Phase 3). All synthesized edges are
- * tagged `provenance:'heuristic'`. See docs/design/callback-edge-synthesis.md.
+ * channels paired by event and receiver, and capped by event fan-out (generic
+ * names like 'error' skipped). All synthesized edges are tagged
+ * `provenance:'heuristic'`. See docs/design/callback-edge-synthesis.md.
  */
 import type { Edge, Language, Node, NodeKind } from '../types';
 import type { QueryBuilder } from '../db/queries';
@@ -45,6 +45,7 @@ import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
 import { hasTauriPattern, tauriEdges } from './tauri-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
+import { eventEmitterEdges } from './event-emitter-synthesizer';
 import { resolveImportPath } from './import-resolver';
 import { cppSpecializationArguments, crossesCodeBoundary, goRefQualification, isManualMockHiddenFrom, isManualMockPath, jsCodeBindsName } from './name-matcher';
 import { goStdlibMethods } from './go-stdlib-methods';
@@ -58,8 +59,6 @@ const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
 const MAX_CALLBACKS_PER_CHANNEL = 40;
 const EVENT_FANOUT_CAP = 6; // skip events with more handlers/dispatchers than this (too generic without type info)
 
-const ON_RE = /\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*(?:function\s+(\w+)|(?:this\.)?(\w+))/g;
-const EMIT_RE = /\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]/g;
 const SETSTATE_RE = /this\.setState\s*\(/;
 const FLUTTER_SETSTATE_RE = /\bsetState\s*\(/; // Flutter: setState((){…}) / this.setState
 const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
@@ -347,69 +346,6 @@ async function closureCollectionEdges(queries: QueryBuilder, ctx: ResolutionCont
         provenance: 'heuristic',
         metadata: { synthesizedBy: 'closure-collection', field, registeredAt: `${reg.node.filePath}:${reg.line}` },
       });
-    }
-  }
-  return edges;
-}
-
-/** Phase 2: string-keyed EventEmitter channels (on('e', fn) ↔ emit('e')). */
-async function eventEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
-  let scannedFiles = 0;
-  const emitsByEvent = new Map<string, Set<string>>();          // event → dispatcher node ids
-  const handlersByEvent = new Map<string, Map<string, string>>(); // event → handler id → registration site (file:line)
-
-  let scanned = 0;
-  for (const file of ctx.getAllFiles()) {
-    if ((++scannedFiles & 15) === 0) await onYield();
-    if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
-    const content = ctx.readFile(file);
-    if (!content) continue;
-    const hasEmit = content.includes('.emit(') || content.includes('.fire(') || content.includes('.dispatchEvent(');
-    const hasOn = content.includes('.on(') || content.includes('.once(') || content.includes('.addListener(');
-    if (!hasEmit && !hasOn) continue;
-    const nodesInFile = ctx.getNodesInFile(file);
-    const lineOf = makeLineAt(content, 1);
-
-    if (hasEmit) {
-      EMIT_RE.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = EMIT_RE.exec(content))) {
-        const disp = enclosingFn(nodesInFile, lineOf(m.index));
-        if (!disp) continue;
-        const set = emitsByEvent.get(m[1]!) ?? new Set<string>();
-        set.add(disp.id); emitsByEvent.set(m[1]!, set);
-      }
-    }
-    if (hasOn) {
-      ON_RE.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = ON_RE.exec(content))) {
-        const handlerName = m[2] || m[3];
-        if (!handlerName) continue;
-        // A manual mock's function is a handler only test code registers (#2455).
-        const handler = ctx.getNodesByName(handlerName).find((n) =>
-          (n.kind === 'function' || n.kind === 'method') && !isManualMockHiddenFrom(n.filePath, file));
-        if (!handler) continue;
-        const map = handlersByEvent.get(m[1]!) ?? new Map<string, string>();
-        map.set(handler.id, `${file}:${lineOf(m.index)}`); handlersByEvent.set(m[1]!, map);
-      }
-    }
-  }
-
-  const edges: Edge[] = [];
-  const seen = new Set<string>();
-  for (const [event, dispatchers] of emitsByEvent) {
-    const handlers = handlersByEvent.get(event);
-    if (!handlers) continue;
-    // Precision guard: a generic event name with many handlers/dispatchers can't
-    // be matched without receiver-type info (Phase 3) — skip rather than over-link.
-    if (dispatchers.size > EVENT_FANOUT_CAP || handlers.size > EVENT_FANOUT_CAP) continue;
-    for (const d of dispatchers) for (const [h, registeredAt] of handlers) {
-      if (d === h) continue;
-      const key = `${d}>${h}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      edges.push({ source: d, target: h, kind: 'calls', provenance: 'heuristic', metadata: { synthesizedBy: 'event-emitter', event, registeredAt } });
     }
   }
   return edges;
@@ -5364,7 +5300,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   // `$this->postJson('api/x')`) onto the route it reaches, so the handler
   // counts as tested.
   { name: 'testRequestEdges', gate: (has) => has('java', 'kotlin', 'php'), run: (_q, c, y) => testRequestEdges(c, y) },
-  { name: 'emitterEdges', gate: ALWAYS, run: (_q, c, y) => eventEmitterEdges(c, y) },
+  { name: 'emitterEdges', gate: ALWAYS, run: (q, c, y) => eventEmitterEdges(q, c, y) },
   { name: 'renderEdges', gate: ALWAYS, run: (q, c, y) => reactRenderEdges(q, c, y) },
   { name: 'jsxEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactJsxChildEdges(c, y) },
   { name: 'vueEdges', gate: (has) => has('vue'), run: (_q, c, y) => vueTemplateEdges(c, y) },
