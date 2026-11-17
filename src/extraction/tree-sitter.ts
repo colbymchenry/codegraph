@@ -7626,6 +7626,12 @@ export class TreeSitterExtractor {
       // A CFML `include "x.cfm";` in a function body includes the template
       // there, as it does at component scope (#2651).
       if (nodeType === 'include_statement' && this.language === 'cfscript') this.extractImport(node);
+      // So does a PHP `require`/`include` (#3296): the function depends on
+      // the file, as a call it makes is its own. (A namespace `use` can't
+      // sit in a body.)
+      if (this.language === 'php' && nodeType !== 'namespace_use_declaration' && this.extractor!.importTypes.includes(nodeType)) {
+        this.extractImport(node);
+      }
 
       if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);

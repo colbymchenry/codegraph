@@ -622,6 +622,17 @@ impl<'t> Walker<'t> {
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
 
+        // A `require`/`include` in a body includes its file there, so the
+        // function depends on it (#3296), as visitForCallsAndStructure does.
+        // Its children are still walked below.
+        if matches!(
+            kind,
+            "include_expression" | "include_once_expression" | "require_expression"
+                | "require_once_expression"
+        ) {
+            self.extract_import(node);
+        }
+
         if matches!(
             kind,
             "function_call_expression" | "member_call_expression" | "scoped_call_expression"
