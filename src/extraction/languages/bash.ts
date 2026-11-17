@@ -32,6 +32,13 @@ const SCRIPT_DIR_FORMS: readonly RegExp[] = [
   new RegExp(String.raw`^${SCRIPT_DIR}()$`),
 ];
 
+/**
+ * Marks a file reference relative to the directory of `$0`, the script the
+ * shell was started with: `$0/lib.sh`, `$0/../lib/a.sh`. Shared with the
+ * resolver, which places it (resolution/bash-resolution.ts).
+ */
+export const SCRIPT_ZERO_PREFIX = '$0/';
+
 /** Bats sets this to the directory of the test file being run. */
 const BATS_TEST_DIRNAME = 'BATS_TEST_DIRNAME';
 
@@ -92,11 +99,22 @@ function compactExpression(text: string): string {
     .replace(/\s+/g, '');
 }
 
-/** The `/..` chain a script-directory expression climbs, or null when it is not one. */
-function matchScriptDirectory(compact: string): string | null {
+/**
+ * A script-directory expression: the `/..` chain it climbs, and whether it is
+ * built from `$0` alone. `$0` is the script the shell was started with, so in
+ * a file that is sourced it names the sourcing script, not this one;
+ * `BASH_SOURCE` always names the file it is written in. Null when the text is
+ * not a script-directory expression.
+ */
+interface ScriptDirectory {
+  up: string;
+  viaZero: boolean;
+}
+
+function matchScriptDirectory(compact: string): ScriptDirectory | null {
   for (const form of SCRIPT_DIR_FORMS) {
     const match = form.exec(compact);
-    if (match) return match[1] ?? '';
+    if (match) return { up: match[1] ?? '', viaZero: !compact.includes('BASH_SOURCE') };
   }
   return null;
 }
@@ -123,13 +141,13 @@ function topLevelValueAt(name: string, use: SyntaxNode, ctx: ExtractorContext): 
   return getNodeText(value, ctx.source);
 }
 
-/** The `/..` chain of a script-directory expression, read directly or through a variable. */
-function scriptDirectoryOf(head: SyntaxNode, ctx: ExtractorContext): string | null {
+/** A script-directory expression, read directly or through a variable. */
+function scriptDirectoryOf(head: SyntaxNode, ctx: ExtractorContext): ScriptDirectory | null {
   const compact = compactExpression(getNodeText(head, ctx.source));
   const variable = /^\$(?:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)\})$/.exec(compact);
   if (!variable) return matchScriptDirectory(compact);
   const name = variable[1] ?? variable[2]!;
-  if (name === BATS_TEST_DIRNAME && isBatsFile(ctx.filePath)) return '';
+  if (name === BATS_TEST_DIRNAME && isBatsFile(ctx.filePath)) return { up: '', viaZero: false };
   const value = topLevelValueAt(name, head, ctx);
   return value === null ? null : matchScriptDirectory(compactExpression(value));
 }
@@ -141,6 +159,11 @@ function scriptDirectoryOf(head: SyntaxNode, ctx: ExtractorContext): string | nu
  * `./lib.sh` it does not depend on the directory the script is run from, so
  * the resolver takes it as-is. Null for anything else, or a path that leaves
  * the project.
+ *
+ * A path built from `$0` alone is relative to the script the shell was started
+ * with, which is this file only when nothing sources it. That is known once
+ * every file is read, so it is kept as `$0/<path relative to that script's
+ * directory>` for the resolver to place (resolution/bash-resolution.ts).
  */
 function scriptRelativePath(arg: SyntaxNode, ctx: ExtractorContext): string | null {
   if (arg.type !== 'string' && arg.type !== 'concatenation') return null;
@@ -148,10 +171,11 @@ function scriptRelativePath(arg: SyntaxNode, ctx: ExtractorContext): string | nu
   if (!head) return null;
   const rest = ctx.source.slice(head.endIndex, arg.endIndex).replace(/"/g, '');
   if (!/^\/[\w./-]+$/.test(rest)) return null;
-  const up = scriptDirectoryOf(head, ctx);
-  if (up === null) return null;
+  const dir = scriptDirectoryOf(head, ctx);
+  if (dir === null) return null;
+  if (dir.viaZero) return `${SCRIPT_ZERO_PREFIX}${path.posix.normalize(`.${dir.up}${rest}`)}`;
   const scriptDir = path.posix.dirname(ctx.filePath.replace(/\\/g, '/'));
-  const target = path.posix.join(scriptDir, `.${up}${rest}`);
+  const target = path.posix.join(scriptDir, `.${dir.up}${rest}`);
   return target === '..' || target.startsWith('../') ? null : target;
 }
 
@@ -228,18 +252,50 @@ function batsLoadPath(arg: SyntaxNode, ctx: ExtractorContext): string | null {
   return /\.(?:bash|sh)$/.test(target) ? target : `${target}.bash`;
 }
 
-/** The description of a Bats `@test "…" {` header, or null for any other statement. */
-function batsTestName(statement: SyntaxNode, source: string): string | null {
+/**
+ * A Bats `@test "…" {` header: the test's description, and the words after
+ * the `{` when the body starts on the same line. The grammar reads
+ * `@test "x" { run foo; }` as one command, `@test "x" { run foo`, so the
+ * body's first command is those words; `closed` when a `}` ends them, as in
+ * `@test "x" { run foo }`. Null for any other statement.
+ */
+interface BatsTestHeader {
+  name: string;
+  inline: SyntaxNode[];
+  closed: boolean;
+}
+
+function batsTestHeader(statement: SyntaxNode, source: string): BatsTestHeader | null {
   if (statement.type !== 'command') return null;
   const parts = statement.namedChildren;
   if (parts.length < 3 || getNodeText(parts[0]!, source) !== '@test') return null;
-  if (getNodeText(parts[parts.length - 1]!, source) !== '{') return null;
-  const description = parts.slice(1, -1)
+  const brace = parts.findIndex((part, i) => i >= 2 && part.type === 'word' && getNodeText(part, source) === '{');
+  if (brace < 0) return null;
+  const name = parts.slice(1, brace)
     .map((part) => unquote(getNodeText(part, source)))
     .join(' ')
     .replace(/\s+/g, ' ')
     .trim();
-  return description || null;
+  if (!name) return null;
+  let inline = parts.slice(brace + 1);
+  const last = inline[inline.length - 1];
+  const closed = last !== undefined && last.type === 'word' && getNodeText(last, source) === '}';
+  if (closed) inline = inline.slice(0, -1);
+  return { name, inline, closed };
+}
+
+/** The body's first command, when a Bats header carries it: `run foo` in `@test "x" { run foo; }`. */
+function visitInlineBatsCommand(words: SyntaxNode[], ctx: ExtractorContext): void {
+  const [head, ...rest] = words;
+  if (!head) return;
+  const name = head.type === 'word' ? getNodeText(head, ctx.source).trim() : '';
+  if (name && !/[$`{}()[\];"'<>]/.test(name)) {
+    if (isScriptPathCommand(name)) emitImport(ctx, head, name, name, false);
+    else emitCall(ctx, head, name);
+  } else {
+    ctx.visitNode(head);
+  }
+  for (const word of rest) ctx.visitNode(word);
 }
 
 function isClosingBrace(statement: SyntaxNode, source: string): boolean {
@@ -256,23 +312,29 @@ function visitBatsProgram(program: SyntaxNode, ctx: ExtractorContext): void {
   const statements = program.namedChildren;
   for (let i = 0; i < statements.length; i++) {
     const statement = statements[i]!;
-    const name = batsTestName(statement, ctx.source);
-    let close = i + 1;
-    while (name !== null && close < statements.length && !isClosingBrace(statements[close]!, ctx.source)) close++;
-    if (name === null || close >= statements.length) {
+    const header = batsTestHeader(statement, ctx.source);
+    // The statement that ends the test: the header itself when its own words
+    // close it, else the next lone `}`.
+    let close = i;
+    if (header && !header.closed) {
+      close = i + 1;
+      while (close < statements.length && !isClosingBrace(statements[close]!, ctx.source)) close++;
+    }
+    if (header === null || close >= statements.length) {
       ctx.visitNode(statement);
       continue;
     }
     const end = statements[close]!;
     // Marked `@test`: a test is run by Bats, never called by its name, so the
     // resolver never takes it for a function a command could reach.
-    const test = ctx.createNode('function', name, statement, {
+    const test = ctx.createNode('function', header.name, statement, {
       signature: '()',
       decorators: ['@test'],
       endLine: end.endPosition.row + 1,
       endColumn: end.endPosition.column,
     });
     if (test) ctx.pushScope(test.id);
+    visitInlineBatsCommand(header.inline, ctx);
     for (let j = i + 1; j < close; j++) ctx.visitNode(statements[j]!);
     if (test) ctx.popScope();
     i = close;

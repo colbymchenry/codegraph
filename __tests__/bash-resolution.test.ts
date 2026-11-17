@@ -126,7 +126,10 @@ describe('paths anchored to the script directory', () => {
       'source "$(dirname "$(readlink -f "$0")")/real.sh"',
       '',
     ].join('\n'));
-    expect(refs).toEqual(['bin/lib.sh', 'share/common.sh', 'bin/real.sh']);
+    // A `$0` path is relative to the script the shell started with, known only
+    // once every file is read: kept as `$0/…` for the resolver to place
+    // (bash-script-zero.test.ts). `BASH_SOURCE` is always this file.
+    expect(refs).toEqual(['$0/lib.sh', 'share/common.sh', '$0/real.sh']);
   });
 
   it('assumes nothing about a variable whose value depends on what ran', () => {
@@ -146,10 +149,17 @@ describe('paths anchored to the script directory', () => {
       'source "$REASSIGNED_DIR/reassigned.sh"',
       'if true; then BRANCH_DIR=$(cd "$(dirname "$0")" && pwd); fi',
       'source "$BRANCH_DIR/branch.sh"',
-      'source "$(dirname "$0")/../../outside.sh"',
       '',
     ].join('\n'));
     expect(refs).toEqual([]);
+  });
+
+  it('leaves a `$0` path that climbs out of the project unresolved', async () => {
+    const graph = await index({
+      'scripts/run.sh': 'source "$(dirname "$0")/../../outside.sh"\n',
+      'outside.sh': ':\n',
+    });
+    expect(importsOf(graph, 'scripts/run.sh')).toEqual([]);
   });
 
   it('resolves an anchored path exactly, even where a literal `./x` would be ambiguous', async () => {

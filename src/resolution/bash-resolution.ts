@@ -19,14 +19,23 @@
  *   `./lib.sh` that `resolveShellPath` can't place never falls back to some
  *   other `lib.sh` by name.
  *
+ * - A path built from `$0` (`$(dirname "$0")/lib.sh`, kept as `$0/lib.sh`)
+ *   is relative to the script the shell was started with. In a file nothing
+ *   sources, that is the file itself; in a sourced file it is the script at the
+ *   top of the sourcing chain, so the path links only when every such script
+ *   places it at the same file. Under Bats, `$0` is Bats' own runner, so a
+ *   path a test file reaches through `$0` stays unresolved.
+ *
  * Not followed (missing edges, never wrong ones): a library function calling a
  * sibling library that only its entry script sources; files sourced through a
  * variable the extractor can't read; a `source` inside a function or an `if`
  * counts as if it always ran.
  */
+import * as path from 'path';
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 import { resolveImportPath } from './import-resolver';
+import { SCRIPT_ZERO_PREFIX } from '../extraction/languages/bash';
 
 /** Whether `ref` is a Bash reference this module answers (calls and file imports). */
 export function isBashRef(ref: UnresolvedRef): boolean {
@@ -35,12 +44,12 @@ export function isBashRef(ref: UnresolvedRef): boolean {
 
 /** The resolution of a Bash call or import; null leaves it unresolved (no other strategy runs). */
 export function resolveBashRef(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const memo = memoFor(context);
   if (ref.referenceKind === 'imports') {
-    const file = resolveImportPath(ref.referenceName, ref.filePath, 'bash', context);
+    const file = importTarget(ref.referenceName, ref.filePath, memo, context);
     const node = file ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
     return node ? { original: ref, targetNodeId: node.id, confidence: 0.95, resolvedBy: 'import' } : null;
   }
-  const memo = memoFor(context);
   if (!isBashFunctionName(ref.referenceName, memo, context)) return null; // `echo`, `grep`, …: no lookup needed
   const pos: Pos = [ref.line ?? Number.MAX_SAFE_INTEGER, ref.column ?? 0];
   // Inside any function body, a Bats test included: it runs after the whole
@@ -90,14 +99,98 @@ interface BashMemo {
   defs: Map<string, Node[]>;
   ends: Map<string, Map<string, Node>>;
   reading: Set<string>;
+  /** Each file to the files that source it; built once per pass. */
+  sourcedBy: Map<string, Set<string>> | null;
+  /** Each file to the scripts `$0` can name while it runs; empty when unknown. */
+  starters: Map<string, Set<string>>;
 }
 
 const memos = new WeakMap<ResolutionContext, BashMemo>();
 
 function memoFor(context: ResolutionContext): BashMemo {
   let memo = memos.get(context);
-  if (!memo) memos.set(context, (memo = { names: null, sources: new Map(), defs: new Map(), ends: new Map(), reading: new Set() }));
+  if (!memo) {
+    memo = { names: null, sources: new Map(), defs: new Map(), ends: new Map(), reading: new Set(), sourcedBy: null, starters: new Map() };
+    memos.set(context, memo);
+  }
   return memo;
+}
+
+/** The file a Bash path names, or null: the exact file, never a name match. */
+function importTarget(spec: string, fromFile: string, memo: BashMemo, context: ResolutionContext): string | null {
+  if (!spec.startsWith(SCRIPT_ZERO_PREFIX)) return resolveImportPath(spec, fromFile, 'bash', context);
+  const relative = spec.slice(SCRIPT_ZERO_PREFIX.length);
+  const starters = startersOf(fromFile, memo, context);
+  let found: string | null = null;
+  for (const starter of starters) {
+    // Under Bats, `$0` is Bats' runner, which is not in the project.
+    if (/\.bats$/i.test(starter)) return null;
+    const target = placeFrom(starter, relative, context);
+    if (!target || (found !== null && target !== found)) return null;
+    found = target;
+  }
+  return found;
+}
+
+/** `relative` joined to `starter`'s directory, when that file is in the project. */
+function placeFrom(starter: string, relative: string, context: ResolutionContext): string | null {
+  const target = path.posix.join(path.posix.dirname(starter.replace(/\\/g, '/')), relative);
+  if (target === '..' || target.startsWith('../')) return null;
+  return context.fileExists(target) ? target : null;
+}
+
+/**
+ * The scripts `$0` can name while `file` runs: the file itself when nothing
+ * sources it, else the scripts at the top of each chain that sources it. Empty
+ * when every chain loops back on itself.
+ */
+function startersOf(file: string, memo: BashMemo, context: ResolutionContext, seen = new Set<string>()): Set<string> {
+  const cached = memo.starters.get(file);
+  if (cached) return cached;
+  const sourcers = sourcedByOf(memo, context).get(file);
+  if (!sourcers || sourcers.size === 0) {
+    const own = new Set([file]);
+    memo.starters.set(file, own);
+    return own;
+  }
+  if (seen.has(file)) return new Set();
+  seen.add(file);
+  const out = new Set<string>();
+  for (const sourcer of sourcers) for (const starter of startersOf(sourcer, memo, context, seen)) out.add(starter);
+  seen.delete(file);
+  // A result reached through a loop depends on where the walk began: kept only at its start.
+  if (seen.size === 0) memo.starters.set(file, out);
+  return out;
+}
+
+/**
+ * Which files source which. A path built from `$0` is placed here only in a
+ * file nothing else sources (where `$0` is that file), so that knowing who
+ * sources a file never depends on itself; deeper `$0` paths are placed later,
+ * through `startersOf`, once this map is known.
+ */
+function sourcedByOf(memo: BashMemo, context: ResolutionContext): Map<string, Set<string>> {
+  if (memo.sourcedBy) return memo.sourcedBy;
+  const map = new Map<string, Set<string>>();
+  const add = (target: string | null, from: string): void => {
+    if (!target || target === from) return;
+    let set = map.get(target);
+    if (!set) map.set(target, (set = new Set()));
+    set.add(from);
+  };
+  const viaZero: Node[] = [];
+  for (const imp of context.getNodesByKind('import')) {
+    if (imp.language !== 'bash') continue;
+    const spec = imp.qualifiedName || imp.name;
+    if (spec.startsWith(SCRIPT_ZERO_PREFIX)) viaZero.push(imp);
+    else add(resolveImportPath(spec, imp.filePath, 'bash', context), imp.filePath);
+  }
+  for (const imp of viaZero) {
+    if (map.has(imp.filePath)) continue;
+    add(placeFrom(imp.filePath, (imp.qualifiedName || imp.name).slice(SCRIPT_ZERO_PREFIX.length), context), imp.filePath);
+  }
+  memo.sourcedBy = map;
+  return map;
 }
 
 /** Drop the per-context Bash memos (with the resolver's other caches, on every sync). */
@@ -119,7 +212,7 @@ function sourcesOf(file: string, memo: BashMemo, context: ResolutionContext): Ar
   out = [];
   for (const imp of context.getNodesInFile(file)) {
     if (imp.kind !== 'import' || imp.language !== 'bash') continue;
-    const target = resolveImportPath(imp.qualifiedName || imp.name, file, 'bash', context);
+    const target = importTarget(imp.qualifiedName || imp.name, file, memo, context);
     if (target && target !== file) out.push({ pos: [imp.startLine, imp.startColumn], target });
   }
   out.sort((a, b) => (before(a.pos, b.pos) ? -1 : before(b.pos, a.pos) ? 1 : 0));
