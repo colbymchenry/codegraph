@@ -4624,6 +4624,9 @@ function isReceiverLessCall(ref: UnresolvedRef, context: ResolutionContext): boo
   // closes a statement header — `if (open) setOpen()`, `for (…) f()`, a header
   // that wraps lines or holds a `)` in a string — and the call is bare (#2585).
   if (line[end - 1] === ')' && JS_FAMILY.has(ref.language)) return true;
+  // Nor is a spread's or a rest's `...`: `{...register('email')}` calls
+  // `register` as bare as `register('email')` does (#2962).
+  if (end >= 3 && line.startsWith('...', end - 3) && JS_FAMILY.has(ref.language)) return true;
   let start = end;
   while (start > 0 && WORD_CHAR.test(line[start - 1]!)) start--;
   return BARE_CALL_KEYWORDS.has(line.slice(start, end));
@@ -14810,6 +14813,43 @@ function bindsAtSites(source: string, name: string, sites: LocalBindingSites): b
 }
 
 /**
+ * A bare JS/TS call's candidates without the calling file's declarations of
+ * the name that are out of scope where the call is written, when the file
+ * declares the name more than once: two `setup` helpers, each in its own
+ * `describe(…)` callback, which is no node, so neither has a container that
+ * isLexicallyReachable could read, and the nearer one took both blocks' calls
+ * (#2944). A declaration is the `function`, `class` or `const`/`let` of the
+ * name alone written on the node's first line (jsBindingSites), in scope
+ * through the block it is written in. A `var` (scoped to its function, not
+ * its block) or a declaration the reader doesn't find stays a candidate.
+ */
+function jsDeclarationsInScope(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  if (candidates.filter((n) => n.filePath === ref.filePath).length < 2) return candidates;
+  const file = jsScopeFile(ref.filePath, context);
+  if (!file) return candidates;
+  const sites = jsBindingSites(ref.referenceName, file);
+  const at = (file.lineStarts[ref.line - 1] ?? file.code.length) + ref.column;
+  return candidates.filter((n) => {
+    if (n.filePath !== ref.filePath) return true;
+    const site = sites.find((s) => (s.kind === 'function' || s.kind === 'declaration') && jsLineOf(file, s.at) === n.startLine);
+    if (!site || file.code.startsWith('var', site.at) || (site.kind === 'function' && isJsExpressionAt(file.code, site.at))) return true;
+    return site.from <= at && site.to >= at;
+  });
+}
+
+/**
+ * Whether the `function` or `class` keyword at `at` starts an expression, whose
+ * name binds only inside it: `readBinary = function readBinary(f) {…}`,
+ * `(function x() {…})`, `return class Y {…}` — an operand's place, after an
+ * operator, an opening bracket, a comma, a colon or a keyword that takes a value.
+ */
+function isJsExpressionAt(code: string, at: number): boolean {
+  let before = code.slice(Math.max(0, at - 64), at).replace(/\s+$/, '');
+  if (/(?:^|[^\w$])async$/.test(before)) before = before.slice(0, -5).replace(/\s+$/, '');
+  return /(?:[=(,:?[!&|+\-*/%<>~^]|=>|(?:^|[^\w$.])(?:return|yield|await|new|typeof|void|delete|in|of|case))$/.test(before);
+}
+
+/**
  * The calling file's declarations of an out-of-repo imported name that sit
  * inside a function or method — only those can shadow the import. A top-level
  * one is the import's own binding (`request = require('supertest')`), not a
@@ -15330,7 +15370,8 @@ export function matchByExactName(
     // file's symbol of that name, so a bare call has no cross-file candidate.
     !(bareJs && n.filePath !== ref.filePath && (locallyBoundJsName ??= isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))
   );
-  const ranked = dartBare ? nearestDartMembers(preferOwnDartLibrary(filtered, ref, context), ref, context)
+  const ranked = bareJs ? jsDeclarationsInScope(filtered, ref, context)
+    : dartBare ? nearestDartMembers(preferOwnDartLibrary(filtered, ref, context), ref, context)
     : dartTypeRef && dartPrefix === null ? preferOwnDartLibrary(filtered, ref, context)
     : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context)
     : kotlinBare ? lexicalKotlinMembers(filtered, ref, context)
