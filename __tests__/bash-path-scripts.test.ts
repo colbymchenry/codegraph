@@ -146,4 +146,20 @@ describe('explore across scripts run through PATH', () => {
     const flow = text.slice(text.indexOf('**Flow'), text.indexOf('> Full source'));
     expect(flow).toMatch(/1\. tool \(libexec\/tool\/tool:1\)[\s\S]*tool-suite[\s\S]*tool-file[\s\S]*tool-test[\s\S]*perform_test/);
   });
+
+  it('renders the line where each script on the Flow starts the next one, however far down', async () => {
+    // A long entry script whose hop is its last line, and a suite nothing but the
+    // Flow reaches (the query does not name it): both must show their call line.
+    const filler = Array.from({ length: 400 }, (_, i) => `opt_${i}="\${OPT_${i}:-}"`).join('\n');
+    const graph = await index({
+      'libexec/tool/tool': `${SH}${SELF_DIR}export PATH="$TOOL_LIBEXEC:$PATH"\n${filler}\nexec tool-suite "$@"\n`,
+      'libexec/tool/tool-suite': `${SH}${filler}\ntool-file "$1"\n`,
+      'libexec/tool/tool-file': `${SH}perform_file() { :; }\nperform_file\n`,
+    });
+    const handler = new ToolHandler(graph);
+    const result = await handler.execute('codegraph_explore', { query: 'tool tool-file perform_file' });
+    const text = result.content[0]!.text as string;
+    expect(text).toContain('exec tool-suite "$@"');
+    expect(text).toContain('tool-file "$1"');
+  });
 });

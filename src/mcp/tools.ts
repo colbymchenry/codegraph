@@ -5512,6 +5512,30 @@ export class ToolHandler {
       .filter((p) => cg.getNodesInFile(p).some((n) => n.kind === 'file' && n.language === 'bash'))
       .map((p) => p.slice(p.lastIndexOf('/') + 1));
     const flow = this.buildFlowFromNamedSymbols(cg, [matchQuery, ...pinnedScripts].join(' '));
+    // A script the Flow passes through by its top-level code (bats-core's `bats`,
+    // whose last lines `exec bats-exec-suite`) is a step the gather has no symbol
+    // for, so its file may not be listed at all. It goes in after the pinned files,
+    // and the call window below renders the line that starts the next hop.
+    {
+      let at = sortedFiles.findIndex(([fp]) => !pinnedSet.has(fp));
+      if (at < 0) at = sortedFiles.length;
+      for (const id of flow.pathNodeIds) {
+        const n = cg.getNode(id);
+        if (!n || n.kind !== 'file' || n.language !== 'bash' || pinnedSet.has(n.filePath)) continue;
+        // Listed only for its variables (ranked low, so it would be cut to a
+        // pointer), gated out, or never gathered: either way it is moved up here.
+        const listed = sortedFiles.findIndex(([fp]) => fp === n.filePath);
+        if (listed >= 0) {
+          sortedFiles.splice(listed, 1);
+          if (listed < at) at--;
+        }
+        const group = fileGroups.get(n.filePath) ?? { nodes: [], score: 0, peripheral: 0 };
+        if (!group.nodes.some((g) => g.id === n.id)) group.nodes.push(n);
+        group.score = Math.max(group.score, 50);
+        fileGroups.set(n.filePath, group);
+        sortedFiles.splice(at++, 0, [n.filePath, group]);
+      }
+    }
 
     // The symbols the question is about: exact targets, the named ones, the spine.
     const questionIds = new Set([...exactNodeIds, ...flow.pathNodeIds, ...flow.namedNodeIds]);
@@ -6878,6 +6902,23 @@ export class ToolHandler {
         if (span.start > fileLines.length) continue;
         const end = Math.min(span.end, fileLines.length);
         ranges.push({ start: span.start, end, name: `lines ${span.start}-${end}`, kind: 'range', importance: EXACT_IMPORTANCE, spine: false });
+      }
+
+      // A shell script on the Flow is a step through its top-level code, but its
+      // file node is the whole-file envelope dropped above, and the line where it
+      // starts the next hop went with it: bats-core's `exec bats-exec-suite` at
+      // the end of a 550-line `bats`, which the agent then Read back. The call
+      // line is the step, so it gets a window of its own, ranked as the spine.
+      for (const id of flow.pathNodeIds) {
+        const call = flow.spineCallSites.get(id);
+        if (!call || call > fileLines.length) continue;
+        const n = cg.getNode(id);
+        if (!n || n.kind !== 'file' || n.filePath !== filePath) continue;
+        const SPINE_CALL_CONTEXT = 3;
+        ranges.push({
+          start: Math.max(1, call - SPINE_CALL_CONTEXT), end: Math.min(fileLines.length, call + SPINE_CALL_CONTEXT),
+          name: n.name, kind: 'call', importance: 10, spine: true, spineCallLine: call,
+        });
       }
 
       ranges.sort((a, b) => a.start - b.start);
