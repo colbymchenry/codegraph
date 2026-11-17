@@ -38,7 +38,15 @@ export const REGEX_START_BEFORE = /(?:^|[=(:,)!&|?;{}\[\]+*%~^<>-]|\b(?:return|t
  * closing `/` of every span read as a regex literal (left as is).
  */
 export function blankStringContents(text: string, regexLiterals?: number[]): string {
-  const out = text.split('');
+  // Blanked runs are spaces, and the text between them is copied by the
+  // slice, as BlankedText does for the strippers.
+  const parts: string[] = [];
+  let copied = 0;
+  const blank = (start: number, end: number): void => {
+    if (end <= start) return;
+    parts.push(text.slice(copied, start), ' '.repeat(end - start));
+    copied = end;
+  };
   let i = 0;
   const n = text.length;
   while (i < n) {
@@ -63,23 +71,30 @@ export function blankStringContents(text: string, regexLiterals?: number[]): str
     if (c === '"' || c === "'" || c === '`') {
       const quote = c;
       i++;
+      // An escape blanks both its characters, an escaped newline too; a
+      // template's own newlines stay.
+      let run = i;
       while (i < n && text[i] !== quote) {
         if (text[i] === '\\' && i + 1 < n) {
-          out[i] = ' ';
-          out[i + 1] = ' ';
           i += 2;
           continue;
         }
         if (quote !== '`' && text[i] === '\n') break;
-        if (text[i] !== '\n') out[i] = ' ';
+        if (text[i] === '\n') {
+          blank(run, i);
+          run = i + 1;
+        }
         i++;
       }
+      blank(run, i);
       if (i < n && text[i] === quote) i++;
       continue;
     }
     i++;
   }
-  return out.join('');
+  if (copied === 0) return text;
+  parts.push(text.slice(copied));
+  return parts.join('');
 }
 
 /** A keyword after which a `/` opens a regex literal, at the end of the text before it. */
