@@ -13,24 +13,137 @@ const PHP_INCLUDE_TYPES = new Set([
 ]);
 
 /**
- * Extract a static string-literal path from a PHP include/require expression.
+ * Extract a static path from a PHP include/require expression: a string
+ * literal, or one appended to the including file's own directory (#3298).
  *
- * Returns null for dynamic forms (`include $var`, `require __DIR__ . '/x'`,
- * interpolated strings) — they have no resolvable compile-time path, which
- * matches the issue's "static string literals (the common case)" scope.
+ * Returns null for dynamic forms (`include $var`, interpolated strings,
+ * `$_SERVER['DOCUMENT_ROOT'] . '/x'`): they have no resolvable compile-time
+ * path.
  */
 function phpStaticIncludePath(node: SyntaxNode, source: string): string | null {
   // The path argument is the expression's first named child; the call-style
   // form `require("x")` wraps it in a parenthesized_expression.
   let arg: SyntaxNode | null = node.namedChild(0);
   if (arg?.type === 'parenthesized_expression') arg = arg.namedChild(0);
-  if (!arg || (arg.type !== 'string' && arg.type !== 'encapsed_string')) return null;
+  if (!arg) return null;
+  if (arg.type === 'binary_expression') return phpDirectoryIncludePath(arg, source);
+  return phpLiteralText(arg, source);
+}
+
+/** The text of a pure string literal (no interpolation or escapes), else null. */
+function phpLiteralText(arg: SyntaxNode, source: string): string | null {
+  if (arg.type !== 'string' && arg.type !== 'encapsed_string') return null;
   // Pure literal only: any non-`string_content` child (interpolated variable,
   // escape sequence, …) means the value isn't a static path.
   const parts = arg.namedChildren;
   if (parts.some((c: SyntaxNode) => c.type !== 'string_content')) return null;
   const content = parts.find((c: SyntaxNode) => c.type === 'string_content');
   return content ? getNodeText(content, source) : null;
+}
+
+/**
+ * `__DIR__`, `dirname(__FILE__)`, `\\dirname(__DIR__)`, `dirname(__FILE__, 2)`
+ * (whitespace removed first): the including file's directory, or one that many
+ * levels above it. A levels argument is a plain decimal of at least 1, as PHP
+ * requires (`010` is octal there); a trailing comma is allowed.
+ */
+const PHP_OWN_DIRECTORY = /^(?:__DIR__|\\?dirname\((__FILE__|__DIR__)(?:,([1-9]\d*))?,?\))$/i;
+
+/**
+ * The parts of a `.` concatenation, left to right: `__DIR__ . '/inc/' . 'a.php'`
+ * is a left-nested tree of binary expressions.
+ */
+function phpConcatParts(expr: SyntaxNode, source: string, out: SyntaxNode[] = []): SyntaxNode[] {
+  const left = getChildByField(expr, 'left');
+  const right = getChildByField(expr, 'right');
+  const operator = getChildByField(expr, 'operator');
+  if (!left || !right || (operator && getNodeText(operator, source) !== '.')) return [];
+  if (left.type === 'binary_expression') {
+    if (phpConcatParts(left, source, out).length === 0) return [];
+  } else {
+    out.push(left);
+  }
+  out.push(right);
+  return out;
+}
+
+const PHP_DIRNAME_SHADOWED = new WeakMap<object, boolean>();
+
+/**
+ * Whether an unqualified `dirname(...)` in this file reaches a function other
+ * than PHP's: one a `use function` imports under that name (`use function
+ * Foo\\dirname;`, `Foo\\{dirname}`, `Foo\\bar, Foo\\dirname`; not the global
+ * `use function dirname;`, nor one renamed `as dn`), or one the file declares
+ * inside a namespace (in the global namespace that redeclares the built-in,
+ * which PHP refuses). A method named `dirname` or the word in a comment is
+ * neither. Read once per file.
+ */
+function phpShadowsDirname(node: SyntaxNode, source: string): boolean {
+  // Keyed on the tree: each read of `tree.rootNode` hands back a new wrapper.
+  const root = node.tree.rootNode;
+  const cached = PHP_DIRNAME_SHADOWED.get(node.tree);
+  if (cached !== undefined) return cached;
+  let shadowed = false;
+  for (const use of root.descendantsOfType('namespace_use_declaration')) {
+    const text = getNodeText(use, source).replace(/\s+/g, ' ').replace(/\s*([\\{},])\s*/g, '$1').trim();
+    // `use function A\b;` imports functions throughout; a group `use A\{B,
+    // function c}` marks each function clause on its own.
+    const m = /^use (function )?(.*?);?$/i.exec(text);
+    if (!m) continue;
+    const allFunctions = m[1] !== undefined;
+    const group = /^([\w\\]*)\{(.*)\}$/.exec(m[2]!.trim());
+    if (!allFunctions && !group) continue;
+    const prefix = group ? group[1]!.replace(/\\$/, '') : '';
+    for (const raw of (group ? group[2]! : m[2]!).split(',')) {
+      const fn = /^function /i.exec(raw.trim());
+      if (!allFunctions && !fn) continue;
+      const clause = fn ? raw.trim().slice(fn[0].length) : raw;
+      const [name = '', alias] = clause.trim().split(/\s+as\s+/i);
+      const fqn = (prefix ? `${prefix}\\${name}` : name).replace(/^\\/, '');
+      const local = alias ?? fqn.split('\\').pop()!;
+      if (local.toLowerCase() === 'dirname' && fqn.toLowerCase() !== 'dirname') shadowed = true;
+    }
+  }
+  if (!shadowed && root.descendantsOfType('namespace_definition').length > 0) {
+    shadowed = root.descendantsOfType('function_definition').some((fn) => {
+      const name = getChildByField(fn, 'name');
+      return !!name && getNodeText(name, source).toLowerCase() === 'dirname';
+    });
+  }
+  PHP_DIRNAME_SHADOWED.set(node.tree, shadowed);
+  return shadowed;
+}
+
+/**
+ * `__DIR__ . '/inc/a.php'`, `dirname(__FILE__) . DIRECTORY_SEPARATOR . 'a.php'`:
+ * string literals (and `DIRECTORY_SEPARATOR`) appended to the including file's
+ * directory, read as a path relative to it (`./inc/a.php`, `../config/a.php`),
+ * which the resolver loads exactly as written, as PHP does. The appended text
+ * must start with `/` (or the two run together) and name a file, not a
+ * directory. Null when an unqualified `dirname` would reach one the file
+ * declares or imports (see {@link phpShadowsDirname}).
+ */
+function phpDirectoryIncludePath(expr: SyntaxNode, source: string): string | null {
+  const [head, ...tail] = phpConcatParts(expr, source);
+  if (!head || tail.length === 0) return null;
+  const dir = PHP_OWN_DIRECTORY.exec(getNodeText(head, source).replace(/\s+/g, ''));
+  if (!dir) return null;
+  const qualified = getNodeText(head, source).trimStart().startsWith('\\');
+  if (dir[1] !== undefined && !qualified && phpShadowsDirname(expr, source)) return null;
+  let rest = '';
+  for (const part of tail) {
+    const literal = phpLiteralText(part, source);
+    if (literal !== null) rest += literal;
+    else if (getNodeText(part, source).replace(/^\\/, '') === 'DIRECTORY_SEPARATOR') rest += '/';
+    else return null;
+  }
+  if (!rest.startsWith('/') || rest.endsWith('/')) return null;
+  // __DIR__ and dirname(__FILE__) are the file's directory; dirname(__DIR__)
+  // is one up; a levels argument climbs that many from __FILE__ (one more from __DIR__).
+  const levels = dir[1] === undefined ? 1 : Number(dir[2] ?? '1') + (dir[1].toUpperCase() === '__DIR__' ? 1 : 0);
+  if (levels > 16) return null;
+  const relative = `${levels === 1 ? './' : '../'.repeat(levels - 1)}${rest.slice(1)}`;
+  return relative.split('/').slice(1).every((seg) => seg !== '') ? relative : null;
 }
 
 /** PHP built-in return types that can't be a method receiver (so no class to chain on). */
