@@ -18,6 +18,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Rust, a call through a module that a glob `use` brings in, like `gzip::write()` in a test module with `use super::*`, or that a `use` inside the function names, now links to that module's function again. Thanks @Egrn for the report and @mohitdixit02. (#3253)
 - CodeGraph no longer takes git's index lock while it checks your repository for changes, so a `git add` in a pre-commit hook, a commit or a checkout that runs while CodeGraph syncs no longer fails with "index.lock: File exists". Thanks @iamclaudia-ai for the report. (#3295)
 - `codegraph impact` and `codegraph_impact` are as fast as they were in 1.6.2 again, with the same results: 1.6.3 read each symbol's dependents in a way that slowed down every step of the walk. Thanks @inth3shadows for the report and the fix, and @Marcos-199-GitHub for #3285. (#3248)
+- When the CodeGraph server's catch-up sync on a large project is stopped because the tool calls it is serving keep its write-ahead log from shrinking, it now waits before trying again, a little longer each time, instead of starting over every second while you keep working. Thanks @kiliman for the report. (#3273)
 
 ## [1.6.3] - 2026-11-17
 
