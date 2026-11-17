@@ -43,6 +43,7 @@ import { adoptProjectScans, readProjectScans, type ProjectScans } from './projec
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCMacroRenames } from './c-macro-renames';
 import { isObjcDeclaredTypeRef, matchByExactName } from './name-matcher';
+import { pythonSelfCallReaches } from './name-matcher';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
@@ -1667,6 +1668,13 @@ export class ReferenceResolver {
       const declaringFile = specifier === undefined ? undefined : this.nodeById(resolved.targetNodeId)?.filePath;
       if (declaringFile !== undefined && declaringFile !== ref.filePath &&
           !reachesAmbientModule(ref, specifier!, declaringFile, this.context)) return null;
+    }
+    // A Python `self.x()` / `cls.x()` names a member of the instance or the class:
+    // never a module-level function of another file, nor what a binding of the
+    // attribute doesn't name (#2958).
+    if (resolved && ref.language === 'python' && ref.referenceKind === 'calls' && resolved.resolvedBy !== 'framework') {
+      const target = this.nodeById(resolved.targetNodeId);
+      if (target && !pythonSelfCallReaches(target, ref, this.context)) return null;
     }
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
     // A Pascal call to data runs only a routine the data holds, in scope, and

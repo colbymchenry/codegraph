@@ -4541,6 +4541,114 @@ export function isJsThisCall(ref: UnresolvedRef, context: ResolutionContext): bo
   return JS_FAMILY.has(ref.language) && bareCallReceiver(ref, context)?.receiver === 'self';
 }
 
+/**
+ * Whether a Python `self.x()` or `cls.x()` call, recorded by its bare name,
+ * can mean `target`, the answer a strategy gave by that name (#2958). The call
+ * names a member of the instance or the class: a method the class has or
+ * inherits, or an attribute holding a callable. So:
+ * - a method of the class, of a project base or of a subclass is the call;
+ * - when the class or a base binds `x` itself (`self.x = …`, `cls.x = …`, `x =
+ *   …` in its body), the call is that value, and `target` only when the value
+ *   names it under its own name: `self.x = x` with a module-level `x`, `x =
+ *   staticmethod(x)`, `self.Graph = nx.Graph`. flask's `self.create_app = create_app`
+ *   takes the parameter, and `self.out = Layer()` an instance: neither is a
+ *   function named `create_app` or `out` elsewhere;
+ * - otherwise a module-level function or variable is out of reach, but for a
+ *   function of the caller's own file, which the file can put on the class;
+ * - a class stays (an attribute holds one under its own name), and so does
+ *   another class's method when nothing binds `x`: a mixin calls one of the
+ *   class it is mixed into.
+ */
+export function pythonSelfCallReaches(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'python' || ref.referenceKind !== 'calls' || target.kind === 'class') return true;
+  if (!/^[A-Za-z_]\w*$/.test(ref.referenceName)) return true;
+  const receiver = bareCallReceiver(ref, context)?.receiver;
+  if (receiver !== 'self' && receiver !== 'cls') return true;
+  const owner = context.getNodesInFile(ref.filePath)
+    .filter((n) => n.kind === 'class' && n.startLine <= ref.line && n.endLine >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine)[0];
+  if (!owner) return true;
+  if (target.kind === 'method') {
+    const cut = target.qualifiedName.lastIndexOf('::');
+    const holderName = cut > 0 ? target.qualifiedName.slice(0, cut) : '';
+    if (holderName && pythonClassLineage(owner, ref, context).has(`${target.filePath}\0${holderName}`)) return true;
+    // A subclass's override is what the call runs on its instances: django's
+    // ListMixin calls `self._set_single()`, which LineString defines.
+    const holder = holderName ? context.getNodesByQualifiedName(holderName).find((n) => n.kind === 'class' && n.filePath === target.filePath) : undefined;
+    if (holder && pythonDerivesFrom(holder, owner, ref, context)) return true;
+  }
+  const member = ref.referenceName;
+  const values = pythonNameScan(context, `attribute\0${owner.id}\0${member}`, () => pythonAttributeValues(owner, member, ref, context));
+  if (values.length > 0) return values.some((v) => pythonValueNames(v, target, ref, context));
+  if (target.qualifiedName.includes('::')) return true;
+  return target.kind === 'function' && target.filePath === ref.filePath;
+}
+
+/** `file\0qualifiedName` of a Python class and of each project class it derives from. */
+function pythonClassLineage(cls: Node, ref: UnresolvedRef, context: ResolutionContext): Set<string> {
+  return pythonNameScan(context, `lineage\0${cls.id}`, () =>
+    new Set([cls, ...pythonClassLineageNodes(cls, ref, context)].map((c) => `${c.filePath}\0${c.qualifiedName}`)));
+}
+
+/**
+ * The values a Python class, or a project base of it, binds to its attribute
+ * `member`: `self.member = value` / `cls.member = value` in any method, or
+ * `member = value` in the class body. A tuple target (`self.repo, self.run =
+ * f()`) gives each name a value nothing can name: ''.
+ */
+function pythonAttributeValues(cls: Node, member: string, ref: UnresolvedRef, context: ResolutionContext): Array<{ value: string; filePath: string; line: number }> {
+  const out: Array<{ value: string; filePath: string; line: number }> = [];
+  const attr = new RegExp(`^\\(?\\s*(?:self|cls)\\s*\\.\\s*${escapeRegExp(member)}\\s*\\)?$`);
+  for (const c of [cls, ...pythonClassLineageNodes(cls, ref, context)]) {
+    const lines = pythonMemberLines(c.filePath, context);
+    const starts = pythonStatementStarts(c.filePath, context);
+    const own = new Set(pythonOwnLines(c, c.filePath, context));
+    for (let i = c.startLine; i < Math.min(c.endLine, lines.length); i++) {
+      if (!starts[i] || !lines[i]!.includes(member)) continue;
+      const assignment = pythonAssignment(pythonBlankStrings(lines[i]!));
+      if (!assignment || assignment.augmented) continue;
+      for (const target of assignment.targets) {
+        const t = target.split(':')[0]!.trim();
+        const parts = pythonTopLevelParts(t.replace(/^\((.*)\)$/, '$1')).map((p) => p.trim());
+        const binds = parts.some((p) => attr.test(p)) || (own.has(i) && parts.includes(member));
+        if (binds) out.push({ value: parts.length === 1 ? assignment.value.trim() : '', filePath: c.filePath, line: i + 1 });
+      }
+    }
+  }
+  return out;
+}
+
+/** The project classes a Python class derives from, nearest first, without the class itself. */
+function pythonClassLineageNodes(cls: Node, ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  return pythonNameScan(context, `bases\0${cls.id}`, () => {
+    const out: Node[] = [];
+    const queue = pythonBases(cls, ref, context);
+    const seen = new Set<string>([cls.id]);
+    while (queue.length > 0 && seen.size < 32) {
+      const c = queue.shift()!;
+      if (seen.has(c.id)) continue;
+      seen.add(c.id);
+      out.push(c);
+      queue.push(...pythonBases(c, ref, context));
+    }
+    return out;
+  });
+}
+
+/**
+ * Whether an attribute's value names `target` under the target's own name:
+ * `create_app`, `mod.create_app`, `staticmethod(create_app)`. A bare name the
+ * function around the binding binds itself (a parameter, a local) is that
+ * value, not the module-level one.
+ */
+function pythonValueNames(bound: { value: string; filePath: string; line: number }, target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const value = bound.value.replace(/^(?:static|class)method\s*\(\s*([\s\S]*?)\s*\)$/, '$1');
+  const m = /^((?:[A-Za-z_]\w*\s*\.\s*)*)([A-Za-z_]\w*)$/.exec(value);
+  if (!m || m[2] !== target.name) return false;
+  if (m[1]) return true;
+  return pythonReceiverBinding(target.name, { ...ref, filePath: bound.filePath, line: bound.line, column: 0 }, context) !== 'local';
+}
+
 /** Whether a call recorded by its bare name is written on something other than the caller's own object. */
 function isCollapsedNonRecursion(ref: UnresolvedRef, context: ResolutionContext): boolean {
   const written = bareCallReceiver(ref, context);
