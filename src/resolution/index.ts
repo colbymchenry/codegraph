@@ -154,6 +154,38 @@ const PYTHON_BUILT_INS = new Set([
   'super', 'self', 'cls', 'None', 'True', 'False',
 ]);
 
+/**
+ * The rest of Python's builtins: functions, types, constants and the exception
+ * and warning classes. Unlike PYTHON_BUILT_INS, a name here is the builtin only
+ * where the file can't mean anything else by it (isUnboundPythonBuiltin):
+ * projects define their own `TimeoutError`, `ConnectionError`, `format` or
+ * `filter` all the time.
+ */
+const PYTHON_BUILTIN_NAMES = new Set([
+  'abs', 'aiter', 'all', 'anext', 'any', 'ascii', 'bin', 'bool', 'breakpoint', 'bytearray', 'bytes',
+  'callable', 'chr', 'classmethod', 'compile', 'complex', 'delattr', 'dict', 'dir', 'divmod', 'enumerate',
+  'eval', 'exec', 'filter', 'float', 'format', 'frozenset', 'getattr', 'globals', 'hasattr', 'hash', 'help',
+  'hex', 'id', 'input', 'int', 'isinstance', 'issubclass', 'iter', 'len', 'list', 'locals', 'map', 'max',
+  'memoryview', 'min', 'next', 'object', 'oct', 'open', 'ord', 'pow', 'print', 'property', 'range', 'repr',
+  'reversed', 'round', 'set', 'setattr', 'slice', 'sorted', 'staticmethod', 'str', 'sum', 'super', 'tuple',
+  'type', 'vars', 'zip', '__import__', 'Ellipsis', 'NotImplemented', 'exit', 'quit', 'copyright', 'credits',
+  'license',
+  'BaseException', 'BaseExceptionGroup', 'Exception', 'ExceptionGroup', 'GeneratorExit', 'KeyboardInterrupt',
+  'SystemExit', 'ArithmeticError', 'FloatingPointError', 'OverflowError', 'ZeroDivisionError', 'AssertionError',
+  'AttributeError', 'BufferError', 'EOFError', 'ImportError', 'ModuleNotFoundError', 'LookupError', 'IndexError',
+  'KeyError', 'MemoryError', 'NameError', 'UnboundLocalError', 'OSError', 'EnvironmentError', 'IOError',
+  'WindowsError', 'BlockingIOError', 'ChildProcessError', 'ConnectionError', 'BrokenPipeError',
+  'ConnectionAbortedError', 'ConnectionRefusedError', 'ConnectionResetError', 'FileExistsError',
+  'FileNotFoundError', 'InterruptedError', 'IsADirectoryError', 'NotADirectoryError', 'PermissionError',
+  'ProcessLookupError', 'TimeoutError', 'ReferenceError', 'RuntimeError', 'NotImplementedError',
+  'PythonFinalizationError', 'RecursionError', 'StopAsyncIteration', 'StopIteration', 'SyntaxError',
+  'IndentationError', 'TabError', 'SystemError', 'TypeError', 'ValueError', 'UnicodeError',
+  'UnicodeDecodeError', 'UnicodeEncodeError', 'UnicodeTranslateError',
+  'Warning', 'BytesWarning', 'DeprecationWarning', 'EncodingWarning', 'FutureWarning', 'ImportWarning',
+  'PendingDeprecationWarning', 'ResourceWarning', 'RuntimeWarning', 'SyntaxWarning', 'UnicodeWarning',
+  'UserWarning',
+]);
+
 const PYTHON_BUILT_IN_TYPES = new Set([
   'list', 'dict', 'set', 'tuple', 'str', 'int', 'float', 'bool',
   'bytes', 'bytearray', 'frozenset', 'object', 'super',
@@ -764,6 +796,7 @@ export class ReferenceResolver {
     this.goModules = null;
     this.goPackageDirs.clear();
     this.cachesWarmed = false;
+    this.pythonFileBindings = null;
     // The import-resolver's and name-matcher's per-context memos assume the
     // same stable window as the caches above — drop them together.
     if (this.context) {
@@ -3745,6 +3778,32 @@ export class ReferenceResolver {
   }
 
   /**
+   * The file isUnboundPythonBuiltin read last: every name its nodes have and
+   * its imports bind, and whether it star-imports a module. References arrive
+   * grouped by file, so one slot serves them all.
+   */
+  private pythonFileBindings: { filePath: string; names: Set<string>; star: boolean } | null = null;
+
+  /**
+   * Whether a Python reference to a builtin's name (PYTHON_BUILTIN_NAMES) can
+   * only mean the builtin: written bare (`self.format()` and `errors.Timeout`
+   * name a member), in a file that defines nothing of that name, imports
+   * nothing under it and star-imports no module that might export it.
+   */
+  private isUnboundPythonBuiltin(ref: UnresolvedRef): boolean {
+    const line = (this.context.getFileLines?.(ref.filePath) ?? this.context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+    if (line === undefined || !line.startsWith(ref.referenceName, ref.column) || /\.\s*$/.test(line.slice(0, ref.column))) return false;
+    let file = this.pythonFileBindings;
+    if (file?.filePath !== ref.filePath) {
+      const names = new Set(this.context.getNodesInFile(ref.filePath).map((n) => n.name));
+      for (const m of this.context.getImportMappings(ref.filePath, 'python')) names.add(m.localName);
+      const star = /^[ \t]*from[ \t]+[\w.]+[ \t]+import[ \t(]*\*/m.test(this.context.readFile(ref.filePath) ?? '');
+      this.pythonFileBindings = file = { filePath: ref.filePath, names, star };
+    }
+    return !file.star && !file.names.has(ref.referenceName);
+  }
+
+  /**
    * True when the Go file imports `qualifier` — by its last path segment or
    * an alias — from a package of one of the project's own modules.
    */
@@ -3790,6 +3849,13 @@ export class ReferenceResolver {
 
     // Python built-ins (bare calls only — dotted calls like console.print are method calls)
     if (ref.language === 'python' && PYTHON_BUILT_INS.has(name)) {
+      return true;
+    }
+    // The rest of them, `raise TimeoutError(…)` or `sorted(xs)`, written bare in
+    // a file that neither defines nor imports the name, nor star-imports a module
+    // that could: there it can only be the builtin, never a project class or
+    // function of that name in a file it doesn't import (#3232).
+    if (ref.language === 'python' && PYTHON_BUILTIN_NAMES.has(name) && this.isUnboundPythonBuiltin(ref)) {
       return true;
     }
 
