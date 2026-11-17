@@ -2828,10 +2828,22 @@ export function resolvePhpImportedStaticCall(
     .filter((n) => n.language === 'php' && STATIC_MEMBER_CONTAINERS.has(n.kind));
   if (owners.length !== 1) return null;
   const owner = owners[0]!;
-  const methods = context.getNodesByQualifiedName(`${owner.qualifiedName}::${member}`)
-    .filter((n) => n.language === 'php' && n.kind === 'method' && n.filePath === owner.filePath);
+  const methods = phpOwnMethods(owner, member!, context);
   if (methods.length !== 1) return null;
   return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
+}
+
+/**
+ * The methods a PHP class declares as `member`: spelled exactly so, else in
+ * any letter case, since PHP reads method names without regard to it (#3297).
+ */
+function phpOwnMethods(owner: Node, member: string, context: ResolutionContext): Node[] {
+  const exact = context.getNodesByQualifiedName(`${owner.qualifiedName}::${member}`)
+    .filter((n) => n.language === 'php' && n.kind === 'method' && n.filePath === owner.filePath);
+  if (exact.length > 0) return exact;
+  const want = `${owner.qualifiedName}::${member}`.toLowerCase();
+  return context.getNodesInFile(owner.filePath)
+    .filter((n) => n.language === 'php' && n.kind === 'method' && n.qualifiedName.toLowerCase() === want);
 }
 
 /**
@@ -2949,8 +2961,7 @@ export function resolvePhpQualifiedClassRef(
   if (classes.length !== 1) return ref.referenceKind === 'references' ? undefined : null;
   const owner = classes[0]!;
   if (!member) return { original: ref, targetNodeId: owner.id, confidence: 0.95, resolvedBy: 'import' };
-  const methods = context.getNodesByQualifiedName(`${owner.qualifiedName}::${member}`)
-    .filter((n) => n.language === 'php' && n.kind === 'method' && n.filePath === owner.filePath);
+  const methods = phpOwnMethods(owner, member, context);
   // A method the class inherits is left to the strategies that walk supertypes.
   if (methods.length !== 1) return undefined;
   return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
