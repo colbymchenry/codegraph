@@ -6,7 +6,7 @@ description: Every CodeGraph command and the flags it accepts.
 ```bash
 codegraph                         # Run interactive installer
 codegraph install                 # Run installer (explicit)
-codegraph uninstall               # Remove CodeGraph from your agents (inverse of install)
+codegraph uninstall               # Remove CodeGraph from your agents and the CLI itself (--keep-cli keeps the CLI)
 codegraph init [path]             # Initialize a project + build its graph (--local-only)
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
 codegraph index [path]            # Rebuild the full index from scratch (--quiet, --verbose, --force)

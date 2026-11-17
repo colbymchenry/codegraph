@@ -35,6 +35,8 @@ codegraph install --print-config codex               # print snippet, no file wr
 | `--yes` | (boolean) | prompt every step |
 | `--no-permissions` | (boolean) skip the auto-allow list (Claude Code, Qwen Code) | permissions on |
 | `--print-config <id>` | dump snippet for one agent and exit | — |
+| `--init` | (boolean) after wiring agents, also run `codegraph init` in the current folder | off |
+| `--refresh` | (boolean) rewrite what earlier installs configured, for agents already set up; `codegraph upgrade` runs it for you | off |
 
 ## 2. Restart your agent
 
@@ -63,7 +65,7 @@ As of CodeGraph 1.6.3 the bundled runtime is Node.js 24.22.1, Node's October 202
 
 ## Uninstall
 
-Changed your mind? One command removes CodeGraph from every agent it configured:
+Changed your mind? One command removes CodeGraph from every agent it configured **and** the CLI itself: every install it finds (standalone bundle, npm global package, launcher link), shown to you before anything is deleted. Pass `--keep-cli` to remove only the agent configurations:
 
 ```bash
 codegraph uninstall

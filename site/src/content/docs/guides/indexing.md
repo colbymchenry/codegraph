@@ -40,12 +40,12 @@ Run `codegraph index` to rebuild. Only a full index picks up the new engine's im
 
 ### 1. File watcher with debounced auto-sync (always on)
 
-`serve --mcp` spins up a native file watcher (FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on Windows) over the project root. Every source-file create / modify / delete is captured. A debounce timer collapses bursts of edits into a single sync.
+`serve --mcp` spins up a native file watcher (FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on Windows) over the project root. Every source-file create / modify / delete is captured. A lone save, or a pair like a file and its test, syncs after 300ms of quiet; a bigger burst waits the full debounce, 2000ms by default, so it lands as a single sync.
 
 ```
 agent writes src/Widget.ts
   → watcher fires (event delivery: typically <100ms)
-  → 2000ms debounce
+  → 300ms quiet window (a burst of more files waits the 2000ms debounce)
   → sync runs; Widget.ts's nodes + edges are in the index
   → next agent query sees it
 ```
@@ -56,7 +56,7 @@ agent writes src/Widget.ts
 
 ### 2. Per-file staleness banner — covers the debounce window
 
-The watcher debounce introduces a small window (typically 2s) where a freshly-edited file is on disk but not yet in the index. CodeGraph closes that window with a per-file staleness banner: if any MCP tool response would reference a file that's currently pending re-index, the response prepends a `⚠️` banner naming the stale file:
+The watcher debounce introduces a small window (under a second for a lone save, about 2s for a burst) where a freshly-edited file is on disk but not yet in the index. CodeGraph closes that window with a per-file staleness banner: if any MCP tool response would reference a file that's currently pending re-index, the response prepends a `⚠️` banner naming the stale file:
 
 ```
 ⚠️ Some files referenced below were edited since the last index sync —
