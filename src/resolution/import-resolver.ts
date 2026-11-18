@@ -3176,6 +3176,45 @@ function namespaceDeclaringFile(
   return undefined;
 }
 
+/**
+ * The module whose namespace object `file` exports as `name`, when that
+ * export is one (#2951): `export * as name from './m'`, or a namespace import
+ * the file exports by clause, zod's `import * as z from './external.js';
+ * export { z }` — through named re-exports and `export *` lines, as the
+ * barrels that pass the name on write them. Null when the file declares the
+ * name itself, or exports no namespace by it.
+ */
+function namespaceExportModule(
+  file: string,
+  name: string,
+  language: Language,
+  context: ResolutionContext,
+  depth = 0,
+  seen = new Set<string>(),
+): string | null {
+  if (depth > REEXPORT_MAX_DEPTH || seen.has(file)) return null;
+  seen.add(file);
+  if (exportedByName(file, getFileExportIndex(file, context), name, context)) return null;
+  const reExports = context.getReExports?.(file, language) ?? [];
+  const namespaced = reExports.find((rex) => rex.kind === 'namespace' && rex.exportedName === name);
+  if (namespaced) return resolveImportPath(namespaced.source, file, language, context);
+  const source = context.readFile(file);
+  if (source?.includes('export')) {
+    for (const { exportedName, localName } of extractLocalExportAliases(source)) {
+      if (exportedName !== name) continue;
+      const imported = context.getImportMappings(file, language).find((m) => m.isNamespace && m.localName === localName);
+      if (imported) return resolveImportPath(imported.source, file, language, context);
+    }
+  }
+  for (const rex of reExports) {
+    if (rex.kind !== 'wildcard' && !(rex.kind === 'named' && rex.exportedName === name)) continue;
+    const next = resolveImportPath(rex.source, file, language, context);
+    const found = next ? namespaceExportModule(next, rex.kind === 'named' ? rex.originalName : name, language, context, depth + 1, seen) : null;
+    if (found) return found;
+  }
+  return null;
+}
+
 export function resolveViaImport(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -3425,6 +3464,25 @@ export function resolveViaImport(
 
         const targetNode = findImportedExport(imp.source, resolvedPath, want, ref, context);
         const memberRead = !imp.isNamespace && ref.referenceName.startsWith(imp.localName + '.');
+
+        // A name the module exports as a module namespace — `export * as ns
+        // from './m'`, or zod's `import * as z from './external.js'; export
+        // { z }` — is that module, as `import * as` of it is (#2951): `z.ipv4()`
+        // is what the module exports as `ipv4` and nothing else, and the import
+        // itself links the module's file.
+        const namespace = !targetNode && !imp.isNamespace && !imp.isDefault && resolvedPath && ESM_IMPORT_LANGUAGES.has(ref.language)
+          ? namespaceExportModule(resolvedPath, exportedName, ref.language, context) : null;
+        if (namespace) {
+          if (memberRead) {
+            const member = ref.referenceName.slice(imp.localName.length + 1);
+            const found = findExportedSymbol(namespace, { isDefault: false, isNamespace: true, exportedName: member.split('.')[0]!, memberName: member }, ref.language, context, new Set());
+            if (found) return { original: ref, targetNodeId: found.id, confidence: 0.9, resolvedBy: 'import' };
+          } else if (ref.referenceKind === 'imports') {
+            const fileNode = context.getNodesInFile(namespace).find((n) => n.kind === 'file');
+            if (fileNode) return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+          }
+          continue;
+        }
 
         // `named.second()` through a default binding: what the module exports
         // as `second`. `require('./m')` is the whole module, and so is a
@@ -4281,14 +4339,15 @@ function findExportedSymbol(
   language: Language,
   context: ResolutionContext,
   visited: Set<string>,
-  depth = 0
+  depth = 0,
+  members: MemberAnswers = 'after'
 ): Node | undefined {
   // Memoize fresh (top-level) lookups only: recursive re-export steps carry a
   // populated `visited` set, whose contents change the reachable answer.
   // Every ref to the same imported symbol repeats this exact walk, so the
   // top-level memo removes the re-export chase + per-file linear scans from
   // all but the first occurrence.
-  if (depth === 0 && visited.size === 0) {
+  if (depth === 0 && visited.size === 0 && members === 'after') {
     let memo = exportedSymbolMemos.get(context);
     if (!memo) {
       memo = new Map();
@@ -4296,12 +4355,20 @@ function findExportedSymbol(
     }
     const key = `${filePath}\0${want.isDefault ? 1 : 0}${want.isNamespace ? 1 : 0}\0${want.exportedName}\0${want.memberName ?? ''}\0${language}`;
     if (memo.has(key)) return memo.get(key);
-    const result = findExportedSymbolWalk(filePath, want, language, context, visited, depth);
+    const result = findExportedSymbolWalk(filePath, want, language, context, visited, depth, members);
     memo.set(key, result);
     return result;
   }
-  return findExportedSymbolWalk(filePath, want, language, context, visited, depth);
+  return findExportedSymbolWalk(filePath, want, language, context, visited, depth, members);
 }
+
+/**
+ * When a member of something else in a file (exportedMember, the walk's last
+ * answer) may answer: `'yes'` where the walk finds one, `'no'` never, and
+ * `'after'` only once no module an `export *` reaches exports the name itself
+ * (#3233) — a walk with no members, then one with them.
+ */
+type MemberAnswers = 'after' | 'no' | 'yes';
 
 function findExportedSymbolWalk(
   filePath: string,
@@ -4314,7 +4381,8 @@ function findExportedSymbolWalk(
   language: Language,
   context: ResolutionContext,
   visited: Set<string>,
-  depth: number
+  depth: number,
+  members: MemberAnswers
 ): Node | undefined {
   if (depth > REEXPORT_MAX_DEPTH) return undefined;
   if (visited.has(filePath)) return undefined;
@@ -4334,7 +4402,7 @@ function findExportedSymbolWalk(
     const commonJs = typeof stated === 'object' ? null : commonJsDefaultExport(filePath, context);
     if (commonJs?.source) {
       const next = resolveImportPath(commonJs.source, filePath, language, context);
-      const forwarded = next ? findExportedSymbol(next, want, language, context, visited, depth + 1) : undefined;
+      const forwarded = next ? findExportedSymbol(next, want, language, context, visited, depth + 1, members) : undefined;
       if (forwarded) return forwarded;
     } else if (commonJs?.name) {
       const bound = moduleBindingsFirst(filePath, nodesInFileNamed(filePath, commonJs.name, context)
@@ -4355,7 +4423,7 @@ function findExportedSymbolWalk(
     // `module.exports = require('./lib/m')` forwards the whole module.
     const source = commonJsDefaultExport(filePath, context)?.source;
     const next = source ? resolveImportPath(source, filePath, language, context) : null;
-    const forwarded = next ? findExportedSymbol(next, want, language, context, visited, depth + 1) : undefined;
+    const forwarded = next ? findExportedSymbol(next, want, language, context, visited, depth + 1, members) : undefined;
     if (forwarded) return forwarded;
   } else {
     const direct = exportedByName(filePath, exportIndex, want.exportedName, context);
@@ -4380,7 +4448,7 @@ function findExportedSymbolWalk(
 
   // 2. Re-export hit: the file forwards the symbol to another module.
   const reExports = context.getReExports?.(filePath, language) ?? [];
-  if (reExports.length === 0) return exportedMember(exportIndex, want);
+  if (reExports.length === 0) return members === 'no' ? undefined : exportedMember(exportIndex, want);
 
   // Look for explicit `export { want } from './other'` (with optional rename) — for
   // `ns.member` through `import * as ns`, the member is the name wanted.
@@ -4402,7 +4470,8 @@ function findExportedSymbolWalk(
         language,
         context,
         visited,
-        depth + 1
+        depth + 1,
+        members
       );
       if (chained) return chained;
     }
@@ -4417,25 +4486,32 @@ function findExportedSymbolWalk(
       const next = resolveImportPath(rex.source, filePath, language, context);
       const rest = want.memberName.slice(dot + 1);
       return next
-        ? findExportedSymbol(next, { ...want, exportedName: rest.split('.')[0]!, memberName: rest }, language, context, visited, depth + 1)
+        ? findExportedSymbol(next, { ...want, exportedName: rest.split('.')[0]!, memberName: rest }, language, context, visited, depth + 1, members)
         : undefined;
     }
   }
 
   // 3. Wildcard re-export: `export * from './other'` — try every
-  //    forwarding source. This is the barrel-of-barrels case.
-  for (const rex of reExports) {
-    if (rex.kind === 'wildcard') {
+  //    forwarding source. This is the barrel-of-barrels case. A source's own
+  //    export of the name answers before any source's member of an object,
+  //    whichever `export *` line comes first (#3233): the members are the
+  //    second pass, over the same sources afresh.
+  const wildcards = reExports.filter((rex) => rex.kind === 'wildcard');
+  const passes: MemberAnswers[] = members === 'after' && wildcards.length > 0 ? ['no', 'yes'] : [members];
+  const before = passes.length > 1 ? new Set(visited) : visited;
+  for (const [i, pass] of passes.entries()) {
+    const seen = i > 0 ? new Set(before) : visited;
+    for (const rex of wildcards) {
       const next = resolveImportPath(rex.source, filePath, language, context);
       if (!next) continue;
       // Python's `from m import *` binds only `m.__all__`, else m's public names.
       if (PYTHON_MODULE_FILE.test(next) && !want.isDefault && !pythonStarAllows(next, want.exportedName, context)) continue;
-      const chained = findExportedSymbol(next, want, language, context, visited, depth + 1);
+      const chained = findExportedSymbol(next, want, language, context, seen, depth + 1, pass);
       if (chained) return chained;
     }
   }
 
-  return exportedMember(exportIndex, want);
+  return members === 'no' ? undefined : exportedMember(exportIndex, want);
 }
 
 /**

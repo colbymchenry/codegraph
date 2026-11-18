@@ -27453,7 +27453,13 @@ function isImportedModuleReceiver(receiver: string, ref: UnresolvedRef, context:
   const root = receiver.split('.')[0]!;
   const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === root);
   if (!binding) return false;
-  return binding.isNamespace || context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+  if (binding.isNamespace || context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true) return true;
+  // So is a name the module exports as a module namespace, `import { z }` of
+  // zod's `export { z }` of `import * as z` (#2951): the import resolver links
+  // what imports it to that module's file.
+  if (binding.isDefault || !JS_FAMILY.has(ref.language)) return false;
+  const bound = context.resolveImport?.({ ...ref, referenceName: root, referenceKind: 'imports' });
+  return !!bound && context.getNodeById?.(bound.targetNodeId)?.kind === 'file';
 }
 
 const JS_ASSIGNED_MEMBERS = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();

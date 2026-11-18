@@ -26,6 +26,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In JavaScript and TypeScript, a call to a name that a function around the caller declares for itself, like a helper an inner arrow function calls, now links to that local declaration instead of the file's import of the same name. Thanks @inth3shadows for the report. (#2949)
 - In JavaScript and TypeScript, a call to a helper declared inside a `describe(…)` block, or any other callback, now links to the helper that block declares instead of a same-named one from another block that happens to sit nearer. Thanks @inth3shadows for the report. (#2944)
 - In JavaScript and TypeScript, a call inside a spread, like `<input {...register('email')} />` with `register` taken from `useForm()`, no longer links to an unrelated project function that shares the name. Thanks @inth3shadows for the report. (#2962)
+- In JavaScript and TypeScript, a module namespace that another module hands on by name, like zod's `import { z } from 'zod'` of `import * as z from './external'; export { z }`, or `export * as ns from './schemas'`, now leads `z.string()` to what that module exports, as `import * as z` does, instead of a same-named method elsewhere. Thanks @inth3shadows for the report. (#2951)
+- In JavaScript and TypeScript, an import through a barrel of several `export *` lines now links to the module that exports the name itself, whichever line comes first, instead of a same-named method of an object another module exports. Thanks @inth3shadows for the report. (#3233)
 
 ## [1.6.3] - 2026-11-17
 
