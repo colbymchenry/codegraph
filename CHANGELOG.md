@@ -14,7 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
-- The Claude Code prompt hook now gets its context from the CodeGraph server your session already has running for the project, which answers several times sooner than the hook working it out again on every prompt, most of all on a large project. It waits up to 15 seconds, or `CODEGRAPH_PROMPT_HOOK_DAEMON_TIMEOUT_MS`, and adds nothing if the server is still busy then. With no server running, or with `CODEGRAPH_NO_DAEMON=1`, the hook works as before. (#3284)
+- The Claude Code prompt hook now gets its context from the CodeGraph server already running for your project instead of loading the index again on every prompt, so structural prompts are answered sooner, most of all in large projects; with no server running, one that is busy, or one that can't prove it runs as you, the hook works it out itself as before. Thanks @aidenpan0x for the report, the measurements and the pull request. (#3284)
 
 ### Fixes
 
