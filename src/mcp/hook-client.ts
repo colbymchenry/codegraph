@@ -16,13 +16,15 @@ import type * as net from 'net';
 import * as path from 'path';
 import { daemonOptOutSet, getDaemonSocketCandidates } from './daemon-paths';
 import { connectWithHello } from './proxy';
-import { PROMPT_EXPLORE_METHOD } from './session';
+import { PROMPT_EXPLORE_METHOD } from './prompt-explore';
 
 /**
  * - `answered`: the daemon's explore, ready to inject.
  * - `unavailable`: nothing asked the daemon to explore, or it could not: no
- *   daemon, another version, one that predates the request, an error. The
- *   caller's own explore is as good as it ever was.
+ *   daemon, another version, one that predates the request, an error, or one
+ *   that said it could not start the explore at once (busy catching up,
+ *   serving other calls, or on its way out). The caller's own explore is as
+ *   good as it ever was.
  * - `timed-out`: the daemon is exploring and has not answered by the deadline.
  *   A second explore in the caller would only add load to a machine already
  *   too slow to answer in time.
@@ -68,35 +70,60 @@ function boundByThisUser(socketPath: string): boolean {
   }
 }
 
+/**
+ * How long the daemon gets to say hello. A healthy one says it the moment it
+ * accepts; one that can't within a second is too busy to beat the hook's own
+ * explore, so the hook runs that instead of waiting on it.
+ */
+const HANDSHAKE_TIMEOUT_MS = 1_000;
+
+/** Most the hook reads from the daemon for one answer, so a broken peer can't fill its memory. */
+const MAX_ANSWER_CHARS = 8 * 1024 * 1024;
+
+const REQUEST_ID = 1;
+
 async function connectToDaemon(projectRoot: string): Promise<net.Socket | null> {
   for (const socketPath of getDaemonSocketCandidates(projectRoot)) {
     if (!boundByThisUser(socketPath)) continue;
-    const socket = await connectWithHello(socketPath);
+    const socket = await connectWithHello(socketPath, undefined, HANDSHAKE_TIMEOUT_MS);
     if (socket && typeof socket !== 'string') return socket;
   }
   return null;
 }
 
-/** Send the one request and read the one line that answers it. */
+/**
+ * Send the one request and read the line that answers it. Lines that answer
+ * anything else are skipped. A daemon that could not start the explore at
+ * once answers `{ busy: true }`, and that is `unavailable`: the hook explores
+ * itself rather than wait, or inject a busy notice.
+ */
 function ask(socket: net.Socket, query: string): Promise<DaemonExplore> {
   return new Promise((resolve) => {
     let buffer = '';
+    // For the socket's whole life: an 'error' with no listener would throw.
+    socket.on('error', () => resolve(UNAVAILABLE));
     socket.on('close', () => resolve(UNAVAILABLE));
     socket.on('data', (chunk: string | Buffer) => {
       buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-      const newline = buffer.indexOf('\n');
-      if (newline === -1) return;
-      try {
-        const reply = JSON.parse(buffer.slice(0, newline)) as {
-          result?: { isError?: boolean; content?: Array<{ text?: string }> };
-        };
-        const text = reply.result?.content?.[0]?.text ?? '';
-        resolve(reply.result && !reply.result.isError && text.trim() ? { status: 'answered', text } : UNAVAILABLE);
-      } catch {
-        resolve(UNAVAILABLE);
+      if (buffer.length > MAX_ANSWER_CHARS) return resolve(UNAVAILABLE);
+      let newline: number;
+      while ((newline = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        let reply: { id?: unknown; result?: { busy?: unknown; isError?: boolean; content?: Array<{ text?: unknown }> } };
+        try {
+          reply = JSON.parse(line);
+        } catch {
+          return resolve(UNAVAILABLE);
+        }
+        if (reply?.id !== REQUEST_ID) continue;
+        const result = reply.result;
+        if (!result || result.busy === true || result.isError) return resolve(UNAVAILABLE);
+        const text = result.content?.[0]?.text;
+        return resolve(typeof text === 'string' && text.trim() ? { status: 'answered', text } : UNAVAILABLE);
       }
     });
-    socket.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: PROMPT_EXPLORE_METHOD, params: { query } }) + '\n');
+    socket.write(JSON.stringify({ jsonrpc: '2.0', id: REQUEST_ID, method: PROMPT_EXPLORE_METHOD, params: { query } }) + '\n');
   });
 }
 
