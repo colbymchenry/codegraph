@@ -123,6 +123,55 @@ const DEFAULT_CLIENT_SWEEP_MS = 30_000;
 /** How often the daemon checks that the install it runs from is still in place (#2335). */
 const DEFAULT_INSTALL_CHECK_MS = 30_000;
 
+/** How often the daemon checks that the project it serves is still there (#3245). */
+const DEFAULT_ROOT_CHECK_MS = 5_000;
+
+/**
+ * How long the project must stay gone before the daemon exits (#3245). A
+ * folder on a network share or a removable drive can be out of reach for a
+ * moment, and a healthy daemon that exited then would cost the next session
+ * a cold start.
+ */
+const DEFAULT_ROOT_GONE_GRACE_MS = 30_000;
+
+/** A missing path, as opposed to one that could not be read right now. */
+function isMissing(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+/**
+ * Why the project a daemon serves is gone, or null while it is still there
+ * (#3245). A git worktree removed, or a project folder deleted, under a running
+ * daemon left it serving, watching and registered until its last client went
+ * and the idle timeout passed. Gone means:
+ * - the project folder, or its `.codegraph/` folder, no longer exists; or
+ * - its lock file (`daemon.pid`) is gone or names another process. On Windows
+ *   the daemon's own open database keeps `.codegraph/` from being deleted with
+ *   the rest of the folder (`rd /s /q`, `git worktree remove`), but the lock
+ *   file, which nothing holds open, goes; and a lock that names another
+ *   process means another daemon has taken the project over.
+ * Any other failure to read answers null: the next check looks again, as does
+ * a lock file caught mid-write. Exported for testing.
+ */
+export function projectGoneReason(projectRoot: string, pidPath: string, pid: number): string | null {
+  for (const dir of [projectRoot, path.dirname(pidPath)]) {
+    try {
+      if (!fs.statSync(dir).isDirectory()) return `${dir} is no longer a folder`;
+    } catch (err) {
+      return isMissing(err) ? `${dir} was removed` : null;
+    }
+  }
+  let raw: string;
+  try {
+    raw = fs.readFileSync(pidPath, 'utf8');
+  } catch (err) {
+    return isMissing(err) ? `its lock file ${pidPath} was removed` : null;
+  }
+  const holder = decodeLockInfo(raw)?.pid;
+  return holder === undefined || holder === pid ? null : `its lock file ${pidPath} now names pid ${holder}`;
+}
+
 /**
  * Why the install this daemon was started from no longer matches it, or null
  * while it still does. An upgrade replaces or deletes the package directory
@@ -218,6 +267,10 @@ export class Daemon {
   private maxIdleTimer: NodeJS.Timeout | null = null;
   private clientSweepTimer: NodeJS.Timeout | null = null;
   private installCheckTimer: NodeJS.Timeout | null = null;
+  private rootCheckTimer: NodeJS.Timeout | null = null;
+  /** When the project was first found gone, in the current run of checks (#3245). */
+  private projectGoneSince: number | null = null;
+  private rootGoneGraceMs: number;
   private engine: MCPEngine;
   private stopping = false;
   private socketPath: string;
@@ -227,13 +280,14 @@ export class Daemon {
 
   constructor(
     private projectRoot: string,
-    opts: { idleTimeoutMs?: number; maxIdleMs?: number; handoverFrom?: number | null } = {},
+    opts: { idleTimeoutMs?: number; maxIdleMs?: number; handoverFrom?: number | null; rootGoneGraceMs?: number } = {},
   ) {
     this.socketPath = getDaemonSocketPath(projectRoot);
     this.pidPath = getDaemonPidPath(projectRoot);
     this.idleTimeoutMs = opts.idleTimeoutMs ?? resolveIdleTimeoutMs();
     this.maxIdleMs = opts.maxIdleMs ?? resolveMaxIdleMs();
     this.handoverFrom = opts.handoverFrom ?? null;
+    this.rootGoneGraceMs = opts.rootGoneGraceMs ?? resolveRootGoneGraceMs();
     // Daemon mode serves many concurrent clients on one event loop, so off-load
     // read-tool dispatch to a worker pool — otherwise concurrent explores
     // serialize and starve the MCP transport (clients time out). Direct mode
@@ -409,6 +463,10 @@ export class Daemon {
       clearInterval(this.installCheckTimer);
       this.installCheckTimer = null;
     }
+    if (this.rootCheckTimer) {
+      clearInterval(this.rootCheckTimer);
+      this.rootCheckTimer = null;
+    }
     process.stderr.write(`[CodeGraph daemon] Shutting down (${reason}; clients=${this.clients.size}).\n`);
     for (const session of [...this.clients]) {
       try { session.stop(); } catch { /* best-effort */ }
@@ -422,7 +480,9 @@ export class Daemon {
     }
     await this.engine.stop();
     this.cleanupLockfile();
-    deregisterDaemon(this.projectRoot);
+    // Only this daemon's record: one that found another daemon serving its
+    // project leaves that one's record in place (#3245).
+    deregisterDaemon(this.projectRoot, process.pid);
     if (process.platform !== 'win32') {
       try { fs.unlinkSync(this.socketPath); } catch { /* may already be gone */ }
     }
@@ -535,6 +595,40 @@ export class Daemon {
       this.installCheckTimer = setInterval(() => { this.checkInstall(); }, installMs);
       this.installCheckTimer.unref?.();
     }
+    const rootMs = resolveRootCheckMs();
+    if (rootMs > 0) {
+      this.rootCheckTimer = setInterval(() => { this.checkProject(); }, rootMs);
+      this.rootCheckTimer.unref?.();
+    }
+  }
+
+  /**
+   * Exit once the project this daemon serves has stayed gone for the grace
+   * period (#3245; see {@link projectGoneReason}): the daemon stops watching,
+   * closes the index and removes its registry record, instead of lingering
+   * until its last client leaves and the idle timeout passes. A project back
+   * within the grace period, like a network share that dropped out for a
+   * moment, keeps it running. Returns whether the daemon is exiting. The
+   * check and the clock are injected for tests; the timer passes the real ones.
+   */
+  checkProject(
+    gone: () => string | null = () => projectGoneReason(this.projectRoot, this.pidPath, process.pid),
+    now: number = Date.now(),
+  ): boolean {
+    if (this.stopping) return false;
+    const reason = gone();
+    if (!reason) {
+      this.projectGoneSince = null;
+      return false;
+    }
+    if (this.projectGoneSince === null) {
+      this.projectGoneSince = now;
+      process.stderr.write(`[CodeGraph daemon] The project looks gone (${reason}); exiting if it is still gone in ${Math.round(this.rootGoneGraceMs / 1000)}s.\n`);
+    }
+    if (now - this.projectGoneSince < this.rootGoneGraceMs) return false;
+    process.stderr.write(`[CodeGraph daemon] The project is gone (${reason}); exiting.\n`);
+    void this.stop('project removed');
+    return true;
   }
 
   /**
@@ -933,6 +1027,24 @@ function resolveInstallCheckMs(): number {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_INSTALL_CHECK_MS;
   return Math.floor(parsed); // 0 disables the check
+}
+
+/** `CODEGRAPH_DAEMON_ROOT_CHECK_MS`: how often the project's presence is checked (#3245); 0 disables it. */
+function resolveRootCheckMs(): number {
+  const raw = process.env.CODEGRAPH_DAEMON_ROOT_CHECK_MS;
+  if (raw === undefined || raw === '') return DEFAULT_ROOT_CHECK_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_ROOT_CHECK_MS;
+  return Math.floor(parsed);
+}
+
+/** `CODEGRAPH_DAEMON_ROOT_GRACE_MS`: how long the project must stay gone before the daemon exits (#3245). */
+function resolveRootGoneGraceMs(): number {
+  const raw = process.env.CODEGRAPH_DAEMON_ROOT_GRACE_MS;
+  if (raw === undefined || raw === '') return DEFAULT_ROOT_GONE_GRACE_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_ROOT_GONE_GRACE_MS;
+  return Math.floor(parsed);
 }
 
 /**
