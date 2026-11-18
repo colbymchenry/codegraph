@@ -27,6 +27,20 @@ abstract contract AccessControl {
     }
 }
 `,
+    'contracts/Token.sol': `pragma solidity ^0.8.20;
+
+contract Token {
+    function send(address to) public {
+        send(to, 0);
+    }
+
+    function send(address to, uint256 amount) public {
+    }
+
+    function send(address to, bytes32 memo) public {
+    }
+}
+`,
   };
   for (const [rel, content] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
@@ -43,6 +57,12 @@ afterAll(() => {
 describe('Solidity overloads', () => {
   it('a call reaches the overload its argument count fits', () => {
     const ids = cg.getNodesInFile('contracts/access/AccessControl.sol').map((n) => n.id);
+    const targets = cg.getOutgoingEdgesFrom(ids).filter((e) => e.kind === 'calls' && e.line === 5).map((e) => cg.getNode(e.target)!.startLine);
+    expect(targets).toEqual([8]);
+  });
+
+  it('with several overloads the argument count fits, a self-call leaves itself for the first of them', () => {
+    const ids = cg.getNodesInFile('contracts/Token.sol').map((n) => n.id);
     const targets = cg.getOutgoingEdgesFrom(ids).filter((e) => e.kind === 'calls' && e.line === 5).map((e) => cg.getNode(e.target)!.startLine);
     expect(targets).toEqual([8]);
   });
