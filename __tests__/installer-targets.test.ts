@@ -31,8 +31,15 @@ import {
   CODEGRAPH_SECTION_START,
 } from '../src/installer/instructions-template';
 
+/**
+ * A fresh temp folder, by its real path. On macOS `os.tmpdir()` is under
+ * `/var`, a link to `/private/var`, and a process that chdirs there reads its
+ * cwd back as `/private/var/…`. The installer's local paths come from
+ * `process.cwd()`, so a test that built expected paths from the unresolved
+ * folder compared `/var/…` with `/private/var/…` and failed on macOS alone.
+ */
 function mkTmpDir(label: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`)));
 }
 
 describe('standalone installer Windows shell guidance (#1294)', () => {
