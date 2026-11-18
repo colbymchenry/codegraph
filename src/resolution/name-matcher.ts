@@ -15467,6 +15467,17 @@ function matchEnclosingScopeMember(
       : callableFirst(byOwner.get(owner) ?? []);
   const typesNamed = (qn: string): Node[] =>
     context.getNodesByQualifiedName(qn).filter((n) => MEMBER_OWNER_KINDS.has(n.kind) && sameLanguageFamily(n.language, ref.language));
+  // JS/TS also hang members on what is no type declaration (#2966): a
+  // constructor function given methods (`Ctor.prototype.m = function () {…}`,
+  // `Ctor.m = …`), and an object literal's owner (`const api = { load() {…} }`,
+  // `module.exports = {…}`). Such an owner is its members' `this`, read like a
+  // class's own scope, when the caller's file holds both it and the member.
+  const ownsMember = (scope: string): boolean =>
+    JS_FAMILY.has(ref.language) &&
+    members(scope).some((c) => c.filePath === ref.filePath && (c.kind === 'method' || c.kind === 'function')) &&
+    context.getNodesByQualifiedName(scope).some((n) => n.filePath === ref.filePath &&
+      (n.kind === 'variable' || n.kind === 'constant' ||
+        (n.kind === 'function' && members(scope).some((c) => c.kind === 'method' && c.filePath === ref.filePath))));
   // One member of `owner`: the caller's file first; another file only when a
   // single type in the index carries that qualified name.
   const pick = (owner: string, isType: boolean): Node | null => {
@@ -15565,12 +15576,21 @@ function matchEnclosingScopeMember(
 
   const segments = caller.qualifiedName.split('::');
   // A method's scopes start at its owner; a class caller (a field initializer)
-  // is its own scope.
-  const start = MEMBER_OWNER_KINDS.has(caller.kind) ? segments.length : segments.length - 1;
+  // is its own scope, and so is a constructor function's own `this.m()`.
+  const start = MEMBER_OWNER_KINDS.has(caller.kind) ||
+    (receiver === 'self' && caller.kind === 'function' && ownsMember(caller.qualifiedName))
+    ? segments.length
+    : segments.length - 1;
   for (let i = start; i > 0; i--) {
     const scope = segments.slice(0, i).join('::');
     const isType = typesNamed(scope).length > 0;
     if (!isType) {
+      // `this.m()` in a member of a JS/TS owner that is no type declaration:
+      // the owner's own `m`, as a class's would be.
+      if (receiver === 'self' && i === start && ownsMember(scope)) {
+        const own = pick(scope, false);
+        if (own) return own;
+      }
       // `this.`/`super.` name a class member; only a bare call sees locals.
       if (receiver !== 'bare') continue;
       const localFn = members(scope).find((c) => c.filePath === ref.filePath && (c.kind === 'method' || c.kind === 'function'));
@@ -23884,6 +23904,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CSHARP_EXTENSION_METHODS.delete(context);
   CSHARP_PARAMETERS.delete(context);
   JS_ASSIGNED_MEMBERS.delete(context);
+  JS_CONSTRUCTOR_METHODS.delete(context);
   CFML_CHAINS.delete(context);
   NO_RECEIVER_LINES.delete(context);
   OBJC_SUPERS.delete(context);
@@ -28083,6 +28104,15 @@ function matchMethodCallOn(
       narrowed ||= kept.length !== targetMethods.length;
       targetMethods = kept;
     }
+    // A test file's own constructor (`function Server () {}`, `Server.prototype
+    // .close = …`, #2966) is that file's helper, never another file's
+    // `server.close()`.
+    if (JS_FAMILY.has(ref.language)) {
+      const kept = targetMethods.filter((m) =>
+        m.filePath === ref.filePath || !isTestPath(m.filePath) || !isConstructorFunctionMethod(m, context));
+      narrowed ||= kept.length !== targetMethods.length;
+      targetMethods = kept;
+    }
 
     // A python attribute chain nothing typed (matchPythonAttrCall) is guessed
     // only by the name of its last link, in the scoring below — Django's
@@ -28098,6 +28128,14 @@ function matchMethodCallOn(
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
     if (targetMethods.length === 1 && !narrowed && !rubySuiteNarrowed && !scopedOut && !pythonChain && targetMethods[0]!.language === ref.language &&
         !(JS_FAMILY.has(ref.language) && targetMethods[0]!.filePath !== ref.filePath && jsFileAssignsMember(ref.filePath, methodName!, context)) &&
+        // A JS constructor function's method (`Ctor.prototype.m = function`,
+        // `Ctor.m = …`, #2966) is the one of that name only for a receiver
+        // that names its constructor, as in the untyped languages below: an
+        // example's `User.all` is no `app.all()`, a test's own
+        // `Instance.prototype.test` no `t.test()`.
+        !(JS_FAMILY.has(ref.language) && targetMethods[0]!.filePath !== ref.filePath &&
+          !/^(?:this|self|super)$/.test(objectOrClass!) && !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
+          isConstructorFunctionMethod(targetMethods[0]!, context)) &&
         // A test double is only what a test names — as in the scoring below:
         // allauth's `resp.json()` on a Django test response is not the one
         // `json` of its `MockedResponse`.
@@ -34823,6 +34861,27 @@ function namesOwnerType(receiver: string, method: Node): boolean {
   const cut = method.qualifiedName.lastIndexOf('::');
   if (cut < 0) return false;
   return flatWord(receiver.split('.').pop()!) === flatWord(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!);
+}
+
+/** Per context: a method's id → whether a JS constructor function owns it. */
+const JS_CONSTRUCTOR_METHODS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * A method a JS constructor function owns (`Ctor.prototype.m = function () {…}`,
+ * `Ctor.m = …`, #2966): its owner is a function declared in its file.
+ */
+function isConstructorFunctionMethod(method: Node, context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (method.kind !== 'method' || cut <= 0) return false;
+  let memo = JS_CONSTRUCTOR_METHODS.get(context);
+  if (!memo) JS_CONSTRUCTOR_METHODS.set(context, (memo = new Map()));
+  let owned = memo.get(method.id);
+  if (owned === undefined) {
+    owned = context.getNodesByQualifiedName(method.qualifiedName.slice(0, cut))
+      .some((n) => n.kind === 'function' && n.filePath === method.filePath);
+    memo.set(method.id, owned);
+  }
+  return owned;
 }
 
 /** A name's letters and digits, lowercased, a trailing number dropped: `executor1` → `executor`. */

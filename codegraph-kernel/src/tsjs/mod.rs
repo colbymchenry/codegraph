@@ -217,6 +217,14 @@ pub struct Walker<'t> {
     object_path_owners: HashMap<u32, String>,
     /// ownsObjectLiterals: false for a generated or minified bundle (#2300).
     owns_objects: bool,
+    /// The functions and classes each scope declares, by (scope row, name):
+    /// what a `Ctor.prototype.m = function () {…}` or `Ctor.m = function () {…}`
+    /// written in that scope hangs its method on (#2966). Mirrors
+    /// TreeSitterExtractor.scopeDeclarations.
+    scope_declarations: HashMap<(u32, String), (u32, &'static str)>,
+    /// The function of a `module.exports = {…}` member being extracted: the
+    /// module exports it (#2966). Mirrors TreeSitterExtractor.exportedMemberFn.
+    exported_member_fn: Option<usize>,
 }
 
 const MAX_VALUE_REF_NODES: usize = 20_000;
@@ -268,6 +276,8 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         vue_store_file: None,
         object_path_owners: HashMap::new(),
         owns_objects: !util::is_generated_file(file_path) && !util::is_minified_content(file_path, source),
+        scope_declarations: HashMap::new(),
+        exported_member_fn: None,
     };
 
     // File node (TreeSitterExtractor.extract): id `file:<path>`, endLine =
@@ -471,6 +481,9 @@ impl<'t> Walker<'t> {
             source_id_str: NONE_STR,
             target_id_str: NONE_STR,
         });
+        if kind == "function" || kind == "class" {
+            self.scope_declarations.insert((parent_row, name.to_string()), (row, kind));
+        }
 
         self.node_ids.push(id);
         if kind == "function" || kind == "method" {
@@ -843,6 +856,17 @@ impl<'t> Walker<'t> {
             // its declarator, like at module scope. Mirrors
             // TreeSitterExtractor's declaratorBoundFunction.
             if self.declarator_bound_function(node) {
+                self.extract_function(node, None);
+                return;
+            }
+            // `Ctor.prototype.m = function () {…}` in a body — a module
+            // wrapper, a factory — is a method of the constructor declared
+            // beside it (#2966). Mirrors TreeSitterExtractor's visitFunctionBody.
+            let constructor_member = node
+                .parent()
+                .filter(|p| p.kind() == "assignment_expression")
+                .is_some_and(|assignment| self.constructor_member(assignment, node).is_some());
+            if constructor_member {
                 self.extract_function(node, None);
                 return;
             }
