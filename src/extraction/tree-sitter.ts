@@ -6675,6 +6675,13 @@ export class TreeSitterExtractor {
       }
     }
 
+    // C# null-conditional and null-forgiving receivers — `_maybe?.Send()`,
+    // `_maybe!.Send()`, `a?.B()?.Send()` — call the member a plain `.` does.
+    // The raw text kept the `?`/`!`, which no receiver rule reads, so every
+    // such call went unlinked (#2906). Spell the chain with plain dots.
+    // Mirrored in the kernel's extract_call (csharp.rs).
+    if (calleeName && this.language === 'csharp') calleeName = calleeName.replace(/[?!]\./g, '.');
+
     // Parenthesized type conversions — Go `(*T)(x)` / `(T)(x)` (and a
     // parenthesized callee generally) parse as a call whose "function" is a
     // parenthesized type/expression, so the callee text is the un-resolvable

@@ -211,6 +211,23 @@ describe.skipIf(!kernelBuilt)('kernel C# extraction parity', () => {
       ].join('\n'),
       minNodes: 17,
     },
+    {
+      // `?.` and `!.` receivers are spelled with plain dots (#2906); `?[` is
+      // left as written.
+      name: 'null-conditional and null-forgiving receivers are spelled with plain dots',
+      source: [
+        'public class C {',
+        '  void M(Mailer? m) {',
+        '    m?.Send("a"); _maybe!.Send("b"); this._maybe?.Next?.Send("c");',
+        '    m?.Make()?.Send("d"); m!?.Send("e"); xs?[0].Send("f");',
+        '    m',
+        '      ?.Send("g");',
+        '  }',
+        '}',
+        '',
+      ].join('\n'),
+      minNodes: 3,
+    },
   ];
 
   for (const m of MICROS) {

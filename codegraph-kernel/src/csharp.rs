@@ -69,6 +69,11 @@ fn generic_args_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"<[^>]*>").unwrap())
 }
+/// extractCall's C# null-conditional / null-forgiving receiver (`/[?!]\./g`).
+fn null_receiver_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[?!]\.").unwrap())
+}
 /// `/^[A-Za-z_]\w*$/` with JS's ASCII `\w` (Rust's default `\w` is Unicode).
 fn ascii_ident_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -1169,6 +1174,13 @@ impl<'t> Walker<'t> {
             // `nameof(...)` → a calls ref named `nameof`, `?.` chains raw,
             // `(myDel)(x)` → parenthesized text (normalized below).
             callee_name = self.text(func).to_string();
+        }
+
+        // Null-conditional / null-forgiving receivers spelled with plain dots
+        // (#2906): `_maybe?.Send` / `_maybe!.Send` → `_maybe.Send`. Mirrors
+        // extractCall's `/[?!]\./g` (tree-sitter.ts): leftmost, non-overlapping.
+        if callee_name.contains("?.") || callee_name.contains("!.") {
+            callee_name = null_receiver_re().replace_all(&callee_name, ".").into_owned();
         }
 
         // Shared parenthesized-conversion normalization — the one shared
