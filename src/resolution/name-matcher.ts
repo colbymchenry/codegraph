@@ -4063,6 +4063,54 @@ function isJavaTypeVisible(candidate: Node, ref: UnresolvedRef, context: Resolut
   return here.single.has(fqn) || here.demand.has(ownerFqn);
 }
 
+/**
+ * The project's Java class a simple type name means in `filePath`, the way
+ * javac looks it up: a top-level type the file declares, a single-type import,
+ * the file's own package, then the packages its on-demand (`.*`) imports name
+ * (#2976, #3291). Null when two on-demand packages each supply one: javac
+ * rejects such a name as ambiguous. Undefined when this decides nothing — no
+ * project class of the name is in reach that way, a nested type has the name
+ * (isJavaTypeVisible's to judge), or one step holds two classes of one
+ * fully qualified name (copies in two modules).
+ */
+function javaClassInScope(name: string, filePath: string, context: ResolutionContext): Node | null | undefined {
+  const all = context.getNodesByName(name).filter((n) => n.language === 'java' && JAVA_TYPE_KINDS_VISIBLE.has(n.kind));
+  if (all.length === 0) return undefined;
+  const pkgOf = (n: Node): string => javaFileScope(n.filePath, context).pkg;
+  if (all.some((n) => n.qualifiedName !== (pkgOf(n) ? `${pkgOf(n)}::${name}` : name))) return undefined;
+  const one = (found: Node[]): Node | undefined => (found.length === 1 ? found[0] : undefined);
+  const own = all.filter((n) => n.filePath === filePath);
+  if (own.length > 0) return one(own);
+  const here = javaFileScope(filePath, context);
+  const imported = all.filter((n) => here.single.has(pkgOf(n) ? `${pkgOf(n)}.${name}` : name));
+  if (imported.length > 0) return one(imported);
+  const local = all.filter((n) => pkgOf(n) === here.pkg);
+  if (local.length > 0) return one(local);
+  const onDemand = all.filter((n) => here.demand.has(pkgOf(n)));
+  if (onDemand.length === 0) return undefined;
+  return new Set(onDemand.map(pkgOf)).size > 1 ? null : one(onDemand);
+}
+
+/** A Java type's fully qualified name, `com.x.b.Util` for `com.x.b::Util`. */
+function javaTypeFqn(n: Node): string {
+  return n.qualifiedName.replace(/::/g, '.');
+}
+
+/**
+ * The project's Java type a receiver written with its package names,
+ * `com.x.b.Util` or `com.x.c.Outer.Inner` (#3290): the package is the
+ * lowercase segments before the first capitalized one. Undefined when the
+ * text isn't written that way, or the project declares no such type.
+ */
+function javaQualifiedReceiverType(written: string, context: ResolutionContext): Node | undefined {
+  const segs = written.split('.');
+  const first = segs.findIndex((s) => /^[A-Z]/.test(s));
+  if (first < 1 || !segs.slice(0, first).every((s) => /^[a-z_][\w]*$/.test(s)) || !segs.slice(first).every((s) => /^[A-Z][\w$]*$/.test(s))) return undefined;
+  const qn = `${segs.slice(0, first).join('.')}::${segs.slice(first).join('::')}`;
+  const types = context.getNodesByQualifiedName(qn).filter((n) => n.language === 'java' && JAVA_TYPE_KINDS_VISIBLE.has(n.kind));
+  return types.length === 1 ? types[0] : undefined;
+}
+
 /** Whether a type of `ref`'s name is nested in the type `qualifier` ends in. */
 function javaNestedInQualifier(ref: UnresolvedRef, qualifier: string, context: ResolutionContext): boolean {
   const owner = qualifier.slice(qualifier.lastIndexOf('.') + 1);
@@ -21911,7 +21959,13 @@ function importedFqnOf(
   context: ResolutionContext,
 ): string | undefined {
   const imports = context.getImportMappings(ref.filePath, ref.language);
-  return imports.find((i) => i.localName === typeName)?.source;
+  const imported = imports.find((i) => i.localName === typeName)?.source;
+  if (imported !== undefined || ref.language !== 'java' || !/^[A-Z][\w$]*$/.test(typeName)) return imported;
+  // A Java class the file names without importing it by name: its own
+  // package's, or the one its on-demand imports supply (#3291), which the
+  // import mappings don't list.
+  const scoped = javaClassInScope(typeName, ref.filePath, context);
+  return scoped ? javaTypeFqn(scoped) : undefined;
 }
 
 /** How many lines past its first a Kotlin call is read for its arguments. */
@@ -22448,6 +22502,12 @@ function javaTypeRef(written: string, filePath: string, context: ResolutionConte
   const pins = pkg
     ? [`${pkg}.${outer}`]
     : context.getImportMappings(filePath, 'java').filter((i) => i.localName === outer).map((i) => i.source);
+  // A class the file's own package or an on-demand import supplies, which the
+  // import mappings don't list (#3291).
+  if (pins.length === 0 && /^[A-Z][\w$]*$/.test(outer)) {
+    const scoped = javaClassInScope(outer, filePath, context);
+    if (scoped) pins.push(javaTypeFqn(scoped));
+  }
   if (pins.length === 0) {
     if (!decls.some((d) => isJavaTypeNameable(d, filePath, context))) return null;
     if (chain.length === 1) return { name: outer };
@@ -26918,7 +26978,9 @@ function matchMethodCallOn(
       // TS/JS: the file declaring the class the file imports under that name.
       // Other languages disambiguate by call-site file.
       let importedFqn =
-        ref.language === 'java' || ref.language === 'kotlin'
+        ref.language === 'java'
+          ? importedFqnOf(inferredType, ref, context)
+          : ref.language === 'kotlin'
           ? context
               .getImportMappings(ref.filePath, ref.language)
               .find((i) => i.localName === inferredType)?.source
@@ -27260,6 +27322,16 @@ function matchMethodCallOn(
   // with a `Logger` in both `a/` and `b/`), try the class in the call site's
   // own file first — otherwise the first-indexed class wins and a call in `b/`
   // resolves to `a/`'s method (#1079).
+  // A Java class named at the call is the one the calling file can see
+  // (#2976), or, written with its package, the one that names (#3290). A name
+  // two on-demand imports both supply is ambiguous, which javac rejects: no
+  // class's method is meant.
+  const javaClass = ref.language === 'java' && dotMatch
+    ? objectOrClass!.includes('.')
+      ? javaQualifiedReceiverType(objectOrClass!, context)
+      : /^[A-Z][\w$]*$/.test(objectOrClass!) ? javaClassInScope(objectOrClass!, ref.filePath, context) : undefined
+    : undefined;
+  if (javaClass === null) return null;
   const strat1 = nmTimedT('mc-class', ref, (): ResolvedRef | null => {
     // A Ruby constant is the class Ruby's lookup finds where the call is
     // written, as the calling file's run declares it, never a namesake:
@@ -27292,6 +27364,8 @@ function matchMethodCallOn(
       const named = classCandidates.filter((c) => phpFileNamesClass(c, ref.filePath, context));
       classCandidates = [...named, ...classCandidates.filter((c) => !named.includes(c))];
     }
+    // The Java class the file sees under that name, or the one its package names.
+    if (javaClass) classCandidates = [javaClass];
 
     const productionCaller = !isTestPath(ref.filePath);
     for (const classNode of classCandidates) {
@@ -33697,10 +33771,13 @@ function matchJavaCsharpNewReceiverCall(cls: string, written: string, method: st
     const visible = twins.filter((n) => isCsharpTypeVisible(n, ref, context));
     if (visible.length === 1) chosen = visible[0];
   } else {
+    // The written package's class, the imported one, or the one the file's
+    // own package or on-demand imports supply (importedFqnOf, #2976).
     const fqn = written.includes('.') ? written : importedFqnOf(cls, ref, context);
     const byPath = (n: Node) => n.filePath.replace(/\.java$/, '').endsWith('/' + fqn!.replace(/\./g, '/'));
     const ownPackage = twins.filter((n) => dirOf(n.filePath) === dirOf(ref.filePath));
-    chosen = fqn ? twins.find(byPath) : ownPackage.length === 1 ? ownPackage[0] : undefined;
+    chosen = fqn ? twins.find((n) => n.language === 'java' && javaTypeFqn(n) === fqn) ?? twins.find(byPath)
+      : ownPackage.length === 1 ? ownPackage[0] : undefined;
   }
   if (!chosen) return null;
   const own = context.getNodesInFile(chosen.filePath).find((n) =>

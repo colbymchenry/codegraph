@@ -42,6 +42,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph sync` and the file watcher now follow an edit that adds, removes or repoints a member of an exported object, like `export const api = { getUser, saveUser }`, so a call such as `api.saveUser()` in a file the edit didn't touch links to the new member, or back to the object, as a fresh index does. Thanks @inth3shadows for the report. (#3015)
 - In PHP, a method called on a freshly built object, like `(new SettingClient())->getSet(1)`, now links to the class the file's namespace and `use` imports name, or to a method it inherits, so these calls show up in `callers` and impact. Thanks @holysor for the report. (#3244)
 - In Laravel, a route written like `[UserController::class, 'show']` now links to the controller the routes file imports, through a plain or aliased `use`, a group `use`, an imported namespace or a fully qualified name, instead of a same-named controller elsewhere or nothing. Thanks @inth3shadows for the reports and @johnhldiver-beep. (#2975, #3292)
+- In Java, when two packages declare a class of the same name, a static call, a call on a new object or a call through a variable now reaches the one the calling file can see, including through a wildcard import, and a call written with the package, like `com.x.b.Util.log(…)`, reaches that package's class. Thanks @inth3shadows for the reports and @johnhldiver-beep. (#2976, #3290, #3291)
 
 ## [1.6.3] - 2026-11-17
 
