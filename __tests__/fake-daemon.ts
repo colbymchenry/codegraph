@@ -34,6 +34,8 @@ export interface RecordedRequest {
 }
 
 export interface FakeDaemonOptions {
+  /** Listen here instead of on the project's own daemon path. */
+  socketPath?: string;
   version?: string;
   proof?: FakeProof;
   /** `{ result }` or `{ error }` for a request, or undefined to send nothing. */
@@ -52,7 +54,7 @@ export interface FakeDaemon {
 }
 
 export async function startFakeDaemon(root: string, opts: FakeDaemonOptions): Promise<FakeDaemon> {
-  const socketPath = getDaemonSocketCandidates(root)[0]!;
+  const socketPath = opts.socketPath ?? getDaemonSocketCandidates(root)[0]!;
   if (process.platform !== 'win32') fs.mkdirSync(path.dirname(socketPath), { recursive: true });
   const requests: RecordedRequest[] = [];
   const challenges: string[] = [];

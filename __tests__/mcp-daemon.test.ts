@@ -826,6 +826,67 @@ describe('Shared MCP daemon (issue #411)', () => {
     }
   }, 30000);
 
+  // Something of this very version answers where the daemon listens but can't
+  // prove it runs as this user: a stand-in another user put there first (on
+  // Windows, a pipe name anyone can take), or one that answers no challenge.
+  // The proxy sends it none of the session and serves in-process (#3284).
+  it.each(['wrong', 'none'] as const)('proxy serves in-process when the daemon cannot prove it runs as this user (proof: %s)', async (proof) => {
+    const sockPath = getDaemonSocketPath(realRoot);
+    fs.writeFileSync(
+      path.join(realRoot, '.codegraph', 'daemon.pid'),
+      JSON.stringify({ pid: process.pid, version: CodeGraphPackageVersion, socketPath: sockPath, startedAt: Date.now() }),
+    );
+    const received: string[] = [];
+    const sockets = new Set<net.Socket>();
+    const standIn = net.createServer((sock) => {
+      sockets.add(sock);
+      sock.on('error', () => { /* the proxy hung up */ });
+      sock.write(JSON.stringify({ codegraph: CodeGraphPackageVersion, pid: process.pid, socketPath: sockPath, protocol: 1 }) + '\n');
+      let buffer = '';
+      sock.on('data', (chunk) => {
+        buffer += chunk.toString('utf8');
+        let newline: number;
+        while ((newline = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          const message = JSON.parse(line);
+          if (message.codegraph_client) {
+            if (proof === 'wrong') sock.write(JSON.stringify({ codegraph_proof: 'ab'.repeat(32) }) + '\n');
+            continue;
+          }
+          received.push(line);
+        }
+      });
+    });
+    await new Promise<void>((resolve) => standIn.listen(sockPath, () => resolve()));
+
+    try {
+      const server = spawnServer(tempDir);
+      servers.push(server);
+      sendInitialize(server.child, `file://${tempDir}`, 1);
+      const resp = await waitFor(() => findResponse(server.stdout, 1), 10000);
+      expect(resp.result.serverInfo.name).toBe('codegraph');
+      await waitFor(() => server.stderr.some((l) => l.includes('could not prove it runs as this user')), 10000);
+
+      sendMessage(server.child, {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'codegraph_status', arguments: {} },
+      });
+      const toolResponse = await waitFor(() => findResponse(server.stdout, 2), 5000);
+      expect(toolResponse.error).toBeUndefined();
+      expect(JSON.stringify(toolResponse.result)).toContain('CodeGraph Status');
+      // None of the session reached the stand-in: not the initialize, not the call.
+      expect(received).toEqual([]);
+      server.child.stdin.end();
+      await waitFor(() => server.child.exitCode !== null, 5000);
+    } finally {
+      for (const sock of sockets) sock.destroy();
+      await new Promise<void>((resolve) => standIn.close(() => resolve()));
+    }
+  }, 30000);
+
   // The over-the-wire client-hello → record → sweep path, and the inactivity
   // backstop's liveness gate, are covered by the deterministic unit tests in
   // daemon-client-liveness (`reapDeadClients`, `backstopShouldExit`) — a

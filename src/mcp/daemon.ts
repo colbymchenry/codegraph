@@ -236,9 +236,10 @@ export interface DaemonClientHello {
   hostPid: number | null;  // the MCP host pid (past any launcher shim), if known
   /**
    * A fresh random string from a client that wants this user's daemon to prove
-   * it is one before the client sends anything (the prompt hook, #3284). The
-   * daemon answers with one `{"codegraph_proof": …}` line before the session
-   * starts; a client-hello without it gets no such line. See `./daemon-proof`.
+   * it is one before the client sends anything: the prompt hook and the MCP
+   * proxy (#3284). The daemon answers with one `{"codegraph_proof": …}` line
+   * before the session starts; a client-hello without it gets no such line.
+   * See `./daemon-proof`.
    */
   challenge?: string;
 }
