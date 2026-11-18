@@ -4737,6 +4737,50 @@ function pythonValueNames(bound: { value: string; filePath: string; line: number
   return pythonReceiverBinding(target.name, { ...ref, filePath: bound.filePath, line: bound.line, column: 0 }, context) !== 'local';
 }
 
+/**
+ * Whether `target` is a lexical binding, which a JS/TS call written on `this`
+ * never names. `this.cast(x)` (or `super.cast(x)`, or fields deep,
+ * `this.a.b.cast(x)`) is recorded by the bare name `cast` and reads a
+ * property of the object: no `const`/`let`/`var` (a `require` binding among
+ * them) and no `function` declaration, in this file or another, is that
+ * property. Since #3345 such a call skips the file's imports, so name matching
+ * reached the file's own `const cast = require('./cast')`. A function
+ * assigned to a property (`app.set = function set (…)`), an object literal's
+ * member and a class's member are properties, and stay answers, as does a
+ * declared function the calling file hands to a property of its name:
+ * fastify's `fastify.ready = ready`, then `this.ready()` in the instance's
+ * methods.
+ */
+export function isLexicalBindingOfJsThisCall(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!JS_FAMILY.has(ref.language) || ref.referenceKind !== 'calls') return false;
+  if (target.kind === 'function') {
+    if (!isJsDeclaredFunction(target, context)) return false;
+    const name = target.name.replace(/\$/g, '\\$');
+    if (new RegExp(String.raw`\.\s*${name}\s*=\s*${name}(?![\w$])`).test(context.readFile(ref.filePath) ?? '')) return false;
+  } else if (target.kind !== 'constant' && target.kind !== 'variable') {
+    return false;
+  }
+  const written = bareCallReceiver(ref, context);
+  return written !== null && (written.receiver === 'self' || written.links.length > 0);
+}
+
+/**
+ * Whether a JS/TS function node binds its name lexically, as read where it
+ * starts: a `function` declaration (`export default async function m (…)`,
+ * `declare function m (…)`) or a `const`/`let`/`var` declarator's value
+ * (`const m = (…) =>`, `let m: Fn = function (…)`), not a function assigned
+ * to a property or written as an object's or a class's member.
+ */
+function isJsDeclaredFunction(n: Node, context: ResolutionContext): boolean {
+  const line = (context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/))?.[n.startLine - 1];
+  if (line === undefined) return false;
+  // What a minified line holds before the function is read only as far back as a declarator reaches.
+  const head = line.slice(Math.max(0, n.startColumn - 200), n.startColumn);
+  if (n.startColumn <= 200 && /^\s*(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:async\s+)?$/.test(head) &&
+      /^(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:async\s+)?function\b/.test(line.slice(n.startColumn, n.startColumn + 64))) return true;
+  return /(?:^|[^\w$.])(?:const|let|var)\s+[\w$]+\s*(?::[^=]*)?=\s*(?:async\s*)?$/.test(head);
+}
+
 /** Whether a call recorded by its bare name is written on something other than the caller's own object. */
 function isCollapsedNonRecursion(ref: UnresolvedRef, context: ResolutionContext): boolean {
   const written = bareCallReceiver(ref, context);
@@ -8310,11 +8354,21 @@ function isCsharpMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionC
   if (cut < 0 || !hasNoReceiverOnLine(ref, context)) return true;
   const owner = n.qualifiedName.slice(0, cut).split(/::|\./).pop()!;
   if (csharpStaticUsings(ref.filePath, context).has(owner)) return true;
+  return csharpTypesAround(ref, context, owner) !== false;
+}
+
+/**
+ * Whether the C# type named `owner` is one written around `ref` (an enclosing
+ * type, outer ones included) or a base of theirs: the types whose members a
+ * bare name, or one after `this.` / `base.`, reaches. Undefined when no type
+ * declaration around the reference was recovered, so there is nothing to
+ * judge by.
+ */
+function csharpTypesAround(ref: UnresolvedRef, context: ResolutionContext, owner: string): boolean | undefined {
   const around = context
     .getNodesInFile(ref.filePath)
     .filter((t) => CSHARP_TYPE_KINDS.has(t.kind) && t.startLine <= ref.line && t.endLine >= ref.line);
-  // No type around the name: the declaration wasn't recovered — nothing to judge by.
-  if (around.length === 0) return true;
+  if (around.length === 0) return undefined;
   const seen = new Set<string>();
   const queue = around.map((t) => t.name);
   while (queue.length > 0 && seen.size < 40) {
@@ -8325,6 +8379,34 @@ function isCsharpMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionC
     queue.push(...csharpSupertypesOf(name, context));
   }
   return false;
+}
+
+/**
+ * A C# call written on what a bare call returns — `GetMailer().Send("c")`,
+ * `this.GetMailer().Send("c")` — encoded `GetMailer().Send` (#2906). C# reads
+ * the bare call as one of a method of the types around it or their bases, or
+ * of a `using static` type (not after `this.` / `base.`). The receiver is the
+ * type that method's declaration returns, and the call is to that type's
+ * method or to nothing (resolveMethodOnType checks it is there). Null when no
+ * such method is found, or the ones found don't declare one return type.
+ */
+function matchCsharpCallResultCall(inner: string, method: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const self = /^(?:this|base)\s*\.\s*/.exec(inner);
+  // A generic method's type arguments are no part of its name (`Get<Mailer>`).
+  const name = (self ? inner.slice(self[0].length) : inner).replace(/<[\s\S]*>$/, '');
+  if (!/^[A-Za-z_]\w*$/.test(name)) return null;
+  const statics = self ? new Set<string>() : csharpStaticUsings(ref.filePath, context);
+  const returnTypes = new Set<string>();
+  for (const n of context.getNodesByName(name)) {
+    if (n.language !== 'csharp' || n.kind !== 'method' || !n.returnType) continue;
+    const cut = n.qualifiedName.lastIndexOf('::');
+    if (cut < 0) continue;
+    const owner = n.qualifiedName.slice(0, cut).split(/::|\./).pop()!;
+    if (statics.has(owner) || csharpTypesAround(ref, context, owner) === true) returnTypes.add(n.returnType);
+  }
+  if (returnTypes.size !== 1) return null;
+  const ret = [...returnTypes][0]!;
+  return resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqnOf(ret, ref, context));
 }
 
 /** The simple names a C# type's declarations (every `partial` one) derive from. */
@@ -15467,6 +15549,17 @@ function matchEnclosingScopeMember(
       : callableFirst(byOwner.get(owner) ?? []);
   const typesNamed = (qn: string): Node[] =>
     context.getNodesByQualifiedName(qn).filter((n) => MEMBER_OWNER_KINDS.has(n.kind) && sameLanguageFamily(n.language, ref.language));
+  // JS/TS also hang members on what is no type declaration (#2966): a
+  // constructor function given methods (`Ctor.prototype.m = function () {…}`,
+  // `Ctor.m = …`), and an object literal's owner (`const api = { load() {…} }`,
+  // `module.exports = {…}`). Such an owner is its members' `this`, read like a
+  // class's own scope, when the caller's file holds both it and the member.
+  const ownsMember = (scope: string): boolean =>
+    JS_FAMILY.has(ref.language) &&
+    members(scope).some((c) => c.filePath === ref.filePath && (c.kind === 'method' || c.kind === 'function')) &&
+    context.getNodesByQualifiedName(scope).some((n) => n.filePath === ref.filePath &&
+      (n.kind === 'variable' || n.kind === 'constant' ||
+        (n.kind === 'function' && members(scope).some((c) => c.kind === 'method' && c.filePath === ref.filePath))));
   // One member of `owner`: the caller's file first; another file only when a
   // single type in the index carries that qualified name.
   const pick = (owner: string, isType: boolean): Node | null => {
@@ -15565,12 +15658,21 @@ function matchEnclosingScopeMember(
 
   const segments = caller.qualifiedName.split('::');
   // A method's scopes start at its owner; a class caller (a field initializer)
-  // is its own scope.
-  const start = MEMBER_OWNER_KINDS.has(caller.kind) ? segments.length : segments.length - 1;
+  // is its own scope, and so is a constructor function's own `this.m()`.
+  const start = MEMBER_OWNER_KINDS.has(caller.kind) ||
+    (receiver === 'self' && caller.kind === 'function' && ownsMember(caller.qualifiedName))
+    ? segments.length
+    : segments.length - 1;
   for (let i = start; i > 0; i--) {
     const scope = segments.slice(0, i).join('::');
     const isType = typesNamed(scope).length > 0;
     if (!isType) {
+      // `this.m()` in a member of a JS/TS owner that is no type declaration:
+      // the owner's own `m`, as a class's would be.
+      if (receiver === 'self' && i === start && ownsMember(scope)) {
+        const own = pick(scope, false);
+        if (own) return own;
+      }
       // `this.`/`super.` name a class member; only a bare call sees locals.
       if (receiver !== 'bare') continue;
       const localFn = members(scope).find((c) => c.filePath === ref.filePath && (c.kind === 'method' || c.kind === 'function'));
@@ -22232,6 +22334,9 @@ export function matchDottedCallChain(
       const bareMatch = matchByExactName(bareRef, context) ?? matchFuzzy(bareRef, context);
       return bareMatch ? { ...bareMatch, original: ref } : null;
     }
+    // C#: a bare call — `GetMailer().Send()` — is to a method of the types
+    // around it; the receiver is what that method returns (#2906).
+    if (ref.language === 'csharp') return matchCsharpCallResultCall(inner, method, ref, context);
     // Constructor receiver `Foo(args).method()` (encoded `Foo().method`): a bare,
     // capitalized inner is a class construction, so the receiver's type is the
     // class itself — resolve the method on it. Only in languages where an
@@ -22241,6 +22346,11 @@ export function matchDottedCallChain(
     // whose type we can't recover — bail.
     if (!CONSTRUCTS_VIA_BARE_CALL.has(ref.language) || !/^[A-Z]/.test(inner)) return null;
     return resolveMethodOnType(inner, method, ref, context, 0.85, 'instance-method', importedFqnOf(inner, ref, context));
+  }
+
+  // C#: `this.GetMailer().Send()` / `base.GetMailer().Send()` likewise.
+  if (ref.language === 'csharp' && /^(?:this|base)\s*\.\s*[A-Za-z_]\w*(?:<[\s\S]*>)?$/.test(inner)) {
+    return matchCsharpCallResultCall(inner, method, ref, context);
   }
 
   // Factory/fluent receiver `Receiver.factory(args).method()`: the receiver's
@@ -23883,7 +23993,10 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CSHARP_TYPE_ARITY.delete(context);
   CSHARP_EXTENSION_METHODS.delete(context);
   CSHARP_PARAMETERS.delete(context);
+  CSHARP_EXTENSION_THIS.delete(context);
+  CSHARP_FILE_BASENAMES.delete(context);
   JS_ASSIGNED_MEMBERS.delete(context);
+  JS_CONSTRUCTOR_METHODS.delete(context);
   CFML_CHAINS.delete(context);
   NO_RECEIVER_LINES.delete(context);
   OBJC_SUPERS.delete(context);
@@ -26869,6 +26982,11 @@ function matchMethodCallOn(
   if (ref.language === 'python' && ref.referenceKind === 'calls' && /\]\.\w+$/.test(ref.referenceName)) {
     return matchPythonElementCall(ref, context);
   }
+  // A C# call on a literal (`"hi".Shout()`): an extension method of its type, or nothing.
+  if (ref.language === 'csharp') {
+    const literal = matchCsharpLiteralCall(ref, context);
+    if (literal !== undefined) return literal;
+  }
   // Parse method call patterns like "obj.method" or "Class::method". The method
   // part allows trailing `:` keywords so Objective-C selectors resolve
   // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
@@ -27461,6 +27579,12 @@ function matchMethodCallOn(
         if (!(typedAt && target?.isStatic) && (!target || !isOtherLanguageConstructor(target, ref.language))) return withTypeFrom(typedMatch, typedFrom);
       }
       if (awaited) return null;
+      // A C# method the receiver's type lacks is an extension method that
+      // takes that type, or none of the project's for a keyword type (#2906).
+      if (ref.language === 'csharp') {
+        const extension = nmTimedT('mc-csext', ref, () => matchCsharpExtensionCall(inferredType!, methodName!, ref, context));
+        if (extension !== undefined) return extension;
+      }
       // A known JS/TS builtin receiver is external when it has no project
       // method (#1566). Inference already strips generics (`Map<K, V>` →
       // `Map`); do not let Strategy 3 guess an unrelated `get`/`set`/`has`.
@@ -28083,6 +28207,15 @@ function matchMethodCallOn(
       narrowed ||= kept.length !== targetMethods.length;
       targetMethods = kept;
     }
+    // A test file's own constructor (`function Server () {}`, `Server.prototype
+    // .close = …`, #2966) is that file's helper, never another file's
+    // `server.close()`.
+    if (JS_FAMILY.has(ref.language)) {
+      const kept = targetMethods.filter((m) =>
+        m.filePath === ref.filePath || !isTestPath(m.filePath) || !isConstructorFunctionMethod(m, context));
+      narrowed ||= kept.length !== targetMethods.length;
+      targetMethods = kept;
+    }
 
     // A python attribute chain nothing typed (matchPythonAttrCall) is guessed
     // only by the name of its last link, in the scoring below — Django's
@@ -28098,6 +28231,14 @@ function matchMethodCallOn(
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
     if (targetMethods.length === 1 && !narrowed && !rubySuiteNarrowed && !scopedOut && !pythonChain && targetMethods[0]!.language === ref.language &&
         !(JS_FAMILY.has(ref.language) && targetMethods[0]!.filePath !== ref.filePath && jsFileAssignsMember(ref.filePath, methodName!, context)) &&
+        // A JS constructor function's method (`Ctor.prototype.m = function`,
+        // `Ctor.m = …`, #2966) is the one of that name only for a receiver
+        // that names its constructor, as in the untyped languages below: an
+        // example's `User.all` is no `app.all()`, a test's own
+        // `Instance.prototype.test` no `t.test()`.
+        !(JS_FAMILY.has(ref.language) && targetMethods[0]!.filePath !== ref.filePath &&
+          !/^(?:this|self|super)$/.test(objectOrClass!) && !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
+          isConstructorFunctionMethod(targetMethods[0]!, context)) &&
         // A test double is only what a test names — as in the scoring below:
         // allauth's `resp.json()` on a Django test response is not the one
         // `json` of its `MockedResponse`.
@@ -28642,6 +28783,176 @@ function csharpExtensionOverload(picked: Node, ref: UnresolvedRef, context: Reso
   }
   if (fitting.length === 1) return fitting[0]!;
   return fitting.some((n) => n.id === picked.id) ? picked : null;
+}
+
+/** C#'s keyword types and the .NET type each one names. */
+const CSHARP_KEYWORD_TYPES: ReadonlyMap<string, string> = new Map([
+  ['string', 'String'], ['object', 'Object'], ['bool', 'Boolean'], ['char', 'Char'], ['byte', 'Byte'], ['sbyte', 'SByte'],
+  ['short', 'Int16'], ['ushort', 'UInt16'], ['int', 'Int32'], ['uint', 'UInt32'], ['long', 'Int64'], ['ulong', 'UInt64'],
+  ['nint', 'IntPtr'], ['nuint', 'UIntPtr'], ['float', 'Single'], ['double', 'Double'], ['decimal', 'Decimal'],
+]);
+
+/** A C# call on a literal, `"hi".Shout`, `21.Twice`, `2.5m.Round`: the literal and the method. */
+const CSHARP_LITERAL_CALL = /^(@?"(?:[^"\\]|\\.|"")*"|'(?:[^'\\]|\\.)+'|\d[\w.]*?|true|false)\.([A-Za-z_]\w*)$/;
+
+/** The keyword type of a C# literal: `"hi"` string, `'c'` char, `21` int, `21L` long, `2.5` double, `2.5f` float, `2.5m` decimal, `true` bool. */
+function csharpLiteralType(literal: string): string | null {
+  if (literal.startsWith('"') || literal.startsWith('@')) return 'string';
+  if (literal.startsWith("'")) return 'char';
+  if (literal === 'true' || literal === 'false') return 'bool';
+  const number = literal.toLowerCase().replace(/_/g, '');
+  if (/^0x[\da-f]+(?:ul|lu|u|l)?$/.test(number) || /^0b[01]+(?:ul|lu|u|l)?$/.test(number) || /^\d+(?:ul|lu|u|l)?$/.test(number)) {
+    if (/(?:ul|lu)$/.test(number)) return 'ulong';
+    if (number.endsWith('l')) return 'long';
+    if (number.endsWith('u')) return 'uint';
+    return 'int';
+  }
+  if (/^(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?[fdm]?$/.test(number)) {
+    if (number.endsWith('f')) return 'float';
+    if (number.endsWith('m')) return 'decimal';
+    return 'double';
+  }
+  return null;
+}
+
+const CSHARP_EXTENSION_THIS = new WeakMap<ResolutionContext, Map<string, { type: string; generic: boolean } | null>>();
+
+/**
+ * The type a C# extension method's `this` parameter declares, as its last
+ * name without generic arguments, nullability or namespace (`IEnumerable`,
+ * `Mailer`, `string`); `generic` when it is one of the method's own type
+ * parameters (`Each<T>(this T item)`). Null for an array or a type that
+ * can't be read.
+ */
+function csharpExtensionThisType(method: Node, context: ResolutionContext): { type: string; generic: boolean } | null {
+  let memo = CSHARP_EXTENSION_THIS.get(context);
+  if (!memo) CSHARP_EXTENSION_THIS.set(context, (memo = new Map()));
+  const hit = memo.get(method.id);
+  if (hit !== undefined) return hit;
+  let found: { type: string; generic: boolean } | null = null;
+  const source = csharpDeclarationSource(method, context);
+  const head = new RegExp(String.raw`\b${escapeRegExp(method.name)}\s*(?:<([^()]*)>\s*)?\(`).exec(source);
+  if (head) {
+    const at = csharpPastAttributes(source, head.index + head[0].length);
+    const param = /^(?:(?:ref|in|scoped|readonly)\s+)*this\s+(?:(?:ref|in|scoped|readonly)\s+)*((?:global::)?[A-Za-z_][\w.]*)\s*(<[^()]*?>)?\s*(\[[\s,]*\])?\s*\??\s+@?[A-Za-z_]\w*/.exec(source.slice(at));
+    if (param && !param[3]) {
+      const type = param[1]!.split(/::|\./).pop()!;
+      const typeParams = (head[1] ?? '').split(',').map((t) => t.trim());
+      found = { type, generic: !param[2] && typeParams.includes(type) };
+    }
+  }
+  memo.set(method.id, found);
+  return found;
+}
+
+/**
+ * Whether the C# extension method `n` is one a call in `file` can see: its
+ * static class's namespace is the global one, one the file is in (or a
+ * namespace around that), or one a `using` brings in.
+ */
+function isCsharpExtensionVisible(n: Node, file: string, context: ResolutionContext): boolean {
+  const segments = n.qualifiedName.split('::');
+  if (segments.length < 3) return true;
+  const namespace = segments.slice(0, -2).join('.');
+  const scope = csharpNamespaceScope(file, context);
+  if (scope.usings.has(namespace)) return true;
+  return scope.namespaces.some((ns) => ns === namespace || ns.startsWith(`${namespace}.`));
+}
+
+/**
+ * A C# call of a method its receiver's type doesn't declare, on a receiver
+ * of known type — a literal (`"hi".Shout()`), or a value its declaration
+ * types (`_mailer.Shout()`, `string s; s.Shout()`) — is a call of the
+ * extension method whose `this` parameter takes that type (#2906): the type
+ * itself first, then a base type or interface the project declares it to
+ * derive from, then `object` or a type parameter of the method's own. Of
+ * several in the first such group, the one the call's arguments fit. Null
+ * when the receiver's type is a C# keyword type and no project extension
+ * takes it: its methods are .NET's. Undefined otherwise, which leaves the
+ * call to the strategies after it.
+ */
+function matchCsharpExtensionCall(receiverType: string, methodName: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const bare = receiverType.replace(/<[\s\S]*>$/, '').replace(/\?$/, '').split(/::|\./).pop()!;
+  const keyword = CSHARP_KEYWORD_TYPES.get(bare);
+  const names = new Set([bare, keyword ?? bare]);
+  for (const [k, v] of CSHARP_KEYWORD_TYPES) if (v === bare) names.add(k);
+  // (An extension calling itself through its own receiver is far rarer than
+  // one handing the call to an overload outside the project: jellyfin's
+  // `WaitForExitAsync(this Process, TimeSpan)` awaits Process's own.)
+  const candidates = context.getNodesByName(methodName).filter((n) =>
+    n.language === 'csharp' && n.kind === 'method' && n.id !== ref.fromNodeId &&
+    isCsharpExtensionMethod(n, context) && isCsharpExtensionVisible(n, ref.filePath, context));
+  const outside = keyword !== undefined || CSHARP_KEYWORD_TYPES.has(bare.toLowerCase());
+  if (candidates.length === 0) return outside ? null : undefined;
+  // A project type the index couldn't read (serilog's `#if`-split ILogger.cs)
+  // may declare the method itself, and C# calls a type's own method first.
+  const types = context.getNodesByName(bare).filter((t) => t.language === 'csharp' && CSHARP_TYPE_KINDS.has(t.kind));
+  if (!outside && types.length === 0 && csharpFileBasenames(context).has(`${bare}.cs`)) return undefined;
+  // The types the receiver's own type derives from, as the project declares them.
+  const ancestors = new Set<string>();
+  for (const t of types) for (const a of csharpAncestorNames(t.qualifiedName, context)) ancestors.add(a);
+  const tiers: Node[][] = [[], [], []];
+  for (const n of candidates) {
+    const self = csharpExtensionThisType(n, context);
+    if (!self) continue;
+    if (!self.generic && names.has(self.type)) tiers[0]!.push(n);
+    else if (!self.generic && ancestors.has(self.type)) tiers[1]!.push(n);
+    else if (self.generic || self.type === 'object' || self.type === 'Object') tiers[2]!.push(n);
+  }
+  // The ones the call's arguments fit, past the `this` receiver.
+  const list = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), methodName, context);
+  const args = list === null ? null : list.trim() === '' ? [] : splitCppTopLevel(cppWithoutComments(list));
+  const fits = (n: Node): boolean => {
+    const params = args === null ? null : csharpParameters(n, context);
+    return args === null || (!!params && csharpArgumentsFit(params.slice(1), args));
+  };
+  const tier = tiers.map((t) => t.filter(fits)).find((t) => t.length > 0);
+  if (!tier) return outside ? null : undefined;
+  // C# prefers an overload the arguments fill without defaults.
+  if (args !== null && tier.length > 1) {
+    const exact = (n: Node): boolean => (csharpParameters(n, context) ?? []).slice(1).filter((p) => !p.optional && !p.variadic).length === args.length;
+    tier.sort((a, b) => Number(exact(b)) - Number(exact(a)));
+  }
+  // Overloads of one class are told apart after this (csharpExtensionOverload).
+  // Copies of one class in several projects share its qualified name
+  // (ardalis's three ServiceDefaults `Extensions`): take the caller's own
+  // project's, the copy whose directory the calling file shares most of.
+  if (!tier.every((n) => n.qualifiedName === tier[0]!.qualifiedName)) return undefined;
+  let pick = tier[0]!;
+  let nearest = -1;
+  for (const n of tier) {
+    const shared = n.filePath === ref.filePath ? Number.MAX_SAFE_INTEGER : sharedDirDepth(ref.filePath, n.filePath);
+    if (shared > nearest) {
+      nearest = shared;
+      pick = n;
+    }
+  }
+  return { original: ref, targetNodeId: pick.id, confidence: 0.85, resolvedBy: 'instance-method' };
+}
+
+const CSHARP_FILE_BASENAMES = new WeakMap<ResolutionContext, Set<string>>();
+
+/** The names of the project's `.cs` files, `ILogger.cs`. */
+function csharpFileBasenames(context: ResolutionContext): Set<string> {
+  let names = CSHARP_FILE_BASENAMES.get(context);
+  if (!names) {
+    names = new Set(context.getAllFiles().filter((f) => f.endsWith('.cs')).map((f) => path.posix.basename(f)));
+    CSHARP_FILE_BASENAMES.set(context, names);
+  }
+  return names;
+}
+
+/**
+ * A C# call on a literal — `"hi".Shout()`, `21.Twice()` — is to an extension
+ * method that takes the literal's type, or to none of the project's (#2906).
+ * Undefined for any other ref.
+ */
+export function matchCsharpLiteralCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  if (ref.language !== 'csharp' || ref.referenceKind !== 'calls') return undefined;
+  const m = CSHARP_LITERAL_CALL.exec(ref.referenceName);
+  const type = m ? csharpLiteralType(m[1]!) : null;
+  if (!m || !type) return undefined;
+  return matchCsharpExtensionCall(type, m[2]!, ref, context) ?? null;
 }
 
 /** The directory of a Go file, which is its package: Go keeps one package per directory. */
@@ -29781,6 +30092,34 @@ export function matchGoChainedCall(ref: UnresolvedRef, context: ResolutionContex
   if (k < 0) return undefined;
   const receiver = goReceiverChainType(links.slice(0, k), code[at] === '(', at, ref.filePath, index, context, 0);
   return receiver ? goMethodOnElement(receiver, ref, context) ?? null : null;
+}
+
+/**
+ * A Go call on what `new(T)` or `make(T, …)` hands back, which the extractor
+ * keeps with the named type the builtin writes: `new(Route).Host("x")`
+ * arrives as `new(Route).Host` (#3237). It was `new().Host`, a package
+ * factory's shape, and with no `new` function to type it the method went to
+ * the `Host` that sorted nearest: gorilla/mux's route tests reached
+ * `Router`'s methods instead of `Route`'s.
+ */
+const GO_BUILTIN_RECEIVER_CALL = /^(?:new|make)\((.+)\)\.([A-Za-z_]\w*)$/;
+
+/**
+ * Resolve a {@link GO_BUILTIN_RECEIVER_CALL} on the type written, read where
+ * the call is (its package, an import, a type parameter's constraint): that
+ * type's method, its interface's, or one embedding promotes into it. Null —
+ * never a guess by the name — for a type from outside the project or one the
+ * index can't tell. Undefined for any other ref.
+ */
+export function matchGoBuiltinReceiverCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  if (ref.language !== 'go' || ref.referenceKind !== 'calls') return undefined;
+  const m = GO_BUILTIN_RECEIVER_CALL.exec(ref.referenceName);
+  if (!m) return undefined;
+  const index = goScopeIndex(ref.filePath, context);
+  const at = index && ref.line > 0 ? (index.lineStarts[ref.line - 1] ?? index.code.length) + Math.max(ref.column, 0) : 0;
+  // `new(T)` is a `*T` and `make(T, …)` a `T`: T's methods either way.
+  const found = goMethodOnElement(goTypeTextAt(m[1]!, ref.filePath, at, index, context), { ...ref, referenceName: m[2]! }, context);
+  return found ? { ...found, original: ref } : null;
 }
 
 /**
@@ -34823,6 +35162,27 @@ function namesOwnerType(receiver: string, method: Node): boolean {
   const cut = method.qualifiedName.lastIndexOf('::');
   if (cut < 0) return false;
   return flatWord(receiver.split('.').pop()!) === flatWord(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!);
+}
+
+/** Per context: a method's id → whether a JS constructor function owns it. */
+const JS_CONSTRUCTOR_METHODS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * A method a JS constructor function owns (`Ctor.prototype.m = function () {…}`,
+ * `Ctor.m = …`, #2966): its owner is a function declared in its file.
+ */
+function isConstructorFunctionMethod(method: Node, context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (method.kind !== 'method' || cut <= 0) return false;
+  let memo = JS_CONSTRUCTOR_METHODS.get(context);
+  if (!memo) JS_CONSTRUCTOR_METHODS.set(context, (memo = new Map()));
+  let owned = memo.get(method.id);
+  if (owned === undefined) {
+    owned = context.getNodesByQualifiedName(method.qualifiedName.slice(0, cut))
+      .some((n) => n.kind === 'function' && n.filePath === method.filePath);
+    memo.set(method.id, owned);
+  }
+  return owned;
 }
 
 /** A name's letters and digits, lowercased, a trailing number dropped: `executor1` → `executor`. */

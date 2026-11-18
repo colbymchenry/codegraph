@@ -157,6 +157,84 @@ extension Socket.Option {
       cg.close();
     }
   });
+
+  // A type's supertypes are the ones its own header names (#3213). Its first
+  // lines are its members, and a nested type's clause there is not its own.
+  it("reads a type's own inheritance clause, not one a nested type declares", async () => {
+    const cg = await project({
+      'Sources/Scope.swift': `class Base {
+    enum State { case idle }
+}
+
+struct Screen {
+    class Helper: Base {}
+
+    var state: State
+}
+
+struct Plain {
+    class Helper {}
+
+    var state: State
+}
+
+final class Panel: Base {
+    struct Row: Hashable {}
+    var state: State?
+}
+`,
+    });
+    try {
+      const all = edges(cg);
+      expect(all.filter((e) => e.includes(' -> Base::State '))).toEqual(['references Panel -> Base::State (Scope.swift:2)']);
+      const state = cg.getNodesInFile('Sources/Scope.swift').find((n) => n.qualifiedName === 'Base::State')!;
+      const affected = [...cg.getImpactRadius(state.id, 2).nodes.values()].map((n) => n.qualifiedName);
+      expect(affected).not.toContain('Screen');
+      expect(affected).toContain('Panel');
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('skips type keywords, colons and braces in comments and attribute strings before the header', async () => {
+    const cg = await project({
+      'Sources/Kinds.swift': `class Base {
+    enum State { case idle }
+}
+class Other {
+    enum State { case idle }
+}
+// struct Decoy: Base {
+@available(*, deprecated) /* enum Decoy: Base { /* nested */ } */
+struct LineComment {
+    var state: State?
+}
+@available(*, deprecated, message: """
+    use class Decoy: Base {
+    """)
+struct MultilineMessage {
+    var state: State?
+}
+@available(*, deprecated, message: #"class Decoy: Base { \\"#)
+struct RawMessage {
+    var state: State?
+}
+@available(*, deprecated, message: "a \\"class Decoy: Other {\\" b") // class Decoy: Other {
+final class Child<T>:
+    Base
+where T: Equatable {
+    class Helper: Other {}
+    var state: State?
+}
+`,
+    });
+    try {
+      // Only Child's own header names a supertype, Base.
+      expect(edges(cg).filter((e) => e.includes('::State '))).toEqual(['references Child -> Base::State (Kinds.swift:2)']);
+    } finally {
+      cg.close();
+    }
+  });
 });
 
 describe('Swift: a qualified type name lands on the type on that path', () => {

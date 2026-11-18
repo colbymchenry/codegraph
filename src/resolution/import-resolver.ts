@@ -4640,14 +4640,17 @@ function resolveStaticMember(
   localName: string,
   context: ResolutionContext
 ): Node | undefined {
-  if (!STATIC_MEMBER_CONTAINERS.has(container.kind)) return undefined;
+  // A JS constructor function's static methods (`Model.insertMany = function
+  // () {…}`, #2966) are reached the same way; what it nests is not.
+  const constructorFn = container.kind === 'function' && JS_FAMILY_FILE.test(container.filePath);
+  if (!STATIC_MEMBER_CONTAINERS.has(container.kind) && !constructorFn) return undefined;
   // First segment after the receiver: `Foo.bar.baz` → `bar`.
   const [member, ...rest] = ref.referenceName.slice(localName.length + 1).split('.');
   if (!member) return undefined;
 
   const candidates = context
     .getNodesByQualifiedName(`${container.qualifiedName}::${member}`)
-    .filter((n) => n.filePath === container.filePath);
+    .filter((n) => n.filePath === container.filePath && (!constructorFn || (n.kind === 'method' && n.isStatic === true)));
   if (candidates.length === 0) return undefined;
 
   // A Python reference keeps its whole chain, and it reads the chain's last

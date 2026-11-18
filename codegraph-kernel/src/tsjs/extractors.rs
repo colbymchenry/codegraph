@@ -12,10 +12,31 @@ use crate::buffers::edge_kind_index;
 use std::collections::HashSet;
 use tree_sitter::Node;
 
+/// What `constructor_member` finds (#2966): the owner's row, kind and name,
+/// the method's name, and whether it is static (`Ctor.m`, not `Ctor.prototype.m`).
+pub(super) struct ConstructorMember {
+    row: u32,
+    kind: &'static str,
+    owner: String,
+    name: String,
+    is_static: bool,
+}
+
 impl<'t> Walker<'t> {
     // --- extractFunction --------------------------------------------------------
 
     pub(super) fn extract_function(&mut self, node: Node<'t>, name_override: Option<String>) {
+        // `Ctor.prototype.m = function () {…}` / `Ctor.m = function () {…}`: a
+        // method of the constructor (or class) the scope declares (#2966).
+        if name_override.is_none() && matches!(node.kind(), "function_expression" | "arrow_function" | "generator_function") {
+            if let Some(assignment) = node.parent().filter(|p| p.kind() == "assignment_expression") {
+                if let Some(member) = self.constructor_member(assignment, node) {
+                    self.extract_constructor_member(node, assignment, member);
+                    return;
+                }
+            }
+        }
+
         let mut name = name_override
             .clone()
             .unwrap_or_else(|| self.extract_name(node));
@@ -53,11 +74,12 @@ impl<'t> Walker<'t> {
             return;
         }
 
+        let exported_member = self.exported_member_fn == Some(node.id());
         let extra = Extra {
             docstring: crate::docstring::preceding_docstring(node, self.src),
             signature: self.signature_of(node),
             visibility: self.visibility_of(node),
-            is_exported: Some(common_js_export || self.is_exported(node)),
+            is_exported: Some(common_js_export || exported_member || self.is_exported(node)),
             is_async: Some(self.is_async(node)),
             is_static: self.is_static(node),
             ..Extra::default()
@@ -163,6 +185,79 @@ impl<'t> Walker<'t> {
             return None;
         }
         Some(self.text(property).to_string())
+    }
+
+    /// The constructor (or class) a function assigned to `Ctor.prototype.m` or
+    /// `Ctor.m` is a method of, when `Ctor` is a function or class declared in
+    /// the scope the assignment is written in (#2966). None for anything else:
+    /// another target, a constructor declared elsewhere or later, a generated
+    /// or minified bundle. The function must be the assignment's whole
+    /// right-hand side. Mirrors TreeSitterExtractor.constructorMember.
+    pub(super) fn constructor_member(&self, assignment: Node<'t>, value: Node<'t>) -> Option<ConstructorMember> {
+        if !self.owns_object_literals() {
+            return None;
+        }
+        let right = assignment.child_by_field_name("right")?;
+        if right.start_byte() != value.start_byte() || right.end_byte() != value.end_byte() {
+            return None;
+        }
+        let left = assignment.child_by_field_name("left")?;
+        if left.kind() != "member_expression" {
+            return None;
+        }
+        let property = left.child_by_field_name("property")?;
+        if property.kind() != "property_identifier" {
+            return None;
+        }
+        let name = self.text(property);
+        if name == "prototype" {
+            return None;
+        }
+        let mut object = left.child_by_field_name("object")?;
+        let mut is_static = true;
+        if object.kind() == "member_expression" {
+            let link = object.child_by_field_name("property")?;
+            if link.kind() != "property_identifier" || self.text(link) != "prototype" {
+                return None;
+            }
+            object = object.child_by_field_name("object")?;
+            is_static = false;
+        }
+        if object.kind() != "identifier" {
+            return None;
+        }
+        let owner = self.text(object).to_string();
+        let &(row, kind) = self.scope_declarations.get(&(self.top_row(), owner.clone()))?;
+        Some(ConstructorMember { row, kind, owner, name: name.to_string(), is_static })
+    }
+
+    /// Extract a function assigned to `Ctor.prototype.m` / `Ctor.m` as method
+    /// `m` of `Ctor`: contained by it and qualified under it (`Ctor::m`), as a
+    /// class's method is, static for `Ctor.m`. Its body is walked under the
+    /// method. Mirrors TreeSitterExtractor.extractConstructorMember.
+    fn extract_constructor_member(&mut self, node: Node<'t>, assignment: Node<'t>, member: ConstructorMember) {
+        let statement = assignment.parent().filter(|p| p.kind() == "expression_statement").unwrap_or(assignment);
+        let extra = Extra {
+            docstring: crate::docstring::preceding_docstring(statement, self.src),
+            signature: self.signature_of(node),
+            visibility: self.visibility_of(node),
+            is_async: Some(self.is_async(node)),
+            is_static: Some(member.is_static),
+            ..Extra::default()
+        };
+        self.stack.push(Scope { row: member.row, kind: member.kind, name: member.owner });
+        if let Some(row) = self.create_node("method", &member.name, node, extra) {
+            self.extract_type_annotations(node, row);
+            self.extract_decorators_for(node, row);
+            self.stack.push(Scope { row, kind: "method", name: member.name });
+            let body = body_of(node);
+            self.visit_parameter_defaults(node, body);
+            if let Some(body) = body {
+                self.visit_function_body(body);
+            }
+            self.stack.pop();
+        }
+        self.stack.pop();
     }
 
     /// The name a string literal spells when it is a plain identifier: `'svc'`
@@ -726,7 +821,7 @@ impl<'t> Walker<'t> {
             // rest of the literal is walked under the owner (#693). Mirrors
             // the ownedObject branch of TreeSitterExtractor.extractVariable.
             if let (Some(row), Some(obj)) = (var_row, self.owned_object_value(value)) {
-                self.extract_owned_object_members(obj, row, kind, &name, true, false);
+                self.extract_owned_object_members(obj, row, kind, &name, true, false, false);
                 walked.get_or_insert_with(HashSet::new).insert(obj.id());
                 continue;
             }
@@ -904,12 +999,14 @@ impl<'t> Walker<'t> {
     /// for a module-scope declaration (`values_under_owner`, #693), under the
     /// enclosing scope for a local or an assignment. The literal's shorthand
     /// members go to the function-as-value capture the same way.
-    fn extract_owned_object_members(&mut self, obj: Node<'t>, row: u32, kind: &'static str, name: &str, values_under_owner: bool, global: bool) {
+    fn extract_owned_object_members(&mut self, obj: Node<'t>, row: u32, kind: &'static str, name: &str, values_under_owner: bool, global: bool, exported: bool) {
         let held = values_under_owner.then(|| self.enter_owner(row, kind, name, global));
         self.maybe_capture_fn_refs(obj);
         for i in 0..obj.named_child_count() {
             let Some(member) = obj.named_child(i) else { continue };
             if let Some((func, member_name)) = self.owned_member_function(member) {
+                // The members of the module's export object are exported (#2966).
+                self.exported_member_fn = exported.then(|| func.id());
                 if values_under_owner {
                     self.extract_function(func, Some(member_name));
                 } else {
@@ -917,6 +1014,7 @@ impl<'t> Walker<'t> {
                     self.extract_function(func, Some(member_name));
                     self.leave_owner(rest);
                 }
+                self.exported_member_fn = None;
             } else {
                 self.visit_function_body(member);
             }
@@ -950,7 +1048,7 @@ impl<'t> Walker<'t> {
         };
         let Some(row) = self.create_node(kind, &name, declarator, extra) else { return false };
         self.extract_variable_type_annotation(declarator, row);
-        self.extract_owned_object_members(obj, row, kind, &name, false, false);
+        self.extract_owned_object_members(obj, row, kind, &name, false, false, false);
         true
     }
 
@@ -985,17 +1083,19 @@ impl<'t> Walker<'t> {
         let row = self.create_node("variable", &name, node, extra);
         self.stack.extend(rest);
         let Some(row) = row else { return false };
+        let exported = qualified_name.as_deref() == Some("module.exports");
         if let Some(qualified_name) = qualified_name {
             self.object_path_owners.insert(row, qualified_name);
         }
-        self.extract_owned_object_members(obj, row, "variable", &name, false, global);
+        self.extract_owned_object_members(obj, row, "variable", &name, false, global, exported);
         true
     }
 
     /// objectOwnerPath: an assignment target's links written as plain names
-    /// (`dw_page` → [dw_page], `App.utils.dom` → [App, utils, dom]), or None
-    /// for anything else — `this.x`, `a[k]`, a call, CommonJS's
-    /// `module.exports` / `exports.x`, or a prototype.
+    /// (`dw_page` → [dw_page], `App.utils.dom` → [App, utils, dom],
+    /// `module.exports`, the module's export object, #2966), or None for
+    /// anything else — `this.x`, `a[k]`, a call, another CommonJS export
+    /// target (`exports.x`, `module.exports.x`), or a prototype.
     fn object_owner_path(&self, left: Option<Node<'t>>) -> Option<Vec<String>> {
         let mut path: Vec<String> = Vec::new();
         let mut cur = left?;
@@ -1011,7 +1111,9 @@ impl<'t> Walker<'t> {
             return None;
         }
         let root = self.text(cur);
-        if root == "module" || root == "exports" || path.iter().any(|p| p == "prototype") {
+        // `path` holds the links last to first here.
+        let export_object = root == "module" && path.len() == 1 && path[0] == "exports";
+        if !export_object && (root == "module" || root == "exports" || path.iter().any(|p| p == "prototype")) {
             return None;
         }
         path.push(root.to_string());

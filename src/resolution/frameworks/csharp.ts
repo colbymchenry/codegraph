@@ -9,6 +9,7 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 import { stripCommentsForRegex } from '../strip-comments';
 import { pickByNameAndKind } from './name-heuristic';
 import { csharpTypeArityFits } from '../name-matcher';
+import { aspnetAttributeRoutes, aspnetDeclaredTemplates, aspnetRoutePath } from './aspnet-routes';
 
 export const aspnetResolver: FrameworkResolver = {
   name: 'aspnet',
@@ -145,53 +146,44 @@ export const aspnetResolver: FrameworkResolver = {
     const now = Date.now();
     const safe = stripCommentsForRegex(content, 'csharp');
 
-    // Class-level [Route("api/[controller]")] prefix — joined onto each action.
-    let classPrefix = '';
-    const cls = /\[Route\s*\(\s*"([^"]+)"[^)]*\)\]\s*(?:\[[^\]]*\]\s*)*(?:public\s+|sealed\s+|abstract\s+|partial\s+)*class\b/.exec(safe);
-    if (cls) classPrefix = cls[1]!;
-
-    // [HttpGet], [HttpGet("path")], [HttpPost("path", Name="x")] — BARE or with a
-    // path. (The old regex required a string, so bare attributes — with the route
-    // on the class [Route] — were missed; eShopOnWeb was 24 bare / 2 string.)
-    const attrRegex = /\[(HttpGet|HttpPost|HttpPut|HttpPatch|HttpDelete)(?:\s*\(\s*"([^"]+)"[^)]*\))?\s*\]/g;
-    let match: RegExpExecArray | null;
-    while ((match = attrRegex.exec(safe)) !== null) {
-      const verb = match[1]!;
-      const method = verb.replace(/^Http/, '').toUpperCase();
-      const routePath = joinCsPath(classPrefix, match[2] || '');
-      const line = safe.slice(0, match.index).split('\n').length;
-
-      const routeNode: Node = {
-        id: `route:${filePath}:${line}:${method}:${routePath}`,
+    // Attribute routing: each controller's own `[Route]` templates (or its
+    // base class's), each action's verb, `[AcceptVerbs]` and `[Route]`
+    // attributes, and the route tokens, as ASP.NET Core reads them (#2905).
+    const seen = new Set<string>();
+    for (const r of aspnetAttributeRoutes(safe)) {
+      const id = `route:${filePath}:${r.line}:${r.method}:${r.path}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      nodes.push({
+        id,
         kind: 'route',
-        name: `${method} ${routePath}`,
-        qualifiedName: `${filePath}::route:${routePath}`,
+        name: `${r.method} ${r.path}`,
+        // A controller that declares no template takes its base class's, which
+        // postExtract reads once every file is in: the qualified name keeps
+        // what the route is made of until then (inheritedControllerRoutes).
+        qualifiedName: r.inherit
+          ? `${filePath}::aspnet-base:${r.inherit.base}:${r.inherit.controller}:${r.inherit.action}:${r.method}:${JSON.stringify(r.inherit.template)}`
+          : `${filePath}::route:${r.path}`,
         filePath,
-        startLine: line,
-        endLine: line,
+        startLine: r.line,
+        endLine: r.line,
         startColumn: 0,
-        endColumn: match[0].length,
+        endColumn: r.length,
         language: 'csharp',
         updatedAt: now,
-      };
-      nodes.push(routeNode);
-
-      // Next method declaration (skip stacked attributes; C# puts the return type
-      // before the name). Bounded so we don't grab a far one.
-      const tail = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
-      const methodMatch = tail.match(/(?:public|private|protected|internal)\s+[\w<>,\s\[\]?.]+?\s+(\w+)\s*\(/);
-      if (methodMatch) {
-        references.push({
-          fromNodeId: routeNode.id,
-          referenceName: methodMatch[1]!,
-          referenceKind: 'references',
-          line,
-          column: 0,
-          filePath,
-          language: 'csharp',
-        });
-      }
+      });
+      references.push({
+        fromNodeId: id,
+        referenceName: r.handler,
+        referenceKind: 'references',
+        line: r.line,
+        column: 0,
+        filePath,
+        language: 'csharp',
+      });
     }
+
+    let match: RegExpExecArray | null;
 
     // Minimal APIs: app.MapGet("/path", handler)
     const minimalRegex = /\.Map(Get|Post|Put|Patch|Delete)\s*\(\s*"([^"]+)"\s*,\s*([^,)]+)/g;
@@ -320,11 +312,65 @@ export const aspnetResolver: FrameworkResolver = {
     return { nodes, references };
   },
 
-  /** Route names only the whole repository can give: FastEndpoints constant paths, endpoint-group prefixes. */
+  /** Route names only the whole repository can give: FastEndpoints constant paths, endpoint-group prefixes, inherited controller templates. */
   postExtract(context: ResolutionContext): Node[] {
-    return [...fastEndpointConstantRoutes(context), ...endpointGroupRoutes(context)];
+    return [...fastEndpointConstantRoutes(context), ...endpointGroupRoutes(context), ...inheritedControllerRoutes(context)];
   },
 };
+
+/** A route of a controller that declares no `[Route]` of its own: base, controller, action, verb, and the action's template as JSON. */
+const INHERITED_ROUTE = /::aspnet-base:([A-Za-z_]\w*):([A-Za-z_]\w*):([A-Za-z_]\w*):([A-Z]+):(.*)$/;
+
+/**
+ * A controller with no `[Route]` of its own takes the templates of the
+ * nearest base class that declares any — jellyfin's controllers derive from
+ * `BaseJellyfinApiController`, whose `[Route("[controller]")]` names
+ * `/Audio/{itemId}/stream` — wherever that base is declared. Only the first
+ * such template names the route. Idempotent: the qualified name keeps what
+ * the route is made of.
+ */
+function inheritedControllerRoutes(context: ResolutionContext): Node[] {
+  const updates: Node[] = [];
+  const templates = new Map<string, string | null>();
+  for (const route of context.getNodesByKind('route')) {
+    if (route.language !== 'csharp') continue;
+    const q = INHERITED_ROUTE.exec(route.qualifiedName);
+    if (!q) continue;
+    const [, base, controller, action, method, json] = q;
+    let actionTemplate: string | null;
+    try {
+      actionTemplate = JSON.parse(json!) as string | null;
+    } catch {
+      continue;
+    }
+    const template = inheritedTemplate(base!, context, templates, 0);
+    if (template === null) continue;
+    const name = `${method} ${aspnetRoutePath(template, actionTemplate, controller!, action!, null)}`;
+    if (name !== route.name) updates.push({ ...route, name });
+  }
+  return updates;
+}
+
+/** The first `[Route]` template the C# class `name` passes to its subclasses: its own, or a base's (a few levels up). */
+function inheritedTemplate(name: string, context: ResolutionContext, memo: Map<string, string | null>, depth: number): string | null {
+  const hit = memo.get(name);
+  if (hit !== undefined) return hit;
+  // A cycle, or a lookup already under way, finds nothing.
+  memo.set(name, null);
+  let found: string | null = null;
+  for (const decl of context.getNodesByName(name)) {
+    if (decl.language !== 'csharp' || decl.kind !== 'class') continue;
+    const content = context.readFile(decl.filePath);
+    if (!content) continue;
+    const declared = aspnetDeclaredTemplates(stripCommentsForRegex(content, 'csharp'), name);
+    if (!declared) continue;
+    if (declared.templates.length > 0) found = declared.templates[0]!;
+    else if (declared.next && depth < 4) found = inheritedTemplate(declared.next, context, memo, depth + 1);
+    if (found !== null) break;
+  }
+  memo.set(name, found);
+  return found;
+}
 
 /**
  * A FastEndpoints route named by a constant (`Post(CreateContributorRequest.Route)`)

@@ -864,9 +864,39 @@ impl<'t> Walker<'t> {
                                 // Bare package-level factory chain `New().Method()`
                                 // re-encodes; instance chains keep the bare name.
                                 let inner_fn = r.child_by_field_name("function");
-                                let reencode =
-                                    inner_fn.map(|f| f.kind() == "identifier").unwrap_or(false);
-                                if reencode {
+                                let builtin = inner_fn
+                                    .filter(|f| f.kind() == "identifier")
+                                    .map(|f| self.text(f))
+                                    .filter(|t| matches!(*t, "new" | "make" | "append"));
+                                if let Some(builtin) = builtin {
+                                    // A call on what a builtin hands back (#3237):
+                                    // `new` and `make` keep the named type they
+                                    // write (`new(Route).Host`); any other keeps the
+                                    // bare name, read at the call by the resolver.
+                                    // Mirrors goBuiltinNamedType (tree-sitter.ts).
+                                    let written = if builtin == "append" {
+                                        None
+                                    } else {
+                                        r.child_by_field_name("arguments")
+                                            .and_then(|a| a.named_child(0))
+                                            .filter(|t| {
+                                                matches!(
+                                                    t.kind(),
+                                                    "type_identifier" | "qualified_type" | "generic_type"
+                                                )
+                                            })
+                                            .map(|t| {
+                                                self.text(t)
+                                                    .chars()
+                                                    .filter(|c| !c.is_whitespace())
+                                                    .collect::<String>()
+                                            })
+                                    };
+                                    callee_name = match written {
+                                        Some(t) => format!("{builtin}({t}).{method_name}"),
+                                        None => method_name.to_string(),
+                                    };
+                                } else if inner_fn.map(|f| f.kind() == "identifier").unwrap_or(false) {
                                     let inner: String = self
                                         .text(inner_fn.unwrap())
                                         .replace("->", ".")
