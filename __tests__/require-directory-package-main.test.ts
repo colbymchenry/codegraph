@@ -40,6 +40,25 @@ const Srv2 = require('../')
 const Srv3 = require('../srv')
 function t () { Srv(); Srv2(); Srv3() }
 `,
+    // A package.json a Windows editor saved with a byte-order mark.
+    'lib/bom/package.json': '\uFEFF' + JSON.stringify({ main: 'entry.js' }),
+    'lib/bom/entry.js': `function bom () { return 4 }
+module.exports = bom
+`,
+    'c.js': `const bom = require('./lib/bom')
+function v () { bom() }
+`,
+    // Nix imports a folder's default.nix, whatever else the folder holds.
+    'default.nix': `{ pkgs ? import <nixpkgs> {} }:
+let web = import ./web { inherit pkgs; };
+in web
+`,
+    'web/default.nix': `{ pkgs }: pkgs.hello
+`,
+    'web/package.json': JSON.stringify({ main: 'index.js' }),
+    'web/index.js': `function web () { return 5 }
+module.exports = web
+`,
     'b.js': `const helper = require('./lib')
 const inner = require('./lib/inner')
 const bare = require('./lib/bare')
@@ -68,6 +87,16 @@ const callsOf = (file: string, name: string) => {
 describe('a relative require of a directory', () => {
   it("reaches the package root's main through '..' and '../'", () => {
     expect(callsOf('test/a.test.js', 't')).toEqual(['srv srv.js', 'srv srv.js', 'srv srv.js']);
+  });
+
+  it('reads a package.json that starts with a byte-order mark, as Node does', () => {
+    expect(callsOf('c.js', 'v')).toEqual(['bom lib/bom/entry.js']);
+  });
+
+  it("leaves other languages' folder imports alone: Nix still imports the folder's default.nix", () => {
+    const file = cg.getNodesInFile('default.nix').find((n) => n.kind === 'file')!;
+    const imports = cg.getOutgoingEdges(file.id).filter((e) => e.kind === 'imports').map((e) => cg.getNode(e.target)!.filePath);
+    expect(imports).toEqual(['web/default.nix']);
   });
 
   it("reaches a subdirectory's main, with or without its extension, and still an index.js", () => {

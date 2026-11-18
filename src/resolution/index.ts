@@ -48,7 +48,7 @@ import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { clearRubyConstantPathMemos, matchRubyConstantPathRef } from './ruby-constant-paths';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, CPP_COMPILE_DB_FILES, loadCppIncludeDirsFromCompileDB, loadCppIncludeDirsHeuristic, readCompileDbIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, CPP_COMPILE_DB_FILES, loadCppIncludeDirsFromCompileDB, loadCppIncludeDirsHeuristic, readCompileDbIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName, packageJsonMain } from './import-resolver';
 import { ResolverPool, minRefsForPool, poolStartSettled, resolveWorkersWorthStarting, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { readCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
@@ -323,8 +323,18 @@ function moduleConfigDigest(abs: string, projectRoot: string): string {
   const read = file === 'go.mod' ? loadGoModule(path.dirname(abs))?.modulePath ?? ''
     : file === 'Cargo.toml' ? cargoManifestDigestText(abs)
     : file === 'compile_commands.json' ? (readCompileDbIncludeDirs(abs, projectRoot) ?? []).join('\n')
+    : file === 'package.json' ? packageJsonMainOf(abs)
     : aliasConfigFields(abs) ?? '';
   return createHash('sha256').update(read).digest('hex').slice(0, 16);
+}
+
+/** A folder's `package.json` `main`, which a relative import of the folder loads (see `relativeDirectoryMain`). */
+function packageJsonMainOf(abs: string): string {
+  try {
+    return packageJsonMain(fs.readFileSync(abs, 'utf-8')) ?? '';
+  } catch {
+    return '';
+  }
 }
 
 function cargoManifestDigestText(abs: string): string {
@@ -1061,6 +1071,9 @@ export class ReferenceResolver {
       },
 
       readFile: (filePath: string) => this.readFileCached(filePath),
+      noteModuleConfigFile: (filePath: string) => {
+        this.moduleConfigFiles.add(path.join(this.projectRoot, filePath));
+      },
 
       fileContains: (filePath: string, needle: string) => this.fileContains(filePath, needle),
       scanFile: (filePath: string) => this.scanFile(filePath),

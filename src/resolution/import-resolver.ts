@@ -1385,7 +1385,7 @@ function resolveRelativeImport(
     if (relativePath === '' && !ext.startsWith('/')) continue;
     // A directory's `package.json` `main` comes before its index files, as
     // Node loads a directory (#2964).
-    if (ext.startsWith('/') && !mainTried) {
+    if (ext.startsWith('/') && !mainTried && FOLDER_MAIN_LANGUAGES.has(language)) {
       mainTried = true;
       const main = relativeDirectoryMain(relativePath, language, context);
       if (main) return main;
@@ -1405,21 +1405,38 @@ function resolveRelativeImport(
 }
 
 /**
- * The indexed file a directory's `package.json` names as `main`: fastify's
- * tests `require('..')` for the root's `"main": "fastify.js"`. Null when the
- * directory has no manifest, no `main`, or one outside the project.
+ * The importers whose relative import of a folder reads the folder's
+ * `package.json` `main`, as Node and the bundlers do. Nix (`/default.nix`),
+ * Python (`/__init__.py`) and the rest load a folder their own way.
  */
-function relativeDirectoryMain(dir: string, language: Language, context: ResolutionContext): string | null {
-  const manifest = context.readFile(dir === '' ? 'package.json' : `${dir}/package.json`);
-  if (!manifest) return null;
+const FOLDER_MAIN_LANGUAGES: ReadonlySet<Language> = new Set<Language>(['javascript', 'typescript', 'tsx', 'jsx']);
+
+/** A `package.json`'s `main`, trimmed; null when it has none or doesn't parse. A leading byte-order mark is skipped, as Node skips it. */
+export function packageJsonMain(text: string): string | null {
   let main: unknown;
   try {
-    main = (JSON.parse(manifest) as { main?: unknown } | null)?.main;
+    main = (JSON.parse(text.replace(/^\uFEFF/, '')) as { main?: unknown } | null)?.main;
   } catch {
     return null;
   }
-  if (typeof main !== 'string' || !main.trim()) return null;
-  const entry = path.posix.normalize(path.posix.join(dir, main.trim()));
+  return typeof main === 'string' && main.trim() ? main.trim() : null;
+}
+
+/**
+ * The indexed file a directory's `package.json` names as `main`: fastify's
+ * tests `require('..')` for the root's `"main": "fastify.js"`. Null when the
+ * directory has no manifest, no `main`, or one outside the project. A
+ * manifest it reads joins the module-config snapshot, so a sync after an
+ * edit to its `main` resolves the folder's importers again.
+ */
+function relativeDirectoryMain(dir: string, language: Language, context: ResolutionContext): string | null {
+  const manifestPath = dir === '' ? 'package.json' : `${dir}/package.json`;
+  const manifest = context.readFile(manifestPath);
+  if (!manifest) return null;
+  context.noteModuleConfigFile?.(manifestPath);
+  const main = packageJsonMain(manifest);
+  if (!main) return null;
+  const entry = path.posix.normalize(path.posix.join(dir, main));
   if (entry.startsWith('..') || entry === '.') return null;
   return indexedTarget(entry, language, context);
 }
