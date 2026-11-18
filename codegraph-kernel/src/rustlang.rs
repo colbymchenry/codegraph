@@ -1433,7 +1433,7 @@ impl<'t> Walker<'t> {
         }
 
         for v in values {
-            // normalizeValue: idTypes = {identifier} only, no layers/unwrap.
+            // normalizeValue: idTypes = {identifier}, special = {scoped_identifier}; no layers/unwrap.
             if v.kind() == "identifier" {
                 let name = self.text(v).to_string();
                 if name.is_empty() || is_stoplisted(&name) {
@@ -1445,6 +1445,34 @@ impl<'t> Walker<'t> {
                     name,
                     line: p.row as u32 + 1,
                     column_byte: v.start_byte(),
+                    row: p.row,
+                });
+            } else if v.kind() == "scoped_identifier" {
+                // normalizeSpecial's scoped_identifier (#3254): a function passed
+                // through its path, `g.map(Graph::counts)`, `Self::helper`,
+                // `fs::default_sep`, kept whole and placed at its last segment.
+                // Only a function-like last segment (lowercase or `_`, after an
+                // optional `r#`); a generic path or one with a comment in it is
+                // left alone. Mirrored byte-for-byte — change both.
+                let Some(name_node) = v.child_by_field_name("name") else { continue };
+                if name_node.kind() != "identifier" {
+                    continue;
+                }
+                let last = self.text(name_node);
+                let bare = last.strip_prefix("r#").unwrap_or(last);
+                if !bare.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') {
+                    continue;
+                }
+                let name: String = self.text(v).chars().filter(|c| !is_js_space(*c)).collect();
+                if !is_path_value_text(&name) || is_stoplisted(&name) {
+                    continue;
+                }
+                let p = name_node.start_position();
+                self.fn_ref_cands.push(Cand {
+                    from,
+                    name,
+                    line: p.row as u32 + 1,
+                    column_byte: name_node.start_byte(),
                     row: p.row,
                 });
             }
@@ -1650,6 +1678,24 @@ fn is_rust_ident(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A path value's text as normalizeSpecial accepts it: `/^[A-Za-z_][\w:#]*$/`.
+fn is_path_value_text(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '#')
+}
+
+/// JS `\s` (WhiteSpace ∪ LineTerminator), which `.replace(/\s+/g, '')` strips:
+/// unlike Rust's `char::is_whitespace`, U+FEFF yes and U+0085 no.
+fn is_js_space(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\x0B' | '\x0C' | '\r' | ' ' | '\u{00A0}' | '\u{1680}'
+            | '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}'
+            | '\u{3000}' | '\u{FEFF}'
+    )
 }
 
 /// The receiver chain a method call is written on, when it is fields and
