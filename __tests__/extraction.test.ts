@@ -294,6 +294,30 @@ class ENGINE_API UNetConnectionRepControl : public UObject
     expect(result.nodes.find((n) => n.name === 'Base')?.kind).toBe('struct');
   });
 
+  it('should detect declaration-only C++ .h headers with templates, references, or default arguments as cpp', () => {
+    const pdbDiaHeader = `#pragma once
+extern CComPtr<IDiaDataSource> g_pDiaDataSource;
+extern bool g_dia_available;
+qstring get_dia_type_declaration(IDiaSymbol* type, int depth = 0);
+`;
+    expect(detectLanguage('PdbDiaSession.h', pdbDiaHeader)).toBe('cpp');
+    const res1 = extractFromSource('PdbDiaSession.h', pdbDiaHeader);
+    expect(res1.errors).toEqual([]);
+    expect(res1.nodes.some((n) => n.name === 'g_pDiaDataSource' && n.kind === 'variable')).toBe(true);
+
+    const programHeader = `#pragma once
+HRESULT GetMaxVersionVsInstallationPath(bstr_t& bstrVsInstallationPath, ULONGLONG& ullVersion, qvector<qstring>* installation_paths = nullptr);
+`;
+    expect(detectLanguage('Program.h', programHeader)).toBe('cpp');
+    expect(extractFromSource('Program.h', programHeader).errors).toEqual([]);
+
+    const oldPdbHeader = `bool apply_name(ea_t ea, const qstring &name, int maybe_func);
+void load_vc_til(void);
+`;
+    expect(detectLanguage('oldpdb.h', oldPdbHeader)).toBe('cpp');
+    expect(extractFromSource('oldpdb.h', oldPdbHeader).errors).toEqual([]);
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');

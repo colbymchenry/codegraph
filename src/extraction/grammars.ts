@@ -617,6 +617,7 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   if (lang === 'c' && ext === '.h' && source) {
     if (looksLikeCpp(source)) return 'cpp';
     if (looksLikeObjc(source)) return 'objc';
+    if (looksLikeCppDeclarations(source)) return 'cpp';
   }
 
   // `.inc` is PHP's include extension (Drupal) and Pascal/Delphi's too
@@ -776,6 +777,42 @@ function looksLikeCpp(source: string): boolean {
   // comments removed so a doc comment's prose (`struct foo: x, y`) can't
   // flip a C header.
   return CPP_BASE_CLAUSE_RE.test(source.replace(C_COMMENT_RE, ' '));
+}
+
+const C_COMMENT_OR_STRING_RE = /\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:[^"\\\n]|\\.)*"/g;
+
+// Detect declaration-only C++ .h headers (without class/namespace/template definitions)
+// via C++-only keywords, :: scope resolution, template type declarations, reference params, and default args.
+function looksLikeCppDeclarations(source: string): boolean {
+  const code = source.replace(C_COMMENT_OR_STRING_RE, ' ');
+  if (
+    /\b(?:nullptr|constexpr|consteval|constinit|noexcept|decltype|typename|friend|explicit|mutable|co_await|co_yield|co_return|dynamic_cast|static_cast|reinterpret_cast|const_cast)\b/.test(
+      code
+    )
+  ) {
+    return true;
+  }
+  if (/\b[A-Za-z_]\w*\s*::\s*[~A-Za-z_]/.test(code)) {
+    return true;
+  }
+  if (
+    /(?:^|[;{}(),]|\b(?:extern|static|const|volatile|inline|typedef)\s+)[ \t]*[A-Za-z_][\w:]*\s*<\s*[A-Za-z_][\w\s,:*&<>]*>\s*(?:[*&]+\s*)*[A-Za-z_]\w*\s*[;=,)\[(]/m.test(
+      code
+    )
+  ) {
+    return true;
+  }
+  if (/\bconst\s+(?:(?:struct|class)\s+)?[A-Za-z_][\w:]*\s*(?:<\s*[^>;{}()]*>\s*)?[*&]*&\s*[A-Za-z_]\w*\s*[,)=;]/.test(code)) {
+    return true;
+  }
+  const fnDeclRe = /\b(?!(?:if|for|while|switch|return|sizeof|alignof|typeof|_Alignas|_Static_assert)\b)[A-Za-z_][\w:]*[\s*&]+[A-Za-z_]\w*\s*\(([^;{}()]+)\)\s*(?:const\b|noexcept\b|[;{])/g;
+  const refOrDefaultParamRe =
+    /(?:^|,)\s*(?:(?:const|volatile|unsigned|signed|short|long|struct|class|enum)\s+)*[A-Za-z_][\w:]*\s*(?:<\s*[^>()]*>\s*)?(?:[*&]*&\s*[A-Za-z_]\w*\s*(?:=[^,]+)?|[\s*]+[A-Za-z_]\w*\s*=\s*[^,]+)\s*(?:,|$)/;
+  let match: RegExpExecArray | null;
+  while ((match = fnDeclRe.exec(code)) !== null) {
+    if (refOrDefaultParamRe.test(match[1]!)) return true;
+  }
+  return false;
 }
 
 /**
