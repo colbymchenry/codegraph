@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- The Claude Code prompt hook now gets its context from the CodeGraph server your session already has running for the project, which answers several times sooner than the hook working it out again on every prompt, most of all on a large project. It waits up to 15 seconds, or `CODEGRAPH_PROMPT_HOOK_DAEMON_TIMEOUT_MS`, and adds nothing if the server is still busy then. With no server running, or with `CODEGRAPH_NO_DAEMON=1`, the hook works as before. (#3284)
+
 ### Fixes
 
 - In Python, `import time` no longer links the importing file to a project function that happens to be named `time`, so such a function stops listing every file that imports the standard library module among its callers and in its impact. The same goes for `json`, `copy`, `random`, `logging` and any other module, and for a fallback variable like `brotli = None` beside a guarded `import brotli`. Thanks @inth3shadows for the report. (#3239)

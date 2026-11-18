@@ -60,6 +60,7 @@ import {
 } from './writer-lock';
 import {
   canProbeDaemonIdentity,
+  daemonOptOutSet,
   decodeLockInfo,
   getDaemonPidPath,
   getDaemonSocketCandidates,
@@ -230,13 +231,6 @@ export async function pollForDaemon<S>(
     if (answer === 'older-version' || answer === 'version-mismatch') return null;
     if (answer) return answer;
   }
-}
-
-/** Whether `CODEGRAPH_NO_DAEMON` was set to a truthy value. */
-function daemonOptOutSet(): boolean {
-  const raw = process.env.CODEGRAPH_NO_DAEMON;
-  if (!raw) return false;
-  return raw !== '0' && raw.toLowerCase() !== 'false';
 }
 
 /** Whether this process was spawned to BE the detached daemon. */
