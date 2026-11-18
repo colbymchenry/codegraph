@@ -45,6 +45,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Java, when two packages declare a class of the same name, a static call, a call on a new object or a call through a variable now reaches the one the calling file can see, including through a wildcard import, and a call written with the package, like `com.x.b.Util.log(…)`, reaches that package's class. Thanks @inth3shadows for the reports and @johnhldiver-beep. (#2976, #3290, #3291)
 - In Kotlin, an extension declared on an import alias of a library type, like `fun DeclAlias.pad()` after `import androidx.compose.ui.Modifier as DeclAlias`, now links from calls on that type, whatever name the calling file imports it under. Thanks @mixxer for the report and the pull request. (#3084)
 - In PHP, a method called in a different letter case than its declaration, like `PriceConverter::CalcBasePrice(1)` or `$c->GetRate()` for `calcBasePrice` and `getRate`, now links to that method, as PHP reads method names without regard to case, so those calls show up in `callers` and impact. Thanks @artisanya for the report and @johnhldiver-beep. (#3297)
+- In PHP code written for PHP 7 and older, a string offset in braces, like `$code{0}`, no longer makes the function or class around it disappear from the index with its calls credited to the file; it now reads like `$code[0]`. Thanks @artisanya for the report. (#3299)
 
 ## [1.6.3] - 2026-11-17
 
