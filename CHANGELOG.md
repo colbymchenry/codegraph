@@ -72,6 +72,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In JavaScript and TypeScript, a call on a local variable declared after another one in the same statement, like `let n = 0, ob = make()`, or beside a default in a destructuring, like `const { ob = make() } = o`, links again when a variable of the same name outside the function holds a library's type, as it did before 1.6.3. Thanks @inth3shadows for the report and @mohitdixit02. (#3293)
 - In JavaScript, a call to a member a required module of your project doesn't have, like `utils.missing()` after `const utils = require('./utils')`, no longer links to an unrelated class's method of that name. Thanks @inth3shadows for the report and @johnhldiver-beep. (#3272)
 - A `fetch` or HTTP-client call to another company's API, like `fetch('https://api.github.com/users/…')`, no longer links to your own server's route with the same path; a call to localhost, to a host your code fills in, or through a client's base URL still links. Thanks @inth3shadows for the report and @johnhldiver-beep. (#2974)
+- In JavaScript and TypeScript, a call or `new` of a global, like `parseInt(…)`, `new Response(…)` or `new URL(…)`, in a module that doesn't import that name no longer links to a same-named export of another file in your project. Thanks @inth3shadows for the report. (#3238)
 
 ## [1.6.3] - 2026-11-17
 

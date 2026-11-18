@@ -11,7 +11,7 @@ import { escapeRegExp, escapesRoot } from '../utils';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { isJsSuperCallSite } from './js-super-calls';
-import { JS_ARRAY_METHODS, JS_BROWSER_HOST_GLOBALS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
+import { JS_ARRAY_METHODS, JS_BROWSER_HOST_GLOBALS, JS_BUILT_INS, JS_BUILTIN_METHODS, JS_STANDARD_GLOBALS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, dartPrivateVisible, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
@@ -2187,6 +2187,77 @@ function isTsTypeInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext
   const declaration = isDeclarationFile(n.filePath) || (isFlowLibrary(n.filePath, scope) && !/\.[cm]?tsx?$/i.test(ref.filePath));
   if ((scope.script && !declaration) || (isTestFile(n.filePath) && !isTestFile(ref.filePath))) return false;
   return scope.globalWords.has(`${n.startLine}:${n.startColumn}`);
+}
+
+/**
+ * The packages that make a project's own exports callable by a bare name with
+ * no import written: Nuxt's auto-imports of `composables/` and `utils/`, and
+ * unplugin-auto-import's.
+ */
+const JS_AUTO_IMPORT_PACKAGES = ['nuxt', 'nuxt3', '@nuxt/kit', 'unplugin-auto-import'];
+
+/**
+ * Whether `ref` calls or constructs a standard global (JS_STANDARD_GLOBALS)
+ * that its ES module neither declares nor imports (#3238): `parseInt(s)`,
+ * `new Response(body)` are the runtime's, never another module's export,
+ * which is reached only through an import that the import resolver has
+ * followed already. Any other name keeps the name match as a fallback. Not
+ * in a script, a file with no import or export, whose top level other scripts
+ * share; nor in a project whose build auto-imports its own exports.
+ */
+function isJsBareGlobalName(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if ((ref.referenceKind !== 'calls' && ref.referenceKind !== 'instantiates') || !JS_FAMILY.has(ref.language) ||
+      !JS_STANDARD_GLOBALS.has(ref.referenceName) || !TS_JS_FILE.test(ref.filePath) ||
+      context.getImportMappings?.(ref.filePath, ref.language)?.some((m) => m.localName === ref.referenceName)) return false;
+  const scope = tsGlobalScope(ref.filePath, context);
+  return !!scope && !scope.script && !scope.importAliases.has(ref.referenceName) &&
+    !JS_AUTO_IMPORT_PACKAGES.some((p) => context.isDeclaredPackage?.(p, ref.filePath) === true) &&
+    isJsWrittenBare(ref, context) && !isJsBoundAtRef(ref, context);
+}
+
+/**
+ * Whether a binding of the name holds where `ref` is written: a declaration,
+ * a parameter, a destructured one (`.then(({ encode }) => encode(x))` after a
+ * dynamic import), as jsBindingAt reads them. Such a name is no global, and
+ * this leaves its call as it was.
+ */
+function isJsBoundAtRef(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const file = jsScopeFile(ref.filePath, context);
+  if (!file) return isLocallyBoundJsName(ref.referenceName, ref.filePath, context);
+  const at = (file.lineStarts[ref.line - 1] ?? file.code.length) + ref.column;
+  return jsBindingAt(ref.referenceName, file, at) !== null;
+}
+
+/**
+ * Whether a call or `new` recorded by a bare name was written so: `parseInt(…)`,
+ * `new Response(…)`. A member recorded by its last name, `this.set(…)` or
+ * `new ctx.Request(…)`, is some object's, which isJsBareGlobalName doesn't
+ * read; nor is a name its column doesn't find.
+ */
+function isJsWrittenBare(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+  if (ref.referenceKind === 'instantiates') {
+    const made = /^new\s+([\w$.]+)/.exec(line.slice(ref.column));
+    if (made) return made[1] === ref.referenceName;
+  }
+  return line.startsWith(ref.referenceName, ref.column) && !isWrittenQualified(ref, context);
+}
+
+/**
+ * Whether a value a bare global name (isJsBareGlobalName) may be `n`: one of
+ * the file's own, or a global declaration — at a script's top level, directly
+ * inside `declare global`, or one the code hangs on the global object
+ * (`window.helper = …`). A test's or fixture's globals are its tests' only.
+ */
+function isJsValueInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (n.filePath === ref.filePath || !TS_JS_FILE.test(n.filePath)) return true;
+  const scope = tsGlobalScope(n.filePath, context);
+  if (!scope) return true;
+  if (isTestFile(n.filePath) && !isTestFile(ref.filePath)) return false;
+  if (scope.globalWords.has(`${n.startLine}:${n.startColumn}`)) return true;
+  // `window.helper = function helper() {…}`: a global wherever it is written.
+  const line = context.getFileLines?.(n.filePath)?.[n.startLine - 1] ?? context.readFile(n.filePath)?.split(/\r?\n/)[n.startLine - 1] ?? '';
+  return new RegExp(`(?:^|[^\\w$.])(?:window|globalThis|global|self)\\s*\\.\\s*${escapeRegExp(n.name)}\\s*=(?!=)`).test(line);
 }
 
 /**
@@ -15842,6 +15913,8 @@ export function matchByExactName(
   // Every candidate uses the same binding key. Keep this check lazy.
   let locallyBoundJsName: boolean | undefined;
   const tsBareTypeName = (): boolean => (bareTypeName ??= isTsBareTypeName(ref, context));
+  let bareGlobalName: boolean | undefined;
+  const jsBareGlobalName = (): boolean => (bareGlobalName ??= isJsBareGlobalName(ref, context));
   const ambientDeclarations = ambientModuleDeclarations(context);
   const sameName = outOfRepoCall
     ? innerScopeShadows(context.getNodesByName(ref.referenceName), ref, context)
@@ -15961,6 +16034,9 @@ export function matchByExactName(
     // its own or a global, never another module's — ahead of the ranking, so
     // a global `interface Window` in a `declare global` still wins.
     !(n.filePath !== ref.filePath && tsBareTypeName() && !isTsTypeInScope(n, ref, context)) &&
+    // So is a call or `new` of a bare name the module doesn't import: a
+    // global's, `parseInt` or `Response`, never another module's export (#3238).
+    !(n.filePath !== ref.filePath && jsBareGlobalName() && !isJsValueInScope(n, ref, context)) &&
     // Nor is a `declare module` block a file can't see any candidate, ahead of
     // the ranking, where the gate on the winner would drop the reference: a
     // sibling's test stub's `createRef` is no rival to `packages/react`'s own.
@@ -35944,6 +36020,7 @@ export function matchFuzzy(
         (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
     !(JS_FAMILY.has(ref.language) && isOutOfRepoBinding(ref.referenceName, ref, context)) &&
     !(finalCandidates[0]!.filePath !== ref.filePath && isTsBareTypeName(ref, context) && !isTsTypeInScope(finalCandidates[0]!, ref, context)) &&
+    !(finalCandidates[0]!.filePath !== ref.filePath && isJsBareGlobalName(ref, context) && !isJsValueInScope(finalCandidates[0]!, ref, context)) &&
     !(finalCandidates[0]!.kind === 'method' && isBareGoCall(ref, context)) &&
     // A bare PHP call is a function call (case-insensitive, so fuzzy may find
     // one) — never the class `View` for `view(…)`, never a method.
