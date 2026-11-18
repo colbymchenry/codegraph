@@ -412,6 +412,53 @@ function pythonRefClass(name: string, ref: UnresolvedRef, context: ResolutionCon
 }
 
 /**
+ * Whether a Python local the receiver patterns typed holds an instance of the
+ * class they read (#2957). Built through its module, `client =
+ * pkg.AsyncClient()`, the path must name a project class: an outside module's
+ * class says nothing of a project class sharing its last name. Bound by `with
+ * … as client` (or `async with`), the local holds what the class's `__enter__`
+ * (`__aenter__`) returns: the instance, unless the project's own method, the
+ * class's or a base's, returns anything but `self` (`with Pool() as conn`
+ * hands out a connection). An outside class's `with` says nothing either.
+ */
+function pythonPatternTypeHolds(match: string, raw: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const withItem = /(?:^|[\s;:\0])(async\s+)?with\s[\s\S]*\sas\s+\w+$/.exec(match);
+  const throughModule = /^[a-z_]\w*\./.test(raw);
+  if (!withItem && !throughModule) return true;
+  const cls = pythonRefClass(raw, ref, context);
+  if (!cls) return false;
+  if (!withItem) return true;
+  const enter = pythonClassMethod(cls, withItem[1] ? '__aenter__' : '__enter__', ref, context);
+  return !enter || pythonReturnsOnlySelf(enter, context);
+}
+
+/** A Python class's own method of that name, or else the nearest project base's. */
+function pythonClassMethod(cls: Node, name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const queue: Node[] = [cls];
+  const seen = new Set<string>();
+  while (queue.length > 0 && seen.size < 16) {
+    const c = queue.shift()!;
+    if (seen.has(c.id)) continue;
+    seen.add(c.id);
+    const own = context.getNodesByQualifiedName(`${c.qualifiedName}::${name}`).find(n => n.kind === 'method' && n.filePath === c.filePath);
+    if (own) return own;
+    queue.push(...pythonBases(c, ref, context));
+  }
+  return null;
+}
+
+/** Whether a Python method returns, and every `return` in it gives `self` (a body on the `def` line too). */
+function pythonReturnsOnlySelf(method: Node, context: ResolutionContext): boolean {
+  const body = pythonMemberLines(method.filePath, context).slice(method.startLine - 1, method.endLine);
+  const values = body.flatMap(l => {
+    // `\s*$`, not `.*$`: a line of a CRLF file ends in `\r`, which `.` doesn't match.
+    const m = /(?:^|[:;])\s*return\b(.*?)\s*$/.exec(pythonBlankStrings(l));
+    return m ? [m[1]!.trim()] : [];
+  });
+  return values.length > 0 && values.every(v => v === 'self');
+}
+
+/**
  * Whether every import binding a Python name in `filePath` is of a module
  * Python's search doesn't find in the project: `class Color(Enum)` after `from
  * enum import Enum` is not the project's own `Enum`. That search can miss a
@@ -23965,8 +24012,14 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
         // returns one instance of the model (not `filter`/`all`, a QuerySet).
         new RegExp(`(?:^|;)\\s*${r}\\s*=(?!=)\\s*([A-Z]\\w*)\\.objects\\.(?:create|get|first|last|latest|earliest|get_by_natural_key)\\s*\\(`),
         // lg = Logger(...) — a statement of its own: `prefix=IPNetwork(…),`
-        // inside a call's arguments is a keyword argument, not a binding.
-        new RegExp(`(?:^|;)\\s*${r}\\s*=(?!=)\\s*([A-Z][\\w.]*)\\s*\\((?![^\\n]*,\\s*$)`),
+        // inside a call's arguments is a keyword argument, not a binding. The
+        // class may be reached through its module (`lg = log.Logger(…)`), when
+        // that path names a project class (pythonPatternTypeHolds, #2957).
+        new RegExp(`(?:^|;)\\s*${r}\\s*=(?!=)\\s*((?:[a-z_]\\w*\\.)*[A-Z][\\w.]*)\\s*\\((?![^\\n]*,\\s*$)`),
+        // with Logger(…) as lg: / async with log.Logger(…) as lg: — one item of
+        // several too. The local holds what `__enter__` / `__aenter__` returns,
+        // the instance unless the project's own says otherwise (#2957).
+        new RegExp(`(?:^|;)\\s*(?:async\\s+)?with\\s+(?:[^#]*?,\\s*)?((?:[a-z_]\\w*\\.)*[A-Z]\\w*)\\s*\\((?:[^()]|\\([^()]*\\))*\\)\\s+as\\s+${r}\\b`),
         // A quoted forward reference (`lg: "Logger"`, `lg: 'pkg.Logger'`) is the
         // same annotation — and what every file under `from __future__ import
         // annotations` or with a not-yet-defined class writes. The unquoted
@@ -24812,6 +24865,7 @@ export function inferLocalReceiverType(
     for (const re of i >= ownFrom ? withListed : patterns) {
       const m = re.exec(input);
       if (m && m[2]) {
+        if (ref.language === 'python' && !pythonPatternTypeHolds(m[0], m[2], ref, context)) continue;
         let type = ref.language === 'java' ? javaTypeName(m[2]) : normalizeInferredTypeName(m[2]);
         // Delphi dereferences a pointer for a member (`P.Method` is
         // `P^.Method`), and a class reference reaches its class's methods.
@@ -26989,6 +27043,14 @@ function matchMethodCallOn(
       ref.language === 'cpp'
         ? inferCppReceiverType(objectOrClass!, ref, context, 0, cppDecl)
         : inferLocalReceiverType(objectOrClass!, ref, context, decl));
+    // A Python local built through a module (`client = pkg.b.AsyncClient()`) is
+    // of the class that path names, which its last name alone doesn't pick: the
+    // project may have another `AsyncClient` in another module (#2957).
+    if (ref.language === 'python' && dotMatch && inferredType && decl.raw && /^[a-z_]\w*\./.test(decl.raw)) {
+      const cls = pythonRefClass(decl.raw, ref, context);
+      const method = cls ? pythonClassMethod(cls, methodName!, ref, context) : null;
+      if (method) return { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'instance-method' };
+    }
     // Read on another line than the binding the call sees, it is another
     // binding's type: the strategies below guess, unless no project type has
     // that name — as before the binding was read.
