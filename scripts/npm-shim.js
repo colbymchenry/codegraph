@@ -57,6 +57,18 @@ async function main() {
     process.stderr.write('codegraph: ' + res.error.message + '\n');
     process.exit(1);
   }
+  if (res.signal) {
+    // The bundled runtime was killed by a signal, most often the kernel's
+    // out-of-memory killer. Say so and exit as a shell would, 128 plus the
+    // signal's number (137 for SIGKILL), so a script can tell a kill from a
+    // failure; a bare exit 1 said neither (issue #3277). The CLI's own
+    // relaunch (src/extraction/wasm-runtime-flags.ts) does the same.
+    process.stderr.write(res.signal === 'SIGKILL'
+      ? 'codegraph: the process was killed by SIGKILL; the system may have run out of memory.\n'
+      : 'codegraph: the process was stopped by ' + res.signal + '.\n');
+    var signo = os.constants.signals[res.signal];
+    process.exit(typeof signo === 'number' ? 128 + signo : 1);
+  }
   process.exit(res.status === null ? 1 : res.status);
 }
 

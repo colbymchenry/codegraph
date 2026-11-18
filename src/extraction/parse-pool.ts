@@ -29,6 +29,9 @@
 
 import { Worker } from 'worker_threads';
 import type { Language, ExtractionResult } from '../types';
+import { DEFAULT_PARSE_TIMEOUT_MS, resolveParseBudgetMs } from './parse-budget';
+
+export { resolveParseBudgetMs, resolveParseTimeoutMs } from './parse-budget';
 
 /**
  * Minimal worker surface the pool drives — satisfied by a real `worker_threads`
@@ -69,10 +72,6 @@ const PARSES_TO_MEASURE = 8;
  * 40 ms for the CPU and memory of a worker it does without.
  */
 const WORKER_WORTH_MS = 40;
-/** Base per-parse timeout; scaled up for large files by the caller's formula. */
-const DEFAULT_PARSE_TIMEOUT_MS = 10_000;
-/** Keep the default large-file budget bounded; the hard-kill window is 3× this. */
-const MAX_SCALED_PARSE_TIMEOUT_MS = 20_000;
 /**
  * A worker is only killed once a parse has gone this many × its budget with no
  * result. The base timer firing is NOT proof the parse is still running: after
@@ -118,30 +117,6 @@ const CRASH_BUDGET = 100;
  *   - unset / blank / non-numeric → `clamp(cores - 1, 1, 8)` (leave a core for
  *     the main thread + UI; never zero — parsing always needs a worker).
  */
-/**
- * Resolve the base per-parse timeout from the `CODEGRAPH_PARSE_TIMEOUT_MS`
- * override. Slow storage (HDD, network folders) can need a larger budget; a
- * non-numeric / non-positive value falls back to the default (10s).
- */
-export function resolveParseTimeoutMs(envVal: string | undefined): number {
-  if (envVal !== undefined && envVal !== '') {
-    const n = Number(envVal);
-    if (Number.isFinite(n) && n > 0) return Math.floor(n);
-  }
-  return DEFAULT_PARSE_TIMEOUT_MS;
-}
-
-/**
- * Per-file soft timeout. Size scaling helps legitimate large sources, but an
- * uncapped linear budget gave data-only headers near the 1 MiB file limit a
- * 4.5–5 minute hard-kill window (#1555). Explicit larger base overrides remain
- * respected for slow storage.
- */
-export function resolveParseBudgetMs(baseMs: number, contentLength: number): number {
-  const scaled = baseMs + Math.floor(contentLength / 100_000) * 10_000;
-  return Math.min(scaled, Math.max(baseMs, MAX_SCALED_PARSE_TIMEOUT_MS));
-}
-
 export function resolveParsePoolSize(envVal: string | undefined, cpuCount: number): number {
   if (envVal !== undefined && envVal !== '') {
     const n = Number(envVal);

@@ -30,7 +30,7 @@ import type { AgentTarget, Location, TargetId, WriteResult } from './targets/typ
 // installer must stay importable even when native modules can't load).
 import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
-import { getCodeGraphDir } from '../directory';
+import { getCodeGraphDir, unsafeIndexRootReason } from '../directory';
 import { getTelemetry, TELEMETRY_DOCS } from '../telemetry';
 import { maybeOfferBetaSignup } from './beta-signup';
 
@@ -414,7 +414,10 @@ export interface RefreshReport {
  *   - targets that aren't `alreadyConfigured` are skipped untouched;
  *   - permissions are not written (`autoAllow: false`) and the prompt
  *     hook is left as-is (`promptHook: undefined`), so choices the user
- *     made at install time — or by hand since — are preserved.
+ *     made at install time — or by hand since — are preserved;
+ *   - a `local` sweep from a folder that holds no project — the home
+ *     folder, a folder above it, a filesystem root: the folders `init`
+ *     refuses — finds nothing configured there (see below).
  *
  * Every write underneath is the targets' own idempotent upsert, so a
  * re-run on an already-current machine reports `unchanged` everywhere.
@@ -425,12 +428,21 @@ export function refreshTargets(
   targets: readonly AgentTarget[],
   location: Location,
 ): RefreshReport[] {
+  // A local install belongs to the project the command runs in. `codegraph
+  // upgrade` sweeps both locations from wherever the terminal is, and a new
+  // terminal opens in the home folder, where an agent's project file and its
+  // user-wide one are the same file (`./.cursor/mcp.json` is
+  // `~/.cursor/mcp.json`). Detection there takes the global install for a
+  // local one, and re-installing it as local rewrites the user's own setup:
+  // Cursor's server gets pinned to the home folder, and `~/AGENTS.md`,
+  // `~/GEMINI.md` and `~/QWEN.md` appear (#3234). No project, no local install.
+  const noProjectHere = location === 'local' && unsafeIndexRootReason(process.cwd()) !== null;
   return targets.map((target) => {
     const base = { id: target.id, displayName: target.displayName, location };
     if (!target.supportsLocation(location)) {
       return { ...base, status: 'unsupported' as const, changedPaths: [] };
     }
-    if (!target.detect(location).alreadyConfigured) {
+    if (noProjectHere || !target.detect(location).alreadyConfigured) {
       return { ...base, status: 'not-configured' as const, changedPaths: [] };
     }
     let result: WriteResult;

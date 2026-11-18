@@ -31,6 +31,7 @@
  * too.
  */
 import { spawnSync } from 'child_process';
+import { constants as osConstants } from 'os';
 
 /**
  * The V8 flag(s) that keep tree-sitter grammar compilation off the turboshaft
@@ -139,5 +140,30 @@ export function relaunchWithWasmRuntimeFlagsIfNeeded(scriptPath: string): void {
     // this process. Degraded (may OOM on huge repos) but not broken.
     return;
   }
-  process.exit(result.status ?? (result.signal ? 1 : 0));
+  if (result.signal) {
+    // The relaunched process was killed by a signal, most often the kernel's
+    // out-of-memory killer. Say so and exit as a shell would, so a script or
+    // CI can tell a kill from a failure; a bare exit 1 said neither (#3277).
+    process.stderr.write(signalKillMessage(result.signal) + '\n');
+    process.exit(signalExitCode(result.signal));
+  }
+  process.exit(result.status ?? 0);
+}
+
+/**
+ * The exit code a shell gives a process a signal killed: 128 plus the signal's
+ * number (137 for SIGKILL, 143 for SIGTERM), or 1 for a signal this platform
+ * doesn't number. The npm shim (scripts/npm-shim.js) does the same for the
+ * bundled runtime it starts.
+ */
+export function signalExitCode(signal: string): number {
+  const number = (osConstants.signals as Record<string, number | undefined>)[signal];
+  return typeof number === 'number' ? 128 + number : 1;
+}
+
+/** What `codegraph` prints when the process it started was killed by `signal`. */
+export function signalKillMessage(signal: string): string {
+  return signal === 'SIGKILL'
+    ? 'codegraph: the process was killed by SIGKILL; the system may have run out of memory.'
+    : `codegraph: the process was stopped by ${signal}.`;
 }

@@ -161,9 +161,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
     parser
         .set_language(&grammar)
         .map_err(|e| format!("set_language(php) failed: {e}"))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| "parser returned null tree".to_string())?;
+    let tree = crate::parse_budget::parse(&mut parser, source)?;
     if tree.root_node().has_error() {
         return Err("defer: parse tree contains errors — wasm recovery is canonical".to_string());
     }
@@ -621,6 +619,17 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
+
+        // A `require`/`include` in a body includes its file there, so the
+        // function depends on it (#3296), as visitForCallsAndStructure does.
+        // Its children are still walked below.
+        if matches!(
+            kind,
+            "include_expression" | "include_once_expression" | "require_expression"
+                | "require_once_expression"
+        ) {
+            self.extract_import(node);
+        }
 
         if matches!(
             kind,

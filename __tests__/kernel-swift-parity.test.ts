@@ -223,9 +223,10 @@ describe.skipIf(!kernelBuilt)('kernel Swift extraction parity', () => {
   });
 
   it('files with parse errors defer to the wasm extractor (recovery is encoding-dependent)', () => {
-    // A NEW-only regression construct (`#if` between enum cases — the swift
-    // checklist's grammar-bump delta 5) — errors on the 0.7.3 grammar.
-    const broken = 'enum E {\n  case a\n#if DEBUG\n  case b\n#endif\n}\n';
+    // A construct tree-sitter-swift 0.7.4 still errors on: a function type
+    // with a `sending` result (Swift 6; swift-nio's EventLoop.swift). The
+    // `#if` between enum cases this used to take parses since 0.7.4 (#3212).
+    const broken = 'func run<T>(body: () throws -> sending T) -> T { fatalError() }\n';
     process.env.CODEGRAPH_KERNEL_LANGS = 'all';
     delete process.env.CODEGRAPH_KERNEL;
     expect(tryKernelExtract('src/Broken.swift', broken, 'swift')).toBeNull();

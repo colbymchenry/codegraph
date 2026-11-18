@@ -80,7 +80,11 @@ export interface CfnptrFactsOut {
 }
 
 export interface KernelModule {
-  extractFile(filePath: string, content: string, language: string): KernelBuffers;
+  /**
+   * `parseBudgetMs`: how long the native parse may run before it is cancelled,
+   * with a `timeout:` error (#3274). An older binary ignores it.
+   */
+  extractFile(filePath: string, content: string, language: string, parseBudgetMs?: number): KernelBuffers;
   contractInfo(): KernelContractInfo;
   grammarInfo(language: string): KernelGrammarInfo | null;
   /** Batched cFnPtr extraction sweep (task #5 step 2). OPTIONAL: absent on

@@ -483,6 +483,7 @@ export class QueryBuilder {
     deleteEdgesByTarget?: SqliteStatement;
     getEdgesBySource?: SqliteStatement;
     getEdgesByTarget?: SqliteStatement;
+    getDependentEdgesByTarget?: SqliteStatement;
     getUnresolvedFromNode?: SqliteStatement;
     getUnresolvedInFile?: SqliteStatement;
     insertFile?: SqliteStatement;
@@ -2765,6 +2766,24 @@ export class QueryBuilder {
       this.stmts.getEdgesBySource = this.db.prepare('SELECT * FROM edges WHERE source = ? ORDER BY kind, target, line, col');
     }
     const rows = this.stmts.getEdgesBySource.all(sourceId) as EdgeRow[];
+    return rows.map(rowToEdge);
+  }
+
+  /**
+   * Incoming edges to a node except `contains`: the edges that make their
+   * source depend on the target, in {@link getIncomingEdges} order.
+   *
+   * Impact traversal runs this once per visited node, so it stays one index
+   * search with no LIMIT. A kind list searches the index once per kind, and a
+   * LIMIT under this ORDER BY made each read markedly slower (#3248).
+   */
+  getIncomingEdgesExceptContains(targetId: string): Edge[] {
+    if (!this.stmts.getDependentEdgesByTarget) {
+      this.stmts.getDependentEdgesByTarget = this.db.prepare(
+        "SELECT * FROM edges WHERE target = ? AND kind != 'contains' ORDER BY kind, source, line, col"
+      );
+    }
+    const rows = this.stmts.getDependentEdgesByTarget.all(targetId) as EdgeRow[];
     return rows.map(rowToEdge);
   }
 
@@ -5744,10 +5763,18 @@ export class QueryBuilder {
       const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
       const rows = this.db
-        .prepare(`SELECT DISTINCT file_path, name FROM nodes WHERE file_path IN (${placeholders})`)
-        .all(...chunk) as Array<{ file_path: string; name: string }>;
+        .prepare(`SELECT file_path, name, SUM(language = 'python' AND kind IN ('function', 'method')) AS python_defs
+                    FROM nodes WHERE file_path IN (${placeholders}) GROUP BY file_path, name`)
+        .all(...chunk) as Array<{ file_path: string; name: string; python_defs: number }>;
       // NUL-joined: a path or a symbol name can contain a space, never a NUL.
-      for (const row of rows) pairs.add(`${row.file_path}\0${row.name}`);
+      // A Python name a file defines more than once (typing.overload stubs and
+      // the def below them) also counts its defs, behind a \u0001 in the file's
+      // half: adding or removing the implementation moves every call to the
+      // name (#2963) while the set of names stays the same.
+      for (const row of rows) {
+        const file = row.python_defs > 1 ? `${row.file_path}\u0001${row.python_defs}` : row.file_path;
+        pairs.add(`${file}\0${row.name}`);
+      }
     }
     return pairs;
   }

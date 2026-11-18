@@ -42,10 +42,10 @@ tree-sitter-ruby = "=0.23.1"
 # php: the walker calls LANGUAGE_PHP (the full HTML-interleaving variant the
 # wasm ships) — NEVER LANGUAGE_PHP_ONLY, which errors on leading HTML.
 tree-sitter-php = "=0.24.2"
-# swift: NOT a crate dep — the kernel compiles tree-sitter-swift 0.7.3's
-# tarball src/ itself (grammars/swift, build.rs), with a one-line scanner fix
-# the crate's own build lacks on Windows (`try!`; docs/grammars/
-# tree-sitter-swift.md). The vendored wasm is built from the same tarball.
+# swift: NOT a crate dep — the kernel compiles tree-sitter-swift 0.7.4's
+# tarball src/ itself (grammars/swift, build.rs), with the scanner patch the
+# vendored wasm needs (docs/grammars/tree-sitter-swift.md). The vendored wasm
+# is built from the same patched tarball.
 # r: the vendored wasm IS r-lib v1.2.0 and this crate's tarball ships both
 # generated artifacts sha-identical to the tag (parser.c 6221657347…,
 # scanner.c 1209d11076… — r checklist §Grammar prep). ABI 14 (the tag
