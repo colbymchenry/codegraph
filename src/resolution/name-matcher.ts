@@ -16918,12 +16918,13 @@ function holderExtentOf(container: Node, lines: string[]): { lines: string[]; ex
 /**
  * The own members of the object literal a holder's `code` (see holderExtent)
  * initializes it with, as spans of that text, one per top-level comma;
- * undefined when the holder isn't written `name = { … }` (optionally inside
- * `Object.freeze(…)` / `Object.seal(…)`).
+ * undefined unless the holder is written `name = { … }` (optionally inside
+ * `Object.freeze(…)` / `Object.seal(…)`) or is the object a module
+ * default-exports, `export default { … }` (#3393).
  */
 function objectLiteralMemberSpans(code: string): Array<{ start: number; end: number }> | undefined {
   // Start at THIS declarator, including its columns, never a sibling on the same line.
-  const open = /^[^=]*=\s*(?:(?:Object\.(?:freeze|seal)\s*)?\(\s*)*\{/.exec(code);
+  const open = /^(?:export\s+default\s*|[^=]*=\s*)(?:(?:Object\.(?:freeze|seal)\s*)?\(\s*)*\{/.exec(code);
   if (!open) return undefined;
 
   const members: Array<{ start: number; end: number }> = [];

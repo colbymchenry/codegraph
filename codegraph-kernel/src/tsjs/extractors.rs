@@ -6,7 +6,8 @@
 use crate::textutil as util;
 use super::{
     body_of, is_builtin_type, is_host_global_root, is_literal_receiver, is_object_member_function,
-    is_react_hoc, is_static_object_key, is_variable_type, is_vue_collection_name, Extra, Scope, Walker,
+    is_react_hoc, is_sfc_script_host, is_static_object_key, is_variable_type, is_vue_collection_name, Extra, Scope,
+    Walker,
 };
 use crate::buffers::edge_kind_index;
 use std::collections::HashSet;
@@ -1414,7 +1415,10 @@ impl<'t> Walker<'t> {
         objects
     }
 
-    pub(super) fn extract_store_collection_methods(&mut self, config: Node<'t>) {
+    /// extractStoreCollectionMethods: whether the object has an
+    /// actions/mutations/getters collection, whose methods are extracted.
+    fn extract_store_collection_methods(&mut self, config: Node<'t>) -> bool {
+        let mut found = false;
         for i in 0..config.named_child_count() {
             let Some(member) = config.named_child(i) else { continue };
             if member.kind() != "pair" {
@@ -1427,9 +1431,41 @@ impl<'t> Walker<'t> {
             if let Some(value) = member.child_by_field_name("value") {
                 if matches!(value.kind(), "object" | "object_expression") {
                     self.extract_object_literal_functions(value);
+                    found = true;
                 }
             }
         }
+        found
+    }
+
+    /// extractDefaultExportObject: `export default { … }`, read one of two
+    /// ways; true when the statement's subtree is handled here. A Vuex module
+    /// in a store file has its collections' methods extracted, and a store
+    /// file's default object with neither a collection nor a function member is
+    /// skipped, as before. Any other object with function members owns them
+    /// (#3393) under a constant named for the export, `default` (members
+    /// `default::fetchUser`), exported, its other members walked under it.
+    pub(super) fn extract_default_export_object(&mut self, statement: Node<'t>) -> bool {
+        let Some(value) = statement.child_by_field_name("value") else { return false };
+        if !matches!(value.kind(), "object" | "object_expression") {
+            return false;
+        }
+        if self.looks_like_vue_store_file() && self.extract_store_collection_methods(value) {
+            return true;
+        }
+        let obj = if is_sfc_script_host(self.file_path) { None } else { self.owned_object_value(Some(value)) };
+        let Some(obj) = obj else { return self.looks_like_vue_store_file() };
+        let extra = Extra {
+            docstring: crate::docstring::preceding_docstring(statement, self.src),
+            signature: Some(util::init_signature(self.text(obj))),
+            is_exported: Some(true),
+            ..Extra::default()
+        };
+        let Some(row) = self.create_node("constant", "default", statement, extra) else {
+            return self.looks_like_vue_store_file();
+        };
+        self.extract_owned_object_members(obj, row, "constant", "default", true, false, false);
+        true
     }
 
     fn find_pinia_setup_fn(&self, call: Node<'t>) -> Option<Node<'t>> {
