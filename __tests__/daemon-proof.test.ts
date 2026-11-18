@@ -216,7 +216,8 @@ describe('the daemon answers a challenge in its handshake (#3284)', () => {
     expect(JSON.parse(await next())).toMatchObject({ id: 5, result: {} });
   });
 
-  // The proxy's client-hello carries no challenge: its connection is as before.
+  // A client-hello without a challenge, as clients sent before the proof, gets
+  // its session as before, with no line ahead of it.
   it('sends no proof line to a client-hello without a challenge', async () => {
     const socketPath = uniqueSocketPath();
     await daemonOn(socketPath);

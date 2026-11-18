@@ -70,6 +70,15 @@ describe('the poll for a spawned daemon', () => {
     }
     expect(clock.now() - started).toBe(50);
   });
+
+  // A stand-in another user put where the daemon listens can't prove it runs
+  // as this user: waiting on it would only end in serving in-process anyway.
+  it('stops at once for a daemon that cannot prove it runs as this user', async () => {
+    const clock = fakeClock();
+    const started = clock.now();
+    expect(await pollForDaemon(async () => 'unproven' as const, 6_000, 25, clock)).toBeNull();
+    expect(clock.now() - started).toBe(25);
+  });
 });
 
 describe('the probe of the socket candidates', () => {

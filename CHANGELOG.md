@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- On a computer shared with other users, each agent session now checks that the CodeGraph background server it connects to runs as you before sending it anything, and serves the session itself when the server can't prove it, so another user can no longer stand in for your server to read your agent's queries or feed it made-up answers. Thanks @aidenpan0x for pointing it out.
+
 ### New Features
 
 - The Claude Code prompt hook now gets its context from the CodeGraph server already running for your project instead of loading the index again on every prompt, so structural prompts are answered sooner, most of all in large projects; with no server running, one that is busy, or one that can't prove it runs as you, the hook works it out itself as before. Thanks @aidenpan0x for the report, the measurements and the pull request. (#3284)

@@ -23,6 +23,7 @@ import * as net from 'net';
 import { findNearestCodeGraphRoot } from '../directory';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 import { DaemonClientHello, DaemonHello, MAX_HELLO_LINE_BYTES } from './daemon';
+import { daemonKeyPath, daemonProofMatches, newDaemonChallenge, readDaemonKey } from './daemon-proof';
 import { EARLY_PPID } from './early-ppid';
 import { supervisionLostReason } from './ppid-watchdog';
 import { armStartupHandshakeTimeout } from './startup-handshake';
@@ -121,36 +122,13 @@ export async function runProxy(
   socketPath: string,
   expectedVersion: string = CodeGraphPackageVersion,
 ): Promise<ProxyResult> {
-  // POSIX: refuse to connect to a stale socket file that points at no
-  // listening process. `fs.existsSync` is a cheap pre-check; a real
-  // ECONNREFUSED below catches the rare "exists but unbound" race.
-  if (process.platform !== 'win32' && !fs.existsSync(socketPath)) {
-    return { outcome: 'fallback-needed', reason: 'socket file missing' };
+  // The same connect as every session's: the hello, the version and the
+  // daemon's proof that it runs as this user, before any byte is piped.
+  const socket = await connectWithHello(socketPath, expectedVersion);
+  if (!socket) return { outcome: 'fallback-needed', reason: 'no daemon answered' };
+  if (typeof socket === 'string') {
+    return { outcome: 'fallback-needed', reason: socket === 'unproven' ? 'daemon could not prove it runs as this user' : 'version mismatch' };
   }
-
-  const socket = net.createConnection(socketPath);
-  socket.setEncoding('utf8');
-
-  const hello = await readHelloLine(socket).catch((err) => {
-    socket.destroy();
-    return new Error(String(err));
-  });
-  if (hello instanceof Error) {
-    return { outcome: 'fallback-needed', reason: hello.message };
-  }
-
-  if (hello.codegraph !== expectedVersion) {
-    process.stderr.write(
-      `[CodeGraph MCP] Found a daemon on ${socketPath} but version (${hello.codegraph}) ` +
-      `differs from ours (${expectedVersion}); falling back to direct mode.\n`
-    );
-    socket.destroy();
-    return { outcome: 'fallback-needed', reason: 'version mismatch' };
-  }
-
-  logAttachedDaemon(socketPath, hello);
-
-  sendClientHello(socket);
   startPpidWatchdog(socket);
   await pipeUntilClose(socket);
   // Host disconnected (or the daemon went away). The proxy's only job is the
@@ -160,20 +138,27 @@ export async function runProxy(
 }
 
 /**
- * Connect to a daemon at `socketPath` and verify its hello (exact version match).
- * Returns the live socket (hello already consumed), null if unreachable / stale,
+ * Connect to a daemon at `socketPath`, verify its hello (exact version match),
+ * then have it prove it runs as this user (see `./daemon-proof`). Returns the
+ * live socket (hello and proof already consumed), null if unreachable / stale,
  * or — for a daemon of another version — `'older-version'` when it runs an older
  * release ({@link isOlderRelease}; the launcher replaces it, #2335) and
- * `'version-mismatch'` for any other version, which is left alone. Unlike
- * {@link runProxy} it does NOT pipe — the caller owns the socket. Used by the
- * local-handshake proxy's background connect. `helloTimeoutMs` bounds the wait
- * for the hello, so a caller with a deadline can spend no more than it has.
+ * `'version-mismatch'` for any other version, which is left alone. A daemon of
+ * this version that can't prove it is `'unproven'`: a stand-in another user put
+ * where the daemon listens (the shared temp folder's socket, or on Windows a
+ * pipe name anyone can take first), or this user's daemon running with another
+ * home folder. The caller serves that session in-process, as for a mismatch,
+ * rather than send it tool calls and put its answers in front of the agent.
+ * Unlike {@link runProxy} it does NOT pipe — the caller owns the socket. Used by
+ * the local-handshake proxy's background connect. `helloTimeoutMs` bounds the
+ * wait for the hello, and again for the proof, so a caller with a deadline can
+ * spend no more than it has.
  */
 export async function connectWithHello(
   socketPath: string,
   expectedVersion: string = CodeGraphPackageVersion,
   helloTimeoutMs: number = DAEMON_HELLO_TIMEOUT_MS,
-): Promise<net.Socket | 'older-version' | 'version-mismatch' | null> {
+): Promise<net.Socket | 'older-version' | 'version-mismatch' | 'unproven' | null> {
   if (process.platform !== 'win32' && !fs.existsSync(socketPath)) return null;
   const socket = net.createConnection(socketPath);
   socket.setEncoding('utf8');
@@ -204,8 +189,21 @@ export async function connectWithHello(
     );
     return 'version-mismatch';
   }
+  // Before any byte of the session, the daemon proves it holds this user's key.
+  const challenge = newDaemonChallenge();
+  sendClientHello(socket, challenge);
+  const proof = await readProofLine(socket, helloTimeoutMs).catch(() => undefined);
+  // Read once the proof is in: the daemon answering the first challenge makes the key.
+  const key = proof === undefined ? null : readDaemonKey();
+  if (!key || !daemonProofMatches(key, challenge, socketPath, proof)) {
+    socket.destroy();
+    process.stderr.write(
+      `[CodeGraph MCP] The daemon on ${socketPath} could not prove it runs as this user ` +
+      `(with the key in ${daemonKeyPath()}); serving this session in-process.\n`
+    );
+    return 'unproven';
+  }
   logAttachedDaemon(socketPath, hello);
-  sendClientHello(socket);
   return socket;
 }
 
@@ -218,11 +216,12 @@ export async function connectWithHello(
  * socket-close lifecycle). `hostPid` mirrors the PPID watchdog: the threaded
  * host pid if set, else our own parent (the host, on a no-relaunch bundle).
  */
-function sendClientHello(socket: net.Socket): void {
+function sendClientHello(socket: net.Socket, challenge?: string): void {
   const clientHello: DaemonClientHello = {
     codegraph_client: 1,
     pid: process.pid,
     hostPid: parseHostPpid(process.env[HOST_PPID_ENV]) ?? EARLY_PPID,
+    ...(challenge !== undefined ? { challenge } : {}),
   };
   try { socket.write(JSON.stringify(clientHello) + '\n'); } catch { /* best-effort */ }
 }
@@ -696,6 +695,61 @@ function readHelloLine(socket: net.Socket, timeoutMs: number = DAEMON_HELLO_TIME
     const timer = setTimeout(() => {
       cleanup();
       reject(new Error('timed out waiting for daemon hello'));
+    }, timeoutMs);
+    timer.unref?.();
+    socket.on('data', onData);
+    socket.on('error', onError);
+    socket.on('close', onClose);
+  });
+}
+
+/**
+ * Read the daemon's answer to our client-hello's challenge: one
+ * `{"codegraph_proof": …}` line (see `./daemon-proof`), the line a daemon sends
+ * before the session's first byte. Resolves the proof (null from a daemon that
+ * holds no key); rejects on anything else, a close, or no line within
+ * `timeoutMs`. Bounded like the hello, and bytes past the line go back to the
+ * stream, so the pipe that follows sees the session intact.
+ */
+function readProofLine(socket: net.Socket, timeoutMs: number): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let buffer = '';
+    const cleanup = () => {
+      socket.removeListener('data', onData);
+      socket.removeListener('error', onError);
+      socket.removeListener('close', onClose);
+      clearTimeout(timer);
+    };
+    const onData = (chunk: string | Buffer) => {
+      buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      const idx = buffer.indexOf('\n');
+      if (idx === -1) {
+        if (buffer.length > MAX_HELLO_LINE_BYTES) {
+          cleanup();
+          reject(new Error('daemon proof line exceeded size limit'));
+        }
+        return;
+      }
+      const line = buffer.slice(0, idx);
+      const tail = buffer.slice(idx + 1);
+      cleanup();
+      if (tail.length > 0) socket.unshift(tail);
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown> | null;
+        if (!parsed || typeof parsed !== 'object' || !('codegraph_proof' in parsed)) {
+          reject(new Error('daemon sent no proof'));
+          return;
+        }
+        resolve(parsed.codegraph_proof);
+      } catch (err) {
+        reject(new Error(`daemon proof not JSON: ${err instanceof Error ? err.message : String(err)}`));
+      }
+    };
+    const onError = (err: Error) => { cleanup(); reject(err); };
+    const onClose = () => { cleanup(); reject(new Error('daemon closed connection before its proof')); };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('timed out waiting for the daemon proof'));
     }, timeoutMs);
     timer.unref?.();
     socket.on('data', onData);

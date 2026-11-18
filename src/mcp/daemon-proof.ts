@@ -1,8 +1,9 @@
 /**
  * Lets a client tell this user's daemon from a stand-in another user put where
- * the daemon listens, before it sends anything the daemon should not see
- * (#3284: the prompt hook sends the user's prompt, and injects the answer into
- * the agent's context).
+ * the daemon listens, before it sends anything the daemon should not see: the
+ * prompt hook's prompt (#3284), and every MCP session the proxy pipes through,
+ * whose tool calls go to the daemon and whose answers go into the agent's
+ * context.
  *
  * Where the daemon listens is open to others in two cases: the socket fallback
  * in the system temp folder on macOS and Linux, and on Windows the named pipe,
