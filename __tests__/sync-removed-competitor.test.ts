@@ -59,18 +59,20 @@ describe('sync re-resolves a call whose competing candidate went away', () => {
       dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-competitor-py-'));
       write('a.py', 'class A:\n    def go(self):\n        return 1\n');
       write('b.py', 'class B:\n    def go(self):\n        return 2\n');
-      write('t.py', 'from a import A\n\ndef make():\n    return A()\n\ndef use():\n    x = make()\n    x.go()\n');
+      // `x` is a parameter nothing annotates, so its type is unknown. (Bound
+      // by `x = make()` from a `make` that returns `A()`, it would be an A.)
+      write('t.py', 'def use(x):\n    x.go()\n');
       cg = CodeGraph.initSync(dir);
       await cg.indexAll();
       // Two candidates: the call stays unresolved.
-      expect(callTargets('use')).toEqual(['make']);
+      expect(callTargets('use')).toEqual([]);
     });
 
     it('after the file holding the other candidate is deleted', async () => {
       fs.unlinkSync(path.join(dir, 'b.py'));
       const result = await cg.sync();
       expect(result.filesRemoved).toBe(1);
-      expect(callTargets('use')).toEqual(['A::go', 'make']);
+      expect(callTargets('use')).toEqual(['A::go']);
       const synced = graphOf(cg);
       cg = await reindexFromScratch(cg);
       expect(synced).toEqual(graphOf(cg));
@@ -79,7 +81,7 @@ describe('sync re-resolves a call whose competing candidate went away', () => {
     it('after an edit renames the other candidate away', async () => {
       write('b.py', 'class B:\n    def stop(self):\n        return 2\n');
       await cg.sync();
-      expect(callTargets('use')).toEqual(['A::go', 'make']);
+      expect(callTargets('use')).toEqual(['A::go']);
       const synced = graphOf(cg);
       cg = await reindexFromScratch(cg);
       expect(synced).toEqual(graphOf(cg));
@@ -90,7 +92,7 @@ describe('sync re-resolves a call whose competing candidate went away', () => {
       await cg.sync();
       fs.unlinkSync(path.join(dir, 'b.py'));
       await cg.sync();
-      expect(callTargets('use')).toEqual(['make']);
+      expect(callTargets('use')).toEqual([]);
       const synced = graphOf(cg);
       cg = await reindexFromScratch(cg);
       expect(synced).toEqual(graphOf(cg));
