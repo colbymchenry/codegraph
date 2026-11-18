@@ -30,7 +30,7 @@ import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { treatStdoutFailureAsShutdown } from './stdout-teardown';
 import { CodeGraphPackageVersion, isOlderRelease } from './version';
-import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions, toolCallArguments, TOOL_ARGUMENTS_NOT_OBJECT } from './session';
+import { SERVER_INFO, PROTOCOL_VERSION, instructionsForClient, toolsForClient, toolCallArguments, TOOL_ARGUMENTS_NOT_OBJECT } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
 import { ErrorCodes } from './transport';
@@ -271,10 +271,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let daemonSocket: net.Socket | null = null;
   let clientInitId: unknown = undefined;   // suppress the daemon's reply to the forwarded initialize
   let clientInitLine: string | undefined;  // replayed to a daemon that comes up mid-session (#2277)
-  // Telemetry attribution for the in-process fallback only — calls routed to
-  // the daemon are counted by the daemon's own session (which receives the
-  // forwarded initialize, clientInfo included), never double-counted here.
-  let telemetryClient: ClientInfo | undefined;
+  // The host's clientInfo from initialize, kept as MCPSession keeps it. It picks
+  // the tool names the local handshake says (#1267), and attributes telemetry
+  // for the in-process fallback only — calls routed to the daemon are counted
+  // by the daemon's own session (which receives the forwarded initialize,
+  // clientInfo included), never double-counted here.
+  let clientInfo: ClientInfo | undefined;
   const pending: string[] = [];            // client lines buffered until the daemon resolves
   let engine: MCPEngine | null = null;
   let engineReady: Promise<void> | null = null;
@@ -399,7 +401,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         const local = await ensureEngine();
         const result = await local.getToolHandler().execute(params.name, args, exploreSession, indexVersionWarnings);
         writeClient({ jsonrpc: '2.0', id, result });
-        getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
+        getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, clientInfo);
       } catch (err) {
         writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: err instanceof Error ? err.message : String(err) } });
       }
@@ -444,15 +446,15 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         clientInitLine = line;
         const initParams = (msg.params ?? {}) as { clientInfo?: { name?: unknown; version?: unknown } };
         if (initParams.clientInfo) {
-          telemetryClient = {
+          clientInfo = {
             name: typeof initParams.clientInfo.name === 'string' ? initParams.clientInfo.name : undefined,
             version: typeof initParams.clientInfo.version === 'string' ? initParams.clientInfo.version : undefined,
           };
         }
-        writeClient({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: SERVER_INFO, instructions: initializeInstructions(SERVER_INSTRUCTIONS) } });
+        writeClient({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: SERVER_INFO, instructions: instructionsForClient(SERVER_INSTRUCTIONS, clientInfo?.name) } });
         routeToDaemon(line); // prime the daemon so it resolves the project (its reply is suppressed below)
       } else if (msg.method === 'tools/list') {
-        writeClient({ jsonrpc: '2.0', id: msg.id, result: { tools: getStaticTools() } });
+        writeClient({ jsonrpc: '2.0', id: msg.id, result: { tools: toolsForClient(getStaticTools(), clientInfo?.name) } });
       } else if (msg.method === 'resources/list') {
         // No resources exposed — answer the probe locally so it never reaches
         // the daemon as an unhandled method and logs `-32601`. (#621)
