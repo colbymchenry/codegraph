@@ -1117,6 +1117,39 @@ export function pythonModuleImportKeys(name: string, filePath: string, context: 
   return new Set(pythonGlobalBindings(name, filePath, context).flatMap((b) => (b.kind === 'import' ? [b.key] : [])));
 }
 
+/**
+ * The imports binding `name` inside a function or method of `filePath`, keyed
+ * as pythonLineBindings keys them: `def reverts(raw): from pkg.core import
+ * reverts` → `pkg.core:reverts`. Such an import binds the name in that
+ * function only (#3229).
+ */
+export function pythonFunctionImportKeys(name: string, filePath: string, context: ResolutionContext): Set<string> {
+  return pythonNameScan(context, `fnimports\0${filePath}\0${name}`, () => {
+    const lines = pythonMemberLines(filePath, context);
+    const statements = pythonStatementStarts(filePath, context);
+    const keys = new Set<string>();
+    for (const i of pythonFunctionImportLines(filePath, context)) {
+      for (const b of pythonLineBindings(lines, i, statements, name)) if (b.kind === 'import') keys.add(b.key);
+    }
+    return keys;
+  });
+}
+
+/** The statement lines of a Python file that import something inside a function or method, read once per file. */
+function pythonFunctionImportLines(filePath: string, context: ResolutionContext): number[] {
+  return pythonNameScan(context, `fnimportlines\0${filePath}`, () => {
+    const lines = pythonMemberLines(filePath, context);
+    const statements = pythonStatementStarts(filePath, context);
+    const inDef = new Uint8Array(lines.length + 1);
+    for (const def of context.getNodesInFile(filePath)) {
+      if (def.kind === 'function' || def.kind === 'method') inDef.fill(1, def.startLine, Math.min(def.endLine, lines.length));
+    }
+    const out: number[] = [];
+    for (let i = 0; i < lines.length; i++) if (inDef[i] && statements[i] && /\bimport\b/.test(lines[i]!)) out.push(i);
+    return out;
+  });
+}
+
 /** Distinct sources a file imports `name` from, at any scope (`from a import x` → `a:x`). */
 function pythonImportKeys(name: string, filePath: string, context: ResolutionContext): Set<string> {
   return pythonNameScan(context, `imports\0${filePath}\0${name}`, () => scanPythonImportKeys(name, filePath, context));

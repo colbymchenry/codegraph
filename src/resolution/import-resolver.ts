@@ -33,6 +33,7 @@ import {
   pythonFunctionModuleAlias,
   pythonReceiverBinding,
   pythonModuleImportKeys,
+  pythonFunctionImportKeys,
   isPythonFromImportModule,
   isPythonNameFromOutside,
   tsGlobalScope,
@@ -3736,6 +3737,7 @@ export function reachesAmbientModule(ref: UnresolvedRef, specifier: string, decl
 export function pythonImportsInScope(ref: UnresolvedRef, imports: ImportMapping[], context: ResolutionContext): ImportMapping[] {
   if (ref.language !== 'python' || ref.referenceKind === 'imports') return imports;
   const dot = ref.referenceName.indexOf('.');
+  if (dot < 0 && /^[A-Za-z_]\w*$/.test(ref.referenceName)) return pythonBareImportsInScope(ref, imports, context);
   if (dot <= 0) return imports;
   const receiver = ref.referenceName.slice(0, dot);
   // `import pkg.mod` binds `pkg`, under a mapping named after `mod`.
@@ -3764,6 +3766,33 @@ export function pythonImportsInScope(ref: UnresolvedRef, imports: ImportMapping[
     if ('module' in binding) return m.isNamespace && (m.localName === receiver ? m.source : receiver) === binding.module;
     return !m.isNamespace && m.source === binding.source && m.exportedName === binding.exportedName;
   });
+}
+
+/**
+ * The file's import mappings as a bare Python name reads them (#3229). The
+ * mappings read from-imports at any depth, so `from pkg.core import reverts`
+ * written inside one function was the whole file's, and every other call of
+ * `reverts` linked the import, though the file's own `def reverts` is what
+ * those calls run. Such an import binds the name in its function only: a
+ * reference that no function around it binds the name for (nor a function
+ * declaring it `global`) drops the mappings only function-local imports
+ * make; one inside the importing function keeps that import's mapping. A
+ * binding other than an import, and the module's own imports, change nothing.
+ */
+function pythonBareImportsInScope(ref: UnresolvedRef, imports: ImportMapping[], context: ResolutionContext): ImportMapping[] {
+  const name = ref.referenceName;
+  const binds = (m: ImportMapping): boolean => m.localName === name;
+  if (!imports.some(binds)) return imports;
+  const local = pythonFunctionImportKeys(name, ref.filePath, context);
+  if (local.size === 0) return imports;
+  const keyOf = (m: ImportMapping): string => (m.isNamespace ? `${m.source}:*` : `${m.source}:${m.exportedName}`);
+  const binding = pythonReceiverBinding(name, ref, context);
+  if (binding === 'module') {
+    const moduleLevel = pythonModuleImportKeys(name, ref.filePath, context);
+    return imports.filter((m) => !binds(m) || moduleLevel.has(keyOf(m)) || !local.has(keyOf(m)));
+  }
+  if (binding === 'local' || 'module' in binding) return imports;
+  return imports.filter((m) => !binds(m) || (!m.isNamespace && m.source === binding.source && m.exportedName === binding.exportedName));
 }
 
 /**
