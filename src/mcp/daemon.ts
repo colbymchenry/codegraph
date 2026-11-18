@@ -55,6 +55,7 @@ import {
   getDaemonSocketPath,
 } from './daemon-paths';
 import { CodeGraphPackageJsonPath, CodeGraphPackageVersion } from './version';
+import { MAX_CHALLENGE_LENGTH, daemonKey, daemonProof } from './daemon-proof';
 import {
   releaseWriterLock,
   swapWriterLock,
@@ -233,6 +234,20 @@ export interface DaemonClientHello {
   codegraph_client: 1;
   pid: number;             // the proxy process's own pid
   hostPid: number | null;  // the MCP host pid (past any launcher shim), if known
+  /**
+   * A fresh random string from a client that wants this user's daemon to prove
+   * it is one before the client sends anything (the prompt hook, #3284). The
+   * daemon answers with one `{"codegraph_proof": …}` line before the session
+   * starts; a client-hello without it gets no such line. See `./daemon-proof`.
+   */
+  challenge?: string;
+}
+
+/** What a client-hello tells the daemon about the client. */
+interface ClientHelloPeers {
+  pid: number | null;
+  hostPid: number | null;
+  challenge?: string;
 }
 
 export interface DaemonStartResult {
@@ -510,8 +525,10 @@ export class Daemon {
     // peer pids, then hand the socket to the session. Fail-safe: any problem —
     // timeout, a non-hello first line, an early close — yields null pids and we
     // fall back to the socket-close lifecycle exactly as before (#692).
-    void readClientHello(socket).then((peers) => {
+    void readClientHello(socket).then(({ challenge, ...peers }) => {
       if (this.stopping || socket.destroyed) { socket.destroy(); return; }
+      // A client that asked gets its proof before the session's first byte.
+      if (challenge !== undefined) this.answerChallenge(socket, challenge);
       const transport = new SocketTransport(socket);
       const session = new MCPSession(transport, this.engine, {
         explicitProjectPath: this.projectRoot,
@@ -526,6 +543,18 @@ export class Daemon {
       // unshifted client-hello tail reaches the transport intact.
       socket.on('data', () => { this.lastActivityAt = Date.now(); });
     });
+  }
+
+  /**
+   * Answer a client-hello's challenge with this user's proof (see
+   * `./daemon-proof`), so the client can tell this daemon from a stand-in at
+   * its socket before it sends anything. `null` when no key only this user can
+   * read can be had: the client then treats this daemon as none.
+   */
+  private answerChallenge(socket: net.Socket, challenge: string): void {
+    const key = daemonKey();
+    const proof = key ? daemonProof(key, challenge, this.socketPath) : null;
+    try { socket.write(JSON.stringify({ codegraph_proof: proof }) + '\n'); } catch { /* the client hung up */ }
   }
 
   private dropClient(session: MCPSession): void {
@@ -1054,13 +1083,20 @@ function resolveRootGoneGraceMs(): number {
  */
 export function parseClientHelloLine(
   line: string,
-): { pid: number; hostPid: number | null } | null {
+): { pid: number; hostPid: number | null; challenge?: string } | null {
   let parsed: unknown;
   try { parsed = JSON.parse(line); } catch { return null; }
   if (!parsed || typeof parsed !== 'object') return null;
   const o = parsed as Record<string, unknown>;
   if (o.codegraph_client !== 1 || typeof o.pid !== 'number') return null;
-  return { pid: o.pid, hostPid: typeof o.hostPid === 'number' ? o.hostPid : null };
+  const peers: { pid: number; hostPid: number | null; challenge?: string } = {
+    pid: o.pid,
+    hostPid: typeof o.hostPid === 'number' ? o.hostPid : null,
+  };
+  if (typeof o.challenge === 'string' && o.challenge.length > 0 && o.challenge.length <= MAX_CHALLENGE_LENGTH) {
+    peers.challenge = o.challenge;
+  }
+  return peers;
 }
 
 /**
@@ -1089,13 +1125,13 @@ export function peerIsDead(
  */
 function readClientHello(
   socket: net.Socket,
-): Promise<{ pid: number | null; hostPid: number | null }> {
+): Promise<ClientHelloPeers> {
   return new Promise((resolve) => {
     let chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
     const finish = (
-      peers: { pid: number | null; hostPid: number | null },
+      peers: ClientHelloPeers,
       putBack?: Buffer,
     ) => {
       if (settled) return;

@@ -14,7 +14,6 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
-import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../src/index';
@@ -24,9 +23,8 @@ import { MCPSession } from '../src/mcp/session';
 import { PROMPT_EXPLORE_BUSY, PROMPT_EXPLORE_METHOD } from '../src/mcp/prompt-explore';
 import type { MCPEngine } from '../src/mcp/engine';
 import type { JsonRpcNotification, JsonRpcRequest, JsonRpcTransport } from '../src/mcp/transport';
-import { getDaemonSocketCandidates } from '../src/mcp/daemon-paths';
-import { CodeGraphPackageVersion } from '../src/mcp/version';
 import { exploreViaDaemon } from '../src/mcp/hook-client';
+import { startFakeDaemon } from './fake-daemon';
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {
@@ -215,76 +213,26 @@ describe('the daemon answers the hook busy when it cannot start now (#3284)', ()
   });
 });
 
-/**
- * A daemon stand-in on the socket or named pipe the client looks for: says
- * hello as this version, then answers each request with `reply`.
- */
-async function fakeDaemon(root: string, reply: (id: unknown) => unknown): Promise<string[]> {
-  const sockPath = getDaemonSocketCandidates(root)[0]!;
-  if (process.platform !== 'win32') fs.mkdirSync(path.dirname(sockPath), { recursive: true });
-  const methods: string[] = [];
-  const sockets = new Set<net.Socket>();
-  const server = net.createServer((socket) => {
-    sockets.add(socket);
-    socket.on('error', () => { /* a client that hung up */ });
-    socket.write(JSON.stringify({ codegraph: CodeGraphPackageVersion, pid: process.pid, socketPath: sockPath, protocol: 1 }) + '\n');
-    let buffer = '';
-    socket.on('data', (chunk) => {
-      buffer += chunk.toString('utf8');
-      let newline: number;
-      while ((newline = buffer.indexOf('\n')) !== -1) {
-        const message = JSON.parse(buffer.slice(0, newline));
-        buffer = buffer.slice(newline + 1);
-        if (message.codegraph_client) continue;
-        methods.push(message.method);
-        socket.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: reply(message.id) }) + '\n');
-      }
-    });
-  });
-  await new Promise<void>((resolve) => server.listen(sockPath, resolve));
-  cleanups.push(() => new Promise<void>((resolve) => {
-    for (const socket of sockets) socket.destroy();
-    server.close(() => resolve());
-    if (process.platform !== 'win32') fs.rmSync(sockPath, { force: true });
-  }));
-  return methods;
-}
-
 describe('the hook reads a busy daemon as no daemon (#3284)', () => {
   it('is unavailable, so the hook explores itself, when the daemon answers busy', async () => {
     const root = await indexedProject();
-    const methods = await fakeDaemon(root, () => PROMPT_EXPLORE_BUSY);
+    const daemon = await startFakeDaemon(root, { reply: () => ({ result: PROMPT_EXPLORE_BUSY }) });
+    cleanups.push(() => daemon.close());
 
     await expect(exploreViaDaemon(root, 'how does placeOrder work', 5_000)).resolves.toEqual({ status: 'unavailable' });
-    expect(methods).toEqual([PROMPT_EXPLORE_METHOD]);
+    expect(daemon.requests.map((r) => r.method)).toEqual([PROMPT_EXPLORE_METHOD]);
   });
 
   it('skips a line that answers another request, and reads the one that answers its own', async () => {
     const root = await indexedProject();
-    const sockPath = getDaemonSocketCandidates(root)[0]!;
-    if (process.platform !== 'win32') fs.mkdirSync(path.dirname(sockPath), { recursive: true });
-    const server = net.createServer((socket) => {
-      socket.on('error', () => { /* a client that hung up */ });
-      socket.write(JSON.stringify({ codegraph: CodeGraphPackageVersion, pid: process.pid, socketPath: sockPath, protocol: 1 }) + '\n');
-      let buffer = '';
-      socket.on('data', (chunk) => {
-        buffer += chunk.toString('utf8');
-        let newline: number;
-        while ((newline = buffer.indexOf('\n')) !== -1) {
-          const message = JSON.parse(buffer.slice(0, newline));
-          buffer = buffer.slice(newline + 1);
-          if (message.codegraph_client) continue;
-          socket.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/message', params: {} }) + '\n');
-          socket.write(JSON.stringify({ jsonrpc: '2.0', id: 999, result: text('NOT OURS') }) + '\n');
-          socket.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: text('OURS') }) + '\n');
-        }
-      });
+    const daemon = await startFakeDaemon(root, {
+      before: [
+        { jsonrpc: '2.0', method: 'notifications/message', params: {} },
+        { jsonrpc: '2.0', id: 999, result: text('NOT OURS') },
+      ],
+      reply: () => ({ result: text('OURS') }),
     });
-    await new Promise<void>((resolve) => server.listen(sockPath, resolve));
-    cleanups.push(() => new Promise<void>((resolve) => {
-      server.close(() => resolve());
-      if (process.platform !== 'win32') fs.rmSync(sockPath, { force: true });
-    }));
+    cleanups.push(() => daemon.close());
 
     await expect(exploreViaDaemon(root, 'how does placeOrder work', 5_000)).resolves.toEqual({ status: 'answered', text: 'OURS' });
   });

@@ -9,14 +9,20 @@
  *
  * It only ever uses a daemon that is already up. Starting one takes the
  * project's writer lock and a file watcher, which no prompt should cost.
+ *
+ * And only one that proves it runs as this user (`./daemon-proof`), since the
+ * prompt goes to whoever listens and their answer into the agent's context.
+ * The connection is made here rather than through `./proxy`, which would load
+ * the MCP server's tool layer on every prompt the daemon answers.
  */
 
 import * as fs from 'fs';
-import type * as net from 'net';
+import * as net from 'net';
 import * as path from 'path';
 import { daemonOptOutSet, getDaemonSocketCandidates } from './daemon-paths';
-import { connectWithHello } from './proxy';
+import { daemonProofMatches, newDaemonChallenge, readDaemonKey } from './daemon-proof';
 import { PROMPT_EXPLORE_METHOD } from './prompt-explore';
+import { CodeGraphPackageVersion } from './version';
 
 /**
  * - `answered`: the daemon's explore, ready to inject.
@@ -71,11 +77,14 @@ function boundByThisUser(socketPath: string): boolean {
 }
 
 /**
- * How long the daemon gets to say hello. A healthy one says it the moment it
- * accepts; one that can't within a second is too busy to beat the hook's own
- * explore, so the hook runs that instead of waiting on it.
+ * How long the daemon gets for its hello and its proof together. A healthy
+ * one sends both the moment it can; one that can't within a second is too
+ * busy to beat the hook's own explore, so the hook runs that instead.
  */
 const HANDSHAKE_TIMEOUT_MS = 1_000;
+
+/** Longest hello or proof line; both are a few dozen bytes. */
+const MAX_HANDSHAKE_CHARS = 4096;
 
 /** Most the hook reads from the daemon for one answer, so a broken peer can't fill its memory. */
 const MAX_ANSWER_CHARS = 8 * 1024 * 1024;
@@ -85,10 +94,77 @@ const REQUEST_ID = 1;
 async function connectToDaemon(projectRoot: string): Promise<net.Socket | null> {
   for (const socketPath of getDaemonSocketCandidates(projectRoot)) {
     if (!boundByThisUser(socketPath)) continue;
-    const socket = await connectWithHello(socketPath, undefined, HANDSHAKE_TIMEOUT_MS);
-    if (socket && typeof socket !== 'string') return socket;
+    const socket = await connectProven(socketPath, HANDSHAKE_TIMEOUT_MS);
+    if (socket) return socket;
   }
   return null;
+}
+
+/**
+ * Connect to `socketPath` and keep the socket only when the daemon there runs
+ * this version and proves it runs as this user: read its hello, send a
+ * client-hello carrying a fresh challenge, and check the proof it answers
+ * with (see `./daemon-proof`). Null otherwise, and then nothing but the
+ * challenge was sent. On Windows, where a pipe's owner can't be read, this is
+ * the whole check; on macOS and Linux it follows {@link boundByThisUser}.
+ */
+function connectProven(socketPath: string, timeoutMs: number): Promise<net.Socket | null> {
+  return new Promise((resolve) => {
+    let socket: net.Socket;
+    try {
+      socket = net.createConnection(socketPath);
+    } catch {
+      resolve(null);
+      return;
+    }
+    let buffer = '';
+    let challenge: string | null = null;
+    let settled = false;
+    const finish = (proven: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeListener('data', onData);
+      if (proven) {
+        resolve(socket);
+      } else {
+        socket.destroy();
+        resolve(null);
+      }
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    const onData = (chunk: string | Buffer): void => {
+      buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      if (buffer.length > MAX_HANDSHAKE_CHARS) return finish(false);
+      let newline: number;
+      while ((newline = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        let message: Record<string, unknown> | null;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          return finish(false);
+        }
+        if (!message || typeof message !== 'object') return finish(false);
+        if (challenge === null) {
+          // The daemon's hello. Another version gets no prompt: the hook explores itself.
+          if (message.protocol !== 1 || message.codegraph !== CodeGraphPackageVersion) return finish(false);
+          challenge = newDaemonChallenge();
+          socket.write(JSON.stringify({ codegraph_client: 1, pid: process.pid, hostPid: null, challenge }) + '\n');
+        } else {
+          // Read after the proof arrives: a daemon answering the first challenge makes the key.
+          const key = readDaemonKey();
+          return finish(key !== null && daemonProofMatches(key, challenge, socketPath, message.codegraph_proof));
+        }
+      }
+    };
+    socket.setEncoding('utf8');
+    // For the socket's whole life: an 'error' with no listener would throw.
+    socket.on('error', () => finish(false));
+    socket.on('close', () => finish(false));
+    socket.on('data', onData);
+  });
 }
 
 /**
