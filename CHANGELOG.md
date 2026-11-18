@@ -588,6 +588,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Erlang, a comment inside an argument or parameter list no longer counts as an argument, so the call links to the function of its real arity. Thanks @Dshuishui. (#1619)
 - In COBOL, asking `codegraph_explore` about a copybook by name, like `CVACT01Y`, now answers with its source and every `COPY` or `EXEC SQL INCLUDE` that includes it, instead of "No relevant code found". Thanks @popolusiak. (#2342)
 
+- CodeGraph now works on FUSE/virtiofs drives, such as a Windows folder shared into a Linux container: it serves the project itself and keeps the index up to date instead of starting a background server whose socket that filesystem cannot reach. Before, the index stopped following changes until a manual sync, and leftover background servers could hold the project.
+- Running `codegraph` with no arguments outside a terminal now explains what to run and exits instead of waiting forever for input, so an AI agent that launches it by mistake no longer hangs.
+
 ## [1.6.2] - 2026-10-03
 
 ### Highlights
