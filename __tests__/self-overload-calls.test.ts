@@ -159,6 +159,23 @@ class KLoader {
     }
 }
 `,
+    'src/cpp/one.cpp': `class One {
+public:
+  int read(int a) {
+    return read(a, make());
+  }
+  int read(int a, Widget b) { return a; }
+};
+`,
+    'src/cpp/two.cpp': `class Two {
+public:
+  int read(int a) {
+    return read(a, make());
+  }
+  int read(int a, Widget b) { return a; }
+  int read(int a, Gadget b) { return 0; }
+};
+`,
   };
   for (const [rel, content] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
@@ -221,6 +238,17 @@ describe('a method calling its own name', () => {
 
   it('Kotlin: from another class, with several overloads the arguments fit, not the first declared', () => {
     expect(callsFrom('src/main/kotlin/app/KUtil.kt', 'run', 'load')).toEqual([5]);
+  });
+
+  // C++ lookup has already moved these calls off the caller by the time
+  // retargetSelfOverload sees them, so its fallthrough isn't what answers
+  // here. The tests pin the answer all the same.
+  it('C++: a self-call its parameters cannot take moves to the one same-count sibling', () => {
+    expect(selfNamed('src/cpp/one.cpp', 'read')).toEqual(['3 -> 6']);
+  });
+
+  it('C++: with two same-count siblings, a self-call moves to the first declared', () => {
+    expect(selfNamed('src/cpp/two.cpp', 'read')).toEqual(['3 -> 6']);
   });
 
   it('C#: reaches the overload the arguments fit', () => {
