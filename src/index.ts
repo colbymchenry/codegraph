@@ -3222,10 +3222,13 @@ export class CodeGraph {
    * Get dependents of a file
    *
    * @param filePath - Path to the file
+   * @param opts - `skipTiers`: leave out links across a process boundary (a
+   *   client's HTTP call onto a route, a queue job onto its consumer, an event
+   *   onto its handler), as `codegraph affected` does by default (#3320)
    * @returns Array of file paths that depend on this file
    */
-  getFileDependents(filePath: string): string[] {
-    return this.graphManager.getFileDependents(filePath);
+  getFileDependents(filePath: string, opts: { skipTiers?: boolean } = {}): string[] {
+    return this.graphManager.getFileDependents(filePath, opts);
   }
 
   /**
