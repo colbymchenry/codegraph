@@ -3498,6 +3498,20 @@ export function resolveViaImport(
             // A member of the guess at a module's first export is no member of
             // the module: the receiver isn't known, so there is nothing to name.
             if (guessed) continue;
+
+            // Nor is a member of a FUNCTION imported by name a call of the
+            // function: `stream.onAbort()` after `import { stream } from
+            // './streaming'` reads a property of the function object (#2953),
+            // which a namespace merged with the function may declare (vscode's
+            // `observableFromEvent.batchEventsGlobally()`). `fn.call(…)` and
+            // `fn.apply(…)` run it, and `fn.bind(…)` hands it on.
+            const member = ref.referenceName.slice(imp.localName.length + 1);
+            if (targetNode.kind === 'function' && !imp.isDefault && ESM_IMPORT_LANGUAGES.has(ref.language) && !/^(?:call|apply|bind)$/.test(member)) {
+              const merged = hasNamespace(targetNode.filePath, targetNode.name, context)
+                ? typeMemberIn(targetNode.filePath, [targetNode.name], member.split('.'), context) : undefined;
+              if (merged) return { original: ref, targetNodeId: merged.id, confidence: 0.9, resolvedBy: 'import' };
+              continue;
+            }
           }
 
           return {

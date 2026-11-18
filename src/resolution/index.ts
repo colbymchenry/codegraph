@@ -23,6 +23,7 @@ import {
 } from './types';
 import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isPythonImportStatementModule } from './name-matcher';
+import { isJsThisCall } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
@@ -98,6 +99,9 @@ const RESOLUTION_READ_EDGE_KINDS: Edge['kind'][] = ['implements', 'extends'];
  */
 const CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift', 'rust', 'go', 'scala', 'dart', 'objc', 'pascal']);
 const SCOPED_CHAIN_LANGUAGES = new Set(['rust']);
+
+/** Languages whose `this.m()` the extractor records by the bare method name (isJsThisCall). */
+const JS_SELF_CALL_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx', 'vue', 'svelte', 'astro']);
 
 /** The extractor's chained-receiver encoding: `<inner>().<method>`. */
 const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
@@ -1908,7 +1912,8 @@ export class ReferenceResolver {
         return this.gateLanguage(matchFunctionRef(ref, this.context), ref);
       }
       const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
-      if (viaImport) {
+      // A local of the name in scope is the value handed on, which matchFunctionRef finds (#2949).
+      if (viaImport && !isImportShadowedByJsBinding(viaImport, ref, this.context)) {
         const target = this.nodeById(viaImport.targetNodeId);
         if (
           target &&
@@ -2025,11 +2030,18 @@ export class ReferenceResolver {
 
     const tImp = this.profileStages ? process.hrtime.bigint() : 0n;
     // `self.get_ip()` is a method call on the instance even when the file
-    // also imports a function named `get_ip`: the import never names it.
-    const selfCall = ref.language === 'python' && ref.referenceKind === 'calls' &&
+    // also imports a function named `get_ip`: the import never names it. Nor
+    // does TS/JS's `this.findAll()` name the file's `import { findAll }` (#2954).
+    const selfCall = ref.referenceKind === 'calls' &&
+      (ref.language === 'python' || JS_SELF_CALL_LANGUAGES.has(ref.language)) &&
       this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === ref.referenceName) &&
-      isPythonSelfCall(ref, this.context);
-    const importResult = selfCall ? null : this.gateLanguage(resolveViaImport(ref, this.context), ref);
+      (isPythonSelfCall(ref, this.context) || isJsThisCall(ref, this.context));
+    let importResult = selfCall ? null : this.gateLanguage(resolveViaImport(ref, this.context), ref);
+    // A name the calling code binds in scope at the reference — a parameter, a
+    // local, a nested function, in the calling function or one around it — is
+    // that binding, which the name match below finds (#2949), and so is the
+    // receiver of `stream.onAbort()` (#2953).
+    if (importResult && isImportShadowedByJsBinding(importResult, ref, this.context)) importResult = null;
     if (this.profileStages) this.stageAdd('viaImport', ref, !!importResult, tImp);
     if (importResult) {
       if (importResult.confidence >= 0.9) return importResult;
