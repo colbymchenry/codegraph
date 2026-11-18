@@ -10,6 +10,7 @@ import { codeigniterResolver } from './codeigniter';
 import { drupalResolver } from './drupal';
 import { laravelResolver } from './laravel';
 import { expressResolver } from './express';
+import { elysiaResolver } from './elysia';
 import { nestjsResolver } from './nestjs';
 import { reactResolver } from './react';
 import { nextjsResolver } from './nextjs';
@@ -48,6 +49,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   codeigniterResolver,
   // JavaScript/TypeScript
   expressResolver,
+  // Elysia (Bun) — chained `.get('/x', …)` on `new Elysia({ prefix })`, `.group()`, `.use(plugin)` → route nodes
+  elysiaResolver,
   nestjsResolver,
   reactResolver,
   // React Router — `<Route path>` routes are `reactResolver`'s; `history.push('/x')` / `navigate('/x')` → navigates edges
@@ -182,6 +185,7 @@ export { codeigniterResolver } from './codeigniter';
 export { drupalResolver } from './drupal';
 export { laravelResolver, FACADE_MAPPINGS } from './laravel';
 export { expressResolver } from './express';
+export { elysiaResolver } from './elysia';
 export { nestjsResolver } from './nestjs';
 export { reactResolver } from './react';
 export { reactRouterResolver } from './react-router';

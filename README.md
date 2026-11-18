@@ -333,6 +333,7 @@ CodeGraph detects web-framework routing files and emits `route` nodes linked by 
 | **Flask** | `@app.route('/path', methods=[...])`, blueprint routes |
 | **FastAPI** | `@app.get(...)`, `@router.post(...)`, all standard methods |
 | **Express** | `app.get(...)`, `router.post(...)` with middleware chains |
+| **Elysia** | `new Elysia({ prefix })` chains of `.get(...)`, `.post(...)`, `.route('TRACE', ...)` and `.ws(...)`, `.group()` and `.guard()` callbacks, functional plugins, and `.use(plugin)` prefixes composed across files |
 | **NestJS** | `@Controller` + `@Get/@Post/...` (with `RouterModule` prefixes, `setGlobalPrefix` and URI versioning), GraphQL `@Resolver` + `@Query/@Mutation`, `@MessagePattern`/`@EventPattern`, `@SubscribeMessage` |
 | **Laravel** | `Route::get()`, `Route::resource()`, `Controller@action`, tuple syntax |
 | **Drupal** | `*.routing.yml` routes (`_controller`, `_form`, entity handlers); `hook_*` implementations in `.module`/`.theme`/`.install`/`.inc` and `#[Hook]` methods; `*.services.yml` services, and calls through `\Drupal::service()`; plugin definitions, as attributes or annotations |
