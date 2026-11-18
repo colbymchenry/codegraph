@@ -291,6 +291,31 @@ export function gateLanguageMatch(
   return result;
 }
 
+/**
+ * A C# method group through a receiver, `worker.Run` in `Task.Run(worker.Run)`
+ * or `Action later = worker.Run;` (#2906): the method of the type the
+ * receiver's declaration gives it (a local, a parameter, a field, a property),
+ * or of the type the receiver names (`Worker.Run`, a static method). Null when
+ * the receiver can't be typed, is typed by a keyword type (its methods are
+ * .NET's), or the type has no method of that name: a property read
+ * (`person.Name`) is captured the same way and links nothing.
+ */
+function matchCsharpMethodGroup(receiver: string, member: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  // Most such values are a property or an enum member (`x.Name`,
+  // `StringComparison.Ordinal`): no project method has the name, so there is
+  // no receiver to type.
+  if (!context.getNodesByName(member).some((n) => n.kind === 'method' && n.language === 'csharp')) return null;
+  let type = /^[A-Za-z_]\w*$/.test(receiver)
+    ? inferLocalReceiverType(receiver, ref, context) ?? inferMemberReceiverType(receiver, ref, context)
+    : null;
+  if (!type && /^[A-Z]\w*$/.test(receiver) &&
+      context.getNodesByName(receiver).some((n) => n.language === 'csharp' && CSHARP_TYPE_KINDS.has(n.kind))) type = receiver;
+  if (!type || /^[a-z]/.test(type)) return null;
+  const found = resolveMethodOnType(type, member, ref, context, 0.9, 'function-ref');
+  const target = found ? context.getNodeById?.(found.targetNodeId) : undefined;
+  return found && target?.kind === 'method' && target.id !== ref.fromNodeId ? found : null;
+}
+
 /** Member values retain their receiver; never break ties by file order (#1820). */
 function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const dot = ref.referenceName.lastIndexOf('.');
@@ -326,6 +351,10 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
     const node = imported && context.getNodeById?.(imported.targetNodeId);
     return node ? result(context.getNodesByQualifiedName(node.qualifiedName).filter(n => n.filePath === node.filePath)) : null;
   }
+  // A C# method group through a receiver (`Task.Run(worker.Run)`, #2906) is a
+  // method of the receiver's declared type, or of the type it names
+  // (`Worker.Run`), or nothing: never one found by its name alone.
+  if (ref.language === 'csharp') return matchCsharpMethodGroup(receiver, member, ref, context);
   if (ref.language === 'go') {
     if (receiver.includes('.')) return matchGoFieldChainCall(receiver, member, ref, context);
     const decl: GoReceiverDecl = {};
@@ -1613,7 +1642,7 @@ export function matchFunctionRef(
   // resolveOne (resolveThisMemberFnRef) — never by name matching here.
   if (ref.referenceName.startsWith('this.')) return null;
 
-  if ((ref.language === 'python' || ref.language === 'go') && ref.referenceName.includes('.')) {
+  if ((ref.language === 'python' || ref.language === 'go' || ref.language === 'csharp') && ref.referenceName.includes('.')) {
     return matchMemberFunctionRef(ref, context);
   }
 

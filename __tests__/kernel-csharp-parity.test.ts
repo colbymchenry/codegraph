@@ -228,6 +228,24 @@ describe.skipIf(!kernelBuilt)('kernel C# extraction parity', () => {
       ].join('\n'),
       minNodes: 3,
     },
+    {
+      // A method group through a receiver keeps it, a `this.` before a field
+      // dropped, and skips the name gate (#2906); `this.Run` stays bare.
+      name: 'method groups through a receiver keep the receiver',
+      source: [
+        'public class C {',
+        '  Worker _w;',
+        '  void Run() { }',
+        '  void M(Worker w) {',
+        '    Task.Run(w.Run); Action a = w.Run, b = this._w.Run; Register(Worker.Tick, this.Run);',
+        '    Use(w',
+        '      .Run, w.Inner.Run, w[0].Run, Make().Run);',
+        '  }',
+        '}',
+        '',
+      ].join('\n'),
+      minNodes: 5,
+    },
   ];
 
   for (const m of MICROS) {

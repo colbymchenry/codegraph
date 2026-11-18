@@ -74,6 +74,12 @@ fn null_receiver_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"[?!]\.").unwrap())
 }
+/// A method group's `receiver.Member` (function-ref.ts member_access_expression):
+/// `/^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/` with JS's ASCII `\w`.
+fn member_value_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[A-Za-z_][0-9A-Za-z_]*(?:\.[A-Za-z_][0-9A-Za-z_]*)+$").unwrap())
+}
 /// `/^[A-Za-z_]\w*$/` with JS's ASCII `\w` (Rust's default `\w` is Unicode).
 fn ascii_ident_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -1530,6 +1536,15 @@ impl<'t> Walker<'t> {
                 if is_this {
                     let name = self.text(name_node);
                     self.push_fn_ref_cand(from, name, name_node);
+                } else {
+                    // A method group through a receiver, `worker.Run` (#2906):
+                    // the receiver kept, a `this.` before a field dropped; it
+                    // skips the name gate (flush_fn_ref_candidates).
+                    let stripped = strip_js_ws(self.text(v));
+                    let value = stripped.strip_prefix("this.").unwrap_or(&stripped).to_string();
+                    if member_value_re().is_match(&value) {
+                        self.push_fn_ref_cand(from, &value, name_node);
+                    }
                 }
             }
             _ => {}
@@ -1586,11 +1601,14 @@ impl<'t> Walker<'t> {
         }
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for c in cands {
-            // C# candidates are always bare names (its this-forms normalize to
-            // the bare member), so the `this.`/`::` bypasses are inert — kept
-            // for shared-shape parity. Gate: definedHere ∪ importedNames.
+            // C# candidates are bare names (its this-forms normalize to the
+            // bare member), so the `this.`/`::` bypasses are inert — kept for
+            // shared-shape parity — or a method group through a receiver
+            // (`worker.Run`), the only dotted one, which skips the gate as its
+            // TS twin's `skipGate` does. Gate: definedHere ∪ importedNames.
             if !c.name.starts_with("this.")
                 && !c.name.contains("::")
+                && !c.name.contains('.')
                 && !self.defined_fn_names.contains(&c.name)
                 && !self.imported_names.contains(&c.name)
             {

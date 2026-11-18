@@ -1983,7 +1983,7 @@ export class ReferenceResolver {
       if (ref.referenceName.startsWith('this.')) {
         return this.gateLanguage(this.resolveThisMemberFnRef(ref), ref);
       }
-      if ((ref.language === 'python' || ref.language === 'go') && ref.referenceName.includes('.')) {
+      if ((ref.language === 'python' || ref.language === 'go' || ref.language === 'csharp') && ref.referenceName.includes('.')) {
         return this.gateLanguage(matchFunctionRef(ref, this.context), ref);
       }
       const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
