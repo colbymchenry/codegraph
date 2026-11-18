@@ -31,6 +31,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In JavaScript and TypeScript, a method called on a variable that a library call fills in, like `const root = createRoot(el)` from react-dom, `net.createServer()` or `canvas.getContext('2d')`, no longer links to the one project method that happens to share its name. Thanks @inth3shadows for the report. (#2947)
 - In TypeScript, a method called on a variable a class's static factory fills in, like `const writer = DatabaseConnection.initialize(path)`, now links to the method of the class the factory says it returns, instead of a class guessed from the variable's name. Thanks @inth3shadows for the report. (#2946)
 - In TypeScript, a call through an interface's function-typed property, like `matcher.snapshot()`, no longer links to an unrelated class's method of the same name; a class that implements the interface, or builds it, is still linked. Thanks @inth3shadows for the report. (#3035)
+- In JavaScript and TypeScript, a call two or more fields deep from `this`, like `this.cache.list.push(1)` or `this.extractor.functionTypes.includes(type)`, no longer links to an unrelated project method named like JavaScript's own `push`, `includes`, `has` or `set`, or to a property that merely shares the name. Thanks @inth3shadows for the report. (#2948)
 
 ## [1.6.3] - 2026-11-17
 
