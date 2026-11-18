@@ -1800,11 +1800,21 @@ program
           // keyword is signal enough.
           const tokenVerified = !keyworded && codeTokens.some((t) => cg.getNodesByName(t).length > 0);
           if (keyworded || tokenVerified) {
-            const { ToolHandler } = await import('../mcp/tools');
-            const handler = new ToolHandler(cg);
-            const result = await handler.execute('codegraph_explore', { query: prompt });
-            const text = result.content[0]?.text ?? '';
-            if (!result.isError && text.trim()) {
+            const exploreHere = async (): Promise<string> => {
+              const { ToolHandler } = await import('../mcp/tools');
+              const result = await new ToolHandler(cg).execute('codegraph_explore', { query: prompt });
+              return result.isError ? '' : result.content[0]?.text ?? '';
+            };
+            // A daemon already running for this project answers from memory
+            // what an explore here reads from disk again on every prompt
+            // (#3284). One that is exploring but has not answered by the
+            // deadline gets no second explore here, and nothing is injected.
+            const { exploreViaDaemon, promptHookDaemonTimeoutMs } = await import('../mcp/hook-client');
+            const viaDaemon = await exploreViaDaemon(plan.exploreRoot, prompt, promptHookDaemonTimeoutMs());
+            const text = viaDaemon.status === 'answered' ? viaDaemon.text
+              : viaDaemon.status === 'unavailable' ? await exploreHere()
+              : '';
+            if (text.trim()) {
               // Cap the injection so a large-repo explore can't flood the prompt.
               // Claude Code shows hook stdout inline only up to 10,000 characters;
               // above that it persists the output to a file and the model sees a
