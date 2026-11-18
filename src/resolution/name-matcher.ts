@@ -15444,7 +15444,7 @@ function jsDeclarationsInScope(candidates: Node[], ref: UnresolvedRef, context: 
   return candidates.filter((n) => {
     if (n.filePath !== ref.filePath) return true;
     const site = sites.find((s) => (s.kind === 'function' || s.kind === 'declaration') && jsLineOf(file, s.at) === n.startLine);
-    if (!site || file.code.startsWith('var', site.at) || (site.kind === 'function' && isJsExpressionAt(file.code, site.at))) return true;
+    if (!site || file.code.startsWith('var', site.decl ?? site.at) || (site.kind === 'function' && isJsExpressionAt(file.code, site.at))) return true;
     return site.from <= at && site.to >= at;
   });
 }
@@ -25343,7 +25343,16 @@ interface JsScopeFile {
   arrowEnds?: Map<number, number>;
   /** Per callback's parameter list offset, its callee and argument position (jsCallbackCall + jsCalledFunction). */
   callees?: Map<number, { callee: Node; index: number } | null>;
+  /** Per name, what every `const`/`let`/`var` of the file declares (jsDeclaredNames), read when first asked. */
+  declared?: Map<string, JsDeclaredName[]>;
 }
+
+/**
+ * A name a `const`/`let`/`var` declares: its own offset (`at`), the keyword's
+ * (`decl`), whether the declarator is the name alone (`plain`, not a
+ * destructuring) and where its `=` value starts, or null without one.
+ */
+type JsDeclaredName = { at: number; decl: number; plain: boolean; value: number | null };
 
 /**
  * A binding of a name: where it holds (`from`, its block's `{` or its body's
@@ -25359,6 +25368,8 @@ interface JsBindingSite {
   to: number;
   at: number;
   kind: 'declaration' | 'parameter' | 'function' | 'other';
+  /** A later declarator's declaration keyword (jsDeclaredNames), whose `at` is the declarator's own name. */
+  decl?: number;
   reading?: JsBindingReading | null;
   /** What jsReceiverReadElsewhere reads for the binding, and where an assignment would start to matter. */
   elsewhere?: { read: JsReadElsewhere; from: number } | null;
@@ -25462,14 +25473,17 @@ function jsBindingSites(name: string, file: JsScopeFile): JsBindingSite[] {
     const scope = file.scopes[jsScopeAt(file, at)]!;
     return { from: scope.start, to: scope.end };
   };
+  const inForHead = (at: number) => /\bfor\s*(?:await\s*)?\(\s*$/.test(code.slice(Math.max(0, at - 16), at));
   let resume = 0;
+  const matched = new Set<number>();
   for (const at of file.varDecls) {
     if (at < resume) continue;
     decl.lastIndex = at;
     const m = decl.exec(code);
     if (!m) continue;
     resume = at + m[0].length;
-    if (/\bfor\s*(?:await\s*)?\(\s*$/.test(code.slice(Math.max(0, at - 16), at))) {
+    matched.add(at);
+    if (inForHead(at)) {
       // A `for` head's binding holds in the head and the statement after it.
       sites.push({ from: code.lastIndexOf('(', at), to: jsForStatementEnd(code, at), at, kind: 'other' });
       continue;
@@ -25477,6 +25491,19 @@ function jsBindingSites(name: string, file: JsScopeFile): JsBindingSite[] {
     // `const x = require('./x')` binds an import, which the file's imports answer for.
     const plain = !/^(?:const|let|var)\s+[{[]/.test(m[0]) && !IMPORT_BINDING_VALUE.test(m[1] ?? '');
     sites.push({ ...blockOf(at), at, kind: plain ? 'declaration' : 'other' });
+  }
+  // What the pattern reads only from the keyword, the name as the first
+  // declarator or in a destructuring with no default, misses: a later
+  // declarator (`let n = 0, ob = make()`) and a destructured name beside a
+  // default (`const { ob = make() } = o`). Each is written at its own offset.
+  for (const d of jsDeclaredNames(file).get(name) ?? []) {
+    if (matched.has(d.decl)) continue;
+    if (inForHead(d.decl)) {
+      sites.push({ from: code.lastIndexOf('(', d.decl), to: jsForStatementEnd(code, d.decl), at: d.at, kind: 'other', decl: d.decl });
+      continue;
+    }
+    const plain = d.plain && !(d.value !== null && IMPORT_BINDING_VALUE.test(code.slice(d.value, d.value + 40)));
+    sites.push({ ...blockOf(d.decl), at: d.at, kind: plain ? 'declaration' : 'other', decl: d.decl });
   }
   for (const at of file.fnDecls) {
     fn.lastIndex = at;
@@ -25522,6 +25549,266 @@ function jsBindingSites(name: string, file: JsScopeFile): JsBindingSite[] {
   }
   file.bindings.set(name, sites);
   return sites;
+}
+
+/**
+ * Every name the file's `const`/`let`/`var` declarations declare, by name
+ * (JsDeclaredName), read once per file. A declaration is read declarator by
+ * declarator: a name or a destructuring pattern, an optional type and `=`
+ * value, then a comma for the next one (#3293). It stops where the reading
+ * can't follow the code — a value holding a JSX element, whose text can hold
+ * commas of its own — keeping what it read before.
+ */
+function jsDeclaredNames(file: JsScopeFile): Map<string, JsDeclaredName[]> {
+  if (file.declared) return file.declared;
+  const declared = new Map<string, JsDeclaredName[]>();
+  const add = (name: string, d: JsDeclaredName) => {
+    const list = declared.get(name);
+    if (list) list.push(d); else declared.set(name, [d]);
+  };
+  const { code } = file;
+  for (const decl of file.varDecls) {
+    let i = decl;
+    while (i < code.length && /[a-z]/.test(code[i]!)) i++;
+    // Each declarator reads at least its name and the comma after it.
+    while (true) {
+      i = jsSkipSpace(code, i);
+      const found: { name: string; at: number }[] = [];
+      let plain = false;
+      if (code[i] === '{' || code[i] === '[') {
+        const close = jsMatchingBracket(code, i);
+        if (close < 0 || !jsPatternNames(code, i, close, found)) break;
+        i = close + 1;
+      } else {
+        JS_NAME_AT.lastIndex = i;
+        const id = JS_NAME_AT.exec(code);
+        if (!id) break;
+        found.push({ name: id[0], at: i });
+        plain = true;
+        i += id[0].length;
+      }
+      // What follows a declarator's name or pattern on its line: its type, its
+      // value, a comma before the next one, or the end of the declaration.
+      i = jsSkipSpace(code, i, false);
+      if (code[i] === '!' && code[jsSkipSpace(code, i + 1, false)] === ':') i = jsSkipSpace(code, i + 1, false);
+      if (code[i] === '\n' || code[i] === '\r') {
+        // The next line carries the declaration on only with a comma or a value.
+        const next = jsSkipSpace(code, i);
+        if (code[next] === ',' || (code[next] === '=' && !/[=>]/.test(code[next + 1] ?? ''))) i = next;
+      }
+      if (code[i] === ':') {
+        i = jsTypeEnd(code, i + 1);
+        if (i < 0) break;
+      }
+      let value: number | null = null;
+      if (code[i] === '=' && !/[=>]/.test(code[i + 1] ?? '')) {
+        value = i + 1;
+        i = jsDeclaratorValueEnd(file, value);
+        if (i < 0) {
+          for (const f of found) add(f.name, { at: f.at, decl, plain, value });
+          break;
+        }
+      } else if (!(i >= code.length || /[,;)\r\n}]/.test(code[i]!) || /^(?:of|in)(?![\w$])/.test(code.slice(i, i + 3)))) {
+        break;
+      }
+      for (const f of found) add(f.name, { at: f.at, decl, plain, value });
+      if (code[i] !== ',') break;
+      i++;
+    }
+  }
+  file.declared = declared;
+  return declared;
+}
+
+const JS_NAME_AT = /[A-Za-z_$][\w$]*/y;
+const JS_KEY_AT = /[\w$]+/y;
+
+/** The first offset at or after `i` that holds no whitespace (no line break either, when `lines` is false). */
+function jsSkipSpace(code: string, i: number, lines = true): number {
+  while (i < code.length) {
+    const c = code[i]!;
+    if (c === ' ' || c === '\t' || (lines && (c === '\n' || c === '\r'))) i++;
+    else break;
+  }
+  return i;
+}
+
+/** Where the `(`, `[` or `{` at `open` closes, counting all three kinds, or -1 when it doesn't. */
+function jsMatchingBracket(code: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < code.length; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if ((c === ')' || c === ']' || c === '}') && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * The names a destructuring pattern `code[open..close]` binds, into `out`:
+ * shorthand and renamed properties, elements, rest names and nested patterns,
+ * past each default (`{ ob = make(), b: [c] }` binds `ob` and `c`). False when
+ * the pattern holds something it doesn't read.
+ */
+function jsPatternNames(code: string, open: number, close: number, out: { name: string; at: number }[], depth = 0): boolean {
+  if (depth > 32) return false;
+  const object = code[open] === '{';
+  let i = open + 1;
+  while (true) {
+    i = jsSkipSpace(code, i);
+    while (code[i] === ',') i = jsSkipSpace(code, i + 1);
+    if (i >= close) return true;
+    if (code.startsWith('...', i)) i = jsSkipSpace(code, i + 3);
+    if (object) {
+      // The property's key: a name, a quoted or computed key, or a number.
+      let key: string | null = null;
+      const keyAt = i;
+      if (code[i] === '[') {
+        i = jsMatchingBracket(code, i);
+        if (i < 0 || i > close) return false;
+        i++;
+      } else if (code[i] === '"' || code[i] === "'") {
+        const end = code.indexOf(code[i]!, i + 1);
+        if (end < 0 || end > close) return false;
+        i = end + 1;
+      } else {
+        JS_KEY_AT.lastIndex = i;
+        const k = JS_KEY_AT.exec(code);
+        if (!k) return false;
+        key = k[0];
+        i += key.length;
+      }
+      i = jsSkipSpace(code, i);
+      if (code[i] === ':') {
+        i = jsSkipSpace(code, i + 1);
+      } else {
+        // Shorthand: the key is the name it binds.
+        if (key === null || !/^[A-Za-z_$]/.test(key)) return false;
+        out.push({ name: key, at: keyAt });
+        i = jsPatternDefaultEnd(code, i, close);
+        if (i < 0) return false;
+        continue;
+      }
+    }
+    // The binding target: a name or a nested pattern.
+    if (code[i] === '{' || code[i] === '[') {
+      const end = jsMatchingBracket(code, i);
+      if (end < 0 || end > close || !jsPatternNames(code, i, end, out, depth + 1)) return false;
+      i = end + 1;
+    } else {
+      JS_NAME_AT.lastIndex = i;
+      const id = JS_NAME_AT.exec(code);
+      if (!id) return false;
+      out.push({ name: id[0], at: i });
+      i += id[0].length;
+    }
+    i = jsPatternDefaultEnd(code, i, close);
+    if (i < 0) return false;
+  }
+}
+
+/**
+ * Past an element's default (`= make()`) at `i` in a destructuring pattern
+ * that closes at `close`: the offset of the comma or the close that follows
+ * the element, or -1 when something else does.
+ */
+function jsPatternDefaultEnd(code: string, i: number, close: number): number {
+  i = jsSkipSpace(code, i);
+  if (code[i] === '=' && !/[=>]/.test(code[i + 1] ?? '')) {
+    let depth = 0;
+    for (i++; i < close; i++) {
+      const c = code[i];
+      if (c === '(' || c === '[' || c === '{') depth++;
+      else if (c === ')' || c === ']' || c === '}') depth--;
+      else if (c === ',' && depth === 0) break;
+    }
+  }
+  return i >= close || code[i] === ',' ? i : -1;
+}
+
+/**
+ * Past a declarator's type annotation that starts at `i` (after its `:`):
+ * the `=` before its value, or the comma, semicolon or line break that ends
+ * it, with brackets, angle brackets and a function type's `=>` read as part
+ * of the type. A line starting with `|`, `&` or `=` carries it on. -1 when
+ * it doesn't end.
+ */
+function jsTypeEnd(code: string, i: number): number {
+  let depth = 0;
+  for (; i < code.length; i++) {
+    const c = code[i]!;
+    if (c === '=' && code[i + 1] === '>') i++;
+    else if (c === '=' && depth === 0) return i;
+    else if (c === '(' || c === '[' || c === '{' || c === '<') depth++;
+    else if (c === ')' || c === ']' || c === '}' || c === '>') {
+      if (--depth < 0) return i;
+    } else if (depth === 0 && (c === ',' || c === ';')) return i;
+    else if (depth === 0 && c === '\n') {
+      const next = jsSkipSpace(code, i);
+      if (!/[|&=]/.test(code[next] ?? '')) return i;
+      i = next - 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Where the `=` value of a declarator that starts at `i` ends: at the comma
+ * before the next declarator, the semicolon, the bracket closing around the
+ * declaration (a `for` head's `)`, a block's `}`), or the line break that
+ * ends the statement where no semicolon does (as jsBodyEnd reads it). A `{`
+ * is skipped to its scope's end, type arguments before a call's `(` are read
+ * past. -1 when the value can't be read: an element (`<p>Hi, ob</p>`) or an
+ * unclosed bracket.
+ */
+function jsDeclaratorValueEnd(file: JsScopeFile, i: number): number {
+  const { code } = file;
+  let depth = 0;
+  for (; i < code.length; i++) {
+    const c = code[i]!;
+    if (c === '{') {
+      const end = jsScopeEnd(file, i);
+      if (end < 0) return -1;
+      i = end;
+    } else if (c === '(' || c === '[') {
+      depth++;
+    } else if (c === ')' || c === ']' || c === '}') {
+      if (depth === 0) return i;
+      depth--;
+    } else if (depth > 0) {
+      continue;
+    } else if (c === ',' || c === ';') {
+      return i;
+    } else if (c === '<') {
+      const before = jsPrevNonSpace(code, i);
+      if (before < 0 || !JS_OPERAND_END.test(code[before]!)) return -1;
+      JS_CALL_TYPE_ARGUMENTS.lastIndex = i;
+      const typed = JS_CALL_TYPE_ARGUMENTS.exec(code);
+      if (typed) i += typed[0].length - 1;
+    } else if (c === '\n') {
+      const before = jsPrevNonSpace(code, i);
+      const after = jsSkipSpace(code, i);
+      if (JS_OPERAND_END.test(code[before] ?? '') && (after === code.length || JS_OPERAND_START.test(code[after]!))) return i;
+      i = after - 1;
+    }
+  }
+  return code.length;
+}
+
+/** Type arguments on one line before a call's or `new`'s `(`: `<string, number>`, one level of nesting. */
+const JS_CALL_TYPE_ARGUMENTS = /<(?:[\w$. \t,|&[\]'"?]|<[\w$. \t,|&[\]'"?]{0,200}>){0,200}>(?=[ \t]*\()/y;
+
+/** Where the scope the `{` at `open` starts ends, or -1 when it doesn't close. */
+function jsScopeEnd(file: JsScopeFile, open: number): number {
+  const { scopes } = file;
+  let lo = 1, hi = scopes.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const start = scopes[mid]!.start;
+    if (start === open) return scopes[mid]!.end < file.code.length ? scopes[mid]!.end : -1;
+    if (start < open) lo = mid + 1; else hi = mid - 1;
+  }
+  return -1;
 }
 
 /** Where a `for` statement whose head holds `at` ends: past the statement after its head. */
@@ -25631,7 +25918,8 @@ function jsParameterReading(name: string, site: JsBindingSite, file: JsScopeFile
  */
 function jsDeclarationReading(name: string, site: JsBindingSite, file: JsScopeFile): JsBindingReading | null {
   const { code } = file;
-  const head = new RegExp(`(?:const|let|var)\\s+${escapeRegExp(name)}(?![\\w$])\\s*(?:!?\\s*:\\s*${TS_ANNOTATED_TYPE})?`, 'y');
+  // At the keyword, or at a later declarator's own name (jsDeclaredNames).
+  const head = new RegExp(`(?:(?:const|let|var)\\s+)?${escapeRegExp(name)}(?![\\w$])\\s*(?:!?\\s*:\\s*${TS_ANNOTATED_TYPE})?`, 'y');
   head.lastIndex = site.at;
   const m = head.exec(code);
   if (!m) return null;
@@ -26418,8 +26706,11 @@ function jsCallResultReading(
   };
 }
 
-/** A `const`/`let`/`var` of one name and its `=`, matched at the keyword: the head jsCallResultReading reads past. */
-const JS_DECLARATION_HEAD = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*/y;
+/**
+ * A `const`/`let`/`var` of one name and its `=`, matched at the keyword, or
+ * at a later declarator's own name: the head jsCallResultReading reads past.
+ */
+const JS_DECLARATION_HEAD = /(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*=\s*/y;
 
 /**
  * The type a TS class's static method `name` says it returns, read where that
