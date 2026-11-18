@@ -1,6 +1,6 @@
 # Framework & language coverage — what is done, what is left
 
-**Last verified: 2026-08-29** (Angular row: 2026-10-06; React Router row: 2026-10-19; Vue Router / Nuxt row: 2026-10-22) against the build at that date. Re-verify with the
+**Last verified: 2026-08-29** (Angular row: 2026-10-06; React Router row: 2026-10-19; Vue Router / Nuxt row: 2026-10-22; ASP.NET route nodes: 2026-11-17) against the build at that date. Re-verify with the
 queries in [Checking this file is still true](#checking-this-file-is-still-true)
 before trusting a row; this is a snapshot, not a live view.
 
@@ -136,6 +136,27 @@ gets no Screens picture at all today:
 
 The Vue name-index (`VueAppRoutes.byName`) is the closest existing precedent for
 all of these.
+
+**ASP.NET's route nodes** (`frameworks/aspnet-routes.ts`, #2905) read attribute
+routing as ASP.NET Core builds it: each controller's own `[Route]` templates, all
+of them, or else the nearest base class's (one in another file is read in
+`postExtract`, `inheritedControllerRoutes`); `[HttpGet]` … `[HttpOptions]` with or
+without a template, `[AcceptVerbs]`, an action's own `[Route]` (it takes the verbs
+of the verb attributes that name no template, or serves `ANY`), several
+attributes in one `[…]`, `/` and `~/` templates that stand alone, and the
+`[controller]`, `[action]` (`[ActionName]`, or the method without `Async`) and
+`[area]` tokens. Validated on eShopOnWeb (25 of 48 routes renamed, from
+`/[controller]/[action]` to `/Manage/MyAccount` and so on),
+modular-monolith-with-ddd (14 renamed, 11 new from `[HttpGet("")]` and
+`[HttpPut] [Route("…")]`) and jellyfin (its 26 controllers that declare no
+`[Route]` take `[Route("[controller]")]` from `BaseJellyfinApiController`:
+`/{itemId}/stream` became `/Audio/{itemId}/stream`). Preprocessor lines between
+an attribute and its action are skipped. Not read yet:
+conventional routing (`MapControllerRoute("default", "{controller=Home}/{action=Index}/{id?}")`),
+so a verb attribute with no template in a controller that has none anywhere
+still names `VERB /`; a template written as a constant (`[HttpGet(ApiRoutes.List)]`);
+an attribute-routed controller's actions that carry no routing attribute; and a
+base class's second template.
 
 ### 3. Native UI — no route nodes at all
 
