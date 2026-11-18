@@ -16,6 +16,7 @@
 
 import type { ExtractionResult, Language } from '../../types';
 import { commonJsRequireRefs } from '../commonjs-requires';
+import { indexParseBudgetMs, parseTimeoutResult } from '../parse-budget';
 import { EXTRACTORS } from '../languages';
 import { getKernel, kernelSupports } from './loader';
 import { decodeExtractBuffers } from './decode';
@@ -199,6 +200,21 @@ const warned = new Set<string>();
  */
 let deferSlot: { filePath: string; source: string; language: Language; pre: string } | null = null;
 
+/**
+ * One-slot timeout memo, beside deferSlot: the LAST file whose native parse
+ * ran past its budget (`timeout:`, #3274). Its decoded-path retry answers
+ * from here instead of parsing again, and no file that times out takes the
+ * wasm path, which runs the same tree-sitter and would only spend the budget
+ * a second time.
+ */
+let timeoutSlot: { filePath: string; source: string; language: Language; budgetMs: number } | null = null;
+
+/** The budget a just-timed-out file ran past, if it matches. */
+function takeTimedOut(filePath: string, source: string, language: Language): number | null {
+  return timeoutSlot && timeoutSlot.filePath === filePath && timeoutSlot.source === source &&
+    timeoutSlot.language === language ? timeoutSlot.budgetMs : null;
+}
+
 /** The hoisted preParse output for a just-deferred file, if it matches. */
 export function takeDeferredPreParse(
   filePath: string,
@@ -242,11 +258,13 @@ export function tryKernelExtractRaw(
   const kernel = getKernel();
   if (!kernel) return null;
   if (takeDeferredPreParse(filePath, source, language) !== null) return null; // already deferred
+  if (takeTimedOut(filePath, source, language) !== null) return null; // already timed out
   const pre = preParsedSource(filePath, source, language);
   // Its signatures come from the source as written, which needs the decoded path.
   if (keepsReExportsAsWritten(source, pre, language)) return null;
+  const budgetMs = indexParseBudgetMs(pre.length);
   try {
-    const buffers = kernel.extractFile(filePath, pre, language);
+    const buffers = kernel.extractFile(filePath, pre, language, budgetMs);
     const meta = buffers.meta;
     if (meta.readUInt8(LAYOUT_META.version) !== LAYOUT_ABI) {
       throw new Error(`kernel buffer ABI ${meta.readUInt8(0)} != expected ${LAYOUT_ABI}`);
@@ -269,6 +287,11 @@ export function tryKernelExtractRaw(
     const message = err instanceof Error ? err.message : String(err);
     if (message.includes('defer:')) {
       deferSlot = { filePath, source, language, pre };
+      return null;
+    }
+    // The decoded path (extractFromSource) records the timeout from the slot.
+    if (message.startsWith('timeout:')) {
+      timeoutSlot = { filePath, source, language, budgetMs };
       return null;
     }
     if (!warned.has(language)) {
@@ -321,10 +344,13 @@ export function tryKernelExtract(
   const kernel = getKernel();
   if (!kernel) return null;
   if (takeDeferredPreParse(filePath, source, language) !== null) return null; // already deferred
+  const timedOut = takeTimedOut(filePath, source, language);
+  if (timedOut !== null) return parseTimeoutResult(filePath, timedOut);
   const t0 = Date.now();
   const pre = preParsedSource(filePath, source, language);
+  const budgetMs = indexParseBudgetMs(pre.length);
   try {
-    const buffers = kernel.extractFile(filePath, pre, language);
+    const buffers = kernel.extractFile(filePath, pre, language, budgetMs);
     const result = decodeExtractBuffers(buffers, filePath, language);
     if (keepsReExportsAsWritten(source, pre, language)) restoreReExportSignatures(result, source);
     POST_PASSES[language]?.(result, source);
@@ -340,6 +366,12 @@ export function tryKernelExtract(
     if (message.includes('defer:')) {
       deferSlot = { filePath, source, language, pre };
       return null;
+    }
+    // A parse that ran past its budget is the file's result: the wasm path
+    // runs the same tree-sitter and would spend the budget again.
+    if (message.startsWith('timeout:')) {
+      timeoutSlot = { filePath, source, language, budgetMs };
+      return parseTimeoutResult(filePath, budgetMs);
     }
     if (!warned.has(language)) {
       warned.add(language);

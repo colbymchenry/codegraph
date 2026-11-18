@@ -233,9 +233,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
     parser
         .set_language(&grammar)
         .map_err(|e| format!("set_language(kotlin) failed: {e}"))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| "parser returned null tree".to_string())?;
+    let tree = crate::parse_budget::parse(&mut parser, source)?;
     if tree.root_node().has_error() {
         // Includes the PHANTOM errors (complete CSTs with hasError set) and
         // every fun-interface misparse — trust the flag, wasm is canonical.

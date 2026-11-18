@@ -39,6 +39,7 @@ import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
+import { indexParseBudgetMs, parseTimeoutMessage, parseWithinBudget } from './parse-budget';
 import { commonJsRequireRefs } from './commonjs-requires';
 import { frameworks } from './lazy-frameworks';
 
@@ -1052,9 +1053,11 @@ export class TreeSitterExtractor {
         if (preParsed !== this.source) this.sourceAsWritten = this.source;
         this.source = preParsed;
       }
-      this.tree = parser.parse(this.source) ?? null;
+      // Within the file's budget: a parse that never ends (#3274) is cancelled.
+      const budgetMs = indexParseBudgetMs(this.source.length);
+      this.tree = parseWithinBudget(parser, this.source, budgetMs);
       if (!this.tree) {
-        throw new Error('Parser returned null tree');
+        throw new ParseTimeoutError(budgetMs);
       }
       if (this.language === 'cpp' && this.tree.rootNode.hasError) {
         this.cppBraceScopes = scanCppBraceScopes(this.source);
@@ -1132,7 +1135,7 @@ export class TreeSitterExtractor {
       }
 
       this.errors.push({
-        message: `Parse error: ${msg}`,
+        message: error instanceof ParseTimeoutError ? msg : `Parse error: ${msg}`,
         filePath: this.filePath,
         severity: 'error',
         code: 'parse_error',
@@ -10152,6 +10155,13 @@ export class TreeSitterExtractor {
   }
 }
 
+
+/** A parse that ran past its budget (parseWithinBudget), recorded as the file's parse timing out. */
+class ParseTimeoutError extends Error {
+  constructor(budgetMs: number) {
+    super(parseTimeoutMessage(budgetMs));
+  }
+}
 
 /**
  * Extract nodes and edges from source code.
