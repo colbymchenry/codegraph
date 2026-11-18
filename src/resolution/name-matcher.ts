@@ -28271,6 +28271,12 @@ function matchMethodCallOn(
       (isImportedModuleReceiver(objectOrClass!, ref, context) || isImportedFunctionReceiver(objectOrClass!, ref, context))) {
     return null;
   }
+  // So is the default binding of a module of the project's own (#3272).
+  if (ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language)) {
+    const ownModule = projectModuleDefaultBinding(objectOrClass!, ref, context);
+    const settled = ownModule ? projectModuleMemberCall(ownModule, methodName!, ref, context) : undefined;
+    if (settled !== undefined) return settled;
+  }
 
   // A receiver written as a type name the project doesn't declare
   // (`Exception.Create(…)` in Delphi, `Collections.sort(…)`) is a type from
@@ -28711,6 +28717,54 @@ function isImportedModuleReceiver(receiver: string, ref: UnresolvedRef, context:
   if (binding.isDefault || !JS_FAMILY.has(ref.language)) return false;
   const bound = context.resolveImport?.({ ...ref, referenceName: root, referenceKind: 'imports' });
   return !!bound && context.getNodeById?.(bound.targetNodeId)?.kind === 'file';
+}
+
+/**
+ * The project module a member call's receiver is the default binding of,
+ * called on directly: `utils` in `utils.missing()` after `const utils =
+ * require('./utils')`, or a default import of the module. Null for any other
+ * receiver.
+ */
+function projectModuleDefaultBinding(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (receiver.includes('.')) return null;
+  const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === receiver);
+  if (!binding?.isDefault || binding.isNamespace) return null;
+  // A parameter or local of the name in scope at the call is the receiver
+  // instead, as isImportBinding reads it (#2953).
+  if (isLocallyBoundJsName(receiver, ref.filePath, context) && jsBindingAroundReference(receiver, ref, context)) return null;
+  const file = context.resolveModuleFile?.(binding.source, ref.filePath, ref.language);
+  return file && (context.isIndexedFile?.(file) ?? context.fileExists(file)) ? file : null;
+}
+
+/** `module.exports = …`, not `module.exports.x = …`: the module states a default. */
+const MODULE_EXPORTS_DEFAULT = /(?:^|[^\w$.])module\.exports\s*=(?![=>])\s*(new\s+([A-Za-z_$][\w$]*)\s*[(<;\r\n]|\{)?/m;
+/** An ES module's default: `export default …`, `export { x as default }`, `export = …`. */
+const ESM_DEFAULT_EXPORT_STATEMENT = /^[ \t]*export\s+(?:default\b|=)|\bas\s+default\b/m;
+
+/**
+ * A member called on a project module's default binding that the import
+ * resolver didn't place (#3272), when that settles it: `undefined` leaves the
+ * call to the guesses below, as before. The resolver has read what the
+ * module exports under the name, so where the module states no default — a
+ * bag of `exports.x = …`, which the binding is the whole of — or states an
+ * object literal, whose members it reads, the member is none of the
+ * module's, and a method of some class elsewhere, picked by its name alone,
+ * is no answer: `utils.missing()` linked a `Decoy` class's `missing`. A
+ * default the module makes with `new` (`module.exports = new Panel()`) has
+ * the members of its class, which the module file declares or imports.
+ */
+function projectModuleMemberCall(file: string, methodName: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const source = context.readFile(file) ?? '';
+  const commonJs = source.includes('module.exports') ? MODULE_EXPORTS_DEFAULT.exec(source) : null;
+  const made = commonJs?.[2];
+  if (made) {
+    const language = context.getNodesInFile(file)[0]?.language ?? ref.language;
+    const declaring = tsImportedTypeFile(made, { ...ref, filePath: file, language }, context) ?? file;
+    return resolveMethodOnType(made, methodName, ref, context, 0.85, 'instance-method', declaring);
+  }
+  if (commonJs) return commonJs[1] === '{' ? null : undefined;
+  const esmDefault = (source.includes('default') || source.includes('export =')) && ESM_DEFAULT_EXPORT_STATEMENT.test(source);
+  return esmDefault ? undefined : null;
 }
 
 const JS_ASSIGNED_MEMBERS = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
