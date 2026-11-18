@@ -1,8 +1,10 @@
 #include "tree_sitter/parser.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wctype.h>
 
-#define TOKEN_COUNT 33
+#define TOKEN_COUNT 34
 
 enum TokenType {
     BLOCK_COMMENT,
@@ -16,6 +18,7 @@ enum TokenType {
     CONJUNCTION_OPERATOR,
     DISJUNCTION_OPERATOR,
     NIL_COALESCING_OPERATOR,
+    DOUBLE_OPTIONAL,
     EQUAL_SIGN,
     EQ_EQ,
     PLUS_THEN_WS,
@@ -41,6 +44,50 @@ enum TokenType {
 };
 
 #define OPERATOR_COUNT 20
+
+/// Identifies fixed operators by their position in the shared lookup tables.
+enum OperatorIndex {
+    /// Identifies the arrow operator.
+    OPERATOR_INDEX_ARROW,
+    /// Identifies the dot operator.
+    OPERATOR_INDEX_DOT,
+    /// Identifies the conjunction operator.
+    OPERATOR_INDEX_CONJUNCTION,
+    /// Identifies the disjunction operator.
+    OPERATOR_INDEX_DISJUNCTION,
+    /// Identifies the nil-coalescing operator.
+    OPERATOR_INDEX_NIL_COALESCING,
+    /// Identifies the assignment operator.
+    OPERATOR_INDEX_EQUAL_SIGN,
+    /// Identifies the equality operator.
+    OPERATOR_INDEX_EQUALITY,
+    /// Identifies the whitespace-sensitive plus operator.
+    OPERATOR_INDEX_PLUS_THEN_WHITESPACE,
+    /// Identifies the whitespace-sensitive minus operator.
+    OPERATOR_INDEX_MINUS_THEN_WHITESPACE,
+    /// Identifies the bang operator.
+    OPERATOR_INDEX_BANG,
+    /// Identifies the throws keyword.
+    OPERATOR_INDEX_THROWS,
+    /// Identifies the rethrows keyword.
+    OPERATOR_INDEX_RETHROWS,
+    /// Identifies the default keyword.
+    OPERATOR_INDEX_DEFAULT,
+    /// Identifies the where keyword.
+    OPERATOR_INDEX_WHERE,
+    /// Identifies the else keyword.
+    OPERATOR_INDEX_ELSE,
+    /// Identifies the catch keyword.
+    OPERATOR_INDEX_CATCH,
+    /// Identifies the as keyword.
+    OPERATOR_INDEX_AS,
+    /// Identifies the conditional cast operator.
+    OPERATOR_INDEX_AS_QUESTION,
+    /// Identifies the forced cast operator.
+    OPERATOR_INDEX_AS_BANG,
+    /// Identifies the async keyword.
+    OPERATOR_INDEX_ASYNC
+};
 
 const char* OPERATORS[OPERATOR_COUNT] = {
     "->",
@@ -128,8 +175,6 @@ const uint64_t OP_SYMBOL_SUPPRESSOR[OPERATOR_COUNT] = {
     0, // EQ_EQ,
     0, // PLUS_THEN_WS,
     0, // MINUS_THEN_WS,
-    // 1ULL, as upstream has it from 0.7.4: 1UL << 32 overflows where unsigned
-    // long is 32 bits (MSVC), and `try!` lost its `!`. (codegraph patch)
     1ULL << FAKE_TRY_BANG, // BANG,
         0, // THROWS_KEYWORD,
         0, // RETHROWS_KEYWORD,
@@ -183,9 +228,6 @@ static bool is_cross_semi_token(enum TokenType op) {
     switch(op) {
     case ARROW_OPERATOR:
     case DOT_OPERATOR:
-    case CONJUNCTION_OPERATOR:
-    case DISJUNCTION_OPERATOR:
-    case NIL_COALESCING_OPERATOR:
     case EQUAL_SIGN:
     case EQ_EQ:
     case PLUS_THEN_WS:
@@ -208,8 +250,10 @@ static bool is_cross_semi_token(enum TokenType op) {
     }
 }
 
-#define NON_CONSUMING_CROSS_SEMI_CHAR_COUNT 3
-const uint32_t NON_CONSUMING_CROSS_SEMI_CHARS[NON_CONSUMING_CROSS_SEMI_CHAR_COUNT] = { '?', ':', '{' };
+#define NON_CONSUMING_CROSS_SEMI_CHAR_COUNT 8
+const uint32_t NON_CONSUMING_CROSS_SEMI_CHARS[NON_CONSUMING_CROSS_SEMI_CHAR_COUNT] = {
+    '?', ':', '{', '&', '|', '^', '<', '>'
+};
 
 /**
  * All possible results of having performed some sort of parsing.
@@ -283,17 +327,6 @@ static void advance(TSLexer *lexer) {
 
 static bool should_treat_as_wspace(int32_t character) {
     return iswspace(character) || (((int32_t) ';') == character);
-}
-
-static int32_t encountered_op_count(bool *encountered_operator) {
-    int32_t encountered = 0;
-    for (int op_idx = 0; op_idx < OPERATOR_COUNT; op_idx++) {
-        if (encountered_operator[op_idx]) {
-            encountered++;
-        }
-    }
-
-    return encountered;
 }
 
 static bool any_reserved_ops(uint8_t *encountered_reserved_ops) {
@@ -375,33 +408,149 @@ static bool is_legal_custom_operator(
     }
 }
 
+/// Collects valid fixed operators that can begin with the character.
+static uint32_t collect_fixed_operator_candidates(
+    int32_t character,
+    const bool *valid_symbols,
+    uint8_t *candidates
+) {
+    uint32_t count = 0;
+    switch (character) {
+    case '-':
+        if (valid_symbols[ARROW_OPERATOR]) {
+            candidates[count++] = OPERATOR_INDEX_ARROW;
+        }
+        if (valid_symbols[MINUS_THEN_WS]) {
+            candidates[count++] = OPERATOR_INDEX_MINUS_THEN_WHITESPACE;
+        }
+        break;
+    case '.':
+        if (valid_symbols[DOT_OPERATOR]) {
+            candidates[count++] = OPERATOR_INDEX_DOT;
+        }
+        break;
+    case '&':
+        if (valid_symbols[CONJUNCTION_OPERATOR]) {
+            candidates[count++] = OPERATOR_INDEX_CONJUNCTION;
+        }
+        break;
+    case '|':
+        if (valid_symbols[DISJUNCTION_OPERATOR]) {
+            candidates[count++] = OPERATOR_INDEX_DISJUNCTION;
+        }
+        break;
+    case '?':
+        if (
+            valid_symbols[NIL_COALESCING_OPERATOR] ||
+            valid_symbols[DOUBLE_OPTIONAL]
+        ) {
+            candidates[count++] = OPERATOR_INDEX_NIL_COALESCING;
+        }
+        break;
+    case '=':
+        if (valid_symbols[EQUAL_SIGN]) {
+            candidates[count++] = OPERATOR_INDEX_EQUAL_SIGN;
+        }
+        if (valid_symbols[EQ_EQ]) {
+            candidates[count++] = OPERATOR_INDEX_EQUALITY;
+        }
+        break;
+    case '+':
+        if (valid_symbols[PLUS_THEN_WS]) {
+            candidates[count++] = OPERATOR_INDEX_PLUS_THEN_WHITESPACE;
+        }
+        break;
+    case '!':
+        if (valid_symbols[BANG]) {
+            candidates[count++] = OPERATOR_INDEX_BANG;
+        }
+        break;
+    case 't':
+        if (valid_symbols[THROWS_KEYWORD]) {
+            candidates[count++] = OPERATOR_INDEX_THROWS;
+        }
+        break;
+    case 'r':
+        if (valid_symbols[RETHROWS_KEYWORD]) {
+            candidates[count++] = OPERATOR_INDEX_RETHROWS;
+        }
+        break;
+    case 'd':
+        if (valid_symbols[DEFAULT_KEYWORD]) {
+            candidates[count++] = OPERATOR_INDEX_DEFAULT;
+        }
+        break;
+    case 'w':
+        if (valid_symbols[WHERE_KEYWORD]) {
+            candidates[count++] = OPERATOR_INDEX_WHERE;
+        }
+        break;
+    case 'e':
+        if (valid_symbols[ELSE_KEYWORD]) {
+            candidates[count++] = OPERATOR_INDEX_ELSE;
+        }
+        break;
+    case 'c':
+        if (valid_symbols[CATCH_KEYWORD]) {
+            candidates[count++] = OPERATOR_INDEX_CATCH;
+        }
+        break;
+    case 'a':
+        if (valid_symbols[AS_KEYWORD]) {
+            candidates[count++] = OPERATOR_INDEX_AS;
+        }
+        if (valid_symbols[AS_QUEST]) {
+            candidates[count++] = OPERATOR_INDEX_AS_QUESTION;
+        }
+        if (valid_symbols[AS_BANG]) {
+            candidates[count++] = OPERATOR_INDEX_AS_BANG;
+        }
+        if (valid_symbols[ASYNC_KEYWORD]) {
+            candidates[count++] = OPERATOR_INDEX_ASYNC;
+        }
+        break;
+    default:
+        break;
+    }
+    return count;
+}
+
 static bool eat_operators(
     TSLexer *lexer,
     const bool *valid_symbols,
     bool mark_end,
+    bool token_is_immediate,
     const int32_t prior_char,
     enum TokenType *symbol_result
 ) {
-    bool possible_operators[OPERATOR_COUNT];
-    uint8_t reserved_operators[RESERVED_OP_COUNT];
-    for (int op_idx = 0; op_idx < OPERATOR_COUNT; op_idx++) {
-        possible_operators[op_idx] = valid_symbols[OP_SYMBOLS[op_idx]] && (!prior_char || OPERATORS[op_idx][0] == prior_char);
-    }
-    for (int op_idx = 0; op_idx < RESERVED_OP_COUNT; op_idx++) {
-        reserved_operators[op_idx] = !prior_char || RESERVED_OPS[op_idx][0] == prior_char;
+    int32_t first_char = prior_char ? prior_char : lexer->lookahead;
+    bool possible_custom_operator = valid_symbols[CUSTOM_OPERATOR] &&
+                                    is_legal_custom_operator(0, first_char, first_char);
+    uint8_t possible_operators[4];
+    uint32_t possible_operator_count = collect_fixed_operator_candidates(
+                                           first_char,
+                                           valid_symbols,
+                                           possible_operators
+                                       );
+    if (possible_operator_count == 0 && !possible_custom_operator) {
+        return false;
     }
 
-    bool possible_custom_operator = valid_symbols[CUSTOM_OPERATOR];
-    int32_t first_char = prior_char ? prior_char : lexer->lookahead;
+    uint8_t reserved_operators[RESERVED_OP_COUNT];
+    if (possible_custom_operator) {
+        for (int op_idx = 0; op_idx < RESERVED_OP_COUNT; op_idx++) {
+            reserved_operators[op_idx] = RESERVED_OPS[op_idx][0] == first_char;
+        }
+    }
+
     int32_t last_examined_char = first_char;
 
     int32_t str_idx = prior_char ? 1 : 0;
     int32_t full_match = -1;
     while(true) {
-        for (int op_idx = 0; op_idx < OPERATOR_COUNT; op_idx++) {
-            if (!possible_operators[op_idx]) {
-                continue;
-            }
+        uint32_t candidate_idx = 0;
+        while (candidate_idx < possible_operator_count) {
+            int op_idx = possible_operators[candidate_idx];
 
             if (OPERATORS[op_idx][str_idx] == '\0') {
                 // Make sure that the operator is allowed to have the next character as its lookahead.
@@ -447,34 +596,40 @@ static bool eat_operators(
                     }
                 }
 
-                possible_operators[op_idx] = false;
+                possible_operator_count -= 1;
+                possible_operators[candidate_idx] = possible_operators[possible_operator_count];
                 continue;
             }
 
             if (OPERATORS[op_idx][str_idx] != lexer->lookahead) {
-                possible_operators[op_idx] = false;
+                possible_operator_count -= 1;
+                possible_operators[candidate_idx] = possible_operators[possible_operator_count];
                 continue;
             }
+
+            candidate_idx += 1;
         }
 
-        for (int op_idx = 0; op_idx < RESERVED_OP_COUNT; op_idx++) {
-            if (!reserved_operators[op_idx]) {
-                continue;
-            }
+        if (possible_custom_operator) {
+            for (int op_idx = 0; op_idx < RESERVED_OP_COUNT; op_idx++) {
+                if (!reserved_operators[op_idx]) {
+                    continue;
+                }
 
-            if (RESERVED_OPS[op_idx][str_idx] == '\0') {
-                reserved_operators[op_idx] = 0;
-                continue;
-            }
+                if (RESERVED_OPS[op_idx][str_idx] == '\0') {
+                    reserved_operators[op_idx] = 0;
+                    continue;
+                }
 
-            if (RESERVED_OPS[op_idx][str_idx] != lexer->lookahead) {
-                reserved_operators[op_idx] = 0;
-                continue;
-            }
+                if (RESERVED_OPS[op_idx][str_idx] != lexer->lookahead) {
+                    reserved_operators[op_idx] = 0;
+                    continue;
+                }
 
-            if (RESERVED_OPS[op_idx][str_idx + 1] == '\0') {
-                reserved_operators[op_idx] = 2;
-                continue;
+                if (RESERVED_OPS[op_idx][str_idx + 1] == '\0') {
+                    reserved_operators[op_idx] = 2;
+                    continue;
+                }
             }
         }
 
@@ -484,7 +639,7 @@ static bool eat_operators(
                                        lexer->lookahead
                                    );
 
-        uint32_t encountered_ops = encountered_op_count(possible_operators);
+        uint32_t encountered_ops = possible_operator_count;
         if (encountered_ops == 0) {
             if (!possible_custom_operator) {
                 break;
@@ -523,7 +678,19 @@ static bool eat_operators(
                 }
             }
         }
-        *symbol_result = OP_SYMBOLS[full_match];
+        enum TokenType matched_symbol = OP_SYMBOLS[full_match];
+        if (
+            matched_symbol == NIL_COALESCING_OPERATOR &&
+            valid_symbols[DOUBLE_OPTIONAL]
+        ) {
+            if (!token_is_immediate && !valid_symbols[NIL_COALESCING_OPERATOR]) {
+                return false;
+            }
+            matched_symbol = token_is_immediate
+                             ? DOUBLE_OPTIONAL
+                             : NIL_COALESCING_OPERATOR;
+        }
+        *symbol_result = matched_symbol;
         return true;
     }
 
@@ -673,6 +840,7 @@ static enum ParseDirective eat_whitespace(
                                 lexer,
                                 valid_symbols,
                                 /* mark_end */ false,
+                                /* token_is_immediate */ false,
                                 '\0',
                                 &operator_result
                             );
@@ -697,6 +865,20 @@ static enum ParseDirective eat_whitespace(
     }
 
     if (semi_is_valid && ws_directive != CONTINUE_PARSING_NOTHING_FOUND) {
+        // If the upcoming token is a compiler directive (`#if`/`#elseif`/`#else`/`#endif`) that is
+        // valid in this parse state, prefer emitting the directive over an implicit semicolon. This
+        // matters when a directive is the *first* member of a type body (e.g. a `#if` directly after
+        // a `{`): there both a separator-style semi and the directive are valid, but the semi has no
+        // slot in the grammar, so emitting it produces a spurious error. Suppressing the semi here
+        // lets the directive be scanned instead. In a genuine separator position (e.g. between two
+        // members) the directive tokens are not valid until the semi has been consumed, so this does
+        // not interfere with using a newline as a member/statement separator.
+        bool directive_is_valid = valid_symbols[DIRECTIVE_IF] || valid_symbols[DIRECTIVE_ELSEIF] ||
+            valid_symbols[DIRECTIVE_ELSE] || valid_symbols[DIRECTIVE_ENDIF];
+        if (lookahead == '#' && directive_is_valid) {
+            return CONTINUE_PARSING_NOTHING_FOUND;
+        }
+
         *symbol_result = lookahead == ';' ? EXPLICIT_SEMI : IMPLICIT_SEMI;
         return ws_directive;
     }
@@ -870,6 +1052,7 @@ bool tree_sitter_swift_external_scanner_scan(
     struct ScannerState *state = (struct ScannerState *)payload;
 
     // Consume any whitespace at the start.
+    bool token_is_immediate = !should_treat_as_wspace(lexer->lookahead);
     enum TokenType ws_result;
     enum ParseDirective ws_directive = eat_whitespace(lexer, valid_symbols, &ws_result);
     if (ws_directive == STOP_PARSING_TOKEN_FOUND) {
@@ -901,6 +1084,7 @@ bool tree_sitter_swift_external_scanner_scan(
                             lexer,
                             valid_symbols,
                             /* mark_end */ !has_ws_result,
+                            token_is_immediate,
                             comment == CONTINUE_PARSING_SLASH_CONSUMED ? '/' : '\0',
                             &operator_result
                         );
@@ -928,4 +1112,3 @@ bool tree_sitter_swift_external_scanner_scan(
 
     return false;
 }
-

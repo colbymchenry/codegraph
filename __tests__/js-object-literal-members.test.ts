@@ -277,7 +277,7 @@ describe.each(['native', 'wasm'].filter((backend) => backend === 'wasm' || kerne
     expect(callees(g, 'c')).toEqual([]);
   });
 
-  it('leaves CommonJS exports, prototypes, call arguments, data and minified bundles as they were', async () => {
+  it('leaves prototype literals, call arguments, data and minified bundles as they were', async () => {
     const g = await index({
       'shapes.js': [
         'module.exports = { cjs() { return 1; } };',
@@ -293,10 +293,12 @@ describe.each(['native', 'wasm'].filter((backend) => backend === 'wasm' || kerne
       'iife.js': '(function () { var e; if (!e) { e = { getItem: function () { return 1; } }; } })();\n',
     });
     // …and a plain name reassigned inside a function (a bundle's `e = {…}`) is a local.
-    for (const name of ['cjs', 'proto', 'ephemeral', 'onThis', 'b', 'c', 'd', 'getItem']) {
+    for (const name of ['proto', 'ephemeral', 'onThis', 'b', 'c', 'd', 'getItem']) {
       expect(g.getNodesByName(name), name).toEqual([]);
     }
     expect(node(g, 'data').kind).toBe('constant');
+    // The module's own export object owns its members (#2966).
+    expect(node(g, 'module.exports::cjs').kind).toBe('function');
   });
 
   it('keeps a <script setup> literal\'s members under their owner', async () => {

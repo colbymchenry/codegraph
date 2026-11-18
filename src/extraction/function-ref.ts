@@ -246,6 +246,9 @@ const RUST_SPEC: FnRefSpec = {
     ['static_item', { mode: 'varinit', field: 'value' }],
     ['let_declaration', { mode: 'varinit', field: 'value' }],
   ]),
+  // `g.map(Graph::counts)`, `map(Self::helper)`, `or_else(fs::default_sep)`:
+  // a function passed through its path (#3254), resolved as that path's call.
+  special: new Set(['scoped_identifier']),
 };
 
 const JAVA_SPEC: FnRefSpec = {
@@ -669,6 +672,19 @@ function normalizeSpecial(
       return [];
     }
 
+    // Rust `Graph::counts`, `crate::graph::Graph::counts`, `Self::helper`
+    // (#3254): a function named through its path. The whole path is kept;
+    // resolution reads it as the same path written as a call would be, so the
+    // module, `use` and `Self` rules of a call decide what it names. Only a
+    // function-like last segment qualifies (a capitalized one is a variant or
+    // a constant); a generic path (`Vec::<u8>::new`) is left alone.
+    case 'scoped_identifier': {
+      const name = getChildByField(node, 'name');
+      if (!name || name.type !== 'identifier' || !/^(?:r#)?[a-z_]/.test(getNodeText(name, source))) return [];
+      const text = getNodeText(node, source).replace(/\s+/g, '');
+      return /^[A-Za-z_][\w:#]*$/.test(text) ? [{ name: text, node: name }] : [];
+    }
+
     // Kotlin `::targetCb` (one part) / `OtherClass::handle` (two parts —
     // receiver is a type_identifier; lowercase receivers are variables, the
     // deferred obj.method class).
@@ -774,7 +790,14 @@ function normalizeSpecial(
       const isThisReceiver = expr
         ? expr.type === 'this_expression' || expr.type === 'this'
         : getNodeText(node, source).startsWith('this.');
-      return isThisReceiver ? [{ name: getNodeText(name, source), node: name }] : [];
+      if (isThisReceiver) return [{ name: getNodeText(name, source), node: name }];
+      // A method group through a receiver — `Task.Run(worker.Run)`, `Action
+      // later = worker.Run;` (#2906): keep the receiver, as Go and Python
+      // member values do, and let resolution type it; a `this.` before a
+      // field is no part of it. Its name is no file's own, so it skips the
+      // name gate. Mirrored in the kernel (csharp.rs normalize_fn_ref_value).
+      const value = getNodeText(node, source).replace(/\s+/g, '').replace(/^this\./, '');
+      return /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/.test(value) ? [{ name: value, node: name, skipGate: true }] : [];
     }
 
     // PHP string callable — trustworthy ONLY as an argument to a known

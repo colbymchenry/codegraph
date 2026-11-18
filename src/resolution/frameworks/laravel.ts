@@ -119,6 +119,9 @@ export const laravelResolver: FrameworkResolver = {
     // file. A file mounted under a prefix elsewhere (`routes/api.php` under
     // `/api`) is composed in postExtract, from this in-file path.
     const groups = routeGroups(safe);
+    // What the file's `use` imports name, read once, when a handler names a class.
+    let scope: PhpRouteScope | undefined;
+    const scopeOf = (): PhpRouteScope => (scope ??= phpRouteScope(safe));
 
     // Route::METHOD('/path', handler-expr)
     // handler-expr can be: [Class::class, 'method'] | 'Controller@method' | Closure | Class::class
@@ -144,7 +147,7 @@ export const laravelResolver: FrameworkResolver = {
       };
       nodes.push(routeNode);
 
-      const handlerName = extractLaravelHandler(handlerExpr!);
+      const handlerName = extractLaravelHandler(handlerExpr!, scopeOf);
       if (handlerName) {
         references.push({
           fromNodeId: routeNode.id,
@@ -181,7 +184,7 @@ export const laravelResolver: FrameworkResolver = {
 
       if (handlerExpr) {
         // The controller is the first argument; an options array may follow.
-        const controllerName = extractLaravelHandler(splitArgs(handlerExpr)[0] ?? handlerExpr);
+        const controllerName = extractLaravelHandler(splitArgs(handlerExpr)[0] ?? handlerExpr, scopeOf);
         if (controllerName) {
           references.push({
             fromNodeId: routeNode.id,
@@ -470,22 +473,78 @@ function splitArgs(args: string): string[] {
   return out;
 }
 
+/** A PHP file's `namespace` and class `use` imports: local name (lowercased, as PHP compares it) → fully qualified name. */
+interface PhpRouteScope {
+  namespace: string;
+  uses: Map<string, string>;
+}
+
+/**
+ * The `namespace` and class imports of a file that declares routes: `use A\B;`,
+ * `use A\B as C;`, a comma list `use A\B, C\D;` and a group
+ * `use App\Http\Controllers\{Admin\UserController, X as Y};`. `use function`
+ * and `use const` import no class. Only the header counts: a `use` inside a
+ * class body brings in a trait.
+ */
+function phpRouteScope(safe: string): PhpRouteScope {
+  const namespace = /^\s*namespace\s+([\w\\]+)\s*[;{]/m.exec(safe)?.[1] ?? '';
+  const header = safe.slice(0, safe.search(/^\s*(?:(?:abstract|final|readonly)\s+)*(?:class|trait|interface|enum)\s/m) >>> 0 || safe.length);
+  const uses = new Map<string, string>();
+  for (const m of header.matchAll(/^\s*use\s+(?!function\b|const\b)([^;]+);/gm)) {
+    const body = m[1]!.trim();
+    const group = /^\\?([\w\\]+?)\\?\s*\{([^}]*)\}$/.exec(body);
+    for (const raw of (group ? group[2]! : body).split(',')) {
+      const item = raw.trim();
+      if (/^(?:function|const)\s/i.test(item)) continue;
+      const named = /^\\?([A-Za-z_][\w\\]*)(?:\s+as\s+(\w+))?$/i.exec(item);
+      if (!named) continue;
+      const fqn = group ? `${group[1]!}\\${named[1]!}` : named[1]!;
+      uses.set((named[2] ?? fqn.split('\\').pop()!).toLowerCase(), fqn);
+    }
+  }
+  return { namespace, uses };
+}
+
+/**
+ * The class a routes file means by `X::class`, as PHP resolves the name there,
+ * written fully qualified with a leading `\`: a leading `\` already, a first
+ * segment the file imports (so an alias, a group use and a namespace import
+ * `use App\Http\Controllers\Admin;` with `Admin\X::class` all count), or the
+ * file's own namespace. Null for a name the file neither imports nor
+ * qualifies, outside a namespace: Laravel's route namespace (or nothing)
+ * decides that one, so the controllers-root convention reads it.
+ */
+function routeClassName(written: string, scope: PhpRouteScope): string | null {
+  if (written.startsWith('\\')) return written;
+  const [head, ...rest] = written.split('\\');
+  const imported = scope.uses.get(head!.toLowerCase());
+  if (imported) return `\\${[imported, ...rest].join('\\')}`;
+  return scope.namespace ? `\\${scope.namespace}\\${written}` : null;
+}
+
 /**
  * Parse a Laravel route handler expression and return the symbol to link.
- *  - `[Class::class, 'method']`  -> `method`
- *  - `'Controller@method'`       -> `method`
+ *  - `[Class::class, 'method']`  -> `Class@method`
+ *  - `'Controller@method'`       -> `Controller@method`
  *  - `Class::class`              -> `Class`
  *  - anything else (closure etc) -> null
+ * A class written `X::class` is the one the routes file's imports name
+ * (routeClassName), as `\Fully\Qualified\X`, when they name one (#2975, #3292).
  */
-function extractLaravelHandler(expr: string): string | null {
+function extractLaravelHandler(expr: string, scope: () => PhpRouteScope): string | null {
   const trimmed = expr.trim();
   const short = (s: string) => s.split('\\').pop()!; // strip namespace
 
   // [Class::class, 'method'] → `Class@method` (PRECISE — keep the controller, so
   // common action names like `index`/`show` resolve to the RIGHT controller, not
-  // whichever one name-matching happens to pick first).
+  // whichever one name-matching happens to pick first). A class the file
+  // doesn't import keeps its namespace path below the controllers root, as a
+  // string handler does: `[Admin\UserController::class, 'show']`.
   const tupleMatch = trimmed.match(/^\[\s*([A-Za-z_\\][\w\\]*)::class\s*,\s*['"]([^'"]+)['"]\s*\]/);
-  if (tupleMatch) return `${short(tupleMatch[1]!)}@${tupleMatch[2]!}`;
+  if (tupleMatch) {
+    const written = tupleMatch[1]!;
+    return `${routeClassName(written, scope()) ?? controllerPath(written)}@${tupleMatch[2]!}`;
+  }
 
   // 'Controller@method' → `Controller@method`, keeping the namespace below
   // the controllers root: akaunting writes 'Common\Uploads@inline' for
@@ -496,7 +555,7 @@ function extractLaravelHandler(expr: string): string | null {
 
   // Class::class (Route::resource controller) → `Class`
   const classMatch = trimmed.match(/^([A-Za-z_\\][\w\\]*)::class/);
-  if (classMatch) return short(classMatch[1]!);
+  if (classMatch) return routeClassName(classMatch[1]!, scope()) ?? short(classMatch[1]!);
 
   // A controller named by string — no `use` brings it in, so its namespace
   // path below the controllers root is what finds it.
@@ -558,20 +617,38 @@ function resolveModelCall(
 /**
  * A route's `Controller@action`: a class name, or a namespace path under the
  * controllers root (`Common\\Uploads`), or a fully qualified one
- * (`Modules\\OfflinePayments\\Http\\Controllers\\Settings`).
+ * (`Modules\\OfflinePayments\\Http\\Controllers\\Settings`), or one the routes
+ * file's imports named, written from the root (`\\App\\Http\\Controllers\\Admin\\UserController`).
  */
-const CONTROLLER_ACTION = /^([A-Za-z_][\w\\]*)@(\w+)$/;
+const CONTROLLER_ACTION = /^(\\?[A-Za-z_][\w\\]*)@(\w+)$/;
 
 /** A string handler's class as a path under the controllers root, a leading `\\` and `App\\Http\\Controllers\\` off. */
 function controllerPath(written: string): string {
   return written.replace(/^\\+/, '').replace(/^App\\Http\\Controllers\\/i, '');
 }
 
-/** A class written with its namespace path (`Common\\Companies`). */
-const NAMESPACED_CLASS = /^[A-Za-z_]\w*(?:\\\w+)+$/;
+/** A class written with its namespace path (`Common\\Companies`), or from the root (`\\App\\Http\\Controllers\\Admin\\X`). */
+const NAMESPACED_CLASS = /^(?:\\[A-Za-z_]\w*(?:\\\w+)*|[A-Za-z_]\w*(?:\\\w+)+)$/;
+
+/**
+ * The project's PHP classes a `\`-led fully qualified name declares
+ * (`\App\Http\Controllers\Admin\UserController` is `App\Http\Controllers\Admin::UserController`).
+ */
+function phpClassesNamed(fqn: string, context: ResolutionContext): Node[] {
+  const name = fqn.replace(/^\\+/, '');
+  const cut = name.lastIndexOf('\\');
+  const qn = cut < 0 ? name : `${name.slice(0, cut)}::${name.slice(cut + 1)}`;
+  return context.getNodesByQualifiedName(qn).filter((n) => n.kind === 'class' && n.language === 'php');
+}
 
 /** The controller class a resource route names: by its path under the controllers root, else by name. */
 function resolveControllerClass(controller: string, context: ResolutionContext): string | null {
+  // A class the routes file named through its imports: that class, wherever it sits.
+  if (controller.startsWith('\\')) {
+    const named = phpClassesNamed(controller, context);
+    if (named.length > 0) return named[0]!.id;
+    controller = controllerPath(controller);
+  }
   const rel = controller.replace(/\\/g, '/');
   const className = rel.split('/').pop()!;
   const classes = context
@@ -594,13 +671,29 @@ function resolveControllerMethod(
   method: string,
   context: ResolutionContext
 ): string | null {
+  // A class the routes file named through its imports (#2975, #3292): that
+  // class's own method, or nothing. A same-named controller elsewhere, like
+  // the top-level `UserController` beside `Admin\UserController`, is not the
+  // one named. A name no project class has is read as a path below.
+  if (controller.startsWith('\\')) {
+    const named = phpClassesNamed(controller, context);
+    if (named.length > 0) {
+      for (const cls of named) {
+        const own = context.getNodesByQualifiedName(`${cls.qualifiedName}::${method}`)
+          .find((n) => n.kind === 'method' && n.filePath === cls.filePath);
+        if (own) return own.id;
+      }
+      return null;
+    }
+    controller = controllerPath(controller);
+  }
   const rel = controller.replace(/\\/g, '/');
   const methodIn = (filePath: string): string | null =>
     context.getNodesInFile(filePath).find((n) => n.kind === 'method' && n.name === method)?.id ?? null;
 
-  const controllerPath = `app/Http/Controllers/${rel}.php`;
-  if (context.fileExists(controllerPath)) {
-    const found = methodIn(controllerPath);
+  const conventional = `app/Http/Controllers/${rel}.php`;
+  if (context.fileExists(conventional)) {
+    const found = methodIn(conventional);
     if (found) return found;
   }
 

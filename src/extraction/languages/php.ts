@@ -178,7 +178,95 @@ function extractPhpReturnType(node: SyntaxNode, source: string): string | undefi
   return last;
 }
 
+/**
+ * A PHP source's code, with inline HTML, comments, string contents and heredoc
+ * bodies turned to spaces (newlines kept), offsets unchanged: what is left
+ * outside `<?php … ?>`, quotes and comments is code.
+ */
+function phpCodeOnly(source: string): string {
+  const out = source.split('');
+  const blank = (from: number, to: number): void => {
+    for (let k = from; k < to && k < out.length; k++) if (out[k] !== '\n' && out[k] !== '\r') out[k] = ' ';
+  };
+  const n = source.length;
+  let i = 0;
+  let inPhp = false;
+  while (i < n) {
+    if (!inPhp) {
+      const open = source.indexOf('<?', i);
+      const end = open < 0 ? n : open;
+      blank(i, end);
+      if (open < 0) break;
+      inPhp = true;
+      i = open + 2;
+      continue;
+    }
+    const c = source[i]!;
+    if (c === '?' && source[i + 1] === '>') {
+      inPhp = false;
+      i += 2;
+    } else if ((c === '/' && source[i + 1] === '/') || (c === '#' && source[i + 1] !== '[')) {
+      let j = i;
+      while (j < n && source[j] !== '\n' && !(source[j] === '?' && source[j + 1] === '>')) j++;
+      blank(i, j);
+      i = j;
+    } else if (c === '/' && source[i + 1] === '*') {
+      const close = source.indexOf('*/', i + 2);
+      const j = close < 0 ? n : close + 2;
+      blank(i, j);
+      i = j;
+    } else if (c === '\'' || c === '"' || c === '`') {
+      let j = i + 1;
+      while (j < n && source[j] !== c) j += source[j] === '\\' ? 2 : 1;
+      blank(i + 1, Math.min(j, n));
+      i = j + 1;
+    } else if (c === '<' && source.startsWith('<<<', i)) {
+      const head = /^<<<[ \t]*(["']?)([A-Za-z_]\w*)\1\r?\n/.exec(source.slice(i, i + 200));
+      if (!head) { i += 3; continue; }
+      const closing = new RegExp(`^[ \\t]*${head[2]}\\b`, 'm');
+      const bodyStart = i + head[0].length;
+      const m = closing.exec(source.slice(bodyStart));
+      const j = m ? bodyStart + m.index + m[0].length : n;
+      blank(i, j);
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return out.join('');
+}
+
+/**
+ * PHP before 8.0 also wrote a string offset with braces, `$code{0}` or
+ * `$this->name{0}`. The grammar knows only brackets, and its recovery could
+ * drop the whole function around such an offset (#3299). Outside strings,
+ * comments and heredocs, braces right after a variable or a property name
+ * can be nothing else, so they become brackets here, offsets kept. `${x}`,
+ * `{$x}` and `$obj->{$name}` don't match.
+ */
+function phpBraceOffsetsAsBrackets(source: string): string {
+  if (!/(?:\$|->)[A-Za-z_]\w*\{/.test(source)) return source;
+  const code = phpCodeOnly(source);
+  const offset = /(?:\$|->)[A-Za-z_]\w*\{/g;
+  let out: string[] | null = null;
+  for (let m = offset.exec(code); m; m = offset.exec(code)) {
+    const open = m.index + m[0].length - 1;
+    let depth = 0;
+    let close = -1;
+    for (let k = open; k < code.length; k++) {
+      if (code[k] === '{') depth++;
+      else if (code[k] === '}' && --depth === 0) { close = k; break; }
+    }
+    if (close < 0) continue;
+    out ??= source.split('');
+    out[open] = '[';
+    out[close] = ']';
+  }
+  return out ? out.join('') : source;
+}
+
 export const phpExtractor: LanguageExtractor = {
+  preParse: phpBraceOffsetsAsBrackets,
   functionTypes: ['function_definition'],
   classTypes: ['class_declaration', 'trait_declaration'],
   methodTypes: ['method_declaration'],

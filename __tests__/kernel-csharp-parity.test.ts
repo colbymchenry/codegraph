@@ -211,6 +211,41 @@ describe.skipIf(!kernelBuilt)('kernel C# extraction parity', () => {
       ].join('\n'),
       minNodes: 17,
     },
+    {
+      // `?.` and `!.` receivers are spelled with plain dots (#2906); `?[` is
+      // left as written.
+      name: 'null-conditional and null-forgiving receivers are spelled with plain dots',
+      source: [
+        'public class C {',
+        '  void M(Mailer? m) {',
+        '    m?.Send("a"); _maybe!.Send("b"); this._maybe?.Next?.Send("c");',
+        '    m?.Make()?.Send("d"); m!?.Send("e"); xs?[0].Send("f");',
+        '    m',
+        '      ?.Send("g");',
+        '  }',
+        '}',
+        '',
+      ].join('\n'),
+      minNodes: 3,
+    },
+    {
+      // A method group through a receiver keeps it, a `this.` before a field
+      // dropped, and skips the name gate (#2906); `this.Run` stays bare.
+      name: 'method groups through a receiver keep the receiver',
+      source: [
+        'public class C {',
+        '  Worker _w;',
+        '  void Run() { }',
+        '  void M(Worker w) {',
+        '    Task.Run(w.Run); Action a = w.Run, b = this._w.Run; Register(Worker.Tick, this.Run);',
+        '    Use(w',
+        '      .Run, w.Inner.Run, w[0].Run, Make().Run);',
+        '  }',
+        '}',
+        '',
+      ].join('\n'),
+      minNodes: 5,
+    },
   ];
 
   for (const m of MICROS) {

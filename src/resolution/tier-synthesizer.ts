@@ -51,6 +51,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { isTestPath } from '../search/query-utils';
 import { HOLE, readStringAt } from './frameworks/expo-router';
 import { enclosingFn, enclosingValue, makeLineAt } from './synth-utils';
+import { sameLanguageFamily } from './name-matcher';
 
 const JS_FILE = /\.(?:[cm]?[jt]sx?)$/;
 
@@ -460,26 +461,54 @@ function matchHttp(site: HttpSite, routes: readonly HttpRoute[]): HttpRoute | nu
   return tied ? null : best;
 }
 
+/** A host that is this machine: a server the project runs itself, in development. */
+const LOOPBACK_HOST = /^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\]|::1|0\.0\.0\.0)$/i;
+
+/** The host of an absolute URL's authority (`user@host:8080` → `host`), lowercased. */
+function urlHost(authority: string): string {
+  return authority.slice(authority.lastIndexOf('@') + 1).replace(/:[^:\]]*$/, '').toLowerCase();
+}
+
+/**
+ * Whether an absolute URL's host can be the project's own server (#2974): a
+ * loopback host, a host the code fills in (`https://${host}/…`), or the host
+ * of the client's own base URL. Any other host written out is somebody
+ * else's API, like `api.github.com`, whose paths (`/users/:id`) only look
+ * like the project's routes.
+ */
+function ownHost(authority: string, baseURL: string | null): boolean {
+  if (authority.includes(HOLE)) return true;
+  const host = urlHost(authority);
+  if (host === '' || LOOPBACK_HOST.test(host)) return true;
+  const base = baseURL === null ? null : /^(?:[a-z][a-z0-9+.-]*:)?\/\/([^/]*)/i.exec(baseURL);
+  return base !== null && !base[1]!.includes(HOLE) && urlHost(base[1]!) === host;
+}
+
 /**
  * The path a client call names, as segments, with `${…}` as `*`; `suffix`
  * when a base URL came first. Null when the path is not literal enough: a
- * relative path with no base, or nothing but holes.
+ * relative path with no base, or nothing but holes, or when it names
+ * another host than the project's (ownHost). A base URL itself (`isBase`)
+ * is read on any host: the client's calls go there, and its path prefix
+ * (`https://api.example.com/v2`) is theirs.
  */
-function clientPath(raw: string, baseURL: string | null): { segs: string[]; suffix: boolean; display: string } | null {
+function clientPath(raw: string, baseURL: string | null, isBase = false): { segs: string[]; suffix: boolean; display: string } | null {
   let p = raw;
   const cut = p.search(/[?#]/);
   if (cut >= 0) p = p.slice(0, cut);
   let suffix = false;
-  const absolute = /^(?:[a-z][a-z0-9+.-]*:)?\/\/[^/]*(\/.*)?$/i.exec(p);
-  if (absolute) p = absolute[1] ?? '/';
-  else if (!p.startsWith('/')) {
+  const absolute = /^(?:[a-z][a-z0-9+.-]*:)?\/\/([^/]*)(\/.*)?$/i.exec(p);
+  if (absolute) {
+    if (!isBase && !ownHost(absolute[1]!, baseURL)) return null;
+    p = absolute[2] ?? '/';
+  } else if (!p.startsWith('/')) {
     if (p.startsWith(HOLE)) {
       const rest = p.slice(1);
       if (!rest.startsWith('/')) return null;
       p = rest;
       suffix = true;
     } else if (baseURL !== null) {
-      const base = clientPath(baseURL, null);
+      const base = clientPath(baseURL, null, true);
       if (!base) {
         // A base that is itself a hole: match by the tail.
         if (!baseURL.includes(HOLE)) return null;
@@ -492,7 +521,7 @@ function clientPath(raw: string, baseURL: string | null): { segs: string[]; suff
     } else return null;
   } else if (baseURL !== null) {
     // An instance with a literal path base: axios joins `baseURL + url`.
-    const base = clientPath(baseURL, null);
+    const base = clientPath(baseURL, null, true);
     if (base && base.segs.length > 0) {
       suffix = base.suffix;
       p = '/' + [...base.segs, ...p.split('/')].filter(Boolean).join('/');
@@ -1190,9 +1219,21 @@ export async function testRequestEdges(ctx: ResolutionContext, onYield: MaybeYie
   }
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  // A suite's request is served by the program it tests: a Java or Kotlin
+  // test's MockMvc call by the JVM app's routes, a Laravel test's by PHP's.
+  // A route in another language that also matches the path (a TypeScript
+  // server's catch-all `GET /*`, say) is a different program, and an edge to
+  // it made `codegraph affected` select that suite for a change to the web
+  // app's code (#3320).
+  const routesFor = new Map<string, HttpRoute[]>();
+  const ownRoutes = (language: string): HttpRoute[] => {
+    let own = routesFor.get(language);
+    if (!own) routesFor.set(language, (own = routes.filter((r) => sameLanguageFamily(r.node.language, language))));
+    return own;
+  };
   for (const site of sites) {
     const route = matchHttp({ fn: site.from, file: site.from.filePath, line: site.line, column: site.column, callee: site.callee,
-      method: site.method, segs: site.segs, suffix: false, display: site.display }, routes);
+      method: site.method, segs: site.segs, suffix: false, display: site.display }, ownRoutes(site.from.language));
     if (!route) continue;
     const key = `${site.from.id}>${route.node.id}`;
     if (seen.has(key)) continue;
