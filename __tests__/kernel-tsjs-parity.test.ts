@@ -507,6 +507,25 @@ class Consumer:
     expect(result.unresolvedReferences.some(r => r.referenceKind === 'calls' && r.referenceName === 'c.Fetch')).toBe(true);
   });
 
+  it('Go calls on new(T) and make(T) keep the type; on append, the bare method name (#3237)', () => {
+    const result = assertParity('builtins.go', `package demo
+type Route struct{}
+func (r *Route) Host(h string) *Route { return r }
+type Set map[string]struct{}
+type List []int
+func use(list List) *Route {
+	make(Set).Add("k")
+	_ = append(list, 1).Len()
+	_ = New().Host("y")
+	return new(Route).
+		Host("x").
+		Path("/p")
+}
+`, 'go');
+    const names = result.unresolvedReferences.filter(r => r.referenceKind === 'calls').map(r => r.referenceName);
+    expect(names.sort()).toEqual(['Len', 'New', 'New().Host', 'Path', 'append', 'make', 'make(Set).Add', 'new', 'new(Route).Host']);
+  });
+
   it.each(['LF', 'CRLF'])('Go selector values stoplist the whole name, not the field (%s)', (ending) => {
     // The stoplist holds bare words like Python's `None`; `raft.None` (etcd)
     // and cgo's `C.NULL` are still values. The name is operand + field, so a

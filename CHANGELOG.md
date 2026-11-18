@@ -65,6 +65,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In C#, a method called on what a method of the same class returns, like `GetMailer().Send()`, now links to the method of the type that method is declared to return. Thanks @Gobakabana for the report. (#2906)
 - In ASP.NET Core, attribute routes are now named the way ASP.NET serves them: `[controller]` and `[action]` are filled in, each controller uses its own `[Route]` (or its base controller's), `~/` paths stand alone, and actions marked `[HttpHead]`, `[HttpOptions]` or `[AcceptVerbs]`, with their own `[Route]`, or in an attribute list are no longer missed. Thanks @Gobakabana for the report. (#2905)
 - In C#, an extension method is now matched by the type its `this` parameter takes, so `"hi".Shout()` and `mailer.Shout()` each reach their own extension, and a call of a string's own method no longer reaches a project extension of the same name. Thanks @Gobakabana for the report. (#2906)
+- In Go, a method called on `new(T)` or `make(T)` now links to that type's method, not a same-named method of another type that happened to be found first. Thanks @inth3shadows for the report. (#3237)
 
 ## [1.6.3] - 2026-11-17
 
