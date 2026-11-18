@@ -15,9 +15,10 @@
 import * as path from 'path';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
-import { NOT_STARTED, tools } from './tools';
+import { NOT_STARTED, tools, type ToolDefinition } from './tools';
 import { PROMPT_EXPLORE_BUSY, PROMPT_EXPLORE_METHOD } from './prompt-explore';
-import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server-instructions';
+import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX, openCodeInstructions } from './server-instructions';
+import { isOpenCodeClient, withOpenCodeToolNames } from './opencode-tool-names';
 import { CodeGraphPackageVersion } from './version';
 import { resolveServerRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
@@ -80,6 +81,42 @@ export function initializeInstructions(base: string, notice: string | null = get
     `${base}\n\n---\n${notice} This server keeps running the old version until ` +
     `the user upgrades — mention it when convenient; do not run the upgrade yourself.`
   );
+}
+
+/** Every tool this server defines, by name: the names a client's rewrite may touch. */
+const TOOL_NAMES: readonly string[] = tools.map((t) => t.name);
+
+/**
+ * The instructions `initialize` answers a client with: {@link initializeInstructions}
+ * of `base`, which an OpenCode client gets with our tool names the way OpenCode
+ * lists them (#1267). Exported so the proxy's local handshake gives the same
+ * client the IDENTICAL text; every other client gets today's bytes.
+ */
+export function instructionsForClient(base: string, clientName: string | undefined): string {
+  return initializeInstructions(isOpenCodeClient(clientName) ? openCodeInstructions(base, TOOL_NAMES) : base);
+}
+
+/**
+ * The `tools/list` answer for a client: `defs` as they are, except that an
+ * OpenCode client gets every description naming our tools the way OpenCode
+ * lists them (#1267). Each tool keeps its `name`, since OpenCode adds the
+ * prefix itself. Copies, never edits: the daemon serves every client from one
+ * tool handler, and `defs` may be the module's own definitions. Exported for
+ * the proxy, like {@link instructionsForClient}.
+ */
+export function toolsForClient(defs: ToolDefinition[], clientName: string | undefined): ToolDefinition[] {
+  if (!isOpenCodeClient(clientName)) return defs;
+  const rename = (text: string): string => withOpenCodeToolNames(text, TOOL_NAMES);
+  return defs.map((tool) => ({
+    ...tool,
+    description: rename(tool.description),
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: Object.fromEntries(
+        Object.entries(tool.inputSchema.properties).map(([key, prop]) => [key, { ...prop, description: rename(prop.description) }]),
+      ),
+    },
+  }));
 }
 
 /** MCP Protocol Version (latest the server claims). */
@@ -307,7 +344,7 @@ export class MCPSession {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
-      instructions: initializeInstructions(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX),
+      instructions: instructionsForClient(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX, this.clientInfo?.name),
     });
 
     if (explicitPath) {
@@ -330,9 +367,10 @@ export class MCPSession {
     // safe: a call against an un-indexed path returns SUCCESS-shaped guidance
     // ("pass projectPath / run codegraph init"), never `isError`, so it can't
     // teach the agent to abandon codegraph. `getTools()` returns the default
-    // surface even before a project is open.
+    // surface even before a project is open. The handler is shared by every
+    // client of a daemon; `toolsForClient` copies what it changes (#1267).
     this.transport.sendResult(request.id, {
-      tools: this.engine.getToolHandler().getTools(),
+      tools: toolsForClient(this.engine.getToolHandler().getTools(), this.clientInfo?.name),
     });
   }
 

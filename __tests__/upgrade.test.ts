@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { CODEGRAPH_INSTRUCTIONS_BLOCK } from '../src/installer/instructions-template';
+import { CODEGRAPH_INSTRUCTIONS_BLOCK, OPENCODE_INSTRUCTIONS_BLOCK } from '../src/installer/instructions-template';
 import {
   detectInstallMethod,
   deriveInstallDir,
@@ -1068,7 +1068,8 @@ describe('post-upgrade refresh keeps the user\'s instructions files (#2506)', ()
     const refresh = calls.runs[calls.runs.length - 1];
     expect(refresh?.cmd).toBe('codegraph');
     expect(refresh?.args).toEqual(['install', '--refresh']);
-    expect(fs.readFileSync(agentsMd, 'utf-8')).toBe(notes + CODEGRAPH_INSTRUCTIONS_BLOCK + '\n');
+    // OpenCode's own block, naming the tool as OpenCode lists it (#1267).
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toBe(notes + OPENCODE_INSTRUCTIONS_BLOCK + '\n');
   }, 90_000);
 });
 
