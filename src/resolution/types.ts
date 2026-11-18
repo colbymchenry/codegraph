@@ -129,6 +129,8 @@ export interface ResolutionContext {
   fileExists(filePath: string): boolean;
   /** Read file content */
   readFile(filePath: string): string | null;
+  /** Record a project-relative file resolution read its answer from, for sync to watch (see `getModuleConfigSnapshot`). */
+  noteModuleConfigFile?(filePath: string): void;
   /** `readFile(filePath)?.includes(needle) ?? false` for an ASCII `needle`, without decoding a file that lacks it. */
   fileContains?(filePath: string, needle: string): boolean;
   /**
