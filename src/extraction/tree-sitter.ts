@@ -27,7 +27,10 @@ import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { rustMacroArgRefs } from './languages/rust-macro-calls';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
-import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
+import {
+  dartMisparsedCtor, dartMisparsedCtorIn, dartMisparsedGenericCall, dartReceiverOf, dartTypeArgumentsType,
+  isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs,
+} from './languages/dart';
 import { cfmlConstructedComponent, cfmlCreatedComponent, isCfIncludeCall } from './languages/cfscript';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -2884,12 +2887,14 @@ export class TreeSitterExtractor {
 
     // C# primary-constructor parameter dependencies (`class Svc(IRepo r, …)`).
     this.extractCsharpPrimaryCtorParamRefs(node, classNode.id);
+    this.extractDartPrimaryCtorRefs(node, classNode.id);
 
     // Extract decorators applied to the class (`@Foo class X {}`).
     this.extractDecoratorsFor(node, classNode.id);
 
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
+    this.extractDartNamedPrimaryCtor(node, classNode.name);
     const body = resolvedBody ?? node;
 
     // Visit all children for methods and properties
@@ -3180,9 +3185,11 @@ export class TreeSitterExtractor {
 
     // Extract inheritance (e.g. Swift: enum AFError: Error)
     this.extractInheritance(node, enumNode.id);
+    this.extractDartPrimaryCtorRefs(node, enumNode.id);
 
     // Push to stack and visit body children (enum members, nested types, methods)
     this.nodeStack.push(enumNode.id);
+    this.extractDartNamedPrimaryCtor(node, enumNode.name);
 
     const memberTypes = this.extractor.enumMemberTypes;
     for (let i = 0; i < body.namedChildCount; i++) {
@@ -7014,6 +7021,9 @@ export class TreeSitterExtractor {
     if (this.language === 'dart') {
       if (node.type !== 'selector') return;
       if (node.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) return;
+      // So is `Map` in `List<Map<K, V>>.from(m)` when the grammar split the
+      // call into comparisons: the body walker references the call's types.
+      if (knownParent?.type === 'relational_expression' && dartMisparsedCtorIn(knownParent, node)) return;
       const prev = dartReceiverOf(node);
       if (prev?.type === 'identifier' && /^[A-Z][A-Za-z0-9_]*$/.test(prev.text)) {
         // `Map` in `x.read<Map<K, V>>(y)` parsed as comparisons is a type
@@ -7021,7 +7031,13 @@ export class TreeSitterExtractor {
         const before = knownParent?.type === 'relational_expression' ? prev.previousNamedSibling : null;
         if (before?.type === 'relational_operator' && dartMisparsedGenericCall(before)) return;
         this.pushStaticMemberRef(prev.text, ownerId, prev);
+        return;
       }
+      // The type a `<…>` follows is referenced as a type, `_Box` and `$Box`
+      // in `_Box<T>.named(…)` too, and `Box` after an import prefix in
+      // `p.Box<T>.named(…)`.
+      const type = dartTypeArgumentsType(node);
+      if (type && isDartTypeName(type)) this.pushStaticMemberRef(type.text, ownerId, type);
       return;
     }
 
@@ -7987,6 +8003,29 @@ export class TreeSitterExtractor {
             column: typeNode.startPosition.column,
           });
         }
+        // A generic constructor call the grammar read as comparisons and a dot
+        // shorthand, `(Future < void) > .delayed(d)`: the call, from where a
+        // parsed one starts, and the types it names (dartMisparsedCtor).
+        const ctor = nodeType === 'relational_expression' && ownerId ? dartMisparsedCtor(node) : undefined;
+        if (ctor && ownerId) {
+          this.unresolvedReferences.push({
+            fromNodeId: ownerId,
+            referenceName: `${ctor.type.text}.${ctor.name.text}`,
+            referenceKind: 'calls',
+            line: ctor.head.startPosition.row + 1,
+            column: ctor.head.startPosition.column,
+          });
+          for (const type of [ctor.type, ...ctor.typeArgs]) {
+            if (!isDartTypeName(type)) continue;
+            this.unresolvedReferences.push({
+              fromNodeId: ownerId,
+              referenceName: type.text,
+              referenceKind: 'references',
+              line: type.startPosition.row + 1,
+              column: type.startPosition.column,
+            });
+          }
+        }
       }
 
       // Local variable type annotations inside a body — `const items: Foo[] = []`,
@@ -8788,6 +8827,43 @@ export class TreeSitterExtractor {
         if (paramType) this.walkCsharpTypePosition(paramType, nodeId);
       }
     }
+  }
+
+  /**
+   * A Dart 3.13 primary constructor in a class or enum header, `class
+   * Point(final Offset origin, {Size? size})`: the types its parameters name
+   * are the type's, as a field's declared type is, since a `final` or `var`
+   * parameter declares one (#3270). The native kernel's
+   * `primary_ctor_type_refs` mirrors it.
+   */
+  private extractDartPrimaryCtorRefs(node: SyntaxNode, ownerId: string): void {
+    if (this.language !== 'dart') return;
+    const ctor = getChildByField(node, 'primary_constructor');
+    const parameters = ctor ? getChildByField(ctor, 'parameters') : null;
+    if (parameters) pushDartTypeRefs(parameters, ownerId, (ref) => this.unresolvedReferences.push(ref));
+  }
+
+  /**
+   * A named Dart 3.13 primary constructor, `class Point.origin(final int x)`,
+   * is the type's named constructor as `Point.origin(…)` in its body would
+   * be: a method named `origin` that returns the type, which a call
+   * `Point.origin(…)` links. An unnamed one, like `Point()`, mints no node
+   * (#3270). The native kernel's `named_primary_ctor` mirrors it.
+   */
+  private extractDartNamedPrimaryCtor(node: SyntaxNode, typeName: string): void {
+    if (this.language !== 'dart') return;
+    const ctor = getChildByField(node, 'primary_constructor');
+    const name = ctor ? getChildByField(ctor, 'name') : null;
+    if (!ctor || name?.type !== 'identifier') return;
+    const parameters = getChildByField(ctor, 'parameters');
+    const signature = parameters ? getNodeText(parameters, this.source).trim() : '';
+    this.createNode('method', getNodeText(name, this.source), ctor, {
+      signature: signature || undefined,
+      visibility: 'public',
+      isAsync: false,
+      isStatic: false,
+      returnType: typeName,
+    });
   }
 
   /**

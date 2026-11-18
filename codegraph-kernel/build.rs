@@ -63,18 +63,16 @@ fn main() {
     scala.compile("tree-sitter-scala");
     println!("cargo:rerun-if-changed=grammars/scala");
 
-    // Dart grammar — vendored C (fourth vendored-grammar-C language): the
-    // production wasm is the tree-sitter-wasms 0.1.13 artifact, whose dart
-    // dependency is an UNPINNED github:UserNobody14/tree-sitter-dart — the
-    // vendored wasm byte-copy (src/extraction/wasm/) plus these same-commit
-    // sources kill that hazard. crates.io tree-sitter-dart is the nielsenko
-    // FORK (different lineage) — rejected. Sources are
-    // UserNobody14/tree-sitter-dart master@d4d8f3e337d8 (dart checklist
-    // §Grammar prep):
-    //   parser.c  5a42b47abb4d494f125dbdee9138979248041689b1aa36355550fa3e28dcb8b8
+    // Dart grammar — vendored C (fourth vendored-grammar-C language). Sources
+    // are UserNobody14/tree-sitter-dart master@0038280b774b (2026-10-18; Dart
+    // 3.13 primary constructors, #3270), byte-identical to the commit's src/,
+    // and src/extraction/wasm/tree-sitter-dart.wasm is built from the same
+    // files (docs/grammars/tree-sitter-dart.md):
+    //   parser.c  9570f47f9912a4b169f5d959f6db06859087eb95c3f1203e312a33c12da66309
     //   scanner.c 07a7b7818b175e9460523e705dd88d20f7b5141bac95c593d4426e6d52284996
-    // scanner.c is load-bearing: string-template char classes and /** */ doc
-    // comments are external tokens.
+    // crates.io tree-sitter-dart is the nielsenko FORK (different lineage) —
+    // rejected. scanner.c is load-bearing: string-template char classes and
+    // /** */ doc comments are external tokens.
     let mut dart = cc::Build::new();
     dart.include("grammars/dart");
     dart.file("grammars/dart/parser.c");

@@ -4,9 +4,10 @@
  * `RepositoryProvider.of<TodosRepository>(context).saveTodo(t)` — calls a
  * member of the type the factory's type argument names.
  *
- * When the generic call parses as a call (tree-sitter-dart reads about half
- * of them as two comparisons, but a named argument or a type argument like
- * `<A?>` makes it a call), the extractor records the chain as
+ * When the generic call parses as a call (tree-sitter-dart d4d8f3e read about
+ * half of them as two comparisons, but a named argument or a type argument
+ * like `<A?>` made it a call; 0038280 reads them all as calls), the extractor
+ * records the chain as
  * `BlocProvider.of().increment`, and the resolver typed it by what
  * `BlocProvider.of` is declared to return. That is `T` (`static T of<T>(…)`),
  * which names no type, so the call linked nothing. In an app, where

@@ -41,6 +41,12 @@ build ↔ vendored wasm table identity).
 
 ## Grammar prep (wasm byte-copy vendor + vendored-C kernel build)
 
+> **Superseded (#3270, 2026-11):** both the vendored C and the wasm are now
+> tree-sitter-dart master `0038280` (Dart 3.13 primary constructors), the wasm
+> built locally from the same `src/`; provenance, file hashes and the rebuild
+> are in `docs/grammars/tree-sitter-dart.md`. The d4d8f3e record below is kept
+> as the port's history.
+
 dart is NOT in `VENDORED_WASM_LANGS` (grammars.ts:291-333) — production
 resolves `require.resolve('tree-sitter-wasms/out/tree-sitter-dart.wasm')`
 (mapping `dart: 'tree-sitter-dart.wasm'` grammars.ts:36; `.dart` → dart at
