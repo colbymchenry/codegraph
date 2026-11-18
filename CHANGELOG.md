@@ -64,6 +64,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Swift, a type no longer picks up the inheritance of a type nested inside it, which linked a name used in the type to an unrelated type's nested type and put it in the wrong impact results. Thanks @bob-codedaptive for the report and @remote-controlled-man. (#3213)
 - In C#, a method called on what a method of the same class returns, like `GetMailer().Send()`, now links to the method of the type that method is declared to return. Thanks @Gobakabana for the report. (#2906)
 - In ASP.NET Core, attribute routes are now named the way ASP.NET serves them: `[controller]` and `[action]` are filled in, each controller uses its own `[Route]` (or its base controller's), `~/` paths stand alone, and actions marked `[HttpHead]`, `[HttpOptions]` or `[AcceptVerbs]`, with their own `[Route]`, or in an attribute list are no longer missed. Thanks @Gobakabana for the report. (#2905)
+- In C#, an extension method is now matched by the type its `this` parameter takes, so `"hi".Shout()` and `mailer.Shout()` each reach their own extension, and a call of a string's own method no longer reaches a project extension of the same name. Thanks @Gobakabana for the report. (#2906)
 
 ## [1.6.3] - 2026-11-17
 

@@ -23993,6 +23993,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CSHARP_TYPE_ARITY.delete(context);
   CSHARP_EXTENSION_METHODS.delete(context);
   CSHARP_PARAMETERS.delete(context);
+  CSHARP_EXTENSION_THIS.delete(context);
+  CSHARP_FILE_BASENAMES.delete(context);
   JS_ASSIGNED_MEMBERS.delete(context);
   JS_CONSTRUCTOR_METHODS.delete(context);
   CFML_CHAINS.delete(context);
@@ -26980,6 +26982,11 @@ function matchMethodCallOn(
   if (ref.language === 'python' && ref.referenceKind === 'calls' && /\]\.\w+$/.test(ref.referenceName)) {
     return matchPythonElementCall(ref, context);
   }
+  // A C# call on a literal (`"hi".Shout()`): an extension method of its type, or nothing.
+  if (ref.language === 'csharp') {
+    const literal = matchCsharpLiteralCall(ref, context);
+    if (literal !== undefined) return literal;
+  }
   // Parse method call patterns like "obj.method" or "Class::method". The method
   // part allows trailing `:` keywords so Objective-C selectors resolve
   // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
@@ -27572,6 +27579,12 @@ function matchMethodCallOn(
         if (!(typedAt && target?.isStatic) && (!target || !isOtherLanguageConstructor(target, ref.language))) return withTypeFrom(typedMatch, typedFrom);
       }
       if (awaited) return null;
+      // A C# method the receiver's type lacks is an extension method that
+      // takes that type, or none of the project's for a keyword type (#2906).
+      if (ref.language === 'csharp') {
+        const extension = nmTimedT('mc-csext', ref, () => matchCsharpExtensionCall(inferredType!, methodName!, ref, context));
+        if (extension !== undefined) return extension;
+      }
       // A known JS/TS builtin receiver is external when it has no project
       // method (#1566). Inference already strips generics (`Map<K, V>` →
       // `Map`); do not let Strategy 3 guess an unrelated `get`/`set`/`has`.
@@ -28770,6 +28783,176 @@ function csharpExtensionOverload(picked: Node, ref: UnresolvedRef, context: Reso
   }
   if (fitting.length === 1) return fitting[0]!;
   return fitting.some((n) => n.id === picked.id) ? picked : null;
+}
+
+/** C#'s keyword types and the .NET type each one names. */
+const CSHARP_KEYWORD_TYPES: ReadonlyMap<string, string> = new Map([
+  ['string', 'String'], ['object', 'Object'], ['bool', 'Boolean'], ['char', 'Char'], ['byte', 'Byte'], ['sbyte', 'SByte'],
+  ['short', 'Int16'], ['ushort', 'UInt16'], ['int', 'Int32'], ['uint', 'UInt32'], ['long', 'Int64'], ['ulong', 'UInt64'],
+  ['nint', 'IntPtr'], ['nuint', 'UIntPtr'], ['float', 'Single'], ['double', 'Double'], ['decimal', 'Decimal'],
+]);
+
+/** A C# call on a literal, `"hi".Shout`, `21.Twice`, `2.5m.Round`: the literal and the method. */
+const CSHARP_LITERAL_CALL = /^(@?"(?:[^"\\]|\\.|"")*"|'(?:[^'\\]|\\.)+'|\d[\w.]*?|true|false)\.([A-Za-z_]\w*)$/;
+
+/** The keyword type of a C# literal: `"hi"` string, `'c'` char, `21` int, `21L` long, `2.5` double, `2.5f` float, `2.5m` decimal, `true` bool. */
+function csharpLiteralType(literal: string): string | null {
+  if (literal.startsWith('"') || literal.startsWith('@')) return 'string';
+  if (literal.startsWith("'")) return 'char';
+  if (literal === 'true' || literal === 'false') return 'bool';
+  const number = literal.toLowerCase().replace(/_/g, '');
+  if (/^0x[\da-f]+(?:ul|lu|u|l)?$/.test(number) || /^0b[01]+(?:ul|lu|u|l)?$/.test(number) || /^\d+(?:ul|lu|u|l)?$/.test(number)) {
+    if (/(?:ul|lu)$/.test(number)) return 'ulong';
+    if (number.endsWith('l')) return 'long';
+    if (number.endsWith('u')) return 'uint';
+    return 'int';
+  }
+  if (/^(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?[fdm]?$/.test(number)) {
+    if (number.endsWith('f')) return 'float';
+    if (number.endsWith('m')) return 'decimal';
+    return 'double';
+  }
+  return null;
+}
+
+const CSHARP_EXTENSION_THIS = new WeakMap<ResolutionContext, Map<string, { type: string; generic: boolean } | null>>();
+
+/**
+ * The type a C# extension method's `this` parameter declares, as its last
+ * name without generic arguments, nullability or namespace (`IEnumerable`,
+ * `Mailer`, `string`); `generic` when it is one of the method's own type
+ * parameters (`Each<T>(this T item)`). Null for an array or a type that
+ * can't be read.
+ */
+function csharpExtensionThisType(method: Node, context: ResolutionContext): { type: string; generic: boolean } | null {
+  let memo = CSHARP_EXTENSION_THIS.get(context);
+  if (!memo) CSHARP_EXTENSION_THIS.set(context, (memo = new Map()));
+  const hit = memo.get(method.id);
+  if (hit !== undefined) return hit;
+  let found: { type: string; generic: boolean } | null = null;
+  const source = csharpDeclarationSource(method, context);
+  const head = new RegExp(String.raw`\b${escapeRegExp(method.name)}\s*(?:<([^()]*)>\s*)?\(`).exec(source);
+  if (head) {
+    const at = csharpPastAttributes(source, head.index + head[0].length);
+    const param = /^(?:(?:ref|in|scoped|readonly)\s+)*this\s+(?:(?:ref|in|scoped|readonly)\s+)*((?:global::)?[A-Za-z_][\w.]*)\s*(<[^()]*?>)?\s*(\[[\s,]*\])?\s*\??\s+@?[A-Za-z_]\w*/.exec(source.slice(at));
+    if (param && !param[3]) {
+      const type = param[1]!.split(/::|\./).pop()!;
+      const typeParams = (head[1] ?? '').split(',').map((t) => t.trim());
+      found = { type, generic: !param[2] && typeParams.includes(type) };
+    }
+  }
+  memo.set(method.id, found);
+  return found;
+}
+
+/**
+ * Whether the C# extension method `n` is one a call in `file` can see: its
+ * static class's namespace is the global one, one the file is in (or a
+ * namespace around that), or one a `using` brings in.
+ */
+function isCsharpExtensionVisible(n: Node, file: string, context: ResolutionContext): boolean {
+  const segments = n.qualifiedName.split('::');
+  if (segments.length < 3) return true;
+  const namespace = segments.slice(0, -2).join('.');
+  const scope = csharpNamespaceScope(file, context);
+  if (scope.usings.has(namespace)) return true;
+  return scope.namespaces.some((ns) => ns === namespace || ns.startsWith(`${namespace}.`));
+}
+
+/**
+ * A C# call of a method its receiver's type doesn't declare, on a receiver
+ * of known type — a literal (`"hi".Shout()`), or a value its declaration
+ * types (`_mailer.Shout()`, `string s; s.Shout()`) — is a call of the
+ * extension method whose `this` parameter takes that type (#2906): the type
+ * itself first, then a base type or interface the project declares it to
+ * derive from, then `object` or a type parameter of the method's own. Of
+ * several in the first such group, the one the call's arguments fit. Null
+ * when the receiver's type is a C# keyword type and no project extension
+ * takes it: its methods are .NET's. Undefined otherwise, which leaves the
+ * call to the strategies after it.
+ */
+function matchCsharpExtensionCall(receiverType: string, methodName: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const bare = receiverType.replace(/<[\s\S]*>$/, '').replace(/\?$/, '').split(/::|\./).pop()!;
+  const keyword = CSHARP_KEYWORD_TYPES.get(bare);
+  const names = new Set([bare, keyword ?? bare]);
+  for (const [k, v] of CSHARP_KEYWORD_TYPES) if (v === bare) names.add(k);
+  // (An extension calling itself through its own receiver is far rarer than
+  // one handing the call to an overload outside the project: jellyfin's
+  // `WaitForExitAsync(this Process, TimeSpan)` awaits Process's own.)
+  const candidates = context.getNodesByName(methodName).filter((n) =>
+    n.language === 'csharp' && n.kind === 'method' && n.id !== ref.fromNodeId &&
+    isCsharpExtensionMethod(n, context) && isCsharpExtensionVisible(n, ref.filePath, context));
+  const outside = keyword !== undefined || CSHARP_KEYWORD_TYPES.has(bare.toLowerCase());
+  if (candidates.length === 0) return outside ? null : undefined;
+  // A project type the index couldn't read (serilog's `#if`-split ILogger.cs)
+  // may declare the method itself, and C# calls a type's own method first.
+  const types = context.getNodesByName(bare).filter((t) => t.language === 'csharp' && CSHARP_TYPE_KINDS.has(t.kind));
+  if (!outside && types.length === 0 && csharpFileBasenames(context).has(`${bare}.cs`)) return undefined;
+  // The types the receiver's own type derives from, as the project declares them.
+  const ancestors = new Set<string>();
+  for (const t of types) for (const a of csharpAncestorNames(t.qualifiedName, context)) ancestors.add(a);
+  const tiers: Node[][] = [[], [], []];
+  for (const n of candidates) {
+    const self = csharpExtensionThisType(n, context);
+    if (!self) continue;
+    if (!self.generic && names.has(self.type)) tiers[0]!.push(n);
+    else if (!self.generic && ancestors.has(self.type)) tiers[1]!.push(n);
+    else if (self.generic || self.type === 'object' || self.type === 'Object') tiers[2]!.push(n);
+  }
+  // The ones the call's arguments fit, past the `this` receiver.
+  const list = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), methodName, context);
+  const args = list === null ? null : list.trim() === '' ? [] : splitCppTopLevel(cppWithoutComments(list));
+  const fits = (n: Node): boolean => {
+    const params = args === null ? null : csharpParameters(n, context);
+    return args === null || (!!params && csharpArgumentsFit(params.slice(1), args));
+  };
+  const tier = tiers.map((t) => t.filter(fits)).find((t) => t.length > 0);
+  if (!tier) return outside ? null : undefined;
+  // C# prefers an overload the arguments fill without defaults.
+  if (args !== null && tier.length > 1) {
+    const exact = (n: Node): boolean => (csharpParameters(n, context) ?? []).slice(1).filter((p) => !p.optional && !p.variadic).length === args.length;
+    tier.sort((a, b) => Number(exact(b)) - Number(exact(a)));
+  }
+  // Overloads of one class are told apart after this (csharpExtensionOverload).
+  // Copies of one class in several projects share its qualified name
+  // (ardalis's three ServiceDefaults `Extensions`): take the caller's own
+  // project's, the copy whose directory the calling file shares most of.
+  if (!tier.every((n) => n.qualifiedName === tier[0]!.qualifiedName)) return undefined;
+  let pick = tier[0]!;
+  let nearest = -1;
+  for (const n of tier) {
+    const shared = n.filePath === ref.filePath ? Number.MAX_SAFE_INTEGER : sharedDirDepth(ref.filePath, n.filePath);
+    if (shared > nearest) {
+      nearest = shared;
+      pick = n;
+    }
+  }
+  return { original: ref, targetNodeId: pick.id, confidence: 0.85, resolvedBy: 'instance-method' };
+}
+
+const CSHARP_FILE_BASENAMES = new WeakMap<ResolutionContext, Set<string>>();
+
+/** The names of the project's `.cs` files, `ILogger.cs`. */
+function csharpFileBasenames(context: ResolutionContext): Set<string> {
+  let names = CSHARP_FILE_BASENAMES.get(context);
+  if (!names) {
+    names = new Set(context.getAllFiles().filter((f) => f.endsWith('.cs')).map((f) => path.posix.basename(f)));
+    CSHARP_FILE_BASENAMES.set(context, names);
+  }
+  return names;
+}
+
+/**
+ * A C# call on a literal — `"hi".Shout()`, `21.Twice()` — is to an extension
+ * method that takes the literal's type, or to none of the project's (#2906).
+ * Undefined for any other ref.
+ */
+export function matchCsharpLiteralCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  if (ref.language !== 'csharp' || ref.referenceKind !== 'calls') return undefined;
+  const m = CSHARP_LITERAL_CALL.exec(ref.referenceName);
+  const type = m ? csharpLiteralType(m[1]!) : null;
+  if (!m || !type) return undefined;
+  return matchCsharpExtensionCall(type, m[2]!, ref, context) ?? null;
 }
 
 /** The directory of a Go file, which is its package: Go keeps one package per directory. */
