@@ -581,6 +581,7 @@ codegraph affected src/auth.ts --filter "e2e/*"     # Custom test file pattern
 | `-f, --filter <glob>` | Glob for the files that count as tests (see below) | auto-detect |
 | `-j, --json` | Output as JSON | `false` |
 | `-q, --quiet` | Output file paths only | `false` |
+| `--cross-tier` | Also follow links across a process boundary: a client's HTTP call to its server's route, a queue job to its consumer, an event to its handler | `false` |
 
 `--filter` matches the whole name. With no slash (`*_test.go`) it matches the file name at any depth, with a slash (`e2e/*.spec.ts`) that folder at any depth, and with a leading `/` (`/tests/**/*.py`) from the project root only. `**` also matches no folder, so `tests/**/*.py` includes `tests/test_x.py`. Without `--filter`, files with the usual test names and folders count as tests, Google-style `foo_unittest.cc` and `foo_unittest.py` included.
 
