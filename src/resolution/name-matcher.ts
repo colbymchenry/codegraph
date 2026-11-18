@@ -8354,11 +8354,21 @@ function isCsharpMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionC
   if (cut < 0 || !hasNoReceiverOnLine(ref, context)) return true;
   const owner = n.qualifiedName.slice(0, cut).split(/::|\./).pop()!;
   if (csharpStaticUsings(ref.filePath, context).has(owner)) return true;
+  return csharpTypesAround(ref, context, owner) !== false;
+}
+
+/**
+ * Whether the C# type named `owner` is one written around `ref` (an enclosing
+ * type, outer ones included) or a base of theirs: the types whose members a
+ * bare name, or one after `this.` / `base.`, reaches. Undefined when no type
+ * declaration around the reference was recovered, so there is nothing to
+ * judge by.
+ */
+function csharpTypesAround(ref: UnresolvedRef, context: ResolutionContext, owner: string): boolean | undefined {
   const around = context
     .getNodesInFile(ref.filePath)
     .filter((t) => CSHARP_TYPE_KINDS.has(t.kind) && t.startLine <= ref.line && t.endLine >= ref.line);
-  // No type around the name: the declaration wasn't recovered — nothing to judge by.
-  if (around.length === 0) return true;
+  if (around.length === 0) return undefined;
   const seen = new Set<string>();
   const queue = around.map((t) => t.name);
   while (queue.length > 0 && seen.size < 40) {
@@ -8369,6 +8379,34 @@ function isCsharpMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionC
     queue.push(...csharpSupertypesOf(name, context));
   }
   return false;
+}
+
+/**
+ * A C# call written on what a bare call returns — `GetMailer().Send("c")`,
+ * `this.GetMailer().Send("c")` — encoded `GetMailer().Send` (#2906). C# reads
+ * the bare call as one of a method of the types around it or their bases, or
+ * of a `using static` type (not after `this.` / `base.`). The receiver is the
+ * type that method's declaration returns, and the call is to that type's
+ * method or to nothing (resolveMethodOnType checks it is there). Null when no
+ * such method is found, or the ones found don't declare one return type.
+ */
+function matchCsharpCallResultCall(inner: string, method: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const self = /^(?:this|base)\s*\.\s*/.exec(inner);
+  // A generic method's type arguments are no part of its name (`Get<Mailer>`).
+  const name = (self ? inner.slice(self[0].length) : inner).replace(/<[\s\S]*>$/, '');
+  if (!/^[A-Za-z_]\w*$/.test(name)) return null;
+  const statics = self ? new Set<string>() : csharpStaticUsings(ref.filePath, context);
+  const returnTypes = new Set<string>();
+  for (const n of context.getNodesByName(name)) {
+    if (n.language !== 'csharp' || n.kind !== 'method' || !n.returnType) continue;
+    const cut = n.qualifiedName.lastIndexOf('::');
+    if (cut < 0) continue;
+    const owner = n.qualifiedName.slice(0, cut).split(/::|\./).pop()!;
+    if (statics.has(owner) || csharpTypesAround(ref, context, owner) === true) returnTypes.add(n.returnType);
+  }
+  if (returnTypes.size !== 1) return null;
+  const ret = [...returnTypes][0]!;
+  return resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqnOf(ret, ref, context));
 }
 
 /** The simple names a C# type's declarations (every `partial` one) derive from. */
@@ -22296,6 +22334,9 @@ export function matchDottedCallChain(
       const bareMatch = matchByExactName(bareRef, context) ?? matchFuzzy(bareRef, context);
       return bareMatch ? { ...bareMatch, original: ref } : null;
     }
+    // C#: a bare call — `GetMailer().Send()` — is to a method of the types
+    // around it; the receiver is what that method returns (#2906).
+    if (ref.language === 'csharp') return matchCsharpCallResultCall(inner, method, ref, context);
     // Constructor receiver `Foo(args).method()` (encoded `Foo().method`): a bare,
     // capitalized inner is a class construction, so the receiver's type is the
     // class itself — resolve the method on it. Only in languages where an
@@ -22305,6 +22346,11 @@ export function matchDottedCallChain(
     // whose type we can't recover — bail.
     if (!CONSTRUCTS_VIA_BARE_CALL.has(ref.language) || !/^[A-Z]/.test(inner)) return null;
     return resolveMethodOnType(inner, method, ref, context, 0.85, 'instance-method', importedFqnOf(inner, ref, context));
+  }
+
+  // C#: `this.GetMailer().Send()` / `base.GetMailer().Send()` likewise.
+  if (ref.language === 'csharp' && /^(?:this|base)\s*\.\s*[A-Za-z_]\w*(?:<[\s\S]*>)?$/.test(inner)) {
+    return matchCsharpCallResultCall(inner, method, ref, context);
   }
 
   // Factory/fluent receiver `Receiver.factory(args).method()`: the receiver's
