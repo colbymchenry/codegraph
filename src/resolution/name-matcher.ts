@@ -30095,6 +30095,34 @@ export function matchGoChainedCall(ref: UnresolvedRef, context: ResolutionContex
 }
 
 /**
+ * A Go call on what `new(T)` or `make(T, …)` hands back, which the extractor
+ * keeps with the named type the builtin writes: `new(Route).Host("x")`
+ * arrives as `new(Route).Host` (#3237). It was `new().Host`, a package
+ * factory's shape, and with no `new` function to type it the method went to
+ * the `Host` that sorted nearest: gorilla/mux's route tests reached
+ * `Router`'s methods instead of `Route`'s.
+ */
+const GO_BUILTIN_RECEIVER_CALL = /^(?:new|make)\((.+)\)\.([A-Za-z_]\w*)$/;
+
+/**
+ * Resolve a {@link GO_BUILTIN_RECEIVER_CALL} on the type written, read where
+ * the call is (its package, an import, a type parameter's constraint): that
+ * type's method, its interface's, or one embedding promotes into it. Null —
+ * never a guess by the name — for a type from outside the project or one the
+ * index can't tell. Undefined for any other ref.
+ */
+export function matchGoBuiltinReceiverCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  if (ref.language !== 'go' || ref.referenceKind !== 'calls') return undefined;
+  const m = GO_BUILTIN_RECEIVER_CALL.exec(ref.referenceName);
+  if (!m) return undefined;
+  const index = goScopeIndex(ref.filePath, context);
+  const at = index && ref.line > 0 ? (index.lineStarts[ref.line - 1] ?? index.code.length) + Math.max(ref.column, 0) : 0;
+  // `new(T)` is a `*T` and `make(T, …)` a `T`: T's methods either way.
+  const found = goMethodOnElement(goTypeTextAt(m[1]!, ref.filePath, at, index, context), { ...ref, referenceName: m[2]! }, context);
+  return found ? { ...found, original: ref } : null;
+}
+
+/**
  * The method `ref` names on the type of its receiver. A pointer's is the
  * type pointed to's.
  */

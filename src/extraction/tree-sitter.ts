@@ -508,6 +508,24 @@ const HOST_GLOBAL_ROOTS: ReadonlySet<string> = new Set(['window', 'globalThis'])
 const THIS_FIELD_PROPERTY_TYPES = new Set(['property_identifier', 'private_property_identifier']);
 /** A Swift receiver that is a path of types, `API.PackageController.GetRoute` — two segments or more, each capitalized. */
 const SWIFT_TYPE_PATH_RECEIVER = /^(?!Self\.)[A-Z]\w*(?:\.[A-Z]\w*)+$/;
+/**
+ * Go builtins whose result the call writes the type of — `new(T)`, `make(T, …)`,
+ * `append(xs, …)` — and so no factory chain's head (#3237). Mirrored in the
+ * kernel's extract_call (go.rs).
+ */
+const GO_TYPED_BUILTINS: ReadonlySet<string> = new Set(['new', 'make', 'append']);
+/** tree-sitter-go nodes of a named type, one that can have methods: `Route`, `pkg.Route`, `List[int]`. */
+const GO_NAMED_TYPE_NODES: ReadonlySet<string> = new Set(['type_identifier', 'qualified_type', 'generic_type']);
+
+/**
+ * The named type a Go `new(T)` / `make(T, …)` call writes, without its
+ * whitespace (`new(pkg.Route)` → `pkg.Route`); null for any other type
+ * (`new(*T)`, `make([]T, n)`). Mirrored in the kernel's extract_call (go.rs).
+ */
+function goBuiltinNamedType(call: SyntaxNode, source: string): string | null {
+  const first = getChildByField(call, 'arguments')?.namedChild(0);
+  return first && GO_NAMED_TYPE_NODES.has(first.type) ? getNodeText(first, source).replace(/\s+/g, '') : null;
+}
 
 /**
  * Swift wrappers that leave a call's target the same. tree-sitter-swift binds
@@ -6339,6 +6357,25 @@ export class TreeSitterExtractor {
               // call (`Foo::new().a().b()`) keep the bare name. Mirrored in
               // the kernel's extract_call (rustlang.rs).
               calleeName = `${rustChain}.${methodName}`;
+            } else if (
+              this.language === 'go' &&
+              receiver &&
+              receiver.type === 'call_expression' &&
+              getChildByField(receiver, 'function')?.type === 'identifier' &&
+              GO_TYPED_BUILTINS.has(getNodeText(getChildByField(receiver, 'function')!, this.source))
+            ) {
+              // Go call on what a builtin hands back — `new(Route).Host("x")`,
+              // `make(Set).Add(k)`, `append(list, x).Len()`. These are no
+              // package factories: the `new().Host` the factory branch below
+              // encoded dropped the type, and the method went to whichever
+              // `Host` sat nearest (#3237). `new` and `make` keep the named type
+              // they write (`new(Route).Host`, `make(pkg.Set).Add`); any other
+              // builtin call keeps the bare name, whose receiver the resolver
+              // reads where the call is written, as it reads `(&Route{}).Host()`.
+              // Mirrored in the kernel's extract_call (go.rs).
+              const builtin = getNodeText(getChildByField(receiver, 'function')!, this.source);
+              const written = builtin === 'append' ? null : goBuiltinNamedType(receiver, this.source);
+              calleeName = written ? `${builtin}(${written}).${methodName}` : methodName;
             } else if (
               (this.language === 'cpp' ||
                 this.language === 'c' ||
