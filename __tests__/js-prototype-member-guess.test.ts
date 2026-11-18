@@ -1,9 +1,10 @@
 /**
  * A JS file that gives an object a member itself, `Sha256.prototype.update =
- * function…`, holds what the index has no node for. The one method of that
- * name elsewhere is no likelier then: rails' `buffer.update(data)` in
- * activestorage.js is its bundled sha256's, not the guides' turbo
- * `History#update`.
+ * function…`, holds what the index has no node for when the file doesn't
+ * declare `Sha256` (a constructor it declares has its methods as nodes, #2966).
+ * The one method of that name elsewhere is no likelier then: rails'
+ * `buffer.update(data)` in activestorage.js is its bundled sha256's, not the
+ * guides' turbo `History#update`.
  */
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import * as fs from 'fs';
@@ -22,7 +23,7 @@ const FILES: Record<string, string> = {
 }
 `,
   'app/bundle.js': `(function () {
-  function Sha256() {}
+  var Sha256 = window.Sha256;
   Sha256.prototype.update = function (message) {
     return this;
   };

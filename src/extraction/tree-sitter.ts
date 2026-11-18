@@ -927,6 +927,13 @@ export class TreeSitterExtractor {
   // named by the path's last link but qualified by the whole path, which its
   // members are then qualified under (see buildQualifiedName, #2300).
   private objectPathOwners = new Map<string, string>();
+  // The functions and classes each scope declares, by `${scope id}\0${name}`:
+  // what a `Ctor.prototype.m = function () {…}` or `Ctor.m = function () {…}`
+  // written in that scope hangs its method on (#2966). TS/JS only.
+  private scopeDeclarations = new Map<string, Node>();
+  // The function of a `module.exports = {…}` member being extracted: the
+  // module exports it, as it does an `exports.x = function` (#2966, #1675).
+  private exportedMemberFn: number | null = null;
   // Memoized ownsObjectLiterals verdict (per-extractor = per-file).
   private ownsObjects: boolean | null = null;
   // Source already went through the extractor's preParse at the kernel route
@@ -2154,6 +2161,9 @@ export class TreeSitterExtractor {
           target: id,
           kind: 'contains',
         });
+        if ((kind === 'function' || kind === 'class') && TS_JS_CHAIN_LANGUAGES.has(this.language)) {
+          this.scopeDeclarations.set(`${parentId}\0${name}`, newNode);
+        }
       }
     }
 
@@ -2340,6 +2350,20 @@ export class TreeSitterExtractor {
       return;
     }
 
+    // `Ctor.prototype.m = function () {…}` / `Ctor.m = function () {…}`: a
+    // method of the constructor (or class) the scope declares (#2966).
+    if (
+      !nameOverride &&
+      (node.type === 'function_expression' || node.type === 'arrow_function' || node.type === 'generator_function') &&
+      node.parent?.type === 'assignment_expression'
+    ) {
+      const member = this.constructorMember(node.parent, node);
+      if (member) {
+        this.extractConstructorMember(node, node.parent, member);
+        return;
+      }
+    }
+
     // nameOverride is supplied only for explicitly-named anonymous functions the
     // caller resolved itself (e.g. arrow values of exported-const object members
     // — SvelteKit actions). Inline-object arrows reached by the general walker
@@ -2405,7 +2429,7 @@ export class TreeSitterExtractor {
     const docstring = this.docstringFor(node);
     const signature = this.extractor.getSignature?.(node, this.signatureSource);
     const visibility = this.extractor.getVisibility?.(node);
-    const isExported = commonJsExport || this.extractor.isExported?.(node, this.source);
+    const isExported = commonJsExport || this.exportedMemberFn === node.id || this.extractor.isExported?.(node, this.source);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
     const returnType = this.extractor.getReturnType?.(node, this.source);
@@ -2438,6 +2462,74 @@ export class TreeSitterExtractor {
       this.visitFunctionBody(body, funcNode.id);
     }
     this.nodeStack.pop();
+  }
+
+  /**
+   * The constructor (or class) a function assigned to `Ctor.prototype.m` or
+   * `Ctor.m` is a method of, with the method's name, when `Ctor` is a function
+   * or class declared in the scope the assignment is written in (#2966) — the
+   * classic way to give a constructor its methods, and its static ones. Null
+   * for anything else: another target (`exports.x`, `app.use`, a computed
+   * key), a constructor declared elsewhere or later, a generated or minified
+   * bundle. The function must be the assignment's whole right-hand side.
+   * Mirrored in the kernel (tsjs/extractors.rs constructor_member).
+   */
+  private constructorMember(assignment: SyntaxNode, value: SyntaxNode): { owner: Node; name: string; isStatic: boolean } | null {
+    if (!this.ownsObjectLiterals()) return null;
+    const right = getChildByField(assignment, 'right');
+    if (!right || right.startIndex !== value.startIndex || right.endIndex !== value.endIndex) return null;
+    const left = getChildByField(assignment, 'left');
+    if (left?.type !== 'member_expression') return null;
+    const property = getChildByField(left, 'property');
+    if (property?.type !== 'property_identifier') return null;
+    const name = getNodeText(property, this.source);
+    if (name === 'prototype') return null;
+    let object = getChildByField(left, 'object');
+    let isStatic = true;
+    if (object?.type === 'member_expression') {
+      const link = getChildByField(object, 'property');
+      if (link?.type !== 'property_identifier' || getNodeText(link, this.source) !== 'prototype') return null;
+      object = getChildByField(object, 'object');
+      isStatic = false;
+    }
+    if (object?.type !== 'identifier') return null;
+    const scopeId = this.nodeStack[this.nodeStack.length - 1];
+    const owner = scopeId ? this.scopeDeclarations.get(`${scopeId}\0${getNodeText(object, this.source)}`) : undefined;
+    return owner ? { owner, name, isStatic } : null;
+  }
+
+  /**
+   * Extract a function assigned to `Ctor.prototype.m` / `Ctor.m` as method `m`
+   * of `Ctor`: contained by it and qualified under it (`Ctor::m`), as a class's
+   * method is, static for `Ctor.m`. Its body is walked under the method.
+   */
+  private extractConstructorMember(
+    node: SyntaxNode,
+    assignment: SyntaxNode,
+    member: { owner: Node; name: string; isStatic: boolean }
+  ): void {
+    const statement = assignment.parent?.type === 'expression_statement' ? assignment.parent : assignment;
+    const saved = this.nodeStack;
+    this.nodeStack = [...saved, member.owner.id];
+    const method = this.createNode('method', member.name, node, {
+      docstring: this.docstringFor(statement),
+      signature: this.extractor!.getSignature?.(node, this.signatureSource),
+      visibility: this.extractor!.getVisibility?.(node),
+      isAsync: this.extractor!.isAsync?.(node),
+      isStatic: member.isStatic,
+      returnType: this.extractor!.getReturnType?.(node, this.source),
+    });
+    if (method) {
+      this.extractTypeAnnotations(node, method.id);
+      this.extractDecoratorsFor(node, method.id);
+      this.nodeStack.push(method.id);
+      const body = this.extractor!.resolveBody?.(node, this.extractor!.bodyField)
+        ?? getChildByField(node, this.extractor!.bodyField);
+      this.visitParameterDefaults(node, body);
+      if (body) this.visitFunctionBody(body, method.id);
+      this.nodeStack.pop();
+    }
+    this.nodeStack = saved;
   }
 
   /**
@@ -3437,9 +3529,10 @@ export class TreeSitterExtractor {
    * for a module-scope declaration (`valuesUnderOwner`, its initializer's calls
    * are the constant's, #693), under the enclosing function for a local or an
    * assignment, as they were before members had nodes. The literal's shorthand
-   * members (`{ load }`) go to the function-as-value capture the same way.
+   * members (`{ load }`) go to the function-as-value capture the same way. The
+   * members of the module's export object (`exported`) are exported.
    */
-  private extractOwnedObjectMembers(obj: SyntaxNode, ownerId: string, valuesUnderOwner: boolean, global: boolean): void {
+  private extractOwnedObjectMembers(obj: SyntaxNode, ownerId: string, valuesUnderOwner: boolean, global: boolean, exported = false): void {
     const enclosing = this.nodeStack;
     const ownerStack = [...(global ? enclosing.slice(0, 1) : enclosing), ownerId];
     const valueStack = valuesUnderOwner ? ownerStack : enclosing;
@@ -3450,8 +3543,13 @@ export class TreeSitterExtractor {
       if (!member) continue;
       const owned = this.ownedMemberFunction(member);
       this.nodeStack = owned ? ownerStack : valueStack;
-      if (owned) this.extractFunction(owned.fn, owned.name);
-      else this.visitFunctionBody(member, '');
+      if (owned) {
+        this.exportedMemberFn = exported ? owned.fn.id : null;
+        this.extractFunction(owned.fn, owned.name);
+        this.exportedMemberFn = null;
+      } else {
+        this.visitFunctionBody(member, '');
+      }
     }
     this.nodeStack = enclosing;
   }
@@ -3492,9 +3590,11 @@ export class TreeSitterExtractor {
    * `window.App::init`: a property is reached through its object, not through
    * the function that happened to assign it (Lua's `M.helpers::a` reads the
    * same way). A path on the global object is global wherever it is written,
-   * so it is also contained by the file. CommonJS export objects and
-   * prototypes are not namespaces and are left alone. Returns false (nothing
-   * extracted) for any other assignment.
+   * so it is also contained by the file. The module's own export object,
+   * `module.exports = {…}`, owns its members the same way (`module.exports::m`,
+   * #2966); other CommonJS export targets and prototypes are not namespaces
+   * and are left alone. Returns false (nothing extracted) for any other
+   * assignment.
    */
   private extractAssignedObjectOwner(node: SyntaxNode, moduleLevel: boolean): boolean {
     const obj = this.ownedObjectValue(getChildByField(node, 'right'));
@@ -3520,15 +3620,16 @@ export class TreeSitterExtractor {
     this.nodeStack = saved;
     if (!owner) return false;
     if (qualifiedName !== undefined) this.objectPathOwners.set(owner.id, qualifiedName);
-    this.extractOwnedObjectMembers(obj, owner.id, false, global);
+    this.extractOwnedObjectMembers(obj, owner.id, false, global, qualifiedName === 'module.exports');
     return true;
   }
 
   /**
    * The links of an assignment target written as plain names — `dw_page` →
    * `['dw_page']`, `window.App` → `['window', 'App']`, `App.utils.dom` →
-   * `['App', 'utils', 'dom']` — or null for anything else: `this.x`, a
-   * computed `a[k]`, a call, CommonJS's `module.exports` / `exports.x`, or a
+   * `['App', 'utils', 'dom']`, `module.exports` (the module's export object,
+   * #2966) — or null for anything else: `this.x`, a computed `a[k]`, a call,
+   * another CommonJS export target (`exports.x`, `module.exports.x`), or a
    * prototype.
    */
   private objectOwnerPath(left: SyntaxNode | null): string[] | null {
@@ -3542,7 +3643,8 @@ export class TreeSitterExtractor {
     }
     if (cur?.type !== 'identifier') return null;
     const root = getNodeText(cur, this.source);
-    if (root === 'module' || root === 'exports' || path.includes('prototype')) return null;
+    const exportObject = root === 'module' && path.length === 1 && path[0] === 'exports';
+    if (!exportObject && (root === 'module' || root === 'exports' || path.includes('prototype'))) return null;
     path.unshift(root);
     return path;
   }
@@ -7873,6 +7975,12 @@ export class TreeSitterExtractor {
         // the declarator; a destructuring or otherwise unnamed binding stays
         // anonymous and falls through.
         if (this.declaratorBoundFunction(node)) {
+          this.extractFunction(node);
+          return;
+        }
+        // `Ctor.prototype.m = function () {…}` in a body — a module wrapper,
+        // a factory — is a method of the constructor declared beside it (#2966).
+        if (parent?.type === 'assignment_expression' && this.constructorMember(parent, node)) {
           this.extractFunction(node);
           return;
         }
