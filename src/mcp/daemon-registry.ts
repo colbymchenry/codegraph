@@ -100,10 +100,21 @@ export function registerDaemon(rec: DaemonRecord): void {
   }
 }
 
-/** Best-effort: drop this daemon's record on graceful shutdown. */
-export function deregisterDaemon(root: string): void {
+/**
+ * Best-effort: drop this daemon's record on graceful shutdown. With `pid`, a
+ * record that names another daemon is left alone: one record per project, and
+ * a daemon that finds another has taken its project over must not hide the
+ * live one from `list` and `stop --all` on its way out (#3245).
+ */
+export function deregisterDaemon(root: string, pid?: number): void {
+  const file = recordPath(root);
   try {
-    fs.unlinkSync(recordPath(root));
+    if (pid !== undefined) {
+      let named: unknown;
+      try { named = (JSON.parse(fs.readFileSync(file, 'utf8')) as { pid?: unknown } | null)?.pid; } catch { named = undefined; }
+      if (typeof named === 'number' && named !== pid) return;
+    }
+    fs.unlinkSync(file);
   } catch {
     /* already gone */
   }

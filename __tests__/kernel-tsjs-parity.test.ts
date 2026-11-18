@@ -120,9 +120,48 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
       expect(result.nodes.map((n) => n.qualifiedName)).toEqual(expect.arrayContaining([
         'Api::read', 'Api::close', 'Api::gen', 'Api::quoted-key', 'Exported::save', 'Local::run', 'window.WS',
         'window.WS::ws', 'App.utils::pad', 'dw_page::start', 'ns.late::go', 'self.handlers::click',
+        'module.exports::cjs',
       ]));
       // A plain name reassigned inside a function is a local, not a namespace.
-      for (const name of ['cjs', 'proto', 'ephemeral', 'data', 'on']) expect(result.nodes.some((n) => n.name === name), name).toBe(false);
+      for (const name of ['proto', 'ephemeral', 'data', 'on']) expect(result.nodes.some((n) => n.name === name), name).toBe(false);
+    }
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('a constructor\'s prototype and static functions are its methods: %s (#2966)', (ext, language) => {
+    const source = [
+      '/* é😀 */ function Hooks() { this.validate(); }',
+      '/** Checks a hook. */',
+      'Hooks.prototype.validate = function (hook) { return check(hook); };',
+      'Hooks.prototype.add = async function add(hook) { this.validate(hook); };',
+      'Hooks.prototype.size = () => 0;',
+      'Hooks.prototype.each = function* () { yield 1; };',
+      'Hooks.create = function build() { return new Hooks(); };',
+      'class Widget {}',
+      'Widget.prototype.render = function () { return 1; };',
+      '(function () { function Queue() {} Queue.prototype.push = function (x) { return x; }; })();',
+      'function factory() { function Stack() {} Stack.prototype.peek = function () { return 1; }; return Stack; }',
+      'app.use = function use() {};',
+      'exports.handle = function () {};',
+      'Later.prototype.early = function () {};',
+      'function Later() {}',
+      "Later.prototype['computed'] = function () {};",
+      'const proto = module.exports = { inspect() { return this.toJSON(); }, toJSON() { return {}; } };',
+      'function check(h) { return h; }',
+      '',
+    ].join('\n');
+    for (const ending of ['\n', '\r\n']) {
+      const result = assertParity(`proto.${ext}`, source.replace(/\n/g, ending), language);
+      const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => `${n.qualifiedName}${n.isStatic ? ' static' : ''}`);
+      expect(methods.sort()).toEqual([
+        'Hooks::add', 'Hooks::create static', 'Hooks::each', 'Hooks::size', 'Hooks::validate',
+        'Queue::push', 'Widget::render', 'factory::Stack::peek',
+      ]);
+      expect(result.nodes.filter((n) => n.qualifiedName.startsWith('module.exports::')).map((n) => `${n.name} ${n.isExported}`))
+        .toEqual(['inspect true', 'toJSON true']);
+      for (const name of ['build', 'early', 'computed']) expect(result.nodes.some((n) => n.name === name), name).toBe(false);
+      expect(result.nodes.find((n) => n.qualifiedName === 'Hooks::validate')?.docstring).toContain('Checks a hook');
     }
   });
 
@@ -466,6 +505,25 @@ class Consumer:
     const names = result.unresolvedReferences.filter(r => r.referenceKind === 'function_ref').map(r => r.referenceName);
     expect(names.sort()).toEqual(['Store.Fetch', 'c.Fetch', 'c.store.Fetch']);
     expect(result.unresolvedReferences.some(r => r.referenceKind === 'calls' && r.referenceName === 'c.Fetch')).toBe(true);
+  });
+
+  it('Go calls on new(T) and make(T) keep the type; on append, the bare method name (#3237)', () => {
+    const result = assertParity('builtins.go', `package demo
+type Route struct{}
+func (r *Route) Host(h string) *Route { return r }
+type Set map[string]struct{}
+type List []int
+func use(list List) *Route {
+	make(Set).Add("k")
+	_ = append(list, 1).Len()
+	_ = New().Host("y")
+	return new(Route).
+		Host("x").
+		Path("/p")
+}
+`, 'go');
+    const names = result.unresolvedReferences.filter(r => r.referenceKind === 'calls').map(r => r.referenceName);
+    expect(names.sort()).toEqual(['Len', 'New', 'New().Host', 'Path', 'append', 'make', 'make(Set).Add', 'new', 'new(Route).Host']);
   });
 
   it.each(['LF', 'CRLF'])('Go selector values stoplist the whole name, not the field (%s)', (ending) => {

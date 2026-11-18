@@ -298,3 +298,95 @@ class NotRequestsTest extends TestCase {
     }
   });
 });
+
+/**
+ * A suite's request is served by the program it tests (#3320). The pass took
+ * every route in the index, whatever its language, so a Spring test's request
+ * that no Java route serves (an actuator path, a controller in a module the
+ * index lacks) landed on a TypeScript server's catch-all `GET /*`. That
+ * server's code then counted the Java suite among its dependents, and
+ * `codegraph affected` selected Java tests for a change to the web app.
+ */
+describe("a test's request stays in its own program (#3320)", () => {
+  const EXPRESS_CATCH_ALL = {
+    'package.json': JSON.stringify({ name: 'web', dependencies: { express: '^4.19.0' } }),
+    'web/server.ts': [
+      "import express from 'express';",
+      "import { render } from './render';",
+      'const app = express();',
+      "app.get('/*', (req, res) => { res.send(render(req.path)); });",
+      'app.listen(4000);',
+      '',
+    ].join('\n'),
+    'web/render.ts': 'export function render(path: string) { return path; }\n',
+  };
+
+  const MOCKMVC_HEALTH = `package app.owner;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+class HealthTests {
+    private MockMvc mockMvc;
+    void testHealth() throws Exception {
+        mockMvc.perform(get("/management/health")).andExpect(status().isOk());
+    }
+    void testOwners() throws Exception {
+        mockMvc.perform(get("/owners")).andExpect(status().isOk());
+    }
+}
+`;
+
+  it("doesn't link a Java test's request to a TypeScript server's route", async () => {
+    const { cg } = await indexed({
+      ...EXPRESS_CATCH_ALL,
+      'pom.xml': SPRING_POM,
+      'src/main/java/app/owner/OwnerController.java': SPRING_CONTROLLER,
+      'src/test/java/app/owner/HealthTests.java': MOCKMVC_HEALTH,
+    });
+    try {
+      // `/owners` reaches its Java route as before; `/management/health`,
+      // which no Java route serves, reaches nothing.
+      expect(requests(cg)).toEqual(['testOwners → GET /owners']);
+      expect(cg.getNodesByKind('route').map((r) => r.name)).toContain('GET /*');
+      expect(cg.getFileDependents('web/render.ts')).not.toContain('src/test/java/app/owner/HealthTests.java');
+    } finally {
+      cg.close();
+    }
+  });
+
+  it("still links a Kotlin test's request to a Java route", async () => {
+    const { cg } = await indexed({
+      'pom.xml': SPRING_POM,
+      'src/main/java/app/owner/OwnerController.java': SPRING_CONTROLLER,
+      'src/test/kotlin/app/owner/OwnerControllerTests.kt': `package app.owner
+class OwnerControllerTests {
+    lateinit var mockMvc: MockMvc
+    fun listsOwners() {
+        mockMvc.get("/owners").andExpect { status { isOk() } }
+    }
+}
+`,
+    });
+    try {
+      expect(requests(cg)).toEqual(['listsOwners → GET /owners']);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it("doesn't link a Laravel test's request to a JavaScript server's route", async () => {
+    const { cg } = await indexed({
+      ...LARAVEL,
+      ...EXPRESS_CATCH_ALL,
+      'tests/Feature/PageTest.php': `<?php
+class PageTest extends TestCase {
+    public function testAbout() { $this->get('/about'); }
+    public function testPricing() { $this->get('/pricing'); }
+}
+`,
+    });
+    try {
+      expect(requests(cg)).toEqual(['testAbout → GET /about']);
+    } finally {
+      cg.close();
+    }
+  });
+});

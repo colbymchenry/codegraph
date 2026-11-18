@@ -146,17 +146,29 @@ pass after base resolution, language-level (any OO observer), living in
 5. **Synthesize** `dispatcher → fn` (`getNodesByName(arg)` → method|function). Capped at
    `MAX_CALLBACKS_PER_CHANNEL = 40`.
 
-### EventEmitter channels (`eventEmitterEdges`, Phase 2)
+### EventEmitter channels (`eventEmitterEdges`, Phase 2, `event-emitter-synthesizer.ts`)
 - **File-oriented scan** (`ctx.getAllFiles()` + `readFile`, substring pre-filter on
   `.emit(`/`.on(`/etc). `ON_RE` = `\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*
-  (?:function\s+(\w+)|(?:this\.)?(\w+))`; `EMIT_RE` = `\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]`.
-- Dispatcher = **enclosing function** of the `emit('e')` call (`enclosingFn` finds the
-  tightest function/method/component node containing the line). Handler = `getNodesByName`
-  of the on-handler name.
-- Correlate by **event-name literal**; synthesize dispatcher → handler.
-- **Precision — DIVERGENCE:** design proposed receiver-type matching; build uses an
-  **event fan-out cap** (`EVENT_FANOUT_CAP = 6`) — skip events with >6 handlers or
-  dispatchers (generic names like `error`/`change` would over-link without type info).
+  (?:function\s+(\w+)|(this\.)?(\w+))`; `EMIT_RE` = `\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]`.
+- Dispatcher = **enclosing function** of the `emit('e')` call (the tightest
+  function/method/component node containing the line). Each edge carries the `emit`'s
+  `line` and its own registration site in `registeredAt`.
+- Handler = the function the registration names **in its own scope** (#2973): an inline
+  `function name`, a local the registering function declares (`const h = this.m.bind(this)`
+  is method `m`), the `function_ref` reference the resolver made at that argument, the
+  file's own function of that name, or the one it imports. Never a namesake elsewhere.
+- Correlate by **event-name literal and receiver** (#2973). Each receiver gets the
+  identities the code gives it: the class whose instance `this` is (an arrow function has
+  no `this` of its own; an anonymous `function` callback rebinds it), a binding made by
+  `new C()` or typed `C` (TypeScript or JSDoc `@param {C}`), a field of such an instance
+  (typed by its declaration, a constructor parameter property or a `this.f = new C()`),
+  a module binding and the names its module exports it under, an import of one, a local
+  of one function, or a global such as `process`. Two receivers with identities pair when
+  one is shared — classes related by `extends` count as shared. A receiver the code ties
+  to nothing (an untyped parameter, a call's result) pairs only with another such
+  receiver in the same file. JavaScript-family files only; others never tie.
+- **Precision:** the receiver match above, plus the **event fan-out cap**
+  (`EVENT_FANOUT_CAP = 6`) — skip events with >6 handlers or dispatchers project-wide.
 
 ### Provenance — DIVERGENCE
 `Edge.provenance` is a fixed enum (`'tree-sitter'|'scip'|'heuristic'`), so synthesized
@@ -197,9 +209,9 @@ excalidraw +3 nodes, no explosion, no regression.
 2. **Wire into `resolveAndPersist`** (incremental sync) — synthesis currently runs only
    in `resolveAndPersistBatched` (full index). Incremental re-index won't refresh
    synthesized edges.
-3. **Receiver-type matching** for EventEmitter precision (replace/augment the fan-out
-   cap) — use `type_of` edges so `x.emit('change')` only links to `y.on('change', fn)`
-   when `x`,`y` are the same type. Lets the fan-out cap relax.
+3. ~~**Receiver-type matching** for EventEmitter precision~~ — done (#2973), see the
+   EventEmitter section. Still open: relaxing the fan-out cap to count per channel, and
+   typing a receiver a factory returns (`const client = mqtt.connect()`).
 4. **Tree-sitter arg recovery** (replace the regex in field-channel Stage 4) — robust for
    arrows, multi-arg, line-wrapped calls.
 5. **Single-callback fields** (`this.onChange = cb; … this.onChange()`) — scalar-store

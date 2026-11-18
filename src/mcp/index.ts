@@ -470,6 +470,8 @@ export class MCPServer {
   // Worker-thread liveness watchdog (#850). Long-lived modes only; SIGKILLs the
   // process if the main thread wedges in a non-yielding sync loop.
   private livenessWatchdog: WatchdogHandle | null = null;
+  // Direct mode arms the watchdog when work begins (#3250); set once it has.
+  private livenessWatchdogArmed = false;
   // PPID watchdog baseline — from the CLI entry's earliest-possible capture
   // (early-ppid.ts). Capturing here (construction) already lost the race when
   // the launcher was killed during module loading (#1185).
@@ -605,7 +607,15 @@ export class MCPServer {
       this.writerLockRoot = writerRoot;
     }
 
-    this.engine = new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
+    this.engine = new MCPEngine({
+      queryPool: true,
+      queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX,
+      // The liveness watchdog is a process of its own. Start it when this
+      // session first opens a project or serves a tool call, not at launch:
+      // a client that only lists the tools, which is what most sessions in a
+      // folder with no index do, never needs one (#3250).
+      onWorkBegins: () => this.armLivenessWatchdog(),
+    });
     const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
     this.session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.projectPath,
@@ -640,6 +650,18 @@ export class MCPServer {
     this.mode = 'direct';
     this.installSignalHandlers();
     this.installPpidWatchdog();
+  }
+
+  /**
+   * Arm the direct session's liveness watchdog, the first time its engine
+   * starts work (#3250). A launch with `--path` gets here during startup,
+   * because its engine opens the project at once; a launch in a folder with
+   * no index, on its first tool call or when the client names an indexed
+   * project.
+   */
+  private armLivenessWatchdog(): void {
+    if (this.livenessWatchdogArmed || this.stopped) return;
+    this.livenessWatchdogArmed = true;
     this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(resolveDaemonRoot(this.projectPath)));
   }
 
