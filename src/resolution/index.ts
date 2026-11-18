@@ -21,10 +21,12 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
+import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustCallUnreachable, isRustTraitImplMember, isRustOtherTypesMethod, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isPythonImportStatementModule } from './name-matcher';
+import { isJsThisCall } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
+import { isRefusedDeepThisTarget } from './name-matcher';
 import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
@@ -36,11 +38,13 @@ import {
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { isPythonSuperCall, matchPythonSuperCall } from './python-super';
+import { preferPythonImplementation, clearPythonOverloadMemos } from './python-overloads';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { adoptProjectScans, readProjectScans, type ProjectScans } from './project-scans';
 import { clearCppIncluderMemos } from './cpp-includers';
 import { clearCMacroRenames } from './c-macro-renames';
 import { isObjcDeclaredTypeRef, matchByExactName } from './name-matcher';
+import { pythonSelfCallReaches } from './name-matcher';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
@@ -100,6 +104,9 @@ const RESOLUTION_READ_EDGE_KINDS: Edge['kind'][] = ['implements', 'extends'];
 const CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift', 'rust', 'go', 'scala', 'dart', 'objc', 'pascal']);
 const SCOPED_CHAIN_LANGUAGES = new Set(['rust']);
 
+/** Languages whose `this.m()` the extractor records by the bare method name (isJsThisCall). */
+const JS_SELF_CALL_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx', 'vue', 'svelte', 'astro']);
+
 /** The extractor's chained-receiver encoding: `<inner>().<method>`. */
 const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
 
@@ -146,6 +153,38 @@ const PYTHON_BUILT_INS = new Set([
   'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple',
   'open', 'input', 'type', 'isinstance', 'hasattr', 'getattr', 'setattr',
   'super', 'self', 'cls', 'None', 'True', 'False',
+]);
+
+/**
+ * The rest of Python's builtins: functions, types, constants and the exception
+ * and warning classes. Unlike PYTHON_BUILT_INS, a name here is the builtin only
+ * where the file can't mean anything else by it (isUnboundPythonBuiltin):
+ * projects define their own `TimeoutError`, `ConnectionError`, `format` or
+ * `filter` all the time.
+ */
+const PYTHON_BUILTIN_NAMES = new Set([
+  'abs', 'aiter', 'all', 'anext', 'any', 'ascii', 'bin', 'bool', 'breakpoint', 'bytearray', 'bytes',
+  'callable', 'chr', 'classmethod', 'compile', 'complex', 'delattr', 'dict', 'dir', 'divmod', 'enumerate',
+  'eval', 'exec', 'filter', 'float', 'format', 'frozenset', 'getattr', 'globals', 'hasattr', 'hash', 'help',
+  'hex', 'id', 'input', 'int', 'isinstance', 'issubclass', 'iter', 'len', 'list', 'locals', 'map', 'max',
+  'memoryview', 'min', 'next', 'object', 'oct', 'open', 'ord', 'pow', 'print', 'property', 'range', 'repr',
+  'reversed', 'round', 'set', 'setattr', 'slice', 'sorted', 'staticmethod', 'str', 'sum', 'super', 'tuple',
+  'type', 'vars', 'zip', '__import__', 'Ellipsis', 'NotImplemented', 'exit', 'quit', 'copyright', 'credits',
+  'license',
+  'BaseException', 'BaseExceptionGroup', 'Exception', 'ExceptionGroup', 'GeneratorExit', 'KeyboardInterrupt',
+  'SystemExit', 'ArithmeticError', 'FloatingPointError', 'OverflowError', 'ZeroDivisionError', 'AssertionError',
+  'AttributeError', 'BufferError', 'EOFError', 'ImportError', 'ModuleNotFoundError', 'LookupError', 'IndexError',
+  'KeyError', 'MemoryError', 'NameError', 'UnboundLocalError', 'OSError', 'EnvironmentError', 'IOError',
+  'WindowsError', 'BlockingIOError', 'ChildProcessError', 'ConnectionError', 'BrokenPipeError',
+  'ConnectionAbortedError', 'ConnectionRefusedError', 'ConnectionResetError', 'FileExistsError',
+  'FileNotFoundError', 'InterruptedError', 'IsADirectoryError', 'NotADirectoryError', 'PermissionError',
+  'ProcessLookupError', 'TimeoutError', 'ReferenceError', 'RuntimeError', 'NotImplementedError',
+  'PythonFinalizationError', 'RecursionError', 'StopAsyncIteration', 'StopIteration', 'SyntaxError',
+  'IndentationError', 'TabError', 'SystemError', 'TypeError', 'ValueError', 'UnicodeError',
+  'UnicodeDecodeError', 'UnicodeEncodeError', 'UnicodeTranslateError',
+  'Warning', 'BytesWarning', 'DeprecationWarning', 'EncodingWarning', 'FutureWarning', 'ImportWarning',
+  'PendingDeprecationWarning', 'ResourceWarning', 'RuntimeWarning', 'SyntaxWarning', 'UnicodeWarning',
+  'UserWarning',
 ]);
 
 const PYTHON_BUILT_IN_TYPES = new Set([
@@ -758,6 +797,7 @@ export class ReferenceResolver {
     this.goModules = null;
     this.goPackageDirs.clear();
     this.cachesWarmed = false;
+    this.pythonFileBindings = null;
     // The import-resolver's and name-matcher's per-context memos assume the
     // same stable window as the caches above — drop them together.
     if (this.context) {
@@ -777,6 +817,7 @@ export class ReferenceResolver {
       clearCMacroRenames(this.context);
       clearCFeatureVariantMemos(this.context);
       clearAmbientModuleMemos(this.context);
+      clearPythonOverloadMemos(this.context);
       clearDeclaredDependencies(this.context);
     }
   }
@@ -1594,6 +1635,9 @@ export class ReferenceResolver {
   }
 
   private resolveOneIn(ref: UnresolvedRef): ResolvedRef | null {
+    if (ref.referenceKind === 'function_ref' && ref.language === 'rust' && ref.referenceName.includes('::')) {
+      return this.resolveRustPathValue(ref);
+    }
     // A Rust call kept with its receiver chain — `self.services.store.put`,
     // `self.store().put` (#2836) — resolves as the call by its method's name
     // did before the extractor kept the chain: every strategy and gate reads
@@ -1626,10 +1670,11 @@ export class ReferenceResolver {
     const scoped = this.gateRustScope(candidate, ref);
     // A Go name its package defines once per build target is the definition
     // the reference's file builds with (see preferGoBuildTwin).
-    const resolved = preferGoBuildTwin(this.gateSuperSelfCall(
+    // A Python name declared with typing.overload runs the def below its stubs (#2963).
+    const resolved = preferPythonImplementation(preferGoBuildTwin(this.gateSuperSelfCall(
       scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),
       ref,
-    ), ref, this.context);
+    ), ref, this.context), ref, this.context);
     // A Dart class whose field holds its own type (`class Node { Node? next; }`)
     // names itself: a self-edge that says nothing (#2327).
     if (resolved && ref.language === 'dart' && ref.referenceKind === 'references' &&
@@ -1651,6 +1696,9 @@ export class ReferenceResolver {
     // scope at the reference is that binding even when the file imports the
     // name, which the import resolver answers before the matcher's own check.
     if (resolved && resolved.resolvedBy === 'import' && isImportShadowedByJsBinding(resolved, ref, this.context)) return null;
+    // A call two or more fields deep from `this` is matched by its name alone:
+    // never a property, a field or an import, nor a built-in method name (#2948).
+    if (resolved && isRefusedDeepThisTarget(resolved, ref, this.context)) return null;
     // A declaration of a declaration file's `declare module 'x'` is reached
     // through an import of `x`, never by its bare name from a file that
     // reaches no `x` (see reachesAmbientModule).
@@ -1659,6 +1707,13 @@ export class ReferenceResolver {
       const declaringFile = specifier === undefined ? undefined : this.nodeById(resolved.targetNodeId)?.filePath;
       if (declaringFile !== undefined && declaringFile !== ref.filePath &&
           !reachesAmbientModule(ref, specifier!, declaringFile, this.context)) return null;
+    }
+    // A Python `self.x()` / `cls.x()` names a member of the instance or the class:
+    // never a module-level function of another file, nor what a binding of the
+    // attribute doesn't name (#2958).
+    if (resolved && ref.language === 'python' && ref.referenceKind === 'calls' && resolved.resolvedBy !== 'framework') {
+      const target = this.nodeById(resolved.targetNodeId);
+      if (target && !pythonSelfCallReaches(target, ref, this.context)) return null;
     }
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
     // A Pascal call to data runs only a routine the data holds, in scope, and
@@ -1680,6 +1735,25 @@ export class ReferenceResolver {
       targetNodeId: forwarded.id,
       confidence: Math.min(call.confidence, 0.85),
     }, ref);
+  }
+
+  /**
+   * A Rust function passed through its path (`map(Graph::counts)`, #3254)
+   * names what the same path written as a call names, gates included: the
+   * call's module, `use` and `Self` rules decide, and a std type that only
+   * shares a project type's name reaches nothing. Only a function, an
+   * inherent method or a trait's own method counts, never one in an `impl
+   * Trait for T` block (isRustTraitImplMember), nor another project type's
+   * inherent method (isRustOtherTypesMethod).
+   */
+  private resolveRustPathValue(ref: UnresolvedRef): ResolvedRef | null {
+    const asCall = this.resolveOneIn({ ...ref, referenceKind: 'calls' });
+    const target = asCall ? this.nodeById(asCall.targetNodeId) : undefined;
+    if (!asCall || !target || (target.kind !== 'function' && target.kind !== 'method')) return null;
+    if (isRustTraitImplMember(target, this.context)) return null;
+    const segments = ref.referenceName.split('::');
+    if (isRustOtherTypesMethod(target, segments[segments.length - 2]!.replace(/^r#/, ''), this.context)) return null;
+    return { original: ref, targetNodeId: target.id, confidence: asCall.confidence, resolvedBy: 'function-ref' };
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
@@ -1917,7 +1991,8 @@ export class ReferenceResolver {
         return this.gateLanguage(matchFunctionRef(ref, this.context), ref);
       }
       const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
-      if (viaImport) {
+      // A local of the name in scope is the value handed on, which matchFunctionRef finds (#2949).
+      if (viaImport && !isImportShadowedByJsBinding(viaImport, ref, this.context)) {
         const target = this.nodeById(viaImport.targetNodeId);
         if (
           target &&
@@ -2034,11 +2109,18 @@ export class ReferenceResolver {
 
     const tImp = this.profileStages ? process.hrtime.bigint() : 0n;
     // `self.get_ip()` is a method call on the instance even when the file
-    // also imports a function named `get_ip`: the import never names it.
-    const selfCall = ref.language === 'python' && ref.referenceKind === 'calls' &&
+    // also imports a function named `get_ip`: the import never names it. Nor
+    // does TS/JS's `this.findAll()` name the file's `import { findAll }` (#2954).
+    const selfCall = ref.referenceKind === 'calls' &&
+      (ref.language === 'python' || JS_SELF_CALL_LANGUAGES.has(ref.language)) &&
       this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === ref.referenceName) &&
-      isPythonSelfCall(ref, this.context);
-    const importResult = selfCall ? null : this.gateLanguage(resolveViaImport(ref, this.context), ref);
+      (isPythonSelfCall(ref, this.context) || isJsThisCall(ref, this.context));
+    let importResult = selfCall ? null : this.gateLanguage(resolveViaImport(ref, this.context), ref);
+    // A name the calling code binds in scope at the reference — a parameter, a
+    // local, a nested function, in the calling function or one around it — is
+    // that binding, which the name match below finds (#2949), and so is the
+    // receiver of `stream.onAbort()` (#2953).
+    if (importResult && isImportShadowedByJsBinding(importResult, ref, this.context)) importResult = null;
     if (this.profileStages) this.stageAdd('viaImport', ref, !!importResult, tImp);
     if (importResult) {
       if (importResult.confidence >= 0.9) return importResult;
@@ -3705,6 +3787,32 @@ export class ReferenceResolver {
   }
 
   /**
+   * The file isUnboundPythonBuiltin read last: every name its nodes have and
+   * its imports bind, and whether it star-imports a module. References arrive
+   * grouped by file, so one slot serves them all.
+   */
+  private pythonFileBindings: { filePath: string; names: Set<string>; star: boolean } | null = null;
+
+  /**
+   * Whether a Python reference to a builtin's name (PYTHON_BUILTIN_NAMES) can
+   * only mean the builtin: written bare (`self.format()` and `errors.Timeout`
+   * name a member), in a file that defines nothing of that name, imports
+   * nothing under it and star-imports no module that might export it.
+   */
+  private isUnboundPythonBuiltin(ref: UnresolvedRef): boolean {
+    const line = (this.context.getFileLines?.(ref.filePath) ?? this.context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+    if (line === undefined || !line.startsWith(ref.referenceName, ref.column) || /\.\s*$/.test(line.slice(0, ref.column))) return false;
+    let file = this.pythonFileBindings;
+    if (file?.filePath !== ref.filePath) {
+      const names = new Set(this.context.getNodesInFile(ref.filePath).map((n) => n.name));
+      for (const m of this.context.getImportMappings(ref.filePath, 'python')) names.add(m.localName);
+      const star = /^[ \t]*from[ \t]+[\w.]+[ \t]+import[ \t(]*\*/m.test(this.context.readFile(ref.filePath) ?? '');
+      this.pythonFileBindings = file = { filePath: ref.filePath, names, star };
+    }
+    return !file.star && !file.names.has(ref.referenceName);
+  }
+
+  /**
    * True when the Go file imports `qualifier` — by its last path segment or
    * an alias — from a package of one of the project's own modules.
    */
@@ -3750,6 +3858,13 @@ export class ReferenceResolver {
 
     // Python built-ins (bare calls only — dotted calls like console.print are method calls)
     if (ref.language === 'python' && PYTHON_BUILT_INS.has(name)) {
+      return true;
+    }
+    // The rest of them, `raise TimeoutError(…)` or `sorted(xs)`, written bare in
+    // a file that neither defines nor imports the name, nor star-imports a module
+    // that could: there it can only be the builtin, never a project class or
+    // function of that name in a file it doesn't import (#3232).
+    if (ref.language === 'python' && PYTHON_BUILTIN_NAMES.has(name) && this.isUnboundPythonBuiltin(ref)) {
       return true;
     }
 
@@ -4472,6 +4587,10 @@ export class ReferenceResolver {
     if (bare && !isRustNameInScope(target, ref, this.context)) return null;
     if (ref.referenceKind !== 'calls') return result;
     if (!bare && !isRustPathCallReachable(target, ref, this.context)) return null;
+    // What the name alone can't reach: an associated function by a method
+    // call, an outside trait's impl or another type's method by a guess (#3252).
+    const guessed = result.byName === true || result.resolvedBy === 'exact-match' || result.resolvedBy === 'fuzzy';
+    if (isRustCallUnreachable(target, ref, guessed, this.context)) return null;
     return isRustForeignImplCallable(target, ref, this.context) ? result : null;
   }
 

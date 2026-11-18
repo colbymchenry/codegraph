@@ -762,6 +762,22 @@ function includeStaticRoots(patterns: string[]): string[] {
 }
 
 /**
+ * A folder's real path, for the include walk's cycle guard. The OS's realpath
+ * is one call a folder, where the JS one stats every part of the path, which
+ * made the walk the bulk of a `status` on a project that includes a large
+ * ignored tree (#3086). Some volumes refuse the OS call where the JS one works
+ * (a RAM disk, some `subst` and network drives answer EISDIR or the like), so
+ * the JS one answers there; throws only when both do.
+ */
+function walkRealpath(dir: string): string {
+  try {
+    return fs.realpathSync.native(dir);
+  } catch {
+    return fs.realpathSync(dir);
+  }
+}
+
+/**
  * Actively discover the source files an `include` whitelist forces in. `git
  * ls-files` never lists gitignored files, so a filtered filesystem walk of just
  * the opted-in subtrees (`includeStaticRoots`) is the only way to find them.
@@ -805,7 +821,7 @@ function collectIncludedFiles(
   function walk(absDir: string): void {
     let realDir: string;
     try {
-      realDir = fs.realpathSync(absDir);
+      realDir = walkRealpath(absDir);
     } catch {
       return;
     }
@@ -1686,6 +1702,25 @@ export function getGitHeadSha(rootDir: string): string | null {
 }
 
 /**
+ * The environment for the git commands change detection runs, which only read.
+ *
+ * With git's "optional locks" on, `git status` writes the stat info it
+ * refreshed back to the index, and to do that it takes `.git/index.lock` right
+ * after the refresh and holds it through the diff and the whole untracked scan.
+ * Change detection runs on every sync — the watcher's, `codegraph sync` and
+ * `codegraph status`, and the MCP tools' freshness checks — and the watcher
+ * wakes exactly when a commit, a checkout or a hook churns files, so the user's
+ * `git add` or `git checkout` started inside that window failed at once with
+ * "index.lock: File exists" (#3295). `GIT_OPTIONAL_LOCKS=0` skips only that
+ * write-back: the output is the same, and the user's next git command refreshes
+ * the index itself. An environment variable rather than `--no-optional-locks`,
+ * which a git older than 2.15 would reject.
+ */
+function readOnlyGitEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, GIT_OPTIONAL_LOCKS: '0' };
+}
+
+/**
  * NUL-delimited status/path pairs for every path committed
  * between `sinceCommit` and HEAD. Empty when the stamp IS HEAD, which is the
  * common case — one cheap git call on the hot path.
@@ -1695,6 +1730,7 @@ function gitCommittedChangesSince(repoDir: string, sinceCommit: string): string[
   // Let command failures reach getGitChangedFiles: [] would falsely mean clean.
   const out = execFileSync('git', ['diff', '--relative', '--name-status', '--no-renames', '-z', sinceCommit, 'HEAD', '--', '.'], {
     cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    env: readOnlyGitEnv(),
   });
   return out.split('\0');
 }
@@ -1751,7 +1787,8 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, isSo
     repoPrefix
       ? ['status', '--porcelain', '--no-renames', '-z', '-uall', '--', '.']
       : ['status', '--porcelain', '--no-renames', '-z', '-uall'],
-    { cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+    // Read-only: never take `.git/index.lock` from under the user's git (#3295).
+    { cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: readOnlyGitEnv() }
   );
 
   // This repo's own ignore rules — built-in defaults (#407) plus its .gitignore.
@@ -4238,6 +4275,40 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * The files `codegraph.json` `include` brings in that may have changed since
+   * they were indexed. They are gitignored, and `git status` never reports an
+   * ignored file, so the git fast path below saw no edit, addition or deletion
+   * among them (#3086). The test is sync's own: an included file on disk is a
+   * candidate when the index doesn't hold it or holds another size or mtime,
+   * and an indexed file `include` covers is one when it's gone. So status
+   * calls pending exactly what a sync would pick up, and the caller's hash
+   * check decides as for any other candidate.
+   */
+  private includedFileChanges(): string[] {
+    const include = loadIncludeMatcher(this.rootDir);
+    if (!include) return [];
+    const out: string[] = [];
+    const onDisk = collectIncludedFilesForRoot(this.rootDir);
+    for (const filePath of onDisk) {
+      const tracked = this.queries.getFileByPath(filePath);
+      if (!tracked) {
+        out.push(filePath);
+        continue;
+      }
+      try {
+        const stats = fs.statSync(path.join(this.rootDir, filePath));
+        if (stats.size !== tracked.size || Math.floor(stats.mtimeMs) !== Math.floor(tracked.modifiedAt)) out.push(filePath);
+      } catch {
+        out.push(filePath);
+      }
+    }
+    for (const filePath of this.queries.getAllFilePaths()) {
+      if (!onDisk.has(filePath) && include.ignores(filePath) && !fs.existsSync(path.join(this.rootDir, filePath))) out.push(filePath);
+    }
+    return out;
+  }
+
+  /**
    * The files a change of the sparse checkout brought in or took away since the
    * last full index or sync: where the scan and the index disagree. Nothing git
    * reports can supply them, so this runs on a clean tree too. It costs a scan
@@ -4277,7 +4348,7 @@ export class ExtractionOrchestrator {
       // Git supplies candidates, never the verdict. A committed deletion may
       // have been recreated locally; a previously indexed dirty path may have
       // vanished from git status after restore. Classify current disk vs DB once.
-      const candidates = new Set([...gitChanges.deleted, ...gitChanges.modified, ...gitChanges.added, ...dirtyPaths!, ...this.sparseCheckoutChanges()]);
+      const candidates = new Set([...gitChanges.deleted, ...gitChanges.modified, ...gitChanges.added, ...dirtyPaths!, ...this.sparseCheckoutChanges(), ...this.includedFileChanges()]);
       const scope = this.scopedSyncMatcher();
       const overrides = loadExtensionOverrides(this.rootDir);
       for (const filePath of candidates) {

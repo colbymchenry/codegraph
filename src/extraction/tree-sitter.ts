@@ -25,6 +25,7 @@ import { stripCppTemplateArgs, isCppConstructorDeclaration, cAliasTypeNames, cDe
 import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
+import { rustMacroArgRefs } from './languages/rust-macro-calls';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
 import { cfmlConstructedComponent, cfmlCreatedComponent, isCfIncludeCall } from './languages/cfscript';
@@ -1264,7 +1265,8 @@ export class TreeSitterExtractor {
       //    strictly class-scoped (own members or the validated supertype
       //    pass), so nothing fuzzy can leak.
       //  - `Scope::member` (C++ member-pointers, Java/Kotlin type-qualified
-      //    method refs, PHP `'Cls::m'`): ALWAYS flush — the explicit-ref
+      //    method refs, PHP `'Cls::m'`, Rust paths, which resolve as the same
+      //    path's call does, gates included): ALWAYS flush — the explicit-ref
       //    syntax is self-selecting, the referenced type often needs NO
       //    import (Java/Kotlin same-package, Kotlin companions), and
       //    resolution is scope-suffix-anchored + unique-or-drop, so a
@@ -7412,6 +7414,28 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * The calls and variant paths in the arguments of a Rust expression macro —
+   * `format!("{}", label())`, `assert_eq!(count(), 3)`, `vec![x; size()]`,
+   * `write!(f, "{}", self.code.as_str())`, `matches!(c, Code::A | Code::B)`
+   * (#3251) — read from its token tree as the call extractor names them
+   * (rustMacroArgRefs). Mirrored by the kernel's extract_rust_macro_refs.
+   */
+  private extractRustMacroCalls(node: SyntaxNode): void {
+    if (this.language !== 'rust') return;
+    const fromId = this.nodeStack[this.nodeStack.length - 1];
+    if (!fromId) return;
+    for (const r of rustMacroArgRefs(node, this.source)) {
+      this.unresolvedReferences.push({
+        fromNodeId: fromId,
+        referenceName: r.name,
+        referenceKind: r.kind,
+        line: r.at.startPosition.row + 1,
+        column: r.at.startPosition.column,
+      });
+    }
+  }
+
+  /**
    * Record a C++ local function-pointer binding (`local = &fn` / `&fn<…>` /
    * `&ns::fn<…>`) for the CURRENT enclosing symbol, so calls through the local
    * resolve to the real target (see cppLocalFnPtrs). Only the address-of shape
@@ -7620,12 +7644,22 @@ export class TreeSitterExtractor {
       if (nodeType === 'assignment_expression' && this.extractAssignedObjectOwner(node, false)) return;
 
       // Rocket route-registration macros (`routes![…]` / `catchers![…]`): the
-      // handler paths live in a raw token tree the call walker can't see.
-      if (nodeType === 'macro_invocation') this.extractRustRouteMacro(node);
+      // handler paths live in a raw token tree the call walker can't see. So
+      // do the calls in an expression macro's arguments (`format!`, #3251).
+      if (nodeType === 'macro_invocation') {
+        this.extractRustRouteMacro(node);
+        this.extractRustMacroCalls(node);
+      }
 
       // A CFML `include "x.cfm";` in a function body includes the template
       // there, as it does at component scope (#2651).
       if (nodeType === 'include_statement' && this.language === 'cfscript') this.extractImport(node);
+      // So does a PHP `require`/`include` (#3296): the function depends on
+      // the file, as a call it makes is its own. (A namespace `use` can't
+      // sit in a body.)
+      if (this.language === 'php' && nodeType !== 'namespace_use_declaration' && this.extractor!.importTypes.includes(nodeType)) {
+        this.extractImport(node);
+      }
 
       if (this.extractor!.callTypes.includes(nodeType)) {
         this.extractCall(node);

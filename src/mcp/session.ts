@@ -358,6 +358,10 @@ export class MCPSession {
     }
 
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} pre-init\n`);
+    // Before any init or dispatch, so a direct session's liveness watchdog
+    // covers this call from its start (#3250). Optional: an engine stand-in
+    // that predates the hook still serves calls.
+    this.engine.noteToolCall?.();
     await this.retryInitIfNeeded();
 
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);

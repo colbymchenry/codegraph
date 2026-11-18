@@ -361,6 +361,20 @@ export { main };
       // sibling method and explode impact for a leaf symbol. (#536)
       expect(impact.nodes.has(derived!.id)).toBe(false);
     });
+
+    it('reads incoming edges without contains, in the same order as getIncomingEdges (#3248)', () => {
+      const queries = (cg as unknown as { queries: import('../src/db/queries').QueryBuilder }).queries;
+      const all = queries.getAllNodes();
+      let withContains = 0;
+      for (const node of all) {
+        const incoming = queries.getIncomingEdges(node.id);
+        const expected = incoming.filter((e) => e.kind !== 'contains');
+        if (expected.length !== incoming.length) withContains++;
+        expect(queries.getIncomingEdgesExceptContains(node.id)).toEqual(expected);
+      }
+      // The fixture exercises the filter: members have an incoming contains edge.
+      expect(withContains).toBeGreaterThan(0);
+    });
   });
 
   describe('findPath()', () => {
@@ -549,6 +563,8 @@ function tGraph(nodes: Node[], edges: Edge[]): GraphTraverser {
       edges.filter((e) => e.source === source && (!kinds || kinds.includes(e.kind))),
     getIncomingEdges: (target: string, kinds?: string[]) =>
       edges.filter((e) => e.target === target && (!kinds || kinds.includes(e.kind))),
+    getIncomingEdgesExceptContains: (target: string) =>
+      edges.filter((e) => e.target === target && e.kind !== 'contains'),
   };
   return new GraphTraverser(q as never);
 }
@@ -739,6 +755,63 @@ describe('Traversal edge-completeness & limits (#1086–#1090)', () => {
     expect(sub.edges).toHaveLength(2);
     expect(sub.truncated).toBe(true);
     expect(sub.edges.every((edge) => sub.nodes.has(edge.source) && sub.nodes.has(edge.target))).toBe(true);
+  });
+
+  it('getImpactRadius reads a node\'s edges without a SQL LIMIT, and budgets after dropping contains (#3248)', () => {
+    // K is a class that contains A. B calls A, C calls B.
+    const nodes = [tNode('A'), tNode('B'), tNode('C'), tNode('K', 'class')];
+    const edges: Edge[] = [
+      { source: 'K', target: 'A', kind: 'contains', line: 1 },
+      { source: 'B', target: 'A', kind: 'calls', line: 2 },
+      { source: 'C', target: 'B', kind: 'calls', line: 3 },
+    ];
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const limits: unknown[] = [];
+    const q = {
+      getNodeById: (id: string) => byId.get(id) ?? null,
+      getNodesByIds: (ids: readonly string[]) =>
+        new Map(ids.flatMap((id) => (byId.has(id) ? [[id, byId.get(id)!] as const] : []))),
+      // Every read behaves like its SQL: a kind list filters, a limit caps.
+      getOutgoingEdges: (source: string, kinds?: string[], provenance?: string, limit?: number) => {
+        limits.push(limit);
+        const rows = edges.filter((e) => e.source === source && (!kinds || kinds.includes(e.kind)));
+        return limit === undefined ? rows : rows.slice(0, limit);
+      },
+      getIncomingEdges: (target: string, kinds?: string[], limit?: number) => {
+        limits.push(limit);
+        const rows = edges.filter((e) => e.target === target && (!kinds || kinds.includes(e.kind)));
+        return limit === undefined ? rows : rows.slice(0, limit);
+      },
+      getIncomingEdgesExceptContains: (...args: unknown[]) => {
+        // Any argument past the target would be a new bound on the read.
+        limits.push(args.length > 1 ? args[1] : undefined);
+        return edges.filter((e) => e.target === args[0] && e.kind !== 'contains');
+      },
+    };
+    const traverser = new GraphTraverser(q as never);
+
+    const sub = traverser.getImpactRadius('A', 3);
+    expect([...sub.nodes.keys()].sort()).toEqual(['A', 'B', 'C']);
+    expect(sub.edges.some((e) => e.kind === 'contains')).toBe(false);
+    expect(sub.truncated).toBeUndefined();
+    // The walk reads once per visited node, and a LIMIT under the reads'
+    // ORDER BY made each one markedly slower, so the budget is applied after
+    // the read instead. K is a container, so impact on it reads its members.
+    traverser.getImpactRadius('K', 2);
+    traverser.getImpactRadius('K', 2, { maxEdges: 1 });
+    expect(limits.length).toBeGreaterThan(0);
+    expect(limits.every((limit) => limit === undefined)).toBe(true);
+
+    // The contains edge is dropped before the budget applies, so it neither
+    // takes A's one edge slot nor marks the result truncated.
+    const tight = traverser.getImpactRadius('A', 1, { maxEdges: 1 });
+    expect(tight.edges.map((e) => `${e.source}>${e.target}`)).toEqual(['B>A']);
+    expect(tight.truncated).toBeUndefined();
+    // A second dependent of A is over that budget, and says so.
+    edges.push({ source: 'C', target: 'A', kind: 'calls', line: 4 });
+    const over = traverser.getImpactRadius('A', 1, { maxEdges: 1 });
+    expect(over.edges).toHaveLength(1);
+    expect(over.truncated).toBe(true);
   });
 
   it('surfaces impact truncation explicitly in MCP output', () => {

@@ -17,6 +17,7 @@ export {
   reopenReferencesThroughBarrels,
   reopenReferencesThroughChangedDefaults,
   reopenReferencesThroughDeclaredPackages,
+  reopenReferencesThroughObjectMembers,
   reopenReferencesThroughRetargetedModules,
 } from './resolution/module-importers';
 export { manifestStamp, parseManifestStamp, trustedManifestList } from './resolution/workspace-packages';

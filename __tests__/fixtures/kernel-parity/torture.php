@@ -23,6 +23,8 @@ const TOP_LEVEL_MAX = 10;
 function top_helper(?Logger $log, User|PostAlias $u, Logger&Countable $lc, (Foo&Bar)|Baz $dnf, \App\Models\User $qual, string $s, int ...$rest): UserModel
 {
     top_body_call();
+    require_once 'lib/in_function.php';
+    include $dynamicInFunction;
     return new UserModel();
 }
 
