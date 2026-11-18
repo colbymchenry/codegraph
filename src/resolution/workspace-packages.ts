@@ -35,6 +35,7 @@ import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { logDebug } from '../errors';
+import { escapesRoot } from '../utils';
 
 export interface WorkspacePackages {
   /**
@@ -939,9 +940,16 @@ const GLOB_DIR_BUDGET = 10_000;
  * none of GLOBSTAR_SKIP_DIRS; a folder the glob names literally is always
  * entered. Breadth-first with sorted names, so a member nearer the root wins
  * a package name a deeper copy also declares.
+ *
+ * A member is a folder of the project. An entry that leaves it (`../shared`,
+ * `../*`, `packages/../../x`, an absolute path) names none: nothing there is
+ * indexed, so taking its name for the project's own only stopped the import
+ * from reading as an outside package's, and the name matcher then bound its
+ * names to unrelated project code (#3093).
  */
 function expandWorkspaceGlob(projectRoot: string, pattern: string): string[] {
   const norm = pattern.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (path.isAbsolute(norm) || escapesRoot(path.posix.normalize(norm))) return [];
   const glob = compileGlob(norm);
   const first = glob.findIndex((seg) => seg.wildcard);
   if (first === -1) return [norm]; // exact directory
