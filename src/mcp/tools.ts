@@ -1657,6 +1657,26 @@ export interface ToolResult {
   _cgAnswerFiles?: AnswerFile[];
 }
 
+/** Options for {@link ToolHandler.execute}. */
+export interface ExecuteOptions {
+  /**
+   * Start the call now or not at all: when the handler is closing, the
+   * project's post-open catch-up is still running, or every warm pool worker
+   * is busy, `execute` returns {@link NOT_STARTED} at once instead of waiting
+   * or queueing. For a caller with its own way to answer, the prompt hook
+   * (#3284), which should not hold a prompt behind other work.
+   */
+  startNow?: boolean;
+}
+
+/**
+ * What `execute` returns, by identity, for a `startNow` call it did not start.
+ * Never sent to a client as is: the caller checks for it.
+ */
+export const NOT_STARTED: ToolResult = Object.freeze({
+  content: Object.freeze([]) as unknown as ToolResult['content'],
+}) as ToolResult;
+
 /**
  * Common projectPath property for cross-project queries
  */
@@ -3036,8 +3056,11 @@ export class ToolHandler {
     args: Record<string, unknown>,
     sessionState?: ExploreSessionState,
     indexVersionWarnings?: IndexVersionWarningState,
+    opts: ExecuteOptions = {},
   ): Promise<ToolResult> {
-    if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
+    if (this.closing) {
+      return opts.startNow ? NOT_STARTED : this.textResult('This MCP session is closing; retry with a connected session.');
+    }
     this.activeCalls++;
     try {
       // Block the first tool call on the engine's post-open reconcile so we
@@ -3049,6 +3072,7 @@ export class ToolHandler {
       // Catch-up failures are logged by the engine; we proceed regardless so a
       // transient sync error never breaks tools.
       if (this.catchUpGate) {
+        if (opts.startNow) return NOT_STARTED;
         const gate = this.catchUpGate;
         await this.awaitCatchUpGate(gate);
       }
@@ -3142,9 +3166,16 @@ export class ToolHandler {
       const pooled = !!(this.queryPool && this.queryPool.healthy && this.queryPool.ready);
       const projectPath = pooled ? args.projectPath ?? this.cg?.getProjectRoot() : undefined;
       const wasDegraded = project.isWatcherDegraded?.();
-      const raw = (pooled && projectPath)
-        ? await this.queryPool!.run(toolName, { ...dispatchArgs, projectPath })
-        : await this.executeReadTool(toolName, dispatchArgs);
+      let raw: ToolResult;
+      if (pooled && projectPath) {
+        const call = { ...dispatchArgs, projectPath };
+        // `startNow`: an idle worker or none, never a place in the queue.
+        const started = opts.startNow ? this.queryPool!.tryRun(toolName, call) : this.queryPool!.run(toolName, call);
+        if (!started) return NOT_STARTED;
+        raw = await started;
+      } else {
+        raw = await this.executeReadTool(toolName, dispatchArgs);
+      }
       const answeredFrom = raw._cgAnswerFiles;
       delete raw._cgAnswerFiles;
       if (!raw.isError && answeredFrom && (wasDegraded || project.isWatcherDegraded?.())) {

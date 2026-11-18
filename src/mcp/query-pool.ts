@@ -477,6 +477,19 @@ export class QueryPool {
     });
   }
 
+  /**
+   * {@link run}, but only when a warm worker is idle right now, so the call
+   * starts at once; null, with nothing queued, when every worker is busy or
+   * none has finished its cold start. For a caller that has its own way to
+   * answer and must not wait behind other calls: the prompt hook (#3284). An
+   * idle worker means nothing unsettled is queued (each idle worker drains the
+   * queue), so the job goes straight to it.
+   */
+  tryRun(toolName: string, args: Record<string, unknown>): Promise<ToolResult> | null {
+    if (!this.healthy || !this.ready || this.idle.length === 0) return null;
+    return this.run(toolName, args);
+  }
+
   private startSettled(w: PoolWorker): void {
     const start = this.starts.get(w);
     if (!start) return;
