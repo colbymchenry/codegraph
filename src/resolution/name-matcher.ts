@@ -16224,6 +16224,11 @@ export function objectLiteralMemberBinding(
 function holderExtent(container: Node, context: ResolutionContext): { lines: string[]; extent: string; code: string } | null {
   const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
   if (!lines) return null;
+  return holderExtentOf(container, lines);
+}
+
+/** {@link holderExtent} of a holder in `lines`, its file's text. */
+function holderExtentOf(container: Node, lines: string[]): { lines: string[]; extent: string; code: string } | null {
   const extentLines = lines.slice(container.startLine - 1, container.endLine);
   if (!extentLines.length) return null;
   extentLines[extentLines.length - 1] = extentLines[extentLines.length - 1]!.slice(0, container.endColumn);
@@ -16232,15 +16237,13 @@ function holderExtent(container: Node, context: ResolutionContext): { lines: str
   return { lines, extent, code: blankStringContents(extent) };
 }
 
-/** The last own property wins; an unknown spread/computed key invalidates earlier evidence. */
-function objectLiteralProperty(
-  container: Node,
-  member: string,
-  context: ResolutionContext,
-): { binding: string | null; contains: (node: Node) => boolean } | null | undefined {
-  const read = holderExtent(container, context);
-  if (!read) return undefined;
-  const { lines, extent, code } = read;
+/**
+ * The own members of the object literal a holder's `code` (see holderExtent)
+ * initializes it with, as spans of that text, one per top-level comma;
+ * undefined when the holder isn't written `name = { … }` (optionally inside
+ * `Object.freeze(…)` / `Object.seal(…)`).
+ */
+function objectLiteralMemberSpans(code: string): Array<{ start: number; end: number }> | undefined {
   // Start at THIS declarator, including its columns, never a sibling on the same line.
   const open = /^[^=]*=\s*(?:(?:Object\.(?:freeze|seal)\s*)?\(\s*)*\{/.exec(code);
   if (!open) return undefined;
@@ -16263,16 +16266,61 @@ function objectLiteralProperty(
       start = i + 1;
     }
   }
+  return members;
+}
+
+/** A member's key and what its value names: the identifier of a shorthand or `key: ident` member, else null. */
+const MEMBER_KEY = /^(?:(?:async|get|set)\s+)?\*?\s*(?:([A-Za-z_$][\w$]*)|['"]([^'"\\]*)['"])(?=\s*(?:[:(<,=]|$))/;
+function objectLiteralMemberOf(text: string): { key: string; binding: string | null } | null {
+  const key = MEMBER_KEY.exec(text);
+  const name = key?.[1] ?? key?.[2];
+  if (name === undefined) return null;
+  const value = text.slice(key![0].length).trim();
+  return { key: name, binding: value === '' ? name : /^:\s*([A-Za-z_$][\w$]*)$/.exec(value)?.[1] ?? null };
+}
+
+/**
+ * Every own member of the object literal `holder` is initialized with, read
+ * from `lines` (its file's text) the way a call through it resolves one:
+ * key → the identifier a shorthand or `key: ident` member names, or null for
+ * any other value; the last of a key wins. Null when the holder isn't such a
+ * literal, or a spread or computed key leaves its members unknowable.
+ */
+export function objectLiteralMembers(holder: Node, lines: string[]): Map<string, string | null> | null {
+  const read = holderExtentOf(holder, lines);
+  if (!read) return null;
+  const spans = objectLiteralMemberSpans(read.code);
+  if (!spans) return null;
+  const members = new Map<string, string | null>();
+  for (const part of spans) {
+    const text = read.extent.slice(part.start, part.end).trim();
+    if (text === '') continue;
+    if (/^(?:\.\.\.|\[)/.test(text)) return null;
+    const member = objectLiteralMemberOf(text);
+    if (member) members.set(member.key, member.binding);
+  }
+  return members;
+}
+
+/** The last own property wins; an unknown spread/computed key invalidates earlier evidence. */
+function objectLiteralProperty(
+  container: Node,
+  member: string,
+  context: ResolutionContext,
+): { binding: string | null; contains: (node: Node) => boolean } | null | undefined {
+  const read = holderExtent(container, context);
+  if (!read) return undefined;
+  const { lines, extent, code } = read;
+  const members = objectLiteralMemberSpans(code);
+  if (!members) return undefined;
 
   let selected: { start: number; end: number; binding: string | null } | null = null;
   for (const part of members) {
     const text = extent.slice(part.start, part.end).trim();
     if (/^(?:\.\.\.|\[)/.test(text)) { selected = null; continue; }
-    const key = /^(?:(?:async|get|set)\s+)?\*?\s*(?:([A-Za-z_$][\w$]*)|['"]([^'"\\]*)['"])(?=\s*(?:[:(<,=]|$))/.exec(text);
-    if ((key?.[1] ?? key?.[2]) !== member) continue;
-    const value = text.slice(key![0].length).trim();
-    const binding = value === '' ? member : /^:\s*([A-Za-z_$][\w$]*)$/.exec(value)?.[1] ?? null;
-    selected = { ...part, binding };
+    const found = objectLiteralMemberOf(text);
+    if (found?.key !== member) continue;
+    selected = { ...part, binding: found.binding };
   }
   if (!selected) return null;
   const offset = (node: Node): number => {

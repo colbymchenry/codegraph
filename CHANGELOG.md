@@ -39,6 +39,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph status` now reports edits, new files and deletions in gitignored source that `codegraph.json` `include` brings into the index, instead of calling the index up to date until a sync picked them up. Thanks @mixxer for the report and the pull request. (#3086)
 - On Linux and macOS, when the system kills CodeGraph with a signal, such as when it runs out of memory during `codegraph init` or `codegraph index`, the command now says which signal and exits as a shell would (137 for SIGKILL), instead of exiting 1 with no message. Thanks @inth3shadows for the report and @johnhldiver-beep. (#3277)
 - A Spring or Laravel test's request is now linked only to a route of its own app, not to a JavaScript or TypeScript server's route that happens to match the path, so `codegraph affected` no longer selects Java or PHP tests for a change to your web code. Thanks @jotder for the report. (#3320)
+- `codegraph sync` and the file watcher now follow an edit that adds, removes or repoints a member of an exported object, like `export const api = { getUser, saveUser }`, so a call such as `api.saveUser()` in a file the edit didn't touch links to the new member, or back to the object, as a fresh index does. Thanks @inth3shadows for the report. (#3015)
 
 ## [1.6.3] - 2026-11-17
 
