@@ -51,7 +51,6 @@ import {
   realpathSync,
   statSync,
 } from 'fs';
-import { createHash } from 'crypto';
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
@@ -150,7 +149,7 @@ function wslSharedIndexGuidance(err: WslSharedIndexError): string {
  */
 export { PathRefusalError } from '../errors';
 import { PathRefusalError } from '../errors';
-import { indexedHashInput } from '../file-limits';
+import { fileDrift } from '../graph/file-drift';
 import { resolve as resolvePath, relative as relativePath, dirname } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
@@ -2879,28 +2878,9 @@ export class ToolHandler {
     const now = Date.now();
     const hit = this.driftCache.get(key);
     if (hit && now - hit.at < ToolHandler.DRIFT_TTL_MS) return hit.stale;
-    let stale = false;
-    try {
-      const rec = cg.getFile(relPath);
-      const absPath = rec ? validatePathWithinRoot(root, relPath) : null;
-      if (rec && absPath && existsSync(absPath)) {
-        const st = statSync(absPath);
-        // Same freshness test as the sync fast path (extraction/index.ts):
-        // equal size + equal floored mtime ⇒ unchanged, no read needed.
-        if (st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) {
-          // A file over the index's size limit is stored as its size stamp
-          // (#1910), so it is compared as one, without reading it.
-          const data = indexedHashInput(st.size, () => content ?? readFileSync(absPath, 'utf-8'));
-          // Must stay byte-identical to extraction's `hashContent` (sha256 over
-          // the utf-8 string) — the identical-rewrite test in
-          // mcp-stale-slice.test.ts pins the parity. Inlined (not imported)
-          // to keep the extraction module off the MCP startup path.
-          stale = createHash('sha256').update(data).digest('hex') !== rec.contentHash;
-        }
-      }
-    } catch {
-      stale = false;
-    }
+    // The check itself is shared with the CLI's read commands (#3260). A file
+    // gone from disk isn't flagged here: the not-found paths answer for it.
+    const stale = fileDrift(cg, relPath, content) === 'changed';
     this.driftCache.set(key, { at: now, stale });
     return stale;
   }
