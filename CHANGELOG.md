@@ -67,6 +67,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In C#, an extension method is now matched by the type its `this` parameter takes, so `"hi".Shout()` and `mailer.Shout()` each reach their own extension, and a call of a string's own method no longer reaches a project extension of the same name. Thanks @Gobakabana for the report. (#2906)
 - In Go, a method called on `new(T)` or `make(T)` now links to that type's method, not a same-named method of another type that happened to be found first. Thanks @inth3shadows for the report. (#3237)
 - In C#, a method called through `?.` or `!.`, like `_mailer?.Send()`, now links to the method of the receiver's type. Thanks @Gobakabana for the report. (#2906)
+- In C#, a method passed or stored as a value through its object, like `Task.Run(worker.Run)` or `Action later = worker.Run;`, now counts as a use of that method, so `codegraph callers` and impact show it. Thanks @Gobakabana for the report. (#2906)
 
 ## [1.6.3] - 2026-11-17
 

@@ -790,7 +790,14 @@ function normalizeSpecial(
       const isThisReceiver = expr
         ? expr.type === 'this_expression' || expr.type === 'this'
         : getNodeText(node, source).startsWith('this.');
-      return isThisReceiver ? [{ name: getNodeText(name, source), node: name }] : [];
+      if (isThisReceiver) return [{ name: getNodeText(name, source), node: name }];
+      // A method group through a receiver — `Task.Run(worker.Run)`, `Action
+      // later = worker.Run;` (#2906): keep the receiver, as Go and Python
+      // member values do, and let resolution type it; a `this.` before a
+      // field is no part of it. Its name is no file's own, so it skips the
+      // name gate. Mirrored in the kernel (csharp.rs normalize_fn_ref_value).
+      const value = getNodeText(node, source).replace(/\s+/g, '').replace(/^this\./, '');
+      return /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/.test(value) ? [{ name: value, node: name, skipGate: true }] : [];
     }
 
     // PHP string callable — trustworthy ONLY as an argument to a known
