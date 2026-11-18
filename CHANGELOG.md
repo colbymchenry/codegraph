@@ -24,6 +24,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In JavaScript and TypeScript, `this.findAll()` in a class that wraps an imported helper of the same name now links to the class's own method instead of the imported helper. Thanks @inth3shadows for the report. (#2954)
 - In TypeScript, a call on a parameter or local named like an import, like `stream.write()` inside `stream(c, async (stream) => …)`, now goes by that parameter or local, and a method called on an imported function no longer links to the function itself; the same mistake through `require` was already fixed in 1.6.3. Thanks @inth3shadows for the report. (#2953)
 - In JavaScript and TypeScript, a call to a name that a function around the caller declares for itself, like a helper an inner arrow function calls, now links to that local declaration instead of the file's import of the same name. Thanks @inth3shadows for the report. (#2949)
+- In JavaScript and TypeScript, a call to a helper declared inside a `describe(…)` block, or any other callback, now links to the helper that block declares instead of a same-named one from another block that happens to sit nearer. Thanks @inth3shadows for the report. (#2944)
+- In JavaScript and TypeScript, a call inside a spread, like `<input {...register('email')} />` with `register` taken from `useForm()`, no longer links to an unrelated project function that shares the name. Thanks @inth3shadows for the report. (#2962)
 
 ## [1.6.3] - 2026-11-17
 
