@@ -172,11 +172,16 @@ const DEFAULT_BINDING_RE = /^([A-Za-z_$][\w$]*)\s*;?[ \t]*(?:\r?\n|$)/;
 /**
  * The value of the `export default` statement whose value starts at `at`, in
  * comment-stripped code: the name a declaration or a binding gives it,
- * `'anonymous'` for a function, class or arrow function without one, or null
- * for any other expression.
+ * `'anonymous'` for a function, class or arrow function without one, an
+ * object literal (named `default` by its owner, #3393), or null for any other
+ * expression.
  */
-function readDefaultExport(code: string, at: number): { name: string; nameAt: number; declared: boolean } | 'anonymous' | null {
+function readDefaultExport(
+  code: string,
+  at: number
+): { name: string; nameAt: number; declared: boolean; object?: true } | 'anonymous' | null {
   const rest = code.slice(at, at + 2048);
+  if (rest.startsWith('{')) return { name: 'default', nameAt: at, declared: true, object: true };
   const decl = DEFAULT_DECLARATION_RE.exec(rest);
   if (decl) {
     const name = decl[1] ?? decl[2];
@@ -214,12 +219,16 @@ function readDefaultExport(code: string, at: number): { name: string; nameAt: nu
  *   default () => …` — anonymous: no node is the default export, and any
  *   exported function beside it (or nested in it, which the extractor flags
  *   exported too) would be the wrong one.
- * Anything else — an expression (`memo(Card)`, `new Service()`, `{ … }`), a
- * binding the file doesn't declare, no statement at all, a non-JS file — is
- * `'unstated'`. Comments are stripped first. Strings are not masked: a
- * template whose `${…}` holds another template, or a regex with a backtick,
- * sets a masker out of step, and it blanked the real statement after it
- * (outline's 2,900-line styled-components `Styles.ts`). A statement must
+ * - `export default { fetchUser() {…} }` — the object's owner, the constant
+ *   `default` the extractor gives an object with function members, at the
+ *   statement (#3393).
+ * Anything else — an expression (`memo(Card)`, `new Service()`, an object
+ * with no function member, which has no owner), a binding the file doesn't
+ * declare, no statement at all, a non-JS file — is `'unstated'`. Comments are
+ * stripped first. Strings are not masked: a template whose `${…}` holds
+ * another template, or a regex with a backtick, sets a masker out of step,
+ * and it blanked the real statement after it (outline's 2,900-line
+ * styled-components `Styles.ts`). A statement must
  * name a node of the file instead, and of several statements, one that does
  * wins. A line of a template's text is no statement either, though it can
  * name one: a code generator's `export default App` names the file's own
@@ -250,7 +259,10 @@ function statedDefaultExport(filePath: string, idx: FileExportIndex, context: Re
       // the statement breaks before it (`export default\nfunction X`).
       const from = lineAt(m.index);
       const to = lineAt(value.nameAt);
-      const node = value.declared
+      // An object literal's owner is the statement itself (#3393).
+      const node = value.object
+        ? named.find((n) => n.kind === 'constant' && n.startLine === from)
+        : value.declared
         ? named.find((n) => DEFAULT_DECLARATION_KINDS.has(n.kind) && n.startLine >= from && n.startLine <= to)
         : moduleBindingsFirst(filePath, named
             .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))

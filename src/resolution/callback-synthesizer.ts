@@ -4089,9 +4089,19 @@ async function piniaStoreEdges(ctx: ResolutionContext, onYield: MaybeYield): Pro
 // (the store-file gate excludes a same-named `api/` helper — `getInfo`/`login`
 // commonly collide), disambiguated by the namespace appearing in the path (or, for
 // a root key, the same file — Vuex's local-module `commit('M')` inside an action).
-const VUEX_DISPATCH_RE = /\b(?:dispatch|commit)\s*\(\s*['"]([A-Za-z][\w/]*)['"]/g;
+// `dispatch` runs an action and `commit` a mutation, so a function known to be in
+// another collection — `const mutations = { … }`'s, a getter — is never the
+// target: an action and the mutation it commits often share a name.
+const VUEX_DISPATCH_RE = /\b(dispatch|commit)\s*\(\s*['"]([A-Za-z][\w/]*)['"]/g;
 const VUEX_STORE_SIGNAL = /\bdefineStore\b|\bcreateStore\b|\bVuex\b|\bmutations\b|\bactions\b|\bgetters\b|\bnamespaced\b/g;
 const VUEX_FANOUT_CAP = 120;
+// A store split into files (#3393) names its collections only in the store file
+// that assembles it — `import actions from './actions'` — while `actions.js`
+// itself, `export default { FETCH_LIST_DATA() {…} }`, says nothing of Vuex. A
+// file a store file default-imports as its actions, mutations or getters is a
+// store file too, holding that collection.
+const VUEX_COLLECTION_IMPORT = /\bimport\s+(?:actions|mutations|getters)\s+from\b/;
+const VUEX_COLLECTION_NAMES: ReadonlySet<string> = new Set(['actions', 'mutations', 'getters']);
 
 /** A path segment (dir or filename stem) equals `seg` — `…/modules/user.js` has
  *  the segment `user` for namespace `user`. */
@@ -4102,7 +4112,7 @@ function pathHasSegment(filePath: string, seg: string): boolean {
 async function vuexDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scannedFiles = 0;
   const storeFileCache = new Map<string, boolean>();
-  const isStoreFile = (file: string): boolean => {
+  const hasStoreSignals = (file: string): boolean => {
     let v = storeFileCache.get(file);
     if (v === undefined) {
       const c = ctx.readFile(file);
@@ -4117,11 +4127,44 @@ async function vuexDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     }
     return v;
   };
+  // The files store files default-import as collections, and which collection
+  // each is, found once: the first time a candidate's file is asked about.
+  let collectionFiles: Map<string, string> | null = null;
+  const collectionOf = (file: string): string | undefined => {
+    if (collectionFiles === null) {
+      collectionFiles = new Map();
+      for (const store of ctx.getAllFiles()) {
+        if (!PINIA_CONSUMER_EXT.test(store)) continue;
+        const c = ctx.readFile(store);
+        if (!c || !VUEX_COLLECTION_IMPORT.test(c) || !hasStoreSignals(store)) continue;
+        const language = languageForJsxFile(store);
+        for (const im of ctx.getImportMappings(store, language)) {
+          if (!im.isDefault || !VUEX_COLLECTION_NAMES.has(im.localName)) continue;
+          const target = im.resolvedPath ?? resolveImportPath(im.source, store, language, ctx);
+          if (target && !collectionFiles.has(target)) collectionFiles.set(target, im.localName);
+        }
+      }
+    }
+    return collectionFiles.get(file);
+  };
+  const isStoreFile = (file: string): boolean => hasStoreSignals(file) || collectionOf(file) !== undefined;
+  // The collection a function is known to be in: its owner's name (`const
+  // mutations = { … }` holds `mutations::SET_TOKEN`), else its file's.
+  const collectionHolding = (n: Node): string | undefined => {
+    const cut = n.qualifiedName.lastIndexOf('::');
+    const owner = cut < 0 ? '' : n.qualifiedName.slice(0, cut);
+    return VUEX_COLLECTION_NAMES.has(owner) ? owner : collectionOf(n.filePath);
+  };
 
-  const resolve = (key: string, dispatchFile: string): Node | null => {
+  const resolve = (verb: string, key: string, dispatchFile: string): Node | null => {
     const segs = key.split('/');
     const action = segs[segs.length - 1]!;
-    const cands = ctx.getNodesByName(action).filter((n) => n.kind === 'function' && isStoreFile(n.filePath));
+    const runs = verb === 'commit' ? 'mutations' : 'actions';
+    const cands = ctx.getNodesByName(action).filter((n) => {
+      if (n.kind !== 'function' || !isStoreFile(n.filePath)) return false;
+      const holder = collectionHolding(n);
+      return holder === undefined || holder === runs;
+    });
     if (!cands.length) return null;
     if (segs.length > 1) {
       const mod = segs[segs.length - 2]!; // immediate namespace ≈ the module file
@@ -4146,11 +4189,11 @@ async function vuexDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     let m: RegExpExecArray | null;
     let added = 0;
     while ((m = VUEX_DISPATCH_RE.exec(safe)) && added < VUEX_FANOUT_CAP) {
-      const key = m[1]!;
+      const key = m[2]!;
       const line = lineOf(safe, m.index);
       const disp = enclosingFn(nodesInFile, line) ?? fallback;
       if (!disp) continue;
-      const target = resolve(key, file);
+      const target = resolve(m[1]!, key, file);
       if (!target || target.id === disp.id) continue;
       const edgeKey = `${disp.id}>${target.id}`;
       if (seen.has(edgeKey)) continue;

@@ -505,6 +505,12 @@ const STATIC_OBJECT_KEY_TYPES: ReadonlySet<string> = new Set(['property_identifi
  * often `var self = this`, so `self.x = {…}` stays an ordinary path.)
  */
 const HOST_GLOBAL_ROOTS: ReadonlySet<string> = new Set(['window', 'globalThis']);
+/**
+ * A single-file component, whose script blocks the TS/JS extractor reads under
+ * the component's own path: what a Vue script default-exports is the component
+ * (#3393). Mirrored in the kernel (tsjs/extractors.rs), which never sees one.
+ */
+const SFC_SCRIPT_HOST_FILE = /\.(?:vue|svelte|astro)$/i;
 /** The field of a `this.<field>.<method>()` receiver: public or ES private (#1496, #1987). */
 const THIS_FIELD_PROPERTY_TYPES = new Set(['property_identifier', 'private_property_identifier']);
 /** A Swift receiver that is a path of types, `API.PackageController.GetRoute` — two segments or more, each capitalized. */
@@ -2034,23 +2040,16 @@ export class TreeSitterExtractor {
       const parentId = this.nodeStack[this.nodeStack.length - 1];
       if (parentId) this.emitReExportRefs(node, parentId);
     }
-    // Vuex MODULE default export — `export default { namespaced, actions: {…},
-    // mutations: {…} }` (the canonical Vuex module shape). Object-literal methods
-    // aren't otherwise extracted, so scan the config's actions/mutations/getters
-    // collections and extract their methods as nodes. Store-file gated (the
-    // ≥2-signal heuristic) so a plain default-exported object is untouched; skip
-    // the subtree afterward (the collection methods are now handled).
+    // `export default { … }` — a Vuex module, or any other object with
+    // function members (extractDefaultExportObject). Skip the subtree when it
+    // was handled.
     else if (
       nodeType === 'export_statement' &&
       (this.language === 'typescript' || this.language === 'tsx' ||
        this.language === 'javascript' || this.language === 'jsx') &&
-      this.looksLikeVueStoreFile()
+      this.extractDefaultExportObject(node)
     ) {
-      const exported = getChildByField(node, 'value');
-      if (exported && (exported.type === 'object' || exported.type === 'object_expression')) {
-        this.extractStoreCollectionMethods(exported);
-        skipChildren = true;
-      }
+      skipChildren = true;
     }
     // Check for function calls
     else if (this.extractor.callTypes.includes(nodeType)) {
@@ -3646,6 +3645,44 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * `export default { … }` (TS/JS), read one of two ways; true when the
+   * statement's subtree is handled here:
+   * - A Vuex MODULE in a store file (the ≥2-signal heuristic), `export default
+   *   { namespaced, actions: {…}, mutations: {…} }`: the methods of its
+   *   actions/mutations/getters collections are extracted as nodes
+   *   (extractStoreCollectionMethods). A store file's default object with
+   *   neither a collection nor a function member is skipped, as before.
+   * - Any other object with function members owns them as a named literal
+   *   does (#2300, #3393): a Vuex module split into files (`actions.js` is
+   *   `export default { fetchUser() {…} }`), an API module. It has no name of
+   *   its own, so its owner is named for the export, `default`, as
+   *   `module.exports = {…}` is named for its own (#2966): the members read
+   *   `default::fetchUser`. The owner is the statement, a constant (the export
+   *   binding is never reassigned) and the module's default export; its
+   *   members are exported with it, and the rest of the literal is walked
+   *   under it, as a module-scope declaration's is (#693). A single-file
+   *   component's script is not read so: what it default-exports is the
+   *   component, whose options the Vue extractor names (vue-options-api).
+   * Mirrored in the kernel (tsjs/extractors.rs extract_default_export_object).
+   */
+  private extractDefaultExportObject(statement: SyntaxNode): boolean {
+    const value = getChildByField(statement, 'value');
+    if (value?.type !== 'object' && value?.type !== 'object_expression') return false;
+    if (this.looksLikeVueStoreFile() && this.extractStoreCollectionMethods(value)) return true;
+    const obj = SFC_SCRIPT_HOST_FILE.test(this.filePath) ? null : this.ownedObjectValue(value);
+    if (!obj) return this.looksLikeVueStoreFile();
+    const initValue = getNodeText(obj, this.source).slice(0, 100);
+    const owner = this.createNode('constant', 'default', statement, {
+      docstring: this.docstringFor(statement),
+      signature: `= ${initValue}${initValue.length >= 100 ? '...' : ''}`,
+      isExported: true,
+    });
+    if (!owner) return this.looksLikeVueStoreFile();
+    this.extractOwnedObjectMembers(obj, owner.id, true, false);
+    return true;
+  }
+
+  /**
    * The links of an assignment target written as plain names — `dw_page` →
    * `['dw_page']`, `window.App` → `['window', 'App']`, `App.utils.dom` →
    * `['App', 'utils', 'dom']`, `module.exports` (the module's export object,
@@ -4018,8 +4055,10 @@ export class TreeSitterExtractor {
   /** Extract the methods of a store-config object's `actions`/`mutations`/`getters`
    *  properties. Used for the canonical Vuex MODULE shape `export default {
    *  namespaced, actions: {…}, mutations: {…} }` — object-literal methods aren't
-   *  otherwise extracted, so the actions/mutations would never be nodes. */
-  private extractStoreCollectionMethods(configObj: SyntaxNode): void {
+   *  otherwise extracted, so the actions/mutations would never be nodes. Returns
+   *  whether the object has such a collection. */
+  private extractStoreCollectionMethods(configObj: SyntaxNode): boolean {
+    let found = false;
     for (let j = 0; j < configObj.namedChildCount; j++) {
       const member = configObj.namedChild(j);
       if (member?.type !== 'pair') continue;
@@ -4028,8 +4067,10 @@ export class TreeSitterExtractor {
       const value = getChildByField(member, 'value');
       if (value && (value.type === 'object' || value.type === 'object_expression')) {
         this.extractObjectLiteralFunctions(value);
+        found = true;
       }
     }
+    return found;
   }
 
   /** The SETUP function of a Pinia setup store (`defineStore('id', () => {…})`)

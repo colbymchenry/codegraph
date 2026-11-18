@@ -159,6 +159,14 @@ fn is_host_global_root(name: &str) -> bool {
     matches!(name, "window" | "globalThis")
 }
 
+/// SFC_SCRIPT_HOST_FILE (tree-sitter.ts, #3393): a single-file component, whose
+/// script blocks the TS extractor reads under the component's own path. The
+/// kernel is never handed one; the check keeps the two readings the same.
+fn is_sfc_script_host(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".vue") || lower.ends_with(".svelte") || lower.ends_with(".astro")
+}
+
 /// One scope-stack entry (TS keeps node IDs; rows are our equivalent).
 struct Scope {
     row: u32,
@@ -757,14 +765,10 @@ impl<'t> Walker<'t> {
             // reference to the module), then links each re-exported name.
             self.extract_import(node);
             self.emit_re_export_refs(node);
-        } else if kind == "export_statement" && self.looks_like_vue_store_file() {
-            // Vuex MODULE default export (`export default { actions: {…} }`).
-            if let Some(exported) = node.child_by_field_name("value") {
-                if matches!(exported.kind(), "object" | "object_expression") {
-                    self.extract_store_collection_methods(exported);
-                    skip_children = true;
-                }
-            }
+        } else if kind == "export_statement" && self.extract_default_export_object(node) {
+            // `export default { … }`: a Vuex module, or any other object with
+            // function members (#3393).
+            skip_children = true;
         } else if kind == "call_expression" {
             self.extract_call(node);
         } else if kind == "new_expression" {

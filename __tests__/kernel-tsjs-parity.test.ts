@@ -165,6 +165,53 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
     }
   });
 
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('a default-exported object owns its members: %s (#3393)', (ext, language) => {
+    const source = [
+      'import { helper } from "./helper";',
+      '/** The é😀 actions. */',
+      'export default {',
+      '  fetchUser() { return helper(); },',
+      '  async save() { return this.fetchUser(); },',
+      '  close: () => helper(),',
+      '  gen: function* () { yield 1; },',
+      "  'quoted-key': function () {},",
+      '  [dyn()]() { helper(); },',
+      '  eager: helper(),',
+      '  alias: helper,',
+      '  helper,',
+      '  nested: { inner() { helper(); } },',
+      '};',
+      '',
+    ].join('\n');
+    // A store file (the Vuex vocabulary): a whole module keeps its
+    // collections' functions and gets no owner; a split one gets its owner;
+    // one with neither is left unwalked.
+    const whole = 'export default {\n  namespaced: true,\n  state: () => ({ n: helper() }),\n  actions: { inc({ commit }) { commit("INC"); } },\n  mutations: { INC(state) { state.n++; } },\n};\nfunction helper() { return 0; }\n';
+    const split = '// Vuex actions, read with getters.\nexport default {\n  async load({ commit, getters }) { commit("SET", await api.get(getters.id)); },\n};\nfunction other() {}\n';
+    const neither = '// Vuex: namespaced actions.\nimport actions from "./actions";\nexport default { namespaced: true, state: { n: count() }, actions };\nfunction count() { return 0; }\nfunction more() {}\n';
+    for (const ending of ['\n', '\r\n']) {
+      const result = assertParity(`actions.${ext}`, source.replace(/\n/g, ending), language);
+      const owner = result.nodes.find((n) => n.qualifiedName === 'default');
+      expect(owner?.kind).toBe('constant');
+      expect(owner?.isExported).toBe(true);
+      expect(owner?.docstring).toContain('actions');
+      expect(result.nodes.filter((n) => n.qualifiedName.startsWith('default::')).map((n) => `${n.name} ${n.isExported}`).sort())
+        .toEqual(['close true', 'fetchUser true', 'gen true', 'quoted-key true', 'save true']);
+      expect(result.nodes.some((n) => n.name === 'inner')).toBe(false);
+
+      const wholeResult = assertParity(`module.${ext}`, whole.replace(/\n/g, ending), language);
+      expect(wholeResult.nodes.map((n) => n.qualifiedName)).toEqual(expect.arrayContaining(['inc', 'INC']));
+      expect(wholeResult.nodes.some((n) => n.qualifiedName === 'default' || n.name === 'state')).toBe(false);
+      const splitResult = assertParity(`split.${ext}`, split.replace(/\n/g, ending), language);
+      expect(splitResult.nodes.map((n) => n.qualifiedName)).toEqual(expect.arrayContaining(['default', 'default::load']));
+      const neitherResult = assertParity(`index.${ext}`, neither.replace(/\n/g, ending), language);
+      expect(neitherResult.nodes.some((n) => n.qualifiedName === 'default')).toBe(false);
+      expect(neitherResult.unresolvedReferences.some((r) => r.referenceName === 'count')).toBe(false);
+    }
+  });
+
   it.each([['ts', 'typescript'], ['tsx', 'tsx']] as const)('an awaited call with type arguments names its callee: %s (#2586)', (ext, language) => {
     const source = [
       'export async function a() { return await fetchApi<User>("/me"); }',

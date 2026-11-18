@@ -385,11 +385,23 @@ export function reopenReferencesThroughObjectMembers(
       if (!members) continue;
       declaredAs ??= importedNames(reader.mappings(file.path, file.language));
       const names = new Map<string, Set<string>>();
+      const bind = (filePath: string, name: string): void => {
+        const set = names.get(filePath) ?? new Set<string>();
+        set.add(name);
+        names.set(filePath, set);
+      };
       for (const i of queries.getImportsInto(holder.id, holder.filePath)) {
         if (i.refName === null || !BARREL_LANGUAGES.has(i.language)) continue;
-        const set = names.get(i.filePath) ?? new Set<string>();
-        set.add(i.refName);
-        names.set(i.filePath, set);
+        bind(i.filePath, i.refName);
+      }
+      // The object a module default-exports (#3393), `export default { … }`:
+      // a default import binds it, and its binding links the module's file.
+      if (holder.kind === 'constant' && holder.qualifiedName === 'default') {
+        for (const i of queries.getImportsInto(`file:${holder.filePath}`, holder.filePath)) {
+          if (i.refName === null || !BARREL_LANGUAGES.has(i.language)) continue;
+          const name = i.refName;
+          if (reader.mappings(i.filePath, i.language).some((m) => m.isDefault && m.localName === name)) bind(i.filePath, name);
+        }
       }
       for (const [importer, bound] of names) {
         for (const e of queries.getResolutionEdgesThrough(importer, [...bound])) {
