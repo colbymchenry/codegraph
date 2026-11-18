@@ -2187,6 +2187,64 @@ describe('Installer — refreshTargets sweep (codegraph install --refresh)', () 
       expect(r.changedPaths).toEqual([]);
     }
   });
+
+  // `codegraph upgrade` runs this sweep, for both locations, in whatever folder
+  // the terminal is in, and a new terminal starts in the home folder. There an
+  // agent's project file is its user-wide one (`./.cursor/mcp.json` is
+  // `~/.cursor/mcp.json`, `./.codex/config.toml` is `~/.codex/config.toml`), so
+  // the local half took every global install for a project's and rewrote it as
+  // one: Cursor's server was pinned to the home folder, and `~/AGENTS.md`,
+  // `~/GEMINI.md` and `~/QWEN.md` appeared (#3234).
+  it('a local sweep from the home folder leaves every agent\'s user-wide setup as it was (#3234)', () => {
+    for (const t of ALL_TARGETS) {
+      if (t.supportsLocation('global')) t.install('global', { autoAllow: true });
+    }
+    const snapshot = (root: string): Map<string, string> => {
+      const files = new Map<string, string>();
+      const walk = (dir: string): void => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) walk(full);
+          else files.set(path.relative(root, full), fs.readFileSync(full, 'utf-8'));
+        }
+      };
+      walk(root);
+      return files;
+    };
+    const before = snapshot(tmpHome);
+    // Every agent the global sweep can see, so none of them is skipped for
+    // want of a configuration.
+    expect(before.size).toBeGreaterThan(ALL_TARGETS.length);
+
+    process.chdir(tmpHome);
+    for (const r of refreshTargets(ALL_TARGETS, 'local')) {
+      expect(['not-configured', 'unsupported'], r.id).toContain(r.status);
+      expect(r.changedPaths, r.id).toEqual([]);
+    }
+
+    expect(snapshot(tmpHome)).toEqual(before);
+    for (const file of ['AGENTS.md', 'GEMINI.md', 'QWEN.md', 'CLAUDE.md']) {
+      expect(fs.existsSync(path.join(tmpHome, file)), file).toBe(false);
+    }
+    const cursor = JSON.parse(fs.readFileSync(path.join(tmpHome, '.cursor', 'mcp.json'), 'utf-8'));
+    expect(cursor.mcpServers.codegraph.args).toContain('${workspaceFolder}');
+    // The global half of the same sweep still sees every install.
+    for (const r of refreshTargets(ALL_TARGETS, 'global')) {
+      expect(['unchanged', 'refreshed', 'unsupported'], r.id).toContain(r.status);
+    }
+  });
+
+  it('a local sweep inside a project still refreshes what a local install wrote there', () => {
+    const codex = getTarget('codex')!;
+    codex.install('local', { autoAllow: false });
+    const agentsMd = path.join(tmpCwd, 'AGENTS.md');
+    fs.writeFileSync(agentsMd, LEGACY_BLOCK + '\n');
+
+    const report = refreshTargets([codex], 'local')[0]!;
+    expect(report.status).toBe('refreshed');
+    expect(report.changedPaths).toContain(agentsMd);
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toContain('codegraph_explore');
+  });
 });
 
 // ---------------------------------------------------------------------------
