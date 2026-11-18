@@ -152,6 +152,10 @@ pub struct Walker<'t> {
     fs_values: HashMap<String, u32>,
     fs_value_counts: HashMap<String, u32>,
     value_scopes: Vec<ValueScope<'t>>,
+    /// The file's root: phpShadowsDirname reads the whole file.
+    root: Node<'t>,
+    /// phpShadowsDirname's per-file memo (#3298).
+    dirname_shadowed: Option<bool>,
 }
 
 pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
@@ -166,6 +170,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         return Err("defer: parse tree contains errors — wasm recovery is canonical".to_string());
     }
 
+    let root = tree.root_node();
     let mut w = Walker {
         src: source,
         file_path,
@@ -181,6 +186,8 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         fs_values: HashMap::new(),
         fs_value_counts: HashMap::new(),
         value_scopes: Vec::new(),
+        root,
+        dirname_shadowed: None,
     };
 
     let line_count = source.bytes().filter(|b| *b == b'\n').count() as u32 + 1;
@@ -216,7 +223,6 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
     // declaration_list child) make NO node and scope NOTHING. The node stays
     // pushed for the whole walk — QNs become `App\Services::Name` and import
     // nodes/refs hang off it.
-    let root = tree.root_node();
     let mut pkg_pushed = false;
     for i in 0..root.named_child_count() {
         let Some(child) = root.named_child(i) else { continue };
@@ -887,30 +893,11 @@ impl<'t> Walker<'t> {
             "include_expression" | "include_once_expression" | "require_expression"
                 | "require_once_expression"
         ) {
-            // phpStaticIncludePath: static string literals only; dynamic
-            // forms (`__DIR__ . '/x'`, interpolation) emit NOTHING.
-            let mut arg = node.named_child(0);
-            if let Some(a) = arg {
-                if a.kind() == "parenthesized_expression" {
-                    arg = a.named_child(0);
-                }
-            }
-            let Some(arg) = arg else { return };
-            if !matches!(arg.kind(), "string" | "encapsed_string") {
-                return;
-            }
-            let mut content: Option<Node> = None;
-            for i in 0..arg.named_child_count() {
-                let Some(c) = arg.named_child(i) else { continue };
-                if c.kind() != "string_content" {
-                    return; // interpolation/escape → not a static path
-                }
-                if content.is_none() {
-                    content = Some(c);
-                }
-            }
-            let Some(content) = content else { return };
-            let module_name = self.text(content).to_string();
+            // phpStaticIncludePath: a string literal, or literals appended to
+            // the file's own directory (#3298); every other dynamic form
+            // (`$_SERVER['DOCUMENT_ROOT'] . '/x'`, `$var`, interpolation)
+            // emits NOTHING.
+            let Some(module_name) = self.php_static_include_path(node) else { return };
             if module_name.is_empty() {
                 return;
             }
@@ -1002,6 +989,142 @@ impl<'t> Walker<'t> {
         // emitPhpUseRefs → the `Foo\Bar::Baz` ref (bare single-segment `use
         // Countable;` has no `\` → no `::` ref).
         self.push_php_use_ref(&module_name, parent, node);
+    }
+
+    /// phpStaticIncludePath (languages/php.ts): the path argument is
+    /// namedChild(0), one `parenthesized_expression` unwrapped. A
+    /// `binary_expression` reads as a path from the file's own directory
+    /// (#3298), anything else as a pure string literal.
+    fn php_static_include_path(&mut self, node: Node<'t>) -> Option<String> {
+        let mut arg = node.named_child(0)?;
+        if arg.kind() == "parenthesized_expression" {
+            arg = arg.named_child(0)?;
+        }
+        if arg.kind() == "binary_expression" {
+            return self.php_directory_include_path(arg);
+        }
+        self.php_literal_text(arg).map(str::to_string)
+    }
+
+    /// phpLiteralText: a `string` / `encapsed_string` whose named children
+    /// are all `string_content` (any interpolation or escape → None); the
+    /// first one's text.
+    fn php_literal_text(&self, arg: Node) -> Option<&'t str> {
+        if !matches!(arg.kind(), "string" | "encapsed_string") {
+            return None;
+        }
+        let mut content: Option<Node> = None;
+        for i in 0..arg.named_child_count() {
+            let Some(c) = arg.named_child(i) else { continue };
+            if c.kind() != "string_content" {
+                return None;
+            }
+            if content.is_none() {
+                content = Some(c);
+            }
+        }
+        content.map(|c| self.text(c))
+    }
+
+    /// phpDirectoryIncludePath (#3298): `__DIR__ . '/inc/a.php'`,
+    /// `dirname(__FILE__) . DIRECTORY_SEPARATOR . 'a.php'` — string literals
+    /// (and `DIRECTORY_SEPARATOR`, read as `/`) appended to the including
+    /// file's directory, written relative to it (`./inc/a.php`,
+    /// `../config/a.php`). The appended text starts with `/` and doesn't end
+    /// with one, and no segment of the result is empty. None when an
+    /// unqualified `dirname` reaches one the file declares or imports.
+    fn php_directory_include_path(&mut self, expr: Node<'t>) -> Option<String> {
+        let parts = php_concat_parts(expr, self.src)?;
+        let (head, tail) = parts.split_first()?;
+        if tail.is_empty() {
+            return None;
+        }
+        let head_text = self.text(*head);
+        let squeezed: String = head_text.chars().filter(|c| !is_js_space(*c)).collect();
+        let dir = php_own_directory_re().captures(&squeezed)?;
+        let dirname_arg = dir.get(1).map(|m| m.as_str());
+        let qualified = head_text.trim_start_matches(is_js_space).starts_with('\\');
+        if dirname_arg.is_some() && !qualified && self.php_shadows_dirname() {
+            return None;
+        }
+        let mut rest = String::new();
+        for part in tail {
+            if let Some(literal) = self.php_literal_text(*part) {
+                rest.push_str(literal);
+                continue;
+            }
+            let text = self.text(*part);
+            if text.strip_prefix('\\').unwrap_or(text) == "DIRECTORY_SEPARATOR" {
+                rest.push('/');
+            } else {
+                return None;
+            }
+        }
+        if !rest.starts_with('/') || rest.ends_with('/') {
+            return None;
+        }
+        // `__DIR__` and `dirname(__FILE__)` are the file's directory;
+        // `dirname(__DIR__)` is one up; a levels argument climbs that many
+        // from `__FILE__` (one more from `__DIR__`). A levels number past u64
+        // is past the cap as well (JS: a huge Number > 16).
+        let levels: u64 = match dirname_arg {
+            None => 1,
+            Some(arg) => {
+                let n: u64 = match dir.get(2) {
+                    Some(m) => m.as_str().parse().ok()?,
+                    None => 1,
+                };
+                n.saturating_add(u64::from(arg.eq_ignore_ascii_case("__DIR__")))
+            }
+        };
+        if levels > 16 {
+            return None;
+        }
+        let mut relative = if levels == 1 { "./".to_string() } else { "../".repeat(levels as usize - 1) };
+        relative.push_str(&rest[1..]);
+        let whole_segments = relative.split('/').skip(1).all(|seg| !seg.is_empty());
+        whole_segments.then_some(relative)
+    }
+
+    /// phpShadowsDirname (#3298): whether an unqualified `dirname(...)` in
+    /// this file reaches a function other than PHP's — one a `use function`
+    /// imports under that name, or one the file declares when it has a
+    /// namespace. Read once per file, from every node of the tree
+    /// (descendantsOfType: named and anonymous, document order).
+    fn php_shadows_dirname(&mut self) -> bool {
+        if let Some(shadowed) = self.dirname_shadowed {
+            return shadowed;
+        }
+        let mut uses: Vec<Node<'t>> = Vec::new();
+        let mut functions: Vec<Node<'t>> = Vec::new();
+        let mut has_namespace = false;
+        let mut cursor = self.root.walk();
+        'walk: loop {
+            let n = cursor.node();
+            match n.kind() {
+                "namespace_use_declaration" => uses.push(n),
+                "namespace_definition" => has_namespace = true,
+                "function_definition" => functions.push(n),
+                _ => {}
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    break 'walk;
+                }
+            }
+        }
+        let mut shadowed = uses.iter().any(|u| php_use_shadows_dirname(self.text(*u)));
+        if !shadowed && has_namespace {
+            shadowed = functions.iter().any(|f| {
+                f.child_by_field_name("name")
+                    .is_some_and(|name| self.text(name).to_lowercase() == "dirname")
+            });
+        }
+        self.dirname_shadowed = Some(shadowed);
+        shadowed
     }
 
     // --- calls ---------------------------------------------------------------------
@@ -1502,6 +1625,138 @@ fn php_enclosing_call_name(node: Node) -> Option<Node> {
         cur = c.parent();
     }
     None
+}
+
+/// JS `\s` (WhiteSpace ∪ LineTerminator): unlike Rust's
+/// `char::is_whitespace`, U+FEFF yes and U+0085 no.
+fn is_js_space(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\x0B' | '\x0C' | '\r' | ' ' | '\u{00A0}' | '\u{1680}'
+            | '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}'
+            | '\u{3000}' | '\u{FEFF}'
+    )
+}
+
+/// PHP_OWN_DIRECTORY (languages/php.ts), matched on the head's text with JS
+/// whitespace removed: `__DIR__`, `dirname(__FILE__)`, `\dirname(__DIR__)`,
+/// `dirname(__FILE__, 2)`. A levels argument is a plain decimal of at least 1
+/// (`0` throws in PHP, `010` is octal), and a trailing comma is allowed.
+/// ASCII case-insensitive, as JS `/i` without `u` is.
+fn php_own_directory_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i-u)^(?:__DIR__|\\?dirname\((__FILE__|__DIR__)(?:,([1-9][0-9]*))?,?\))$")
+            .unwrap()
+    })
+}
+
+/// `/\s+as\s+/i`, the alias split of a `use` clause. The text is collapsed
+/// to single spaces first, so ASCII `\s` reads it the same; ASCII
+/// case-insensitive, as JS `/i` without `u` is.
+fn php_use_alias_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i-u)\s+as\s+").unwrap())
+}
+
+/// `s` without its prefix `p` when `s` starts with `p` in any ASCII letter
+/// case (JS `/^p/i`).
+fn strip_prefix_ascii_ci<'a>(s: &'a str, p: &str) -> Option<&'a str> {
+    s.get(..p.len()).filter(|head| head.eq_ignore_ascii_case(p)).map(|_| &s[p.len()..])
+}
+
+/// phpConcatParts (languages/php.ts): the parts of a `.` concatenation, left
+/// to right — `__DIR__ . '/inc/' . 'a.php'` is a left-nested tree of binary
+/// expressions — or None when a link of its left spine lacks a side or
+/// isn't a `.`. Walked iteratively.
+fn php_concat_parts<'a>(expr: Node<'a>, src: &str) -> Option<Vec<Node<'a>>> {
+    let mut parts: Vec<Node<'a>> = Vec::new();
+    let mut cur = expr;
+    loop {
+        let left = cur.child_by_field_name("left")?;
+        let right = cur.child_by_field_name("right")?;
+        if cur.child_by_field_name("operator").is_some_and(|op| &src[op.byte_range()] != ".") {
+            return None;
+        }
+        parts.push(right);
+        if left.kind() != "binary_expression" {
+            parts.push(left);
+            break;
+        }
+        cur = left;
+    }
+    parts.reverse();
+    Some(parts)
+}
+
+/// One `namespace_use_declaration`'s part of phpShadowsDirname (#3298): its
+/// text with JS whitespace runs collapsed to one space, the space beside
+/// `\ { } ,` dropped, and trimmed. `use function A\b, C\d;` imports each
+/// listed function, a group `use A\{B, function c}` each `function` clause.
+/// True when one lands on the local name `dirname` (any letter case) from a
+/// name other than the global `dirname`: `Foo\dirname`, not `dirname` or
+/// `Foo\dirname as dn`.
+fn php_use_shadows_dirname(raw: &str) -> bool {
+    // .replace(/\s+/g, ' ')
+    let mut collapsed: Vec<char> = Vec::with_capacity(raw.len());
+    for c in raw.chars() {
+        if !is_js_space(c) {
+            collapsed.push(c);
+        } else if collapsed.last() != Some(&' ') {
+            collapsed.push(' ');
+        }
+    }
+    // .replace(/\s*([\\{},])\s*/g, '$1'): with single spaces, each space
+    // beside one of those characters goes.
+    let special = |c: char| matches!(c, '\\' | '{' | '}' | ',');
+    let mut text = String::with_capacity(raw.len());
+    for (i, &c) in collapsed.iter().enumerate() {
+        let beside = (i > 0 && special(collapsed[i - 1]))
+            || collapsed.get(i + 1).is_some_and(|&next| special(next));
+        if c == ' ' && beside {
+            continue;
+        }
+        text.push(c);
+    }
+    // .trim() (only `' '` is left), then /^use (function )?(.*?);?$/i.
+    let Some(rest) = strip_prefix_ascii_ci(text.trim_matches(' '), "use ") else { return false };
+    let (all_functions, rest) = match strip_prefix_ascii_ci(rest, "function ") {
+        Some(after) => (true, after),
+        None => (false, rest),
+    };
+    let names = rest.strip_suffix(';').unwrap_or(rest);
+    // /^([\w\\]*)\{(.*)\}$/ (JS ASCII `\w`) on the trimmed names.
+    let trimmed = names.trim_matches(is_js_space);
+    let head_len = trimmed
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'\\')
+        .count();
+    let group = trimmed[head_len..]
+        .strip_prefix('{')
+        .and_then(|body| body.strip_suffix('}'))
+        .map(|body| (&trimmed[..head_len], body));
+    if !all_functions && group.is_none() {
+        return false;
+    }
+    let prefix = group.map_or("", |(head, _)| head.strip_suffix('\\').unwrap_or(head));
+    let list = group.map_or(names, |(_, body)| body);
+    for raw_clause in list.split(',') {
+        let function_clause = strip_prefix_ascii_ci(raw_clause.trim_matches(is_js_space), "function ");
+        if !all_functions && function_clause.is_none() {
+            continue;
+        }
+        let clause = function_clause.unwrap_or(raw_clause).trim_matches(is_js_space);
+        let mut pieces = php_use_alias_re().split(clause);
+        let name = pieces.next().unwrap_or("");
+        let alias = pieces.next();
+        let joined = if prefix.is_empty() { name.to_string() } else { format!("{prefix}\\{name}") };
+        let fqn = joined.strip_prefix('\\').unwrap_or(&joined);
+        let local = alias.unwrap_or_else(|| fqn.rsplit('\\').next().unwrap_or(fqn));
+        if local.to_lowercase() == "dirname" && fqn.to_lowercase() != "dirname" {
+            return true;
+        }
+    }
+    false
 }
 
 fn find_anonymous_class_body(node: Node) -> Option<Node> {
