@@ -27,6 +27,7 @@ import { isJsThisCall } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isRefusedDeepThisTarget } from './name-matcher';
+import { isLexicalBindingOfJsThisCall } from './name-matcher';
 import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
@@ -4470,6 +4471,10 @@ export class ReferenceResolver {
       // through its package; as a struct here it read as an instantiation.
       if (target && ref.language === 'go' && GO_TYPE_KINDS.has(target.kind) &&
           !ref.referenceName.includes('.') && !isGoBareName(ref, this.context)) return null;
+      // A JS/TS call written on `this` reads a property of the object: a
+      // `const`/`let`/`var` or a `function` declaration is a lexical binding,
+      // never what `this.cast()` names (see isLexicalBindingOfJsThisCall).
+      if (target && isLexicalBindingOfJsThisCall(target, ref, this.context)) return null;
     }
 
     // A TypeScript interface or type alias is no value: nothing calls one or
