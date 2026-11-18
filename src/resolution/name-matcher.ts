@@ -24128,21 +24128,31 @@ function inheritedClassMethod(classes: Node[], name: string, context: Resolution
 
 const FILE_METHODS = new WeakMap<ResolutionContext, Map<string, Map<string, Node[]>>>();
 
-/** A file's methods named `name`. The walk up a class's supertypes asks this of each one, for each method name. */
+/**
+ * A file's methods named `name`. The walk up a class's supertypes asks this of
+ * each one, for each method name. A PHP method's name ignores case (#3297), so
+ * a PHP file answers with every spelling of it (findOwnMethod prefers the
+ * exact one).
+ */
 function fileMethodsNamed(file: string, name: string, context: ResolutionContext): Node[] {
   let files = FILE_METHODS.get(context);
   if (!files) FILE_METHODS.set(context, (files = new Map()));
   let methods = files.get(file);
   if (!methods) {
     files.set(file, (methods = new Map()));
+    const add = (key: string, n: Node): void => {
+      const named = methods!.get(key);
+      if (named) named.push(n);
+      else methods!.set(key, [n]);
+    };
     for (const n of context.getNodesInFile(file)) {
       if (n.kind !== 'method') continue;
-      const named = methods.get(n.name);
-      if (named) named.push(n);
-      else methods.set(n.name, [n]);
+      add(n.name, n);
+      // Keyed apart from any real name: `\0` starts no identifier.
+      if (n.language === 'php') add(`\0${n.name.toLowerCase()}`, n);
     }
   }
-  return methods.get(name) ?? [];
+  return methods.get(`\0${name.toLowerCase()}`) ?? methods.get(name) ?? [];
 }
 
 function findInheritedClassMethod(classes: Node[], name: string, context: ResolutionContext, kind?: RubyMethodKind): Node | null {
@@ -33626,10 +33636,21 @@ function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string,
   const methods = rubyMethodsOfKindFirst(nodesInFile.filter((n) => n.kind === 'method' && n.name === methodName), kind);
   const exact = `${classNode.qualifiedName}::${methodName}`;
   const byName = `${classNode.name}::${methodName}`;
-  return (
+  const found =
     methods.find((n) => n.qualifiedName === exact) ??
-    methods.find((n) => n.qualifiedName === byName || n.qualifiedName.endsWith(`::${byName}`))
-  );
+    methods.find((n) => n.qualifiedName === byName || n.qualifiedName.endsWith(`::${byName}`));
+  if (found || classNode.language !== 'php') return found;
+  // PHP reads a method name without regard to case (#3297): `$c->GetRate()`
+  // calls `getRate()`. Try each spelling the file declares for it.
+  const lower = methodName.toLowerCase();
+  const spellings = new Set(nodesInFile
+    .filter((n) => n.kind === 'method' && n.language === 'php' && n.name !== methodName && n.name.toLowerCase() === lower)
+    .map((n) => n.name));
+  for (const declared of spellings) {
+    const own = findOwnMethod(nodesInFile, classNode, declared, kind);
+    if (own) return own;
+  }
+  return undefined;
 }
 
 /**
