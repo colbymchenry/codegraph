@@ -28,6 +28,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In JavaScript and TypeScript, a call inside a spread, like `<input {...register('email')} />` with `register` taken from `useForm()`, no longer links to an unrelated project function that shares the name. Thanks @inth3shadows for the report. (#2962)
 - In JavaScript and TypeScript, a module namespace that another module hands on by name, like zod's `import { z } from 'zod'` of `import * as z from './external'; export { z }`, or `export * as ns from './schemas'`, now leads `z.string()` to what that module exports, as `import * as z` does, instead of a same-named method elsewhere. Thanks @inth3shadows for the report. (#2951)
 - In JavaScript and TypeScript, an import through a barrel of several `export *` lines now links to the module that exports the name itself, whichever line comes first, instead of a same-named method of an object another module exports. Thanks @inth3shadows for the report. (#3233)
+- In JavaScript and TypeScript, a method called on a variable that a library call fills in, like `const root = createRoot(el)` from react-dom, `net.createServer()` or `canvas.getContext('2d')`, no longer links to the one project method that happens to share its name. Thanks @inth3shadows for the report. (#2947)
+- In TypeScript, a method called on a variable a class's static factory fills in, like `const writer = DatabaseConnection.initialize(path)`, now links to the method of the class the factory says it returns, instead of a class guessed from the variable's name. Thanks @inth3shadows for the report. (#2946)
+- In TypeScript, a call through an interface's function-typed property, like `matcher.snapshot()`, no longer links to an unrelated class's method of the same name; a class that implements the interface, or builds it, is still linked. Thanks @inth3shadows for the report. (#3035)
 
 ## [1.6.3] - 2026-11-17
 
