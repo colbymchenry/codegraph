@@ -88,17 +88,15 @@ fn main() {
     println!("cargo:rerun-if-changed=grammars/dart");
 
     // Swift grammar — vendored C (fifth vendored-grammar-C language): the
-    // crates.io tree-sitter-swift 0.7.3 tarball's src/, the same sources the
-    // vendored wasm is built from (swift checklist §Grammar prep), with
-    // docs/grammars/tree-sitter-swift.patch applied to scanner.c. The crate's
-    // scanner builds `1UL << FAKE_TRY_BANG` (bit 32) into a constant table;
-    // where `unsigned long` is 32 bits that overflows — MSVC folds it to 0,
-    // so the Windows kernels read the `!` of every `try!` as a logical not
-    // and `try! Foo()` called `!Foo`. Upstream 0.7.4 writes `1ULL`; a bump to
-    // a fixed release can return to the crate (and the wasm moves with it).
-    //   parser.c  d3edff6effe31b9a507f496577407987343b101b23eb7bee7a9b050e8ab5d27a
-    //   scanner.c f3d6271d64f58c39eed544104a70ca2cf9ecbf80c5d900620f1afd38836542cb
-    //   scanner.c 8acafef098ea4a52ebfc4cdf2fe26706113a22ac8ba2faf7d952755ff350cad6 (patched)
+    // crates.io tree-sitter-swift 0.7.4 tarball's src/ (#3212), the same
+    // sources the vendored wasm is built from (swift checklist §Grammar prep),
+    // with docs/grammars/tree-sitter-swift.patch applied to scanner.c: its
+    // out-of-memory report uses stdio, which a wasm parser lacks, and both
+    // are built from one scanner. (0.7.4 also carries the `1ULL <<
+    // FAKE_TRY_BANG` fix the previous patch added for MSVC's `try!`.)
+    //   parser.c  1d332e60ec28e6b398db36e06bf05414061dfbbd3e981b33ff1edfd5159e3e08
+    //   scanner.c b0abca0bb8d9e34da210ef0fac14f67c4fb40cb2625c4e51bd42ea80ac59d1b1
+    //   scanner.c 2b78cad2a49da126388acfa67fdac585226f89cd2feaf4326e98289bc253bf87 (patched)
     // Flags crib the tarball's own bindings/rust/build.rs (c11). parser.c is
     // ~20 MB.
     let mut swift = cc::Build::new();

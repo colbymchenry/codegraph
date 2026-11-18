@@ -462,7 +462,7 @@ const LITERAL_RECEIVER_TYPES = new Set([
   // chars / runes / regex / booleans / null-likes
   'char_literal', 'character_literal', 'rune_literal', 'regex', 'regex_literal',
   'true', 'false', 'boolean_literal', 'bool_literal', 'none', 'null', 'nil',
-  'null_literal', 'undefined',
+  'nil_literal', 'null_literal', 'undefined',
   // collection literals
   'list', 'list_literal', 'array', 'array_literal', 'array_creation_expression',
   'dictionary', 'dict_literal', 'object', 'tuple', 'set',
@@ -531,13 +531,13 @@ function goBuiltinNamedType(call: SyntaxNode, source: string): string | null {
  * Swift wrappers that leave a call's target the same. tree-sitter-swift binds
  * a prefix operator to the leftmost operand, so `!isReady()` parses as
  * `(!isReady)()` and `!store.contains(x)` as `(!store).contains(x)`; and
- * `try`/`await` before a chain bind to the part before its last call, so
- * `try! A().b()` parses as `(try! A()).b()`. An implicit member's leading `.`
- * (`.success(x)`) is part of the name, not a wrapper. Mirrored in the kernel's
- * swift.rs.
+ * `try`/`await` (and Swift 6.2's `unsafe`) before a chain bind to the part
+ * before its last call, so `try! A().b()` parses as `(try! A()).b()`. An
+ * implicit member's leading `.` (`.success(x)`) is part of the name, not a
+ * wrapper. Mirrored in the kernel's swift.rs.
  */
 function isSwiftCallWrapper(node: SyntaxNode, source: string): boolean {
-  if (node.type === 'try_expression' || node.type === 'await_expression') return true;
+  if (node.type === 'try_expression' || node.type === 'await_expression' || node.type === 'unsafe_expression') return true;
   return node.type === 'prefix_expression' && !getNodeText(node, source).startsWith('.');
 }
 
