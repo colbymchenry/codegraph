@@ -51,6 +51,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { isTestPath } from '../search/query-utils';
 import { HOLE, readStringAt } from './frameworks/expo-router';
 import { enclosingFn, enclosingValue, makeLineAt } from './synth-utils';
+import { sameLanguageFamily } from './name-matcher';
 
 const JS_FILE = /\.(?:[cm]?[jt]sx?)$/;
 
@@ -1190,9 +1191,21 @@ export async function testRequestEdges(ctx: ResolutionContext, onYield: MaybeYie
   }
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  // A suite's request is served by the program it tests: a Java or Kotlin
+  // test's MockMvc call by the JVM app's routes, a Laravel test's by PHP's.
+  // A route in another language that also matches the path (a TypeScript
+  // server's catch-all `GET /*`, say) is a different program, and an edge to
+  // it made `codegraph affected` select that suite for a change to the web
+  // app's code (#3320).
+  const routesFor = new Map<string, HttpRoute[]>();
+  const ownRoutes = (language: string): HttpRoute[] => {
+    let own = routesFor.get(language);
+    if (!own) routesFor.set(language, (own = routes.filter((r) => sameLanguageFamily(r.node.language, language))));
+    return own;
+  };
   for (const site of sites) {
     const route = matchHttp({ fn: site.from, file: site.from.filePath, line: site.line, column: site.column, callee: site.callee,
-      method: site.method, segs: site.segs, suffix: false, display: site.display }, routes);
+      method: site.method, segs: site.segs, suffix: false, display: site.display }, ownRoutes(site.from.language));
     if (!route) continue;
     const key = `${site.from.id}>${route.node.id}`;
     if (seen.has(key)) continue;
