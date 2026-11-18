@@ -14,7 +14,6 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
-import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -28,13 +27,14 @@ import { getDaemonSocketCandidates } from '../src/mcp/daemon-paths';
 import { CodeGraphPackageVersion } from '../src/mcp/version';
 import { getTelemetry } from '../src/telemetry';
 import { exploreViaDaemon } from '../src/mcp/hook-client';
+import { startFakeDaemon, type FakeRequest } from './fake-daemon';
 
-const cleanups: Array<() => void> = [];
-afterEach(() => {
+const cleanups: Array<() => void | Promise<void>> = [];
+afterEach(async () => {
   vi.restoreAllMocks();
   __setLoadCodeGraphForTests(null);
   while (cleanups.length) {
-    try { cleanups.pop()!(); } catch { /* best-effort */ }
+    try { await cleanups.pop()!(); } catch { /* best-effort */ }
   }
 });
 
@@ -78,43 +78,18 @@ function fakeTransport(): JsonRpcTransport & {
   };
 }
 
-type Reply = (request: { id: number; method: string; params?: { query?: string } }) => unknown | undefined;
+type Reply = (request: FakeRequest) => unknown | undefined;
 
 /**
- * A daemon stand-in on the socket the client looks for: says hello as
- * `version`, then answers each request with what `reply` returns, or stays
- * silent when it returns undefined. Records the requests it was sent.
+ * A daemon stand-in on the socket (a named pipe on Windows) the client looks
+ * for: says hello as `version`, proves it runs as this user, then answers each
+ * request with what `reply` returns, or stays silent when it returns
+ * undefined. Records the requests it was sent. See `./fake-daemon`.
  */
 async function fakeDaemon(root: string, version: string, reply: Reply): Promise<Array<{ method: string; params?: { query?: string } }>> {
-  const sockPath = getDaemonSocketCandidates(root)[0]!;
-  fs.mkdirSync(path.dirname(sockPath), { recursive: true });
-  const seen: Array<{ method: string; params?: { query?: string } }> = [];
-  const sockets = new Set<net.Socket>();
-  const server = net.createServer((socket) => {
-    sockets.add(socket);
-    socket.on('error', () => { /* a client that hung up */ });
-    socket.write(JSON.stringify({ codegraph: version, pid: process.pid, socketPath: sockPath, protocol: 1 }) + '\n');
-    let buffer = '';
-    socket.on('data', (chunk) => {
-      buffer += chunk.toString('utf8');
-      let newline: number;
-      while ((newline = buffer.indexOf('\n')) !== -1) {
-        const message = JSON.parse(buffer.slice(0, newline));
-        buffer = buffer.slice(newline + 1);
-        if (message.codegraph_client) continue; // the client hello, not a request
-        seen.push({ method: message.method, params: message.params });
-        const body = reply(message);
-        if (body !== undefined) socket.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, ...(body as object) }) + '\n');
-      }
-    });
-  });
-  await new Promise<void>((resolve) => server.listen(sockPath, resolve));
-  cleanups.push(() => {
-    for (const socket of sockets) socket.destroy();
-    server.close();
-    fs.rmSync(sockPath, { force: true });
-  });
-  return seen;
+  const daemon = await startFakeDaemon(root, { version, reply });
+  cleanups.push(() => daemon.close());
+  return daemon.requests;
 }
 
 const answer = (text: string): Reply => () => ({ result: { content: [{ type: 'text', text }] } });
@@ -162,7 +137,7 @@ describe('the daemon answers a prompt hook explore (#3284)', () => {
   });
 });
 
-describe.runIf(process.platform !== 'win32')('exploreViaDaemon — the hook asking a running daemon (#3284)', () => {
+describe('exploreViaDaemon — the hook asking a running daemon (#3284)', () => {
   it('returns what the daemon answered, having asked with the prompt as the query', async () => {
     const root = await indexedProject();
     const seen = await fakeDaemon(root, CodeGraphPackageVersion, answer('FROM THE DAEMON'));
@@ -216,7 +191,11 @@ describe.runIf(process.platform !== 'win32')('exploreViaDaemon — the hook aski
     await expect(exploreViaDaemon(root, 'how does placeOrder work', 300)).resolves.toEqual({ status: 'timed-out' });
     expect(Date.now() - started).toBeLessThan(2_000);
   });
+});
 
+// Socket owners, links and folder modes: on Windows a named pipe has none of
+// these, and the daemon's proof is the whole check (see daemon-proof.test.ts).
+describe.runIf(process.platform !== 'win32')('exploreViaDaemon — the sockets the hook trusts on macOS and Linux (#3284)', () => {
   // One socket candidate is in the system temp directory, which other users
   // of the machine can write to on Linux. Whoever puts a socket there first
   // would read every prompt and write into the agent's context.
@@ -295,14 +274,24 @@ function runPromptHook(dir: string, prompt: string, env: NodeJS.ProcessEnv = {})
 
 /**
  * `spawnSync` blocks this thread, so a fake daemon inside the test process
- * could never answer the hook. This one runs as its own process.
+ * could never answer the hook. This one runs as its own process, on the
+ * socket (a named pipe on Windows) the hook looks for. It proves it runs as
+ * this user with the built proof module, under the same sandboxed home the
+ * hook reads the key from, unless `proof` is `none`; then it answers each
+ * request (`answer`), answers busy (`busy`), or stays silent (`silent`).
  */
-function spawnFakeDaemon(root: string, mode: 'answer' | 'silent'): void {
+function spawnFakeDaemon(root: string, mode: 'answer' | 'silent' | 'busy', proof: 'valid' | 'none' = 'valid'): void {
   const sockPath = getDaemonSocketCandidates(root)[0]!;
-  fs.mkdirSync(path.dirname(sockPath), { recursive: true });
+  if (process.platform !== 'win32') fs.mkdirSync(path.dirname(sockPath), { recursive: true });
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fakedaemon-'));
+  cleanups.push(() => fs.rmSync(markerDir, { recursive: true, force: true }));
+  const ready = path.join(markerDir, 'listening');
+  const proofModule = path.resolve(__dirname, '../dist/mcp/daemon-proof.js');
   const script = `
+    const fs = require('fs');
     const net = require('net');
-    const [sockPath, version, mode] = process.argv.slice(1);
+    const [sockPath, version, mode, proof, ready, proofModule] = process.argv.slice(1);
+    const { daemonKey, daemonProof } = require(proofModule);
     net.createServer((socket) => {
       socket.on('error', () => {});
       socket.write(JSON.stringify({ codegraph: version, pid: process.pid, socketPath: sockPath, protocol: 1 }) + '\\n');
@@ -313,22 +302,33 @@ function spawnFakeDaemon(root: string, mode: 'answer' | 'silent'): void {
         while ((newline = buffer.indexOf('\\n')) !== -1) {
           const message = JSON.parse(buffer.slice(0, newline));
           buffer = buffer.slice(newline + 1);
-          if (message.codegraph_client || mode === 'silent') continue;
-          socket.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'FROM THE DAEMON' }] } }) + '\\n');
+          if (message.codegraph_client) {
+            if (typeof message.challenge === 'string' && proof === 'valid') {
+              socket.write(JSON.stringify({ codegraph_proof: daemonProof(daemonKey(), message.challenge, sockPath) }) + '\\n');
+            }
+            continue;
+          }
+          if (mode === 'silent') continue;
+          const result = mode === 'busy' ? { busy: true } : { content: [{ type: 'text', text: 'FROM THE DAEMON' }] };
+          socket.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\\n');
         }
       });
-    }).listen(sockPath, () => process.stdout.write('listening\\n'));
+    }).listen(sockPath, () => fs.writeFileSync(ready, 'listening'));
   `;
-  const child = spawn(process.execPath, ['-e', script, sockPath, CodeGraphPackageVersion, mode], { stdio: ['ignore', 'pipe', 'ignore'] });
-  cleanups.push(() => { child.kill('SIGKILL'); fs.rmSync(sockPath, { force: true }); });
+  const child = spawn(process.execPath, ['-e', script, sockPath, CodeGraphPackageVersion, mode, proof, ready, proofModule], { stdio: ['ignore', 'ignore', 'inherit'] });
+  cleanups.push(() => new Promise<void>((resolve) => {
+    child.once('exit', () => resolve());
+    child.kill('SIGKILL');
+    if (process.platform !== 'win32') fs.rmSync(sockPath, { force: true });
+  }));
   const deadline = Date.now() + 10_000;
-  while (!fs.existsSync(sockPath)) {
+  while (!fs.existsSync(ready)) {
     if (Date.now() > deadline) throw new Error('fake daemon did not start');
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
   }
 }
 
-describe.runIf(process.platform !== 'win32')('prompt-hook front-loads from a running daemon (#3284)', () => {
+describe('prompt-hook front-loads from a running daemon (#3284)', () => {
   const PROMPT = 'trace the call path of placeOrder';
 
   it('injects the daemon’s answer when one is running for the project', async () => {
@@ -371,5 +371,29 @@ describe.runIf(process.platform !== 'win32')('prompt-hook front-loads from a run
 
     expect(stdout).toBe('');
     expect(ms).toBeLessThan(10_000);
+  });
+
+  // A daemon catching up, serving other calls or on its way out says so at
+  // once, and the hook explores itself rather than wait on it or inject that.
+  it('runs its own explore when the daemon answers busy', async () => {
+    const root = await indexedProject();
+    spawnFakeDaemon(root, 'busy');
+
+    const { stdout } = runPromptHook(root, PROMPT);
+
+    expect(stdout).toMatch(/^<codegraph_context /);
+    expect(stdout).toContain('chargeCard');
+  });
+
+  // The prompt goes to whoever listens: one that can't prove it runs as this
+  // user, like a stand-in another user created first, gets no prompt.
+  it('runs its own explore when the daemon cannot prove it runs as this user', async () => {
+    const root = await indexedProject();
+    spawnFakeDaemon(root, 'answer', 'none');
+
+    const { stdout } = runPromptHook(root, PROMPT);
+
+    expect(stdout).toContain('chargeCard');
+    expect(stdout).not.toContain('FROM THE DAEMON');
   });
 });
