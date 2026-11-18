@@ -162,6 +162,18 @@ describe('a sync follows a module-config change (#2977)', () => {
     expect(stateOf(root, graph)).toEqual(full);
   }, 120_000);
 
+  it("a folder's package.json main retargeted, the importer untouched (#2964)", async () => {
+    const before: Files = {
+      'lib/package.json': JSON.stringify({ main: 'a.js' }),
+      'lib/a.js': 'function a () { return 1 }\nmodule.exports = a\n',
+      'lib/b.js': 'function b () { return 2 }\nmodule.exports = b\n',
+      'app.js': "const lib = require('./lib')\nfunction go () { return lib() }\n",
+    };
+    const { root, graph, full } = await syncEdit(before, { 'lib/package.json': JSON.stringify({ main: 'b.js' }) });
+    expect(callTargets(graph, 'go')).toEqual(['lib/b.js::b']);
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
   it('a mapping declared in the extends chain', async () => {
     const before: Files = {
       ...TS_BEFORE,
