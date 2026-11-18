@@ -4737,6 +4737,50 @@ function pythonValueNames(bound: { value: string; filePath: string; line: number
   return pythonReceiverBinding(target.name, { ...ref, filePath: bound.filePath, line: bound.line, column: 0 }, context) !== 'local';
 }
 
+/**
+ * Whether `target` is a lexical binding, which a JS/TS call written on `this`
+ * never names. `this.cast(x)` (or `super.cast(x)`, or fields deep,
+ * `this.a.b.cast(x)`) is recorded by the bare name `cast` and reads a
+ * property of the object: no `const`/`let`/`var` (a `require` binding among
+ * them) and no `function` declaration, in this file or another, is that
+ * property. Since #3345 such a call skips the file's imports, so name matching
+ * reached the file's own `const cast = require('./cast')`. A function
+ * assigned to a property (`app.set = function set (…)`), an object literal's
+ * member and a class's member are properties, and stay answers, as does a
+ * declared function the calling file hands to a property of its name:
+ * fastify's `fastify.ready = ready`, then `this.ready()` in the instance's
+ * methods.
+ */
+export function isLexicalBindingOfJsThisCall(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!JS_FAMILY.has(ref.language) || ref.referenceKind !== 'calls') return false;
+  if (target.kind === 'function') {
+    if (!isJsDeclaredFunction(target, context)) return false;
+    const name = target.name.replace(/\$/g, '\\$');
+    if (new RegExp(String.raw`\.\s*${name}\s*=\s*${name}(?![\w$])`).test(context.readFile(ref.filePath) ?? '')) return false;
+  } else if (target.kind !== 'constant' && target.kind !== 'variable') {
+    return false;
+  }
+  const written = bareCallReceiver(ref, context);
+  return written !== null && (written.receiver === 'self' || written.links.length > 0);
+}
+
+/**
+ * Whether a JS/TS function node binds its name lexically, as read where it
+ * starts: a `function` declaration (`export default async function m (…)`,
+ * `declare function m (…)`) or a `const`/`let`/`var` declarator's value
+ * (`const m = (…) =>`, `let m: Fn = function (…)`), not a function assigned
+ * to a property or written as an object's or a class's member.
+ */
+function isJsDeclaredFunction(n: Node, context: ResolutionContext): boolean {
+  const line = (context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/))?.[n.startLine - 1];
+  if (line === undefined) return false;
+  // What a minified line holds before the function is read only as far back as a declarator reaches.
+  const head = line.slice(Math.max(0, n.startColumn - 200), n.startColumn);
+  if (n.startColumn <= 200 && /^\s*(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:async\s+)?$/.test(head) &&
+      /^(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:async\s+)?function\b/.test(line.slice(n.startColumn, n.startColumn + 64))) return true;
+  return /(?:^|[^\w$.])(?:const|let|var)\s+[\w$]+\s*(?::[^=]*)?=\s*(?:async\s*)?$/.test(head);
+}
+
 /** Whether a call recorded by its bare name is written on something other than the caller's own object. */
 function isCollapsedNonRecursion(ref: UnresolvedRef, context: ResolutionContext): boolean {
   const written = bareCallReceiver(ref, context);
