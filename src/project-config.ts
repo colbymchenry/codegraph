@@ -82,6 +82,17 @@ export interface ProjectConfig {
    * beyond the built-ins.
    */
   deprioritize?: string[];
+  /**
+   * The folder a PHP site's web server serves, which `$_SERVER['DOCUMENT_ROOT']`
+   * holds at run time (#3298): `"public"`, `"web"`, `"htdocs"`, or `"."` for the
+   * project root. Relative to the project root. With it set, an include built
+   * from it, like `require $_SERVER['DOCUMENT_ROOT'] . '/inc/header.php'`, links
+   * to `public/inc/header.php`. Absent (the default), such an include links
+   * nothing: the server configuration that names the folder isn't in the
+   * project, and a guess would link the wrong file wherever two folders hold
+   * one of the same name.
+   */
+  webRoot?: string;
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -91,6 +102,8 @@ interface ParsedConfig {
   exclude: string[];
   deprioritize: string[];
   include: string[];
+  /** Project-root-relative, `/`-separated, no trailing `/`; '' is the project root. Null when unset or invalid. */
+  webRoot: string | null;
 }
 
 interface CacheEntry {
@@ -114,6 +127,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
+  webRoot: null,
 });
 
 /**
@@ -167,16 +181,48 @@ function parseConfig(file: string): ParsedConfig {
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
+  const webRoot = extractWebRoot(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
-    deprioritize.length === 0
+    deprioritize.length === 0 &&
+    webRoot === null
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { extensions, includeIgnored, exclude, include, deprioritize, webRoot };
+}
+
+/**
+ * Validate `webRoot`: a folder inside the project, written relative to its
+ * root (`"public"`, `"./web/"`, `"site\\htdocs"`, `"."`). Returned with `/`
+ * separators and no `./` or trailing `/`; the project root is ''. A non-string,
+ * an empty string, an absolute path (the server's own path, like
+ * `/var/www/html`, which says nothing about where the folder sits in the
+ * project) or one that leaves the project warns and counts as unset; never
+ * throws.
+ */
+function extractWebRoot(parsed: object, file: string): string | null {
+  const raw = (parsed as ProjectConfig).webRoot;
+  if (raw === undefined) return null;
+  const hint = 'must be a folder relative to the project root, like "public", or "." for the root itself';
+  if (typeof raw !== 'string' || !raw.trim()) {
+    logWarn(`Ignoring "webRoot" in ${PROJECT_CONFIG_FILENAME}: it ${hint}`, { file });
+    return null;
+  }
+  const slashed = raw.trim().replace(/\\/g, '/');
+  if (slashed.startsWith('/') || /^[A-Za-z]:/.test(slashed)) {
+    logWarn(`Ignoring "webRoot" in ${PROJECT_CONFIG_FILENAME}: "${raw}" is an absolute path; it ${hint}`, { file });
+    return null;
+  }
+  const normalized = path.posix.normalize(slashed).replace(/\/+$/, '');
+  if (normalized === '..' || normalized.startsWith('../')) {
+    logWarn(`Ignoring "webRoot" in ${PROJECT_CONFIG_FILENAME}: "${raw}" is outside the project; it ${hint}`, { file });
+    return null;
+  }
+  return normalized === '.' ? '' : normalized;
 }
 
 /**
@@ -389,6 +435,17 @@ export function loadDeprioritizePatterns(rootDir: string): string[] {
  */
 export function loadIncludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).include;
+}
+
+/**
+ * Load the project's validated `webRoot`, mtime-cached: the folder PHP's
+ * `$_SERVER['DOCUMENT_ROOT']` names, relative to the project root with `/`
+ * separators ('' for the root itself), or null when `codegraph.json` sets none
+ * (the zero-config default, under which an include built from
+ * `$_SERVER['DOCUMENT_ROOT']` links nothing).
+ */
+export function loadWebRoot(rootDir: string): string | null {
+  return loadParsedConfig(rootDir).webRoot;
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */

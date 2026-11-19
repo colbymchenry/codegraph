@@ -13,12 +13,22 @@ const PHP_INCLUDE_TYPES = new Set([
 ]);
 
 /**
+ * How an include built from the web server's root is written, followed by the
+ * path appended to it: `$_SERVER['DOCUMENT_ROOT'] . '/inc/c.php'` is
+ * `$_SERVER['DOCUMENT_ROOT']/inc/c.php` (#3298). The resolver places it under
+ * the project's `codegraph.json` `webRoot`, and links nothing without one. No
+ * string literal's text starts with it: a single-quoted string can't hold a
+ * bare `'`, and `$_SERVER` in a double-quoted one is interpolation.
+ */
+export const PHP_DOCUMENT_ROOT = "$_SERVER['DOCUMENT_ROOT']";
+
+/**
  * Extract a static path from a PHP include/require expression: a string
- * literal, or one appended to the including file's own directory (#3298).
+ * literal, or one appended to the including file's own directory or to the
+ * web server's root (#3298).
  *
  * Returns null for dynamic forms (`include $var`, interpolated strings,
- * `$_SERVER['DOCUMENT_ROOT'] . '/x'`): they have no resolvable compile-time
- * path.
+ * `$base . '/x'`): they have no resolvable compile-time path.
  */
 function phpStaticIncludePath(node: SyntaxNode, source: string): string | null {
   // The path argument is the expression's first named child; the call-style
@@ -115,21 +125,25 @@ function phpShadowsDirname(node: SyntaxNode, source: string): boolean {
 }
 
 /**
- * `__DIR__ . '/inc/a.php'`, `dirname(__FILE__) . DIRECTORY_SEPARATOR . 'a.php'`:
- * string literals (and `DIRECTORY_SEPARATOR`) appended to the including file's
- * directory, read as a path relative to it (`./inc/a.php`, `../config/a.php`),
- * which the resolver loads exactly as written, as PHP does. The appended text
- * must start with `/` (or the two run together) and name a file, not a
- * directory. Null when an unqualified `dirname` would reach one the file
- * declares or imports (see {@link phpShadowsDirname}).
+ * `$_SERVER['DOCUMENT_ROOT']`, in either quote and with any spacing inside the
+ * brackets: the folder the web server serves, which only its configuration
+ * names (#3298).
  */
-function phpDirectoryIncludePath(expr: SyntaxNode, source: string): string | null {
-  const [head, ...tail] = phpConcatParts(expr, source);
-  if (!head || tail.length === 0) return null;
-  const dir = PHP_OWN_DIRECTORY.exec(getNodeText(head, source).replace(/\s+/g, ''));
-  if (!dir) return null;
-  const qualified = getNodeText(head, source).trimStart().startsWith('\\');
-  if (dir[1] !== undefined && !qualified && phpShadowsDirname(expr, source)) return null;
+function phpIsDocumentRoot(node: SyntaxNode, source: string): boolean {
+  if (node.type !== 'subscript_expression' || node.namedChildCount !== 2) return false;
+  const variable = node.namedChild(0);
+  const key = node.namedChild(1);
+  return !!variable && !!key && variable.type === 'variable_name' &&
+    getNodeText(variable, source) === '$_SERVER' && phpLiteralText(key, source) === 'DOCUMENT_ROOT';
+}
+
+/**
+ * The path that string literals (and `DIRECTORY_SEPARATOR`, read as `/`)
+ * append to a directory: it starts with `/`, names a file rather than a
+ * directory (no trailing `/`), and has no empty segment. Null when anything
+ * else is appended.
+ */
+function phpAppendedPath(tail: SyntaxNode[], source: string): string | null {
   let rest = '';
   for (const part of tail) {
     const literal = phpLiteralText(part, source);
@@ -138,12 +152,38 @@ function phpDirectoryIncludePath(expr: SyntaxNode, source: string): string | nul
     else return null;
   }
   if (!rest.startsWith('/') || rest.endsWith('/')) return null;
+  return rest.split('/').slice(1).every((seg) => seg !== '') ? rest : null;
+}
+
+/**
+ * `__DIR__ . '/inc/a.php'`, `dirname(__FILE__) . DIRECTORY_SEPARATOR . 'a.php'`:
+ * a path appended to the including file's directory (see
+ * {@link phpAppendedPath}), read as a path relative to it (`./inc/a.php`,
+ * `../config/a.php`), which the resolver loads exactly as written, as PHP
+ * does. Null when an unqualified `dirname` would reach one the file declares
+ * or imports (see {@link phpShadowsDirname}).
+ *
+ * `$_SERVER['DOCUMENT_ROOT'] . '/inc/c.php'` is a path appended to the web
+ * server's root instead, written behind {@link PHP_DOCUMENT_ROOT}.
+ */
+function phpDirectoryIncludePath(expr: SyntaxNode, source: string): string | null {
+  const [head, ...tail] = phpConcatParts(expr, source);
+  if (!head || tail.length === 0) return null;
+  if (phpIsDocumentRoot(head, source)) {
+    const rest = phpAppendedPath(tail, source);
+    return rest === null ? null : PHP_DOCUMENT_ROOT + rest;
+  }
+  const dir = PHP_OWN_DIRECTORY.exec(getNodeText(head, source).replace(/\s+/g, ''));
+  if (!dir) return null;
+  const qualified = getNodeText(head, source).trimStart().startsWith('\\');
+  if (dir[1] !== undefined && !qualified && phpShadowsDirname(expr, source)) return null;
+  const rest = phpAppendedPath(tail, source);
+  if (rest === null) return null;
   // __DIR__ and dirname(__FILE__) are the file's directory; dirname(__DIR__)
   // is one up; a levels argument climbs that many from __FILE__ (one more from __DIR__).
   const levels = dir[1] === undefined ? 1 : Number(dir[2] ?? '1') + (dir[1].toUpperCase() === '__DIR__' ? 1 : 0);
   if (levels > 16) return null;
-  const relative = `${levels === 1 ? './' : '../'.repeat(levels - 1)}${rest.slice(1)}`;
-  return relative.split('/').slice(1).every((seg) => seg !== '') ? relative : null;
+  return `${levels === 1 ? './' : '../'.repeat(levels - 1)}${rest.slice(1)}`;
 }
 
 /** PHP built-in return types that can't be a method receiver (so no class to chain on). */

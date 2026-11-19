@@ -894,9 +894,9 @@ impl<'t> Walker<'t> {
                 | "require_once_expression"
         ) {
             // phpStaticIncludePath: a string literal, or literals appended to
-            // the file's own directory (#3298); every other dynamic form
-            // (`$_SERVER['DOCUMENT_ROOT'] . '/x'`, `$var`, interpolation)
-            // emits NOTHING.
+            // the file's own directory or to `$_SERVER['DOCUMENT_ROOT']`
+            // (#3298); every other dynamic form (`$base . '/x'`, `$var`,
+            // interpolation) emits NOTHING.
             let Some(module_name) = self.php_static_include_path(node) else { return };
             if module_name.is_empty() {
                 return;
@@ -993,8 +993,8 @@ impl<'t> Walker<'t> {
 
     /// phpStaticIncludePath (languages/php.ts): the path argument is
     /// namedChild(0), one `parenthesized_expression` unwrapped. A
-    /// `binary_expression` reads as a path from the file's own directory
-    /// (#3298), anything else as a pure string literal.
+    /// `binary_expression` reads as a path from the file's own directory or
+    /// the web server's root (#3298), anything else as a pure string literal.
     fn php_static_include_path(&mut self, node: Node<'t>) -> Option<String> {
         let mut arg = node.named_child(0)?;
         if arg.kind() == "parenthesized_expression" {
@@ -1026,27 +1026,24 @@ impl<'t> Walker<'t> {
         content.map(|c| self.text(c))
     }
 
-    /// phpDirectoryIncludePath (#3298): `__DIR__ . '/inc/a.php'`,
-    /// `dirname(__FILE__) . DIRECTORY_SEPARATOR . 'a.php'` — string literals
-    /// (and `DIRECTORY_SEPARATOR`, read as `/`) appended to the including
-    /// file's directory, written relative to it (`./inc/a.php`,
-    /// `../config/a.php`). The appended text starts with `/` and doesn't end
-    /// with one, and no segment of the result is empty. None when an
-    /// unqualified `dirname` reaches one the file declares or imports.
-    fn php_directory_include_path(&mut self, expr: Node<'t>) -> Option<String> {
-        let parts = php_concat_parts(expr, self.src)?;
-        let (head, tail) = parts.split_first()?;
-        if tail.is_empty() {
-            return None;
-        }
-        let head_text = self.text(*head);
-        let squeezed: String = head_text.chars().filter(|c| !is_js_space(*c)).collect();
-        let dir = php_own_directory_re().captures(&squeezed)?;
-        let dirname_arg = dir.get(1).map(|m| m.as_str());
-        let qualified = head_text.trim_start_matches(is_js_space).starts_with('\\');
-        if dirname_arg.is_some() && !qualified && self.php_shadows_dirname() {
-            return None;
-        }
+    /// phpIsDocumentRoot (#3298): `$_SERVER['DOCUMENT_ROOT']`, in either
+    /// quote and with any spacing inside the brackets — a
+    /// `subscript_expression` of exactly the `variable_name` `$_SERVER` and
+    /// a pure string literal `DOCUMENT_ROOT`.
+    fn php_is_document_root(&self, node: Node<'t>) -> bool {
+        node.kind() == "subscript_expression"
+            && node.named_child_count() == 2
+            && node
+                .named_child(0)
+                .is_some_and(|v| v.kind() == "variable_name" && self.text(v) == "$_SERVER")
+            && node.named_child(1).and_then(|key| self.php_literal_text(key)) == Some("DOCUMENT_ROOT")
+    }
+
+    /// phpAppendedPath (#3298): the path string literals (and
+    /// `DIRECTORY_SEPARATOR`, read as `/`) append to a directory. It starts
+    /// with `/`, doesn't end with one, and has no empty segment; None when
+    /// anything else is appended.
+    fn php_appended_path(&self, tail: &[Node<'t>]) -> Option<String> {
         let mut rest = String::new();
         for part in tail {
             if let Some(literal) = self.php_literal_text(*part) {
@@ -1063,6 +1060,35 @@ impl<'t> Walker<'t> {
         if !rest.starts_with('/') || rest.ends_with('/') {
             return None;
         }
+        rest.split('/').skip(1).all(|seg| !seg.is_empty()).then_some(rest)
+    }
+
+    /// phpDirectoryIncludePath (#3298): `__DIR__ . '/inc/a.php'`,
+    /// `dirname(__FILE__) . DIRECTORY_SEPARATOR . 'a.php'` — a path appended
+    /// to the including file's directory (php_appended_path), written
+    /// relative to it (`./inc/a.php`, `../config/a.php`). None when an
+    /// unqualified `dirname` reaches one the file declares or imports.
+    /// `$_SERVER['DOCUMENT_ROOT'] . '/inc/c.php'` is a path appended to the
+    /// web server's root instead, written behind PHP_DOCUMENT_ROOT.
+    fn php_directory_include_path(&mut self, expr: Node<'t>) -> Option<String> {
+        let parts = php_concat_parts(expr, self.src)?;
+        let (head, tail) = parts.split_first()?;
+        if tail.is_empty() {
+            return None;
+        }
+        if self.php_is_document_root(*head) {
+            let rest = self.php_appended_path(tail)?;
+            return Some(format!("{PHP_DOCUMENT_ROOT}{rest}"));
+        }
+        let head_text = self.text(*head);
+        let squeezed: String = head_text.chars().filter(|c| !is_js_space(*c)).collect();
+        let dir = php_own_directory_re().captures(&squeezed)?;
+        let dirname_arg = dir.get(1).map(|m| m.as_str());
+        let qualified = head_text.trim_start_matches(is_js_space).starts_with('\\');
+        if dirname_arg.is_some() && !qualified && self.php_shadows_dirname() {
+            return None;
+        }
+        let rest = self.php_appended_path(tail)?;
         // `__DIR__` and `dirname(__FILE__)` are the file's directory;
         // `dirname(__DIR__)` is one up; a levels argument climbs that many
         // from `__FILE__` (one more from `__DIR__`). A levels number past u64
@@ -1082,8 +1108,7 @@ impl<'t> Walker<'t> {
         }
         let mut relative = if levels == 1 { "./".to_string() } else { "../".repeat(levels as usize - 1) };
         relative.push_str(&rest[1..]);
-        let whole_segments = relative.split('/').skip(1).all(|seg| !seg.is_empty());
-        whole_segments.then_some(relative)
+        Some(relative)
     }
 
     /// phpShadowsDirname (#3298): whether an unqualified `dirname(...)` in
@@ -1626,6 +1651,11 @@ fn php_enclosing_call_name(node: Node) -> Option<Node> {
     }
     None
 }
+
+/// PHP_DOCUMENT_ROOT (languages/php.ts, #3298): how an include built from
+/// `$_SERVER['DOCUMENT_ROOT']` is written, followed by the appended path. The
+/// resolver places it under the project's `codegraph.json` `webRoot`.
+const PHP_DOCUMENT_ROOT: &str = "$_SERVER['DOCUMENT_ROOT']";
 
 /// JS `\s` (WhiteSpace ∪ LineTerminator): unlike Rust's
 /// `char::is_whitespace`, U+FEFF yes and U+0085 no.

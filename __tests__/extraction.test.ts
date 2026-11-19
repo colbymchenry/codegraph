@@ -3490,9 +3490,11 @@ include_once("io.php");
     });
 
     it('should skip dynamic include/require with no static path (#660)', () => {
-      // `__DIR__ . '/x.php'` names a file: see php-dir-includes.test.ts (#3298).
+      // `__DIR__ . '/x.php'` names a file (php-dir-includes.test.ts), and so
+      // does `$_SERVER['DOCUMENT_ROOT'] . '/x.php'` under a `webRoot`
+      // (php-web-root-includes.test.ts) (#3298).
       const code = `<?php
-require_once($_SERVER['DOCUMENT_ROOT'] . '/dyn.php');
+require_once($base . '/dyn.php');
 include $file;
 include "tpl/{$name}.php";
 `;
