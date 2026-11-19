@@ -67,6 +67,23 @@ describe.each(['native', 'wasm'].filter((backend) => backend === 'wasm' || kerne
   const callers = (g: CodeGraph, qn: string, file?: string) => calls(g, node(g, qn, file).id, 'in');
   const callees = (g: CodeGraph, qn: string, file?: string) => calls(g, node(g, qn, file).id, 'out');
 
+  it('finds documented data members beyond the binding signature (#3408)', async () => {
+    const g = await index({
+      'config.ts': [
+        'export const settings = {',
+        ...Array.from({ length: 20 }, (_, i) => `  padding${i}: ${i},`),
+        '  /** zzdeeptoken */',
+        '  totalMs: 7,',
+        '} as const;',
+      ].join('\n'),
+    });
+    const hits = g.searchNodes('zzdeeptoken').map(({ node }) => node);
+    expect(hits.map((hit) => hit.qualifiedName)).toContain('settings::totalMs');
+    const property = node(g, 'settings::totalMs');
+    expect(property.docstring).toContain('zzdeeptoken');
+    expect((await g.findRelevantContext('zzdeeptoken')).nodes.has(property.id)).toBe(true);
+  });
+
   it('gives every container shape from the issue its members, and the calls in a member to that member', async () => {
     const g = await index({
       'src/a_export.ts': 'export const objTsExp = { tsExpM() { return 1; }, tsExpProp: () => 1 };\n',

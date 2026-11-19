@@ -3538,6 +3538,23 @@ export class TreeSitterExtractor {
     return { fn: value, name: this.objectKeyName(key) };
   }
 
+  /** Keep data-member documentation searchable independently of the abbreviated initializer. */
+  private extractDocumentedObjectProperties(value: SyntaxNode | null, ownerId: string): void {
+    while (value && ['as_expression', 'satisfies_expression', 'parenthesized_expression'].includes(value.type)) {
+      value = value.namedChildren.find(child => child.type !== 'comment') ?? null;
+    }
+    if (value?.type !== 'object' || !this.ownsObjectLiterals()) return;
+    this.nodeStack.push(ownerId);
+    for (const member of value.namedChildren) {
+      if (member.type !== 'pair' || member.previousNamedSibling?.type !== 'comment') continue;
+      const key = getChildByField(member, 'key');
+      if (!key || !STATIC_OBJECT_KEY_TYPES.has(key.type) || this.ownedMemberFunction(member)) continue;
+      const docstring = this.docstringFor(member);
+      if (docstring) this.createNode('property', this.objectKeyName(key), member, { docstring });
+    }
+    this.nodeStack.pop();
+  }
+
   /** `value` when it is an object literal that owns at least one function member, else null. */
   private ownedObjectValue(value: SyntaxNode | null): SyntaxNode | null {
     if (!value || (value.type !== 'object' && value.type !== 'object_expression') || !this.ownsObjectLiterals()) return null;
@@ -4224,6 +4241,7 @@ export class TreeSitterExtractor {
             // Extract type annotation references (e.g., const x: ITextModel = ...)
             if (varNode) {
               this.extractVariableTypeAnnotation(child, varNode.id);
+              this.extractDocumentedObjectProperties(valueNode, varNode.id);
             }
 
             // A named object literal owns its function members, exported or
