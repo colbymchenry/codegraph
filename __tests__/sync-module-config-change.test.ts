@@ -1,8 +1,9 @@
 /**
  * A sync follows a change to the files import resolution is configured by
  * (#2977): `tsconfig.json` / `jsconfig.json` `paths` and `baseUrl`, their
- * `extends` chain, a `go.mod` module path, Cargo manifests and a
- * `compile_commands.json`. The resolver read them once and
+ * `extends` chain, a `go.mod` module path, Cargo manifests, a
+ * `compile_commands.json`, and the PHP `webRoot` of a `codegraph.json`
+ * (#3298). The resolver read them once and
  * kept the maps for its lifetime, and the watcher follows source files only,
  * so an edit kept resolving imports by the old mapping — in the same process,
  * and in later ones too, since a sync re-resolves only the changed files.
@@ -126,6 +127,22 @@ function includeTarget(graph: CodeGraph, file: string): string[] {
     .map((e) => graph.getNode(e.target)!.filePath);
 }
 
+/** A site whose server serves public/, with a file of the same name at the project root. */
+const PHP_SITE: Files = {
+  'public/index.php': "<?php\nrequire_once $_SERVER['DOCUMENT_ROOT'] . '/config.php';\n",
+  'public/config.php': '<?php\nfunction public_config() {}\n',
+  'config.php': '<?php\nfunction private_config() {}\n',
+};
+
+/** The files a PHP file's includes link to. */
+function phpIncludeTargets(graph: CodeGraph, file: string): string[] {
+  return graph.getNodesInFile(file)
+    .flatMap((n) => graph.getOutgoingEdges(n.id))
+    .filter((e) => e.kind === 'imports' && graph.getNode(e.target)?.kind === 'file')
+    .map((e) => graph.getNode(e.target)!.filePath)
+    .sort();
+}
+
 /** What a full index of C_BEFORE holds under a compile database naming `dir`, which names the folder it's in. */
 async function fullIndexWithDb(dir: string): Promise<string[]> {
   const root = tempRoot();
@@ -240,6 +257,45 @@ describe('a sync follows a module-config change (#2977)', () => {
     await graph.sync();
     expect(includeTarget(graph, 'src/a.c')).toEqual(['other/foo.h']);
     expect(stateOf(root, graph)).toEqual(await fullIndexWithDb('other'));
+  }, 120_000);
+
+  it("a codegraph.json webRoot appears, the PHP untouched (#3298)", async () => {
+    const { root, graph, full } = await syncEdit(PHP_SITE, { 'codegraph.json': JSON.stringify({ webRoot: 'public' }) });
+    expect(phpIncludeTargets(graph, 'public/index.php')).toEqual(['public/config.php']);
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
+  it('a webRoot moves to the project root, then goes away', async () => {
+    const { root, graph, full } = await syncEdit(
+      { ...PHP_SITE, 'codegraph.json': JSON.stringify({ webRoot: 'public' }) },
+      { 'codegraph.json': JSON.stringify({ webRoot: '.' }) }
+    );
+    expect(phpIncludeTargets(graph, 'public/index.php')).toEqual(['config.php']);
+    expect(stateOf(root, graph)).toEqual(full);
+    write(root, { 'codegraph.json': JSON.stringify({ deprioritize: ['scripts/'] }) });
+    await graph.sync();
+    expect(phpIncludeTargets(graph, 'public/index.php')).toEqual([]);
+    const fullRoot = tempRoot();
+    write(fullRoot, { ...PHP_SITE, 'codegraph.json': JSON.stringify({ deprioritize: ['scripts/'] }) });
+    expect(stateOf(root, graph)).toEqual(stateOf(fullRoot, await index(fullRoot)));
+  }, 120_000);
+
+  it('a codegraph.json that sets no webRoot re-opens nothing, written or edited', async () => {
+    const root = tempRoot();
+    write(root, PHP_SITE);
+    const graph = await index(root);
+    const before = stateOf(root, graph);
+    const reopen = vi.spyOn(ExtractionOrchestrator.prototype, 'resurrectResolutionEdgesForLanguage');
+    try {
+      write(root, { 'codegraph.json': JSON.stringify({ deprioritize: ['scripts/'] }) });
+      await graph.sync();
+      write(root, { 'codegraph.json': JSON.stringify({ deprioritize: ['scripts/', 'tools/'] }) });
+      await graph.sync();
+      expect(reopen).not.toHaveBeenCalled();
+    } finally {
+      reopen.mockRestore();
+    }
+    expect(stateOf(root, graph)).toEqual(before);
   }, 120_000);
 
   it('a folder under a config\'s name is no config: it counts as absent, and the next candidate is read', async () => {

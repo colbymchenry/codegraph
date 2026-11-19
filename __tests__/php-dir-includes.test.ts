@@ -4,8 +4,9 @@
  * spelling before PHP 5.3), names one file as surely as a plain literal does,
  * so it gets the same file-to-file `imports` edge (#3298). `dirname(__DIR__)`
  * and `dirname(__FILE__, 2)` climb one directory. Anything else built at run
- * time (`$_SERVER['DOCUMENT_ROOT'] . '/x.php'`, `$base . '/x.php'`) stays
- * unlinked, as does a path that is no file of the project.
+ * time (`$base . '/x.php'`) stays unlinked, as does a path that is no file of
+ * the project, and `$_SERVER['DOCUMENT_ROOT'] . '/x.php'` links only under a
+ * `codegraph.json` `webRoot` (php-web-root-includes.test.ts).
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';

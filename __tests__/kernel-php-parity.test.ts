@@ -9,7 +9,8 @@
  *  - torture.php          — file-level namespace scoping, the use-import trio
  *    (single/aliased/bare/function/const + grouped incl. the nested `Sub\Deep`
  *    SKIP), include/require ×4, paths built from `__DIR__` / `dirname(__FILE__)`
- *    (#3298) + dynamic (nothing), the visitNode hook (consts
+ *    or `$_SERVER['DOCUMENT_ROOT']` (#3298) + dynamic (nothing), the
+ *    visitNode hook (consts
  *    at every scope, trait-use implements WITH filePath — the v2 ref-flag wire
  *    path), interface multi-extends first-only drop, the call-encoding zoo
  *    (`this->prop.m`, DOT-joined scoped calls, `Cls::factory().m` fluent,
@@ -126,9 +127,10 @@ describe.skipIf(!kernelBuilt)('kernel PHP extraction parity', () => {
     });
   }
 
-  // #3298: an include built from the file's own directory. Each source goes
-  // through both extractors, and the kernel's include paths are checked
-  // against the ones PHP loads, so parity can't hold on two empty outputs.
+  // #3298: an include built from the file's own directory, or from the web
+  // server's root. Each source goes through both extractors, and the
+  // kernel's include paths are checked against the ones PHP loads, so parity
+  // can't hold on two empty outputs.
   // The `dirname` shadow cases each need a file of their own.
   const up15 = '../'.repeat(15);
   const DIR_INCLUDE_CASES: Array<{ name: string; src: string; paths: string[] }> = [
@@ -167,7 +169,41 @@ function load() {
 `,
       paths: [
         './inc/a.php', './inc/b.php', './inc/c.php', '../../shared/d.php', '../../e.php', './f.php',
-        './g.php', `${up15}sixteen.php`, 'plain.php', './dot.php', './in_function.php',
+        './g.php', `${up15}sixteen.php`, "$_SERVER['DOCUMENT_ROOT']/docroot.php", 'plain.php', './dot.php',
+        './in_function.php',
+      ],
+    },
+    {
+      // The web server's root: written behind PHP_DOCUMENT_ROOT for the
+      // resolver to place under `codegraph.json`'s `webRoot`.
+      name: 'document-root',
+      src: String.raw`<?php
+require $_SERVER['DOCUMENT_ROOT'] . '/inc/a.php';
+require_once($_SERVER["DOCUMENT_ROOT"] . "/inc/b.php");
+include $_SERVER[ 'DOCUMENT_ROOT' ] . DIRECTORY_SEPARATOR . 'inc' . \DIRECTORY_SEPARATOR . 'c.php';
+include_once $_SERVER['DOCUMENT_ROOT'] . '/../lib/d.php';
+require $_SERVER['DOCUMENT_ROOT'] . 'no_slash.php';
+require $_SERVER['DOCUMENT_ROOT'] . '/dir/';
+require $_SERVER['DOCUMENT_ROOT'] . '/inc//double.php';
+require $_SERVER['DOCUMENT_ROOT'];
+require $_SERVER['document_root'] . '/lower-key.php';
+require $_SERVER['DOCUMENT_ROOT '] . '/spaced-key.php';
+require $_SERVER["DOCUMENT_\x52OOT"] . '/escaped-key.php';
+require $_server['DOCUMENT_ROOT'] . '/lower-var.php';
+require $_ENV['DOCUMENT_ROOT'] . '/env.php';
+require $GLOBALS['_SERVER']['DOCUMENT_ROOT'] . '/globals.php';
+require $_SERVER['DOCUMENT_ROOT'] . "/inc/{$name}.php";
+require $_SERVER['DOCUMENT_ROOT'] . '/a.php' . $suffix;
+require "{$_SERVER['DOCUMENT_ROOT']}/interpolated.php";
+require '$_SERVER[DOCUMENT_ROOT]/literal.php';
+function load() {
+    require $_SERVER['DOCUMENT_ROOT'] . '/in_function.php';
+}
+`,
+      paths: [
+        "$_SERVER['DOCUMENT_ROOT']/inc/a.php", "$_SERVER['DOCUMENT_ROOT']/inc/b.php",
+        "$_SERVER['DOCUMENT_ROOT']/inc/c.php", "$_SERVER['DOCUMENT_ROOT']/../lib/d.php",
+        '$_SERVER[DOCUMENT_ROOT]/literal.php', "$_SERVER['DOCUMENT_ROOT']/in_function.php",
       ],
     },
     {
