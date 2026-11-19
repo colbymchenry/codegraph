@@ -1,0 +1,10 @@
+diff --git a/grammar.js b/grammar.js
+index b03c1d3..bdd1aef 100644
+--- a/grammar.js
++++ b/grammar.js
+@@ -1092,4 +1092,5 @@ module.exports = grammar({
+     simple_identifier: $ => choice(
+       $._lexical_identifier,
++      "annotation",
+       "expect",
+       "data",

@@ -53,3 +53,21 @@ describe('a Kotlin infix call named with a leading `e`', () => {
     expect(methods).toEqual(['found', 'same']);
   });
 });
+
+it('parses annotation as a callee or a class modifier according to context (#3410)', async () => {
+  await initGrammars();
+  await loadGrammarsForLanguages(['kotlin']);
+  const parser = getParser('kotlin')!;
+  for (const [src, kind] of [
+    ['allOpen { annotation("example.Entity") }', 'simple_identifier'],
+    ['annotation class Entity', 'class_modifier'],
+  ]) {
+    const tree = parser.parse(src)!;
+    try {
+      expect(tree.rootNode.hasError).toBe(false);
+      expect(tree.rootNode.descendantsOfType(kind).map(node => node.text)).toContain('annotation');
+    } finally {
+      tree.delete();
+    }
+  }
+});
