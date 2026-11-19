@@ -9,7 +9,8 @@
  *   - `daemon.pid` — atomic-create lockfile holding the daemon's pid + version.
  *
  * Both live under `.codegraph/` so the project-scoped uninstall (`codegraph
- * uninit`) sweeps them up for free.
+ * uninit`) sweeps them up for free — the socket unless it falls back to
+ * tmpdir or, for a group-writable `.codegraph/`, the runtime folder (below).
  *
  * Special-case: Unix domain socket paths have a hard length limit (~104 on
  * macOS, ~108 on Linux); when the in-project path exceeds it we fall back to
@@ -28,6 +29,7 @@
  * converge on whichever the daemon bound with zero coordination.
  */
 
+import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
@@ -61,6 +63,56 @@ function tmpdirSocketPath(projectRoot: string): string {
 }
 
 /**
+ * Whether users other than its owner could replace a socket in a folder with
+ * this `mode`: its group or others can write to it, and no sticky bit keeps a
+ * file for its owner to remove. The prompt hook connects to no socket in such
+ * a folder (see `./hook-client`).
+ */
+export function othersCanReplaceIn(mode: number): boolean {
+  return (mode & 0o022) !== 0 && (mode & 0o1000) === 0;
+}
+
+/**
+ * The socket path in this user's runtime folder, or null when there is none to
+ * trust: an absolute `$XDG_RUNTIME_DIR`, else `/run/user/<uid>`, the folder
+ * systemd makes for each user and sets the variable to. So a process started
+ * without the variable (cron, a host that clears the environment) finds the
+ * same folder, and so does one whose variable names a folder others can write
+ * to (WSLg's shared one). Either must be a folder this user owns that no one
+ * else can write to, so a socket in it can be neither planted nor swapped.
+ */
+function runtimeDirSocketPath(projectRoot: string): string | null {
+  const uid = process.getuid?.();
+  if (uid === undefined) return null;
+  const fromEnv = process.env.XDG_RUNTIME_DIR;
+  for (const dir of [fromEnv && path.isAbsolute(fromEnv) ? fromEnv : null, `/run/user/${uid}`]) {
+    if (!dir || !privateFolderOf(dir, uid)) continue;
+    const socketPath = path.join(dir, `codegraph-${projectHash(projectRoot)}.sock`);
+    if (socketPath.length <= POSIX_SOCKET_PATH_LIMIT) return socketPath;
+  }
+  return null;
+}
+
+/** Whether `dir` is a folder `uid` owns that no one else can write to. */
+function privateFolderOf(dir: string, uid: number): boolean {
+  try {
+    const stat = fs.statSync(dir);
+    return stat.isDirectory() && stat.uid === uid && (stat.mode & 0o022) === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether others could replace a socket in `folder`; false when it can't be read. */
+function folderOthersCanReplace(folder: string): boolean {
+  try {
+    return othersCanReplaceIn(fs.statSync(folder).mode);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Ordered socket / named-pipe path candidates the daemon should try to bind (and
  * the proxy should try to connect) for `projectRoot`, most-preferred first.
  * Deterministic given a project root, so independent processes converge without
@@ -73,6 +125,10 @@ function tmpdirSocketPath(projectRoot: string): string {
  *     project first, fall back to tmpdir if its FS can't host a socket (#997).
  *   - Long in-project path (deep monorepos, Bazel out dirs): `[ <tmpdir> ]` only
  *     — bind would throw ENAMETOOLONG, so we skip straight to tmpdir.
+ *   - `.codegraph/` writable by its group or others (umask 0002; #3417), with a
+ *     private runtime folder: `[ <runtime dir> , .codegraph/daemon.sock ,
+ *     <tmpdir> ]`. The list then also depends on that folder's mode and on the
+ *     environment, which the daemon and its clients share.
  */
 export function getDaemonSocketCandidates(projectRoot: string): string[] {
   if (process.platform === 'win32') {
@@ -81,6 +137,13 @@ export function getDaemonSocketCandidates(projectRoot: string): string[] {
   const inProject = path.join(getCodeGraphDir(projectRoot), 'daemon.sock');
   const tmp = tmpdirSocketPath(projectRoot);
   if (inProject.length > POSIX_SOCKET_PATH_LIMIT) return [tmp];
+  // A `.codegraph/` its group can write to, as a umask of 0002 makes it, holds
+  // no socket the prompt hook will trust (#3417). The runtime folder comes
+  // first then: no one else can plant a socket there, as they can in tmpdir.
+  if (folderOthersCanReplace(path.dirname(inProject))) {
+    const runtime = runtimeDirSocketPath(projectRoot);
+    if (runtime) return [runtime, inProject, tmp];
+  }
   return [inProject, tmp];
 }
 
