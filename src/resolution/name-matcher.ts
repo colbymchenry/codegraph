@@ -5609,7 +5609,9 @@ const DART_CONSTRUCTORS = new WeakMap<ResolutionContext, Map<string, boolean>>()
  * Foo.of(…)`, `const Foo.value(…)`, `const factory Foo.x() = _X;` — read from
  * its declaration. Dart reaches one only through its class (`Foo.value(…)`,
  * the tear-off `Foo.value`), never by a bare name: a parameter `value` passed
- * on is not `const BlocProvider.value(…)`.
+ * on is not `const BlocProvider.value(…)`. Dart 3.13 also writes one without
+ * its class: `new named(…)`, `factory make(…)`, and a primary constructor's
+ * `class Point.origin(…)`, whose method starts at `.origin` (#3270).
  */
 function isDartConstructor(n: Node, context: ResolutionContext): boolean {
   if (n.language !== 'dart' || n.kind !== 'method') return false;
@@ -5621,8 +5623,10 @@ function isDartConstructor(n: Node, context: ResolutionContext): boolean {
   const owner = cut > 0 ? n.qualifiedName.slice(0, cut).split('::').pop()! : '';
   const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
   const head = (lines[n.startLine - 1] ?? '').slice(n.startColumn);
-  const constructor = owner !== '' &&
-    new RegExp(String.raw`^(?:(?:const|factory|external)\s+)*${escapeRegExp(owner)}\s*\.\s*${escapeRegExp(n.name)}(?![\w$])`).test(head);
+  const name = escapeRegExp(n.name);
+  const constructor = owner !== '' && (
+    new RegExp(String.raw`^(?:(?:const|factory|external)\s+)*${escapeRegExp(owner)}\s*\.\s*${name}(?![\w$])`).test(head) ||
+    new RegExp(String.raw`^(?:(?:const|external)\s+)*(?:new|factory)\s+${name}(?![\w$])|^\.\s*${name}\s*\(`).test(head));
   memo.set(n.id, constructor);
   return constructor;
 }

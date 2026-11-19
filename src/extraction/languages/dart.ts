@@ -174,8 +174,23 @@ function dartNextNamed(node: SyntaxNode): SyntaxNode | null {
 export function dartReceiverOf(selector: SyntaxNode): SyntaxNode | null {
   const prev = dartPrevNamed(selector);
   const body = prev?.type === 'function_expression' ? prev.lastNamedChild : null;
-  return body?.type === 'function_expression_body' ? body.lastNamedChild : prev;
+  if (body?.type !== 'function_expression_body') return prev;
+  // The arrow can end on an operator's operand, which is the receiver: `(s) =>
+  // s.id == context.read<Cubit>().id` comes out as `((s) => s.id ==
+  // context).read<Cubit>()…`, and `() => !context.watch<Bloc>().busy` as
+  // `(() => !context).watch<Bloc>()…`.
+  let end = body.lastNamedChild;
+  while (end && DART_OPERATOR_EXPRESSIONS.has(end.type)) end = end.lastNamedChild;
+  return end;
 }
+
+/** The expressions an arrow function's body can end in with the operand on the right last. */
+const DART_OPERATOR_EXPRESSIONS: ReadonlySet<string> = new Set([
+  'equality_expression', 'relational_expression', 'logical_and_expression', 'logical_or_expression',
+  'if_null_expression', 'additive_expression', 'multiplicative_expression', 'bitwise_and_expression',
+  'bitwise_or_expression', 'bitwise_xor_expression', 'shift_expression', 'unary_expression',
+  'await_expression',
+]);
 
 /** Dart's lowercase built-in types, which a type argument can name: `<int>`, `<void>`. */
 const DART_LOWERCASE_TYPES: ReadonlySet<string> = new Set(['int', 'double', 'num', 'bool', 'dynamic', 'void']);
@@ -197,8 +212,10 @@ interface DartMisparsedCall {
  * `DropdownButton<String>(items: items)` come out as `(ref.read < Repo) >
  * (repoProvider)`: a `relational_expression` inside another, with the
  * arguments as a `parenthesized_expression`, or a `record_literal` when they
- * are named. That happens about as often as the call parses as one, because
- * the grammar breaks the tie by the code around it. Dart reads it as a call,
+ * are named. With tree-sitter-dart d4d8f3e that happened about as often as
+ * the call parsed as one, because the grammar broke the tie by the code
+ * around it; 0038280 parses them as calls, but for a type argument list split
+ * over lines in a few places (#3270). Dart reads it as a call,
  * and so does this when the type argument names a type (`Repo`, `p.Repo`,
  * `Map<K, V>`, `int`, `void`) and the code is laid out as a call: `<` against
  * the callee and `(` against the `>`. A comparison is written `a < b`.
@@ -257,7 +274,8 @@ export function dartMisparsedGenericCall(lt: SyntaxNode): DartMisparsedCall | un
  * `parent` — belongs to a misparsed generic call instead of reading a member:
  * its callee (`ref.read` in `ref.read<Repo>(p)`, after an `await` too) is
  * called, and the prefixed type argument (`p.Repo` in `x.read<p.Repo>(y)`)
- * names a type.
+ * names a type. So do the import prefix and a prefixed type argument of a
+ * generic constructor call the grammar misparsed (dartMisparsedCtorIn).
  */
 function dartInMisparsedGenericCall(
   receiver: SyntaxNode,
@@ -270,10 +288,202 @@ function dartInMisparsedGenericCall(
     after = up.nextNamedSibling;
     up = after ? null : up.parent;
   }
-  if (after?.type === 'relational_operator' && dartMisparsedGenericCall(after)) return true;
+  if (after?.type === 'relational_operator') {
+    if (dartMisparsedGenericCall(after)) return true;
+    // `p.Box<int>.named(…)`, under an `await` too: the `<` after the prefix.
+    const rel = after.parent;
+    if (rel && dartMisparsedCtorIn(rel, receiver)) return true;
+  }
   if (parent?.type !== 'relational_expression') return false;
   const before = receiver.previousNamedSibling;
-  return before?.type === 'relational_operator' && dartMisparsedGenericCall(before) !== undefined;
+  if (before?.type === 'relational_operator' && dartMisparsedGenericCall(before) !== undefined) return true;
+  return dartMisparsedCtorIn(parent, receiver);
+}
+
+/** A generic constructor call tree-sitter-dart parsed as comparisons and a dot shorthand (dartMisparsedCtor). */
+export interface DartMisparsedCtor {
+  /** Where the call starts, as a parsed one does: the type's name, or its import prefix. */
+  head: SyntaxNode;
+  /** The identifier naming the type (`Future` in `Future<void>.delayed(d)`). */
+  type: SyntaxNode;
+  /** The constructor's name (`delayed`). */
+  name: SyntaxNode;
+  /** The identifiers naming a type argument that the grammar read as an expression. */
+  typeArgs: SyntaxNode[];
+  /** The `>` closing the type arguments, inside the relational expression holding the call. */
+  gt: SyntaxNode;
+  /** The relational expression where the type arguments start (`X<A`), inside `tail` or apart from it. */
+  start: SyntaxNode;
+}
+
+/**
+ * A type argument the grammar read as an expression, starting at `node`: `T`,
+ * `p.T`, `T<…>` or `p.T<…>`. Returns the identifier naming the type and the
+ * node after the argument (null at the end of its parent). A type is written
+ * in UpperCamelCase, or is one of Dart's lowercase built-ins (`int`, `void`).
+ */
+function dartTypeArgPart(node: SyntaxNode | null): { name: SyntaxNode; next: SyntaxNode | null } | undefined {
+  if (node?.type !== 'identifier') return undefined;
+  let name = node;
+  let rest = node.nextNamedSibling;
+  if (rest?.type === 'selector' && rest.namedChildCount === 1 && rest.firstNamedChild?.type === 'unconditional_assignable_selector') {
+    const id = rest.firstNamedChild.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+    if (!id) return undefined;
+    name = id;
+    rest = rest.nextNamedSibling;
+  }
+  if (rest?.type === 'selector' && rest.namedChildCount === 1 && rest.firstNamedChild?.type === 'type_arguments') {
+    rest = rest.nextNamedSibling;
+  }
+  if (!/^[_$]*[A-Z]/.test(name.text) && !DART_LOWERCASE_TYPES.has(name.text)) return undefined;
+  return { name, next: rest };
+}
+
+/**
+ * The type a misparsed generic constructor call names, from the `<` that opens
+ * its type arguments inside `rel`: `X` in `X<T>`, or `p.X` with its import
+ * prefix. The callee is all of `rel` before the `<`, under an `await` or a
+ * prefix operator too, and the `<` is written against it, as a type
+ * argument list is.
+ */
+function dartCtorCallee(rel: SyntaxNode, lt: SyntaxNode): { head: SyntaxNode; type: SyntaxNode } | undefined {
+  const before = lt.previousNamedSibling;
+  if (!before || before.endIndex !== lt.startIndex) return undefined;
+  // `await Future<void>.delayed(d)` and `await p.Box<int>.named(…)` put the
+  // callee under the `await`.
+  let last: SyntaxNode | null = before;
+  if (DART_PREFIXED.has(before.type)) {
+    if (!rel.firstNamedChild?.equals(before)) return undefined;
+    while (last && DART_PREFIXED.has(last.type)) last = last.lastNamedChild;
+  }
+  if (!last) return undefined;
+  let head: SyntaxNode | null = last;
+  let type: SyntaxNode | undefined = last;
+  if (last.type === 'selector') {
+    // `p.X<T>.named(…)`: the import prefix, then the type.
+    const accessor = last.firstNamedChild;
+    if (last.namedChildCount !== 1 || accessor?.type !== 'unconditional_assignable_selector') return undefined;
+    type = accessor.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+    head = last.previousNamedSibling;
+  }
+  if (!type || head?.type !== 'identifier') return undefined;
+  // Written as it is, the callee is all of `rel` before the `<`.
+  if (last.equals(before) && !rel.firstNamedChild?.equals(head)) return undefined;
+  if (!/^[_$]*[A-Z]/.test(type.text)) return undefined;
+  return { head, type };
+}
+
+/** The `<` of a relational expression that opens a misparsed call's type arguments: its only operator. */
+function dartCtorTypeArgsStart(rel: SyntaxNode): SyntaxNode | undefined {
+  if (rel.type !== 'relational_expression') return undefined;
+  const ops = rel.namedChildren.filter((c: SyntaxNode) => c.type === 'relational_operator');
+  return ops.length === 1 && ops[0]!.firstChild?.type === '<' ? ops[0] : undefined;
+}
+
+/**
+ * The expression before the one `expr` stands for in a list of arguments,
+ * list or map elements, or record fields — where tree-sitter-dart splits a
+ * generic constructor call at the comma between its type arguments.
+ */
+function dartPrevListedExpression(expr: SyntaxNode): SyntaxNode | undefined {
+  const parent = expr.parent;
+  const item = parent?.type === 'argument' || parent?.type === 'record_field' ? parent : expr;
+  const list = item.parent;
+  if (!list || !DART_LISTS.has(list.type)) return undefined;
+  const prev = dartPrevNamed(item);
+  if (!prev) return undefined;
+  if (prev.type === 'pair') return prev.childForFieldName('value') ?? undefined;
+  if (prev.type === 'argument' || prev.type === 'record_field' || prev.type === 'named_argument') {
+    return prev.lastNamedChild ?? undefined;
+  }
+  return prev;
+}
+
+/** The nodes that list the expressions a generic constructor call can be split across. */
+const DART_LISTS: ReadonlySet<string> = new Set(['arguments', 'list_literal', 'set_or_map_literal', 'record_literal']);
+
+/**
+ * A generic constructor call tree-sitter-dart parsed as comparisons and a dot
+ * shorthand, found from the relational expression `tail` that holds its `>`.
+ * Dart 3.10's dot shorthands (`.zero`, `.new(…)`) made `X<T>.named(…)`
+ * ambiguous for the grammar, and it reads `Future<void>.delayed(d)` as
+ * `(Future < void) > .delayed(d)` wherever an expression goes but a
+ * statement's start. With two type arguments in a list of arguments or
+ * elements, it splits the call at their comma (`Map<String, int>.of(m)` is
+ * `Map < String`, then `int > .of(m)`). Dart reads both as the constructor
+ * call, and so does this when it is laid out as one: `<` against the type, a
+ * type in each argument, and `>` against the `.name`, which a comparison
+ * with a shorthand writes `c > .zero()`. The call is named as a parsed one,
+ * `Future.delayed`, from where a parsed one starts.
+ */
+export function dartMisparsedCtor(tail: SyntaxNode): DartMisparsedCtor | undefined {
+  if (tail.type !== 'relational_expression') return undefined;
+  // `… > .name(…)`: the `>`, the shorthand against it, and a call.
+  const kids = tail.namedChildren;
+  const dotAt = kids.findIndex((c: SyntaxNode) => c.type === 'dot_shorthand');
+  if (dotAt < 2) return undefined;
+  const dot = kids[dotAt]!;
+  const gt = kids[dotAt - 1]!;
+  if (gt.type !== 'relational_operator' || gt.firstChild?.type !== '>' || gt.endIndex !== dot.startIndex) return undefined;
+  const call = kids[dotAt + 1];
+  if (call?.type !== 'selector' || !call.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) return undefined;
+  const name = dot.namedChildCount === 1 && dot.firstNamedChild?.type === 'identifier' ? dot.firstNamedChild : undefined;
+  if (!name) return undefined;
+  const first = kids[0]!;
+  // One type argument: `(X < T) > .name(…)`.
+  if (dotAt === 2 && first.type === 'relational_expression') {
+    const lt = dartCtorTypeArgsStart(first);
+    const callee = lt && dartCtorCallee(first, lt);
+    const arg = lt && dartTypeArgPart(lt.nextNamedSibling);
+    if (!callee || !arg || arg.next) return undefined;
+    return { ...callee, name, gt, start: first, typeArgs: [arg.name] };
+  }
+  // Two, split at their comma: `X < A`, then `B > .name(…)` in the next item.
+  const last = dartTypeArgPart(first);
+  if (!last || !last.next?.equals(gt)) return undefined;
+  const start = dartPrevListedExpression(tail);
+  const lt = start && dartCtorTypeArgsStart(start);
+  const callee = lt && dartCtorCallee(start, lt);
+  const arg = lt && dartTypeArgPart(lt.nextNamedSibling);
+  if (!start || !callee || !arg || arg.next) return undefined;
+  return { ...callee, name, gt, start, typeArgs: [arg.name, last.name] };
+}
+
+/**
+ * Whether the relational expression `rel` holds part of a misparsed generic
+ * constructor call before its `>` — where `node` is. The call's import prefix
+ * (`p.X<T>.named()`) and a prefixed type argument (`X<p.T>.named()`) read no
+ * member: a parsed call has neither.
+ */
+export function dartMisparsedCtorIn(rel: SyntaxNode, node: SyntaxNode): boolean {
+  const own = dartMisparsedCtor(rel);
+  if (own) return node.endIndex <= own.gt.startIndex;
+  // The `X < T` of `(X < T) > .name(…)`, or the `X < A` a split call starts
+  // with: laid out as one before looking up from it (`a.length < b.length`
+  // is not).
+  const lt = dartCtorTypeArgsStart(rel);
+  const arg = lt && dartCtorCallee(rel, lt) ? dartTypeArgPart(lt.nextNamedSibling) : undefined;
+  if (!arg || arg.next) return false;
+  const outer = rel.parent;
+  if (outer?.type === 'relational_expression' && outer.firstNamedChild?.equals(rel)) {
+    return dartMisparsedCtor(outer)?.start.equals(rel) === true;
+  }
+  return dartNextListedCtor(rel) !== undefined;
+}
+
+/** The split constructor call that `start` begins (`X < A`), from the next item of its list (dartMisparsedCtor). */
+function dartNextListedCtor(start: SyntaxNode): DartMisparsedCtor | undefined {
+  if (!dartCtorTypeArgsStart(start)) return undefined;
+  const parent = start.parent;
+  let item: SyntaxNode = start;
+  if (parent?.type === 'pair' || parent?.type === 'argument' || parent?.type === 'record_field' || parent?.type === 'named_argument') {
+    item = parent;
+  }
+  const next = dartNextNamed(item);
+  const tail = next?.type === 'argument' || next?.type === 'record_field' ? next.firstNamedChild : next;
+  if (tail?.type !== 'relational_expression') return undefined;
+  const ctor = dartMisparsedCtor(tail);
+  return ctor?.start.equals(start) ? ctor : undefined;
 }
 
 /**
@@ -301,6 +511,8 @@ export function dartMemberRead(
   if (next?.type === 'selector' && next.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) {
     return undefined;
   }
+  // `p.Box` in `p.Box<int>.named(…)` is a type, after its import prefix.
+  if (dartTypeArgumentsType(next)?.equals(member)) return undefined;
   if (dartInMisparsedGenericCall(receiver, next, parent)) return undefined;
   return { name: `${receiver.text}.${member.text}`, node: member };
 }
@@ -386,7 +598,15 @@ function dartCtorInfo(node: SyntaxNode): { className: string; ctorName: string }
     if (c.type === 'identifier') ids.push(c);
   }
   const className = dartEnclosingTypeName(node);
-  if (!className || !ids[0]) return undefined;
+  if (!className) return undefined;
+  // Dart 3.13's concise constructors leave the class out: `new()`, `new
+  // named()`, `const new()`, `factory()` and `factory make()` declare what
+  // `Foo()`, `Foo.named()`, `const Foo()`, `factory Foo()` and `factory
+  // Foo.make()` do (#3270).
+  const factory = ctor.type === 'factory_constructor_signature' || ctor.type === 'redirecting_factory_constructor_signature';
+  const concise = factory ? ids[0]?.text !== className : ctor.children.some((c: SyntaxNode) => c.type === 'new');
+  if (concise) return { className, ctorName: ids[0]?.text ?? className };
+  if (!ids[0]) return undefined;
   if (ids[0].text !== className) return undefined; // misparsed method, not a ctor
   // `<Class>.<name>` is a named ctor; bare `<Class>` is the unnamed ctor.
   return { className, ctorName: ids[1]?.text ?? className };
@@ -420,11 +640,35 @@ function extractDartReturnType(node: SyntaxNode, source: string): string | undef
  * between the type and `.value`. Only a constructor is called that way.
  */
 function dartTypeArgumentsReceiver(selector: SyntaxNode | null): string | undefined {
+  return dartTypeArgumentsType(selector)?.text;
+}
+
+/**
+ * The identifier naming the type that the type-arguments-only `selector`
+ * follows: `BlocProvider` in `BlocProvider<CounterCubit>.value(…)`, and `Box`
+ * in `p.Box<int>.named(…)`, whose import prefix reads as a receiver.
+ */
+export function dartTypeArgumentsType(selector: SyntaxNode | null): SyntaxNode | undefined {
   if (selector?.type !== 'selector' || selector.namedChildCount !== 1 || selector.namedChild(0)?.type !== 'type_arguments') {
     return undefined;
   }
   const type = dartPrevNamed(selector);
-  return type?.type === 'identifier' ? type.text : undefined;
+  if (type?.type === 'identifier') return type;
+  return dartPrefixedTypeName(type);
+}
+
+/**
+ * The type `X` that the selector `.X` names after an import prefix, when a
+ * type's `<…>` follows it (`p.X<T>.named(…)`): a member access to an
+ * UpperCamelCase name, on a plain name.
+ */
+function dartPrefixedTypeName(selector: SyntaxNode | null | undefined): SyntaxNode | undefined {
+  if (selector?.type !== 'selector' || selector.namedChildCount !== 1) return undefined;
+  const accessor = selector.firstNamedChild;
+  if (accessor?.type !== 'unconditional_assignable_selector') return undefined;
+  const name = accessor.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+  if (!name || !/^[_$]*[A-Z]/.test(name.text)) return undefined;
+  return dartPrevNamed(selector)?.type === 'identifier' ? name : undefined;
 }
 
 /**
@@ -658,6 +902,10 @@ export const dartExtractor: LanguageExtractor = {
     // resolve (#750). dartCtorInfo validates against the class name, so a method
     // tree-sitter misparsed as a ctor (`@override (T) m()`) is NOT skipped here.
     // (isMisparsedFunction skips node creation but still visits the body.)
+    // The part of a Dart 3.13 primary constructor written in the class body,
+    // `this : y = x + 1 { … }`, belongs to the constructor the header
+    // declares: its body runs as the unnamed constructor's does.
+    if (node.namedChildren.some((c: SyntaxNode) => c.type === 'primary_constructor_body_signature')) return true;
     const ctor = dartCtorInfo(node);
     // A `const` constructor or redirecting factory is nothing else, so one
     // that names no enclosing type is error recovery's, and skipped.
@@ -687,6 +935,10 @@ export const dartExtractor: LanguageExtractor = {
     return result.trim() || undefined;
   },
   getVisibility: (node) => {
+    // A `const` constructor is public, as d4d8f3e's grammar gave it no `name`
+    // field: 0038280 names its class there (`_Impl` in `const _Impl.named()`),
+    // which says nothing of the constructor's own visibility.
+    if (node.type === 'constant_constructor_signature') return 'public';
     // Dart convention: _ prefix means private, otherwise public
     let nameNode: SyntaxNode | null = null;
     if (node.type === 'method_signature') {
