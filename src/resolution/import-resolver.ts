@@ -20,6 +20,7 @@ import { isTestFile } from '../search/query-utils';
 import { moduleReferenceKeys, moduleTail } from '../db/reference-tail';
 import { PHP_DOCUMENT_ROOT } from '../extraction/languages/php';
 import { loadWebRoot } from '../project-config';
+import { underWebRoot } from './php-web-root';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -2024,17 +2025,17 @@ function resolvePhpIncludePath(
 ): string | null {
   const projectRoot = context.getProjectRoot();
   // The web server's root is in its own configuration, not the project's
-  // code, so only a `codegraph.json` `webRoot` places it (#3298): a guess at
-  // the project root would link `public/index.php`'s include of
+  // code (#3298): a `codegraph.json` `webRoot` names it, or the project's own
+  // includes show it clearly enough (php-web-root.ts). A guess at the project
+  // root would link `public/index.php`'s include of
   // `$_SERVER['DOCUMENT_ROOT'] . '/config.php'` to the root's config.php,
-  // not the public/config.php PHP loads. Loaded exactly as written, like
-  // `./x`, and never outside the project.
+  // not the public/config.php PHP loads, so with neither it links nothing.
+  // Loaded exactly as written, like `./x`, and never outside the project.
   if (includePath.startsWith(`${PHP_DOCUMENT_ROOT}/`)) {
-    const webRoot = loadWebRoot(projectRoot);
+    const webRoot = context.getPhpWebRoot ? context.getPhpWebRoot(fromFile) : loadWebRoot(projectRoot);
     if (webRoot === null) return null;
-    const target = path.posix.normalize(path.posix.join(webRoot || '.', includePath.slice(PHP_DOCUMENT_ROOT.length + 1)));
-    if (target === '..' || target.startsWith('../')) return null;
-    return context.fileExists(target) ? target : null;
+    const target = underWebRoot(webRoot, includePath.slice(PHP_DOCUMENT_ROOT.length + 1));
+    return target !== null && context.fileExists(target) ? target : null;
   }
   const fromDir = path.dirname(path.join(projectRoot, fromFile));
   const basePath = path.resolve(fromDir, includePath);

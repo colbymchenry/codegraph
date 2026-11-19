@@ -87,10 +87,11 @@ export interface ProjectConfig {
    * holds at run time (#3298): `"public"`, `"web"`, `"htdocs"`, or `"."` for the
    * project root. Relative to the project root. With it set, an include built
    * from it, like `require $_SERVER['DOCUMENT_ROOT'] . '/inc/header.php'`, links
-   * to `public/inc/header.php`. Absent (the default), such an include links
-   * nothing: the server configuration that names the folder isn't in the
-   * project, and a guess would link the wrong file wherever two folders hold
-   * one of the same name.
+   * to `public/inc/header.php`. Absent (the default), the folder is the one the
+   * project's own includes settle on (resolution/php-web-root.ts), and an
+   * include they don't settle links nothing: the server configuration that
+   * names the folder isn't in the project, and a guess would link the wrong
+   * file wherever two folders hold one of the same name.
    */
   webRoot?: string;
 }
@@ -441,8 +442,8 @@ export function loadIncludePatterns(rootDir: string): string[] {
  * Load the project's validated `webRoot`, mtime-cached: the folder PHP's
  * `$_SERVER['DOCUMENT_ROOT']` names, relative to the project root with `/`
  * separators ('' for the root itself), or null when `codegraph.json` sets none
- * (the zero-config default, under which an include built from
- * `$_SERVER['DOCUMENT_ROOT']` links nothing).
+ * (the zero-config default, under which the folder is inferred from the
+ * project's includes where they settle it; see resolution/php-web-root.ts).
  */
 export function loadWebRoot(rootDir: string): string | null {
   return loadParsedConfig(rootDir).webRoot;

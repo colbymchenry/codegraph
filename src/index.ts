@@ -143,6 +143,8 @@ export interface IndexOptions {
  */
 /** project_metadata key for the Python package-root digest (see sync). */
 const PYTHON_ROOTS_METADATA_KEY = 'python_root_fingerprint';
+/** project_metadata key for the PHP web roots the index placed `$_SERVER['DOCUMENT_ROOT']` includes under (#3298, see sync). */
+const PHP_WEB_ROOTS_METADATA_KEY = 'php_web_roots';
 /** Metadata key: the digest of the workspace packages and path dependencies the index was resolved by. */
 const WORKSPACE_METADATA_KEY = 'js_workspace_fingerprint';
 /** Metadata key: where the walk that read those packages found their manifests (see ManifestStamp); '' for none. */
@@ -893,6 +895,7 @@ export class CodeGraph {
         // real full index — a sync touches a subset, so it must NOT advance the
         // extraction stamp (the bulk would still be stale). See extraction-version.ts.
         if (result.success) this.stampPythonRootFingerprint();
+        if (result.success) this.stampPhpWebRoots();
         if (result.success) this.stampWorkspaceFingerprint();
         if (result.success) this.stampWorkspaceManifests(this.orchestrator.takeManifestEvidence());
         if (result.success) this.stampModuleConfigSnapshot();
@@ -1011,6 +1014,13 @@ export class CodeGraph {
   private stampPythonRootFingerprint(fingerprint = this.resolver.getPythonRootFingerprint()): void {
     try {
       this.queries.setMetadata(PYTHON_ROOTS_METADATA_KEY, fingerprint);
+    } catch { /* metadata is advisory */ }
+  }
+
+  /** Record the PHP web roots the index placed `$_SERVER['DOCUMENT_ROOT']` includes under (#3298), for a later sync to compare against. */
+  private stampPhpWebRoots(snapshot = this.resolver.getPhpWebRootSnapshot()): void {
+    try {
+      this.queries.setMetadata(PHP_WEB_ROOTS_METADATA_KEY, snapshot);
     } catch { /* metadata is advisory */ }
   }
 
@@ -1773,6 +1783,28 @@ export class CodeGraph {
             }
           }
           if (before !== now) this.stampPythonRootFingerprint(now);
+        }
+
+        // PHP's web root, which an include of `$_SERVER['DOCUMENT_ROOT'] .
+        // '/x.php'` goes under when codegraph.json names none, is read from
+        // every such include in the project and the files their paths name
+        // (#3298). Files that come or go, or an include edited, can move it
+        // for a folder whose files this sync never touched: then re-open PHP's
+        // references for the sweep below, as a moved Python root set re-opens
+        // Python's. A folder that only appears or goes holds files this sync
+        // resolves anyway, and a `webRoot`'s own edits are the module-config
+        // snapshot's. An index stamped by an older engine has no snapshot:
+        // record one rather than re-resolving on upgrade.
+        {
+          const before = this.queries.getMetadata(PHP_WEB_ROOTS_METADATA_KEY);
+          const now = this.resolver.getPhpWebRootSnapshot();
+          if (before !== null && this.resolver.phpWebRootsMoved(before, now)) {
+            this.resolver.clearCaches();
+            this.orchestrator.resurrectResolutionEdgesForLanguage('php');
+            refreshSynthesis = true;
+            this.queries.setMetadata('synthesis_pending', '1');
+          }
+          if (before !== now) this.stampPhpWebRoots(now);
         }
 
         // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850

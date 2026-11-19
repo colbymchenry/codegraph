@@ -59,6 +59,8 @@ import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } fr
 import { clearDeclaredDependencies } from './frameworks/package-deps';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { loadWebRoot, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { folderOf, inferPhpWebRoots, phpWebRootSnapshot, phpWebRootsMoved } from './php-web-root';
+import { PHP_DOCUMENT_ROOT } from '../extraction/languages/php';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { FlowChange, planParameterFlows } from './parameter-flow';
 import { MAX_SOURCE_FILE_SIZE_BYTES, readSourceText } from '../file-limits';
@@ -537,6 +539,10 @@ export class ReferenceResolver {
   private projectAliases: AliasMap | null | undefined = undefined;
   // Per directory: the aliases of the nearest non-root tsconfig declaring `paths` or `baseUrl`.
   private dirAliases = new Map<string, AliasMap | null>();
+  // Per folder holding a `$_SERVER['DOCUMENT_ROOT']` include: the PHP web root
+  // the project's includes agree on, or null (#3298, php-web-root.ts). Read
+  // from the graph, so it lives for one pass: clearCaches drops it.
+  private phpWebRoots: Map<string, string | null> | null = null;
   // The Cargo workspace's crates and the include directories a compile
   // database names (null: the project has none). Same lazy convention: read
   // once, whatever the size of the workspace or the database, and dropped by
@@ -838,6 +844,7 @@ export class ReferenceResolver {
     this.searchedModules.clear();
     this.realModulesDirs.clear();
     this.ownPackageNames = null;
+    this.phpWebRoots = null;
     this.installedNames.clear();
     this.knownNames = null;
     this.knownLowerNames = null;
@@ -1318,6 +1325,8 @@ export class ReferenceResolver {
         for (const d of walked) this.dirAliases.set(d, found);
         return found;
       },
+
+      getPhpWebRoot: (fromFile: string) => this.phpWebRootOf(fromFile),
 
       getGoPackageDir: (importPath: string, fromFile?: string) => {
         const own = fromFile === undefined ? null : this.nearestGoModule(goDirOf(fromFile));
@@ -3516,6 +3525,44 @@ export class ReferenceResolver {
   /** The fingerprint of the workspace map this resolver resolves by (see `workspaceFingerprint`). */
   getWorkspaceFingerprint(): string {
     return workspaceFingerprint(this.context.getWorkspacePackages?.() ?? null);
+  }
+
+  /**
+   * The folder `$_SERVER['DOCUMENT_ROOT']` names for a PHP include in
+   * `fromFile` (#3298): the project's `codegraph.json` `webRoot`, else the one
+   * the project's own includes agree on for the file's folder (see
+   * php-web-root.ts), else null.
+   */
+  phpWebRootOf(fromFile: string): string | null {
+    const configured = loadWebRoot(this.projectRoot);
+    if (configured !== null) return configured;
+    return this.inferredPhpWebRoots().get(folderOf(fromFile)) ?? null;
+  }
+
+  /** Every folder holding a `$_SERVER['DOCUMENT_ROOT']` include → the web root inferred for it, read once a pass. */
+  private inferredPhpWebRoots(): Map<string, string | null> {
+    if (this.phpWebRoots === null) {
+      const prefix = `${PHP_DOCUMENT_ROOT}/`;
+      const includes = this.queries.getPhpDocumentRootIncludes(prefix)
+        .map((row) => ({ filePath: row.filePath, written: row.name.slice(prefix.length) }));
+      this.phpWebRoots = includes.length === 0
+        ? new Map()
+        : inferPhpWebRoots(includes, (relPath) => this.context.fileExists(relPath));
+    }
+    return this.phpWebRoots;
+  }
+
+  /**
+   * The web roots PHP's `$_SERVER['DOCUMENT_ROOT']` includes go under now,
+   * for a sync to compare with the index's (#3298; see phpWebRootSnapshot).
+   */
+  getPhpWebRootSnapshot(): string {
+    return phpWebRootSnapshot(loadWebRoot(this.projectRoot), this.inferredPhpWebRoots());
+  }
+
+  /** Whether files a sync never touched must take another web root (see phpWebRootsMoved). */
+  phpWebRootsMoved(before: string, now: string): boolean {
+    return phpWebRootsMoved(before, now);
   }
 
   /** The folder of the workspace package or path dependency `file` is in (see `workspacePackageDirOf`), or null. */
