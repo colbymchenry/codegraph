@@ -23,6 +23,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In JavaScript and TypeScript, you can now find a named object’s data properties by words in their leading documentation comments, even near the end of a long object literal. (#3408)
+
 - `codegraph affected` no longer selects tests on the other side of an HTTP call, a queue or an event, like an Angular app's specs for a change to the Spring controller it calls, since those tests mock that boundary; pass `--cross-tier` to include them. Thanks @jotder for the report. (#3320)
 - In Python, `import time` no longer links the importing file to a project function that happens to be named `time`, so such a function stops listing every file that imports the standard library module among its callers and in its impact. The same goes for `json`, `copy`, `random`, `logging` and any other module, and for a fallback variable like `brotli = None` beside a guarded `import brotli`. Thanks @inth3shadows for the report. (#3239)
 - In Python, a call to a function or method declared with `typing.overload`, like click's `command` and `prompt`, now links to the `def` that runs instead of the first `@overload` stub, so the implementation shows its callers and a call path goes on through it. A stub with no implementation below it, as in a `Protocol`, stays the target, and another library's `overload` whose bodies all run is left alone. Thanks @inth3shadows for the report and @nilotpal-n7. (#2963)
@@ -93,6 +95,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In JavaScript and TypeScript, a name imported from a package your `package.json` doesn't list but your project has installed, like `import { useForm } from 'react-hook-form'` hoisted to a monorepo's root `node_modules`, no longer links to an unrelated function of the same name elsewhere in your project (#3271). Re-index JavaScript and TypeScript projects after upgrading.
 - A file whose parse never ends, like a `.tsx` file with a half-typed JSX attribute, no longer keeps `codegraph init` from exiting or leaves `codegraph sync` and the file watcher spinning at full CPU: its parse now stops at the file's parse time limit, and the file is listed as a parse that timed out. Thanks @inth3shadows for the report. (#3274)
 - After you upgrade, `codegraph status` and the first CodeGraph answer in each agent session now flag a project indexed by 1.6.3 or earlier as out of date, since this release reads code those indexes are missing, like Dart primary constructors, Elysia routes, PHP includes built from `__DIR__` and the methods of an `export default` object; run `codegraph index` in each project to rebuild it. (#3411)
+
 
 ## [1.6.3] - 2026-11-17
 

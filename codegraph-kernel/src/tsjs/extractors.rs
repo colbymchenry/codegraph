@@ -815,6 +815,7 @@ impl<'t> Walker<'t> {
             );
             if let Some(row) = var_row {
                 self.extract_variable_type_annotation(child, row);
+                self.extract_documented_object_properties(value, row, kind, &name);
             }
 
             // A named object literal owns its function members, exported or
@@ -933,6 +934,26 @@ impl<'t> Walker<'t> {
     }
 
     // --- owned object literals (#2300) ------------------------------------------------
+
+    fn extract_documented_object_properties(&mut self, mut value: Option<Node<'t>>, row: u32, kind: &'static str, name: &str) {
+        while let Some(wrapper) = value.filter(|v| matches!(v.kind(), "as_expression" | "satisfies_expression" | "parenthesized_expression")) {
+            let mut cursor = wrapper.walk();
+            value = wrapper.named_children(&mut cursor).find(|child| child.kind() != "comment");
+        }
+        let Some(obj) = value.filter(|v| v.kind() == "object" && self.owns_object_literals()) else { return };
+        let rest = self.enter_owner(row, kind, name, false);
+        let mut cursor = obj.walk();
+        for member in obj.named_children(&mut cursor) {
+            if member.kind() != "pair" || member.prev_named_sibling().map(|n| n.kind()) != Some("comment") { continue }
+            let Some(key) = member.child_by_field_name("key").filter(|k| is_static_object_key(k.kind())) else { continue };
+            if self.owned_member_function(member).is_some() { continue }
+            if let Some(docstring) = crate::docstring::preceding_docstring(member, self.src) {
+                let name = util::object_key_name(self.text(key));
+                self.create_node("property", &name, member, Extra { docstring: Some(docstring), ..Extra::default() });
+            }
+        }
+        self.leave_owner(rest);
+    }
 
     /// ownsObjectLiterals: a generated or minified bundle — named so or not —
     /// keeps the old shape. (Every tsjs variant is TS/JS, so only that check

@@ -1069,6 +1069,16 @@ export class ContextBuilder {
     // Filter by minimum score
     let filteredResults = searchResults.filter((r) => r.score >= opts.minScore);
 
+    // A documented property can be the only lexical match (#3408). Keep the
+    // normal entry-point ranking when it found anything, and honor explicit filters.
+    if (!filteredResults.length && options.nodeKinds === undefined && !exactFileMatches.length && !copybooks.entries.length) {
+      const term = query.trim().toLowerCase();
+      if (/^[\p{L}\p{N}_]+$/u.test(term)) {
+        filteredResults = this.queries.searchNodes(term, { kinds: ['property'], limit: opts.searchLimit })
+          .filter(({ node, score }) => score >= opts.minScore && node.docstring?.toLowerCase().includes(term));
+      }
+    }
+
     // Resolve imports/exports to their actual definitions
     // If someone searches "terminal" and finds `import { TerminalPanel }`,
     // they want the TerminalPanel class, not the import statement
