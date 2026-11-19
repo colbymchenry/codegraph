@@ -428,15 +428,13 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // scanner's out-of-memory report uses stdio, which a wasm parser lacks) —
   // see that doc's .md.
   'swift',
-  // R7b (Kotlin kernel port prep): fwcd tree-sitter-kotlin 0.3.8 (tag
-  // e1a2d5a), parser.c/scanner.c sha-matched crate↔tag; behavior-IDENTICAL
-  // to the tree-sitter-wasms build (0 CST/error disagreements across the
-  // gate repos) — a reproducibility re-vendor, ABI stays 14. The crates.io
-  // crate is UNUSABLE by the kernel (pins tree-sitter <0.23) and
-  // tree-sitter-kotlin-ng is a different grammar — the kernel compiles the
-  // same vendored C sources instead (codegraph-kernel/grammars/kotlin).
-  // Both carry docs/grammars/tree-sitter-kotlin.patch (scanner: no automatic
-  // semicolon before a same-line `e` word, e.g. an `eq` infix call).
+  // fwcd/tree-sitter-kotlin main@d6af96d2e23e (untagged; 0.3.8, the newest
+  // tag, read a call named after a modifier keyword as a modifier, #3410),
+  // built unpatched from the commit's checked-in src/ with tree-sitter-cli
+  // 0.25.10 and emsdk 4.0.4 (docs/grammars/tree-sitter-kotlin.md); ABI 14.
+  // No crates.io release carries it and tree-sitter-kotlin-ng is a different
+  // grammar, so the kernel compiles the same C sources
+  // (codegraph-kernel/grammars/kotlin).
   'kotlin',
   // Built from UserNobody14/tree-sitter-dart master@0038280b774b (Dart 3.13
   // primary constructors, #3270) with tree-sitter-cli 0.25.10 and emsdk 4.0.4

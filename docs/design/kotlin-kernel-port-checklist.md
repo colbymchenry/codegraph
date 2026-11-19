@@ -1,5 +1,15 @@
 # Kotlin kernel port (R7b) — the bug-for-bug checklist
 
+**Update (2026-11-19, #3410):** both engines now build fwcd/tree-sitter-kotlin
+main@d6af96d instead of the 0.3.8 tag, unpatched (provenance, measurements and
+what the extractors read differently: `docs/grammars/tree-sitter-kotlin.md`).
+What changes below: an extension receiver is a `receiver_type` node wrapping
+the `user_type` (`getReceiverType` / `receiver_type_of` read it there), the
+same-line `e`-word scanner patch is gone, the one-line-class-body PHANTOM error
+no longer happens (the defer test uses a dangling `x = }` instead), and
+parse-error deferrals fall from the 4.7–8.5% recorded here to near zero. The
+rest of this record describes the port as it was done on 0.3.8.
+
 **Status: PORT COMPLETE (2026-07-20)** — walker `codegraph-kernel/src/kotlin.rs`
 + the vendored-grammar-C build (codegraph-kernel/grammars/kotlin via build.rs
 cc — the mechanism's first use), all gates passed (bump dumps byte-identical

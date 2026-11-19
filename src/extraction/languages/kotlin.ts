@@ -59,10 +59,11 @@ function extractKotlinReturnType(node: SyntaxNode, source: string): string | und
 
 /**
  * A property's CODE children: the named child right after the `=` token, a
- * `property_delegate` (`by lazy { … }`), and an accessor the grammar nested
- * under the declaration (`val x: Int get() = compute()` — written on ONE line;
- * an accessor on its own line parses as a SIBLING of the property and is not
- * reachable from here). What stays unwalked is the declaration itself —
+ * `property_delegate` (`by lazy { … }`), an explicit backing field (`val state:
+ * StateFlow<S>` then `field = MutableStateFlow(S())`, Kotlin 2.x), and an
+ * accessor the grammar nested under the declaration (`val x: Int get() =
+ * compute()` — written on ONE line; an accessor on its own line parses as a
+ * SIBLING of the property and is not reachable from here). What stays unwalked is the declaration itself —
  * modifiers, the `val`/`var` keyword, the name+type, and an extension
  * receiver's type and type parameters. (Go's #693 fix walks the `value` field
  * for the same reason; tree-sitter-kotlin exposes no fields at all, hence the
@@ -81,7 +82,7 @@ function kotlinPropertyInitializers(node: SyntaxNode): SyntaxNode[] {
     if (afterEq) {
       out.push(c);
       afterEq = false;
-    } else if (c.type === 'property_delegate' || c.type === 'getter' || c.type === 'setter') {
+    } else if (c.type === 'property_delegate' || c.type === 'getter' || c.type === 'setter' || c.type === 'backing_field') {
       out.push(c);
     }
   }
@@ -237,12 +238,15 @@ export function joinKotlinSplitConstructors(source: string): string {
  *   becomes a second condition, `is H2Dialect,   dialect.mode == X ->`, so
  *   the guard's references are kept;
  * - an open-ended range (1.9), `1..<n`, becomes `1.. n`;
- * - a multi-dollar string (2.1), `$$"?(@.a == $x)"`, loses its prefix;
  * - a nullable receiver in a function type, `Op<Boolean>?.() -> Op<Boolean>`,
  *   becomes `Op<Boolean>.( ) -> …`.
+ *
+ * A multi-dollar string (2.1), `$$"?(@.a == $x)"`, lost its prefix here too
+ * until #3410. The grammar since reads it, and dropping the prefix turned its
+ * literal `${…}` back into interpolation: Spring's `@Value($$"${app.flag:false}")`
+ * then parsed as an expression and broke the file.
  */
 const WHEN_GUARD = /^([ \t]*!?(?:is|in)[ \t]+(?:(?!->)[^\n])*?[\w>?)\]'"])([ \t]+)if(?=[ \t(])/gm;
-const MULTI_DOLLAR_STRING = /(?<![\w$"])\$\$+(?=")/g;
 const NULLABLE_RECEIVER_FN = /([\w>])\?\.\(\)(?=\s*->)/g;
 
 export function rewriteNewerKotlinSyntax(source: string): string {
@@ -252,11 +256,17 @@ export function rewriteNewerKotlinSyntax(source: string): string {
     out = out.replace(WHEN_GUARD, (_m, cond: string, gap: string) => `${cond},${' '.repeat(gap.length + 1)}`);
   }
   if (out.includes('..<')) out = out.replace(/\.\.</g, '.. ');
-  if (out.includes('$$')) out = out.replace(MULTI_DOLLAR_STRING, (m) => ' '.repeat(m.length));
   if (out.includes('?.()')) out = out.replace(NULLABLE_RECEIVER_FN, '$1.( )');
   return out;
 }
 
+/**
+ * The rewrites above work around tree-sitter-kotlin 0.3.8. The grammar vendored
+ * since #3410 (fwcd main@d6af96d) reads each of those forms itself; the
+ * rewrites keep every offset and still parse (the multi-dollar one did not, and
+ * is gone), so extraction is unchanged with them, and dropping them is a change
+ * of its own.
+ */
 function preParseKotlin(source: string): string {
   return rewriteNewerKotlinSyntax(joinKotlinSplitConstructors(blankKotlinQualifiedReceivers(blankKotlinFunInterface(source))));
 }
@@ -475,22 +485,20 @@ export const kotlinExtractor: LanguageExtractor = {
   },
   getReceiverType: (node, source) => {
     // Kotlin extension functions: fun Type.method() { }
-    // AST: function_declaration > user_type, ".", simple_identifier
-    // The user_type before the dot is the receiver type.
-    let foundUserType: SyntaxNode | null = null;
+    // AST: function_declaration > receiver_type > user_type, then ".", simple_identifier.
+    // Only a plain user_type receiver counts (a nullable or function-type one
+    // gives none), and a qualified one names its FIRST type_identifier.
     for (let i = 0; i < node.childCount; i++) {
       const child = node.child(i);
       if (!child) continue;
-      if (child.type === 'user_type') {
-        foundUserType = child;
-      } else if (child.type === '.' && foundUserType) {
-        // The user_type before the dot is the receiver type
-        const typeId = foundUserType.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
-        return typeId ? getNodeText(typeId, source) : getNodeText(foundUserType, source);
-      } else if (child.type === 'simple_identifier' || child.type === 'function_value_parameters') {
-        // Past the function name — no receiver
-        break;
+      if (child.type === 'receiver_type') {
+        const userType = child.namedChildren.find((c: SyntaxNode) => c.type === 'user_type');
+        if (!userType) return undefined;
+        const typeId = userType.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+        return typeId ? getNodeText(typeId, source) : getNodeText(userType, source);
       }
+      // Past the function name — no receiver
+      if (child.type === 'simple_identifier' || child.type === 'function_value_parameters') break;
     }
     return undefined;
   },

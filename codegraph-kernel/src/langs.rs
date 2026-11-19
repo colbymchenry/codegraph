@@ -77,7 +77,8 @@ pub fn grammar_for(language: &str) -> Option<Language> {
         "swift" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_swift) }.into())
         }
-        // R7b: fwcd 0.3.8, vendored C compiled in build.rs (crate unusable).
+        // R7b: fwcd main@d6af96d (#3410), vendored C compiled in build.rs
+        // (no crate carries it).
         "kotlin" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_kotlin) }.into())
         }
