@@ -235,6 +235,8 @@ describe('the daemon answers a challenge in its handshake (#3284)', () => {
 async function indexedProject(): Promise<string> {
   const root = tempDir('cg-proofhook-');
   fs.writeFileSync(path.join(root, 'orders.ts'), 'export function placeOrder() { return 1; }\n');
+  // The hook trusts a private socket directory even on hosts with a group-writable umask.
+  fs.mkdirSync(path.join(root, '.codegraph'), { mode: 0o700 });
   const cg = await CodeGraph.init(root, { index: true });
   cg.close();
   return root;
