@@ -503,6 +503,7 @@ export class QueryBuilder {
     getNodesByFileAndName?: NodeStatement;
     getNodeIdentitiesByFile?: SqliteStatement;
     getFileNodesByNamePrefix?: SqliteStatement;
+    getPhpDocumentRootIncludes?: SqliteStatement;
     getNodesByQualifiedNameExact?: NodeStatement;
     getNodesByLowerName?: NodeStatement;
     hasFilesOfLanguage?: SqliteStatement;
@@ -1766,6 +1767,20 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getNodesByNamePrefix.all(prefix, prefix + '￿', limit) as NodeRow[];
     return rows.map(rowToNode);
+  }
+
+  /**
+   * The PHP includes built from `$_SERVER['DOCUMENT_ROOT']` (#3298): the import
+   * nodes the extractors name `prefix` + the path appended to the web root,
+   * each with its file. By index range scan, ordered for a stable reading.
+   */
+  getPhpDocumentRootIncludes(prefix: string): Array<{ filePath: string; name: string }> {
+    if (!this.stmts.getPhpDocumentRootIncludes) {
+      this.stmts.getPhpDocumentRootIncludes = this.db.prepare(
+        "SELECT file_path AS filePath, name FROM nodes WHERE name >= ? AND name < ? AND kind = 'import' AND language = 'php' ORDER BY name, file_path"
+      );
+    }
+    return this.stmts.getPhpDocumentRootIncludes.all(prefix, prefix + '￿') as Array<{ filePath: string; name: string }>;
   }
 
   /** File nodes whose basename starts with `prefix`, without a result cap. */

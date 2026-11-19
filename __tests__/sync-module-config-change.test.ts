@@ -134,6 +134,15 @@ const PHP_SITE: Files = {
   'config.php': '<?php\nfunction private_config() {}\n',
 };
 
+/** A page that includes three files from the web root, which settle it once all three exist. */
+const PHP_THREE_INCLUDES = [
+  '<?php',
+  "require $_SERVER['DOCUMENT_ROOT'] . '/lib/a.php';",
+  "require $_SERVER['DOCUMENT_ROOT'] . '/lib/b.php';",
+  "require $_SERVER['DOCUMENT_ROOT'] . '/lib/c.php';",
+  '',
+].join('\n');
+
 /** The files a PHP file's includes link to. */
 function phpIncludeTargets(graph: CodeGraph, file: string): string[] {
   return graph.getNodesInFile(file)
@@ -278,6 +287,53 @@ describe('a sync follows a module-config change (#2977)', () => {
     const fullRoot = tempRoot();
     write(fullRoot, { ...PHP_SITE, 'codegraph.json': JSON.stringify({ deprioritize: ['scripts/'] }) });
     expect(stateOf(root, graph)).toEqual(stateOf(fullRoot, await index(fullRoot)));
+  }, 120_000);
+
+  it('the web root the includes show appears when a sync adds the third file that settles it, and goes with it', async () => {
+    const before: Files = { 'index.php': PHP_THREE_INCLUDES, 'lib/a.php': '<?php\nfunction a() {}\n', 'lib/b.php': '<?php\nfunction b() {}\n' };
+    const { root, graph, full } = await syncEdit(before, { 'lib/c.php': '<?php\nfunction c() {}\n' });
+    // Two paths settle nothing; the third places the project root, so the
+    // unchanged index.php's parked includes of lib/a.php and lib/b.php link too.
+    expect(phpIncludeTargets(graph, 'index.php')).toEqual(['lib/a.php', 'lib/b.php', 'lib/c.php']);
+    expect(stateOf(root, graph)).toEqual(full);
+    fs.rmSync(path.join(root, 'lib/c.php'));
+    await graph.sync();
+    expect(phpIncludeTargets(graph, 'index.php')).toEqual([]);
+    const fullRoot = tempRoot();
+    write(fullRoot, before);
+    expect(stateOf(root, graph)).toEqual(stateOf(fullRoot, await index(fullRoot)));
+  }, 120_000);
+
+  it('an edit that leaves the inferred web root where it was re-opens nothing', async () => {
+    const root = tempRoot();
+    write(root, { 'index.php': PHP_THREE_INCLUDES, 'lib/a.php': '<?php\nfunction a() {}\n', 'lib/b.php': '<?php\nfunction b() {}\n', 'lib/c.php': '<?php\nfunction c() {}\n' });
+    const graph = await index(root);
+    expect(phpIncludeTargets(graph, 'index.php')).toEqual(['lib/a.php', 'lib/b.php', 'lib/c.php']);
+    const reopen = vi.spyOn(ExtractionOrchestrator.prototype, 'resurrectResolutionEdgesForLanguage');
+    try {
+      write(root, { 'lib/b.php': '<?php\nfunction b() { return 2; }\n', 'lib/d.php': '<?php\nfunction d() {}\n' });
+      await graph.sync();
+      expect(reopen).not.toHaveBeenCalled();
+    } finally {
+      reopen.mockRestore();
+    }
+    expect(phpIncludeTargets(graph, 'index.php')).toEqual(['lib/a.php', 'lib/b.php', 'lib/c.php']);
+  }, 120_000);
+
+  it('a page in a new folder takes the inferred web root and re-opens nothing else', async () => {
+    const root = tempRoot();
+    write(root, { 'index.php': PHP_THREE_INCLUDES, 'lib/a.php': '<?php\nfunction a() {}\n', 'lib/b.php': '<?php\nfunction b() {}\n', 'lib/c.php': '<?php\nfunction c() {}\n' });
+    const graph = await index(root);
+    const reopen = vi.spyOn(ExtractionOrchestrator.prototype, 'resurrectResolutionEdgesForLanguage');
+    try {
+      write(root, { 'news/item.php': "<?php\nrequire $_SERVER['DOCUMENT_ROOT'] . '/lib/a.php';\n" });
+      await graph.sync();
+      expect(reopen).not.toHaveBeenCalled();
+    } finally {
+      reopen.mockRestore();
+    }
+    expect(phpIncludeTargets(graph, 'news/item.php')).toEqual(['lib/a.php']);
+    expect(phpIncludeTargets(graph, 'index.php')).toEqual(['lib/a.php', 'lib/b.php', 'lib/c.php']);
   }, 120_000);
 
   it('a codegraph.json that sets no webRoot re-opens nothing, written or edited', async () => {
