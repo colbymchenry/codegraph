@@ -19,6 +19,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### New Features
 
 - The Claude Code prompt hook now gets its context from the CodeGraph server already running for your project instead of loading the index again on every prompt, so structural prompts are answered sooner, most of all in large projects; with no server running, one that is busy, or one that can't prove it runs as you, the hook works it out itself as before. Thanks @aidenpan0x for the report, the measurements and the pull request. (#3284)
+- Elysia (Bun) backends now have their HTTP routes in the graph, named by the full path a request takes, with the prefixes of `new Elysia({ prefix })`, `.group()` and a `.use()` in another file included, and linked to their handlers, so `codegraph_explore` can follow a request from its route into your code. Thanks @ChampPABA for the report. (#3255)
 
 ### Fixes
 
