@@ -99,6 +99,11 @@ describe.skipIf(!kernelBuilt)('kernel Kotlin extraction parity', () => {
     expect(viaWasm.nodes.length).toBeGreaterThanOrEqual(minNodes);
   }
 
+  it('accepts annotation as a Gradle DSL callee and a class modifier (#3410)', () => {
+    assertParity('build.gradle.kts', 'allOpen { annotation("example.Entity") }\n', 1);
+    assertParity('Entity.kt', 'annotation class Entity\n', 2);
+  });
+
   const FIXTURES: Array<{ file: string; minNodes: number }> = [
     { file: 'torture.kt', minNodes: 40 },
     { file: 'TortureScript.kts', minNodes: 2 },
