@@ -94,7 +94,13 @@ describe('CG-26 — no admitted file is starved, on any render path', () => {
 
     const sidecar = path.join(testDir, 'explore-diag.jsonl');
     const previous = process.env.CODEGRAPH_EXPLORE_DEBUG;
+    const oneSymbol = process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL;
     process.env.CODEGRAPH_EXPLORE_DEBUG = sidecar;
+    // The `precise` shape names one symbol, which explore now answers with that
+    // symbol and its references (#3407, explore-one-symbol.test.ts). These gates
+    // are about the ranked allocation, which a one-name query still reaches when
+    // the name has several definitions, so they turn that answer off.
+    process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL = '0';
     try {
       const handler = new ToolHandler(cg);
       for (const [shape, query] of Object.entries(QUERIES) as [Shape, string][]) {
@@ -110,6 +116,8 @@ describe('CG-26 — no admitted file is starved, on any render path', () => {
     } finally {
       if (previous === undefined) delete process.env.CODEGRAPH_EXPLORE_DEBUG;
       else process.env.CODEGRAPH_EXPLORE_DEBUG = previous;
+      if (oneSymbol === undefined) delete process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL;
+      else process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL = oneSymbol;
     }
   }, 180_000);
 

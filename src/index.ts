@@ -2561,6 +2561,25 @@ export class CodeGraph {
   }
 
   /**
+   * The references whose last name segment is `name` that the resolver could
+   * not tie to any definition — `h.ServeHTTP(…)` on an interface value,
+   * `x.update()` on a receiver it could not type — at most `limit` in file and
+   * line order, plus how many there are. Imports are left out: a failed import
+   * of a same-named package export names someone else's symbol.
+   */
+  getUnlinkedReferencesNamed(name: string, limit: number): { refs: UnresolvedReference[]; total: number } {
+    return this.queries.getFailedReferencesByTail(name, ['imports'], limit);
+  }
+
+  /**
+   * The references the resolver could not tie to a definition that are written
+   * exactly as one of `names` (`binding.Query`), at most `limit`.
+   */
+  getUnlinkedReferencesWritten(names: readonly string[], limit: number): UnresolvedReference[] {
+    return this.queries.getFailedReferencesByNames(names, limit);
+  }
+
+  /**
    * The symbols with the most distinct dependents, most first — the index's
    * hubs. Distinct dependents, not edges: a helper called forty times from one
    * function has one dependent, and it is dependents a blast radius grows from.

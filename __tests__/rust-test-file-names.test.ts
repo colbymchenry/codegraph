@@ -55,10 +55,28 @@ describe('codegraph_explore with a Rust file named like no identifier', () => {
       fs.writeFileSync(dest, text);
     }
     cg = await CodeGraph.init(root, { index: true });
+
+    // A query naming one symbol gets its callers and its test sites apart (#3407).
     const res = await new ToolHandler(cg).execute('codegraph_explore', { query: 'create_note' });
     expect(res.isError ?? false).toBe(false);
     const text = res.content[0]!.text as string;
-    const line = text.split('\n').find((l) => l.startsWith('- `create_note`')) ?? '';
+    expect(text).toMatch(/\*\*Called by\*\*[^\n]*\n- `odd_caller` — `src\/store\/odd\(name\.rs:2`/);
+    expect(text).toMatch(/\*\*In tests\*\*[^\n]*\n- `src\/store\/tests\.rs`: 3/);
+
+    // The ranked answer's blast radius, which a one-name query still reaches
+    // when the name has several definitions, reads them the same way.
+    const before = process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL;
+    process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL = '0';
+    let ranked: string;
+    try {
+      const r = await new ToolHandler(cg).execute('codegraph_explore', { query: 'create_note' });
+      expect(r.isError ?? false).toBe(false);
+      ranked = r.content[0]!.text as string;
+    } finally {
+      if (before === undefined) delete process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL;
+      else process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL = before;
+    }
+    const line = ranked.split('\n').find((l) => l.startsWith('- `create_note`')) ?? '';
     expect(line).toMatch(/tests: `src\/store\/tests\.rs`/);
     expect(line).toMatch(/`src\/store\/odd\(name\.rs`/);
   });

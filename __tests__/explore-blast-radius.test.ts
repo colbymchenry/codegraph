@@ -6,13 +6,26 @@
  * files cover it, so the agent knows what to update/verify before editing
  * without a separate impact call. Symbols with no dependents are skipped, and
  * the section is omitted entirely when nothing qualifies.
+ *
+ * A query that names ONE symbol now gets that symbol's own answer instead —
+ * its definition and every line that depends on it (#3407), pinned in
+ * explore-one-symbol.test.ts. The blast radius is the general answer's, which a
+ * one-name query still reaches when the name has several definitions, so this
+ * file turns the one-symbol answer off.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { ToolHandler } from '../src/mcp/tools';
+
+const oneSymbolSetting = process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL;
+beforeAll(() => { process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL = '0'; });
+afterAll(() => {
+  if (oneSymbolSetting === undefined) delete process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL;
+  else process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL = oneSymbolSetting;
+});
 
 describe('codegraph_explore — blast radius', () => {
   let testDir: string;
