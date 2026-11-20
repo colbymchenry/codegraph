@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+
+## [1.6.4] - 2026-11-20
+
 ### Highlights
 
 - **Small questions cost less.** Ask your agent what a function or constant is, or who calls it, and `codegraph_explore` now answers with the definition and every line that uses it, instead of a long answer about related files.
@@ -1982,3 +1985,4 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [1.6.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.1
 [1.6.2]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.2
 [1.6.3]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.3
+[1.6.4]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.4
