@@ -4,6 +4,7 @@ import { generateNodeId, NodeIdAllocator } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { getParser } from './grammars';
 import { indexParseBudgetMs, parseTimeoutMessage, parseWithinBudget } from './parse-budget';
+import { isBareScriptCfml } from './cfml-dialect';
 
 /** Tags whose own children include an expression: `<cfset …>`, `<cfif …>`, `<cfelseif …>`, `<cfreturn …>`, and `#…#`. */
 const TAG_EXPRESSION_PARENTS: ReadonlySet<string> = new Set([
@@ -812,30 +813,5 @@ export class CfmlExtractor {
   }
 }
 
-/**
- * Sniff whether CFML source is bare-script (`component { ... }`, modern style)
- * vs tag-based (`<cfcomponent>`, `<cfif>`, HTML). Skips a leading UTF-8 BOM
- * (endemic in CFML's Windows-editor history — 17% of ColdBox's files carry
- * one; both grammars parse fine with it once routed correctly), whitespace,
- * and `//`/`/* *\/` comments to find the first real token; tag-based files
- * start with `<`, script-based files don't.
- */
-export function isBareScriptCfml(source: string): boolean {
-  let i = 0;
-  const len = source.length;
-  while (i < len) {
-    const ch = source[i];
-    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\uFEFF') {
-      i++;
-    } else if (ch === '/' && source[i + 1] === '/') {
-      const nl = source.indexOf('\n', i);
-      i = nl === -1 ? len : nl + 1;
-    } else if (ch === '/' && source[i + 1] === '*') {
-      const end = source.indexOf('*/', i + 2);
-      i = end === -1 ? len : end + 2;
-    } else {
-      return ch !== '<';
-    }
-  }
-  return true; // empty/whitespace-only file — treat as script (no-op extraction either way)
-}
+/** Re-exported from its own module — the viewer's syntax classifier asks the same question. */
+export { isBareScriptCfml };
