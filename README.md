@@ -408,6 +408,7 @@ The installer will:
 - Ask whether configs apply to all your projects or just this one
 - Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `QWEN.md`) — that's how subagents and non-MCP agents learn the `codegraph explore` command, since the MCP server's own guidance only reaches the main agent. Removed cleanly by `codegraph uninstall`.
 - Set up auto-allow permissions when Claude Code or Qwen Code is one of the targets
+- Offer to supply CodeGraph context on structural prompts in Claude Code and Codex CLI. In Codex, use `/hooks` to review and trust the registered prompt hook. Project-local hooks also require a trusted project.
 
 The installer **wires up your agents only — it does not index your code.** After it finishes, build each project's graph yourself with `codegraph init` (step 3). One global `codegraph install` covers every project; you run `codegraph init` once per project.
 

@@ -40,6 +40,7 @@ import {
   WriteResult,
 } from './types';
 import {
+  atomicWriteFileSync,
   getMcpServerConfig,
   removeInstructionsEntry,
   upsertInstructionsEntry,
@@ -79,7 +80,7 @@ function instructionsPath(loc: Location): string {
  * still do nothing. Say so rather than reporting silent success.
  */
 function trustNote(): string {
-  return `Codex applies ${tomlConfigPath('local')} only in a project marked trusted — otherwise the layer is loaded but disabled. Trust this project in Codex to activate it.`;
+  return 'Codex applies project-local MCP settings and hooks only in a trusted project.';
 }
 
 class CodexTarget implements AgentTarget {
@@ -109,7 +110,7 @@ class CodexTarget implements AgentTarget {
     return { installed, alreadyConfigured, configPath: tomlPath };
   }
 
-  install(loc: Location, _opts: InstallOptions): WriteResult {
+  install(loc: Location, opts: InstallOptions): WriteResult {
     const files: WriteResult['files'] = [];
     const notes: string[] = [];
 
@@ -121,6 +122,12 @@ class CodexTarget implements AgentTarget {
     // subagents and non-MCP harnesses read AGENTS.md but never the MCP
     // initialize instructions. Upsert self-heals a stale pre-#529 block.
     files.push(upsertInstructionsEntry(instructionsPath(loc)));
+
+    if (opts.promptHook !== undefined) {
+      const hookResult = updatePromptHook(loc, opts.promptHook);
+      files.push(...hookResult.files);
+      if (hookResult.notes) notes.push(...hookResult.notes);
+    }
 
     if (loc === 'local') notes.push(trustNote());
     return notes.length > 0 ? { files, notes } : { files };
@@ -136,6 +143,10 @@ class CodexTarget implements AgentTarget {
 
     files.push(removeInstructionsEntry(instructionsPath(loc)));
 
+    const hookResult = updatePromptHook(loc, false);
+    files.push(...hookResult.files);
+    if (hookResult.notes) notes.push(...hookResult.notes);
+
     return notes.length > 0 ? { files, notes } : { files };
   }
 
@@ -145,8 +156,87 @@ class CodexTarget implements AgentTarget {
   }
 
   describePaths(loc: Location): string[] {
-    return [tomlConfigPath(loc), instructionsPath(loc)];
+    return [tomlConfigPath(loc), instructionsPath(loc), hookConfigPath(loc)];
   }
+}
+
+const CODEX_PROMPT_HOOK = {
+  type: 'command',
+  command: 'codegraph prompt-hook',
+  commandWindows: 'codegraph.cmd prompt-hook',
+  statusMessage: 'Loading CodeGraph context',
+};
+
+function hookConfigPath(loc: Location): string {
+  return path.join(configDir(loc), 'hooks.json');
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isCodeGraphPromptHook(value: unknown): boolean {
+  return isObject(value) && value.type === 'command' &&
+    (value.command === CODEX_PROMPT_HOOK.command ||
+      value.command === CODEX_PROMPT_HOOK.commandWindows);
+}
+
+function isManagedCodeGraphPromptHook(value: unknown): boolean {
+  return isObject(value) &&
+    Object.keys(value).length === Object.keys(CODEX_PROMPT_HOOK).length &&
+    Object.entries(CODEX_PROMPT_HOOK).every(([field, expected]) => value[field] === expected);
+}
+
+function isHookGroup(value: unknown): value is Record<string, unknown> & { hooks: unknown[] } {
+  return isObject(value) && Array.isArray(value.hooks);
+}
+
+function updatePromptHook(loc: Location, enabled: boolean): WriteResult {
+  const file = hookConfigPath(loc);
+  const exists = fs.existsSync(file);
+  if (!exists && !enabled) return { files: [] };
+
+  const unreadable: WriteResult = {
+    files: [{ path: file, action: 'kept' }],
+    notes: [`Could not read the hook configuration in ${file}. Check the contents and rerun CodeGraph.`],
+  };
+  let json: unknown;
+  try {
+    json = exists ? JSON.parse(fs.readFileSync(file, 'utf-8')) : {};
+  } catch {
+    return unreadable;
+  }
+  if (!isObject(json)) return unreadable;
+  const hooks = json.hooks === undefined ? {} : json.hooks;
+  if (!isObject(hooks)) return unreadable;
+  const groups = hooks.UserPromptSubmit === undefined ? [] : hooks.UserPromptSubmit;
+  if (!Array.isArray(groups) || !groups.every(isHookGroup)) return unreadable;
+
+  const existing = groups.some((group) => group.hooks.some(isCodeGraphPromptHook));
+  if (enabled) {
+    if (!existing) {
+      hooks.UserPromptSubmit = [...groups, { hooks: [CODEX_PROMPT_HOOK] }];
+    }
+    const action = existing ? 'unchanged' : exists ? 'updated' : 'created';
+    if (!existing) atomicWriteFileSync(file, JSON.stringify({ ...json, hooks }, null, 2) + '\n');
+    return {
+      files: [{ path: file, action }],
+      notes: ['Review and trust the CodeGraph prompt hook in Codex with /hooks.'],
+    };
+  }
+
+  if (!groups.some((group) => group.hooks.some(isManagedCodeGraphPromptHook))) return { files: [] };
+  const remaining = groups.flatMap((group) => {
+    const otherHandlers = group.hooks.filter((handler) => !isManagedCodeGraphPromptHook(handler));
+    if (otherHandlers.length === group.hooks.length) return [group];
+    return otherHandlers.length === 0 ? [] : [{ ...group, hooks: otherHandlers }];
+  });
+  if (remaining.length) hooks.UserPromptSubmit = remaining;
+  else delete hooks.UserPromptSubmit;
+  if (Object.keys(hooks).length) json.hooks = hooks;
+  else delete json.hooks;
+  atomicWriteFileSync(file, JSON.stringify(json, null, 2) + '\n');
+  return { files: [{ path: file, action: 'updated' }] };
 }
 
 function buildCodegraphBlock(): string {

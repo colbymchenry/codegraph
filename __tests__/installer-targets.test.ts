@@ -196,6 +196,7 @@ describe('Installer targets — contract', () => {
             // and verify the sibling survives. Skip for Codex (TOML)
             // and any target with no JSON config — they get covered
             // by their own dedicated tests below.
+            if (target.id === 'codex') return;
             const paths = target.describePaths(location);
             // Match .json or .jsonc — opencode prefers .jsonc.
             const jsonPath = paths.find((p) => /\.jsonc?$/.test(p));
@@ -348,6 +349,187 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(codex.detect('global').alreadyConfigured).toBe(true);
     expect(fs.readFileSync(path.join(tmpHome, '.codex', 'config.toml'), 'utf-8'))
       .toContain('[mcp_servers.codegraph]');
+  });
+
+  it('codex: an opted-in project install creates the prompt hook in the project scope', () => {
+    const codex = getTarget('codex')!;
+    const result = codex.install('local', { autoAllow: false, promptHook: true });
+    const hooksPath = path.join(tmpCwd, '.codex', 'hooks.json');
+
+    expect(result.files).toContainEqual({ path: hooksPath, action: 'created' });
+    expect(JSON.parse(fs.readFileSync(hooksPath, 'utf-8'))).toMatchObject({
+      hooks: {
+        UserPromptSubmit: [{
+          hooks: [{
+            type: 'command',
+            command: 'codegraph prompt-hook',
+            commandWindows: 'codegraph.cmd prompt-hook',
+            statusMessage: 'Loading CodeGraph context',
+          }],
+        }],
+      },
+    });
+    expect(fs.existsSync(path.join(tmpHome, '.codex', 'hooks.json'))).toBe(false);
+  });
+
+  it('codex: reinstallation and removal preserve adjacent prompt hooks in an alternate user scope', () => {
+    const codex = getTarget('codex')!;
+    const profile = path.join(tmpHome, 'alternate-codex');
+    process.env.CODEX_HOME = profile;
+    const hooksPath = path.join(profile, 'hooks.json');
+    const userHook = { type: 'command', command: 'print codegraph prompt-hook' };
+    const settings = { hooks: { UserPromptSubmit: [{ hooks: [userHook] }] } };
+    fs.mkdirSync(profile);
+    fs.writeFileSync(hooksPath, JSON.stringify(settings));
+
+    codex.install('global', { autoAllow: false, promptHook: true });
+    const once = fs.readFileSync(hooksPath, 'utf-8');
+    const handlers = JSON.parse(once).hooks.UserPromptSubmit.flatMap(
+      (group: { hooks: unknown[] }) => group.hooks,
+    );
+    expect(handlers).toContainEqual(userHook);
+    expect(handlers).toContainEqual({
+      type: 'command',
+      command: 'codegraph prompt-hook',
+      commandWindows: 'codegraph.cmd prompt-hook',
+      statusMessage: 'Loading CodeGraph context',
+    });
+
+    codex.install('global', { autoAllow: false, promptHook: true });
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe(once);
+    const optOut = codex.install('global', { autoAllow: false, promptHook: false });
+    expect(optOut.files).toContainEqual({ path: hooksPath, action: 'updated' });
+    expect(JSON.parse(fs.readFileSync(hooksPath, 'utf-8'))).toEqual(settings);
+    codex.install('global', { autoAllow: false, promptHook: true });
+    const removed = codex.uninstall('global');
+    expect(removed.files).toContainEqual({ path: hooksPath, action: 'updated' });
+    expect(JSON.parse(fs.readFileSync(hooksPath, 'utf-8'))).toEqual(settings);
+    expect(fs.existsSync(path.join(tmpHome, '.codex', 'hooks.json'))).toBe(false);
+  });
+
+  it('codex: preserves an existing user-managed hook with the same command', () => {
+    const codex = getTarget('codex')!;
+    const folder = path.join(tmpCwd, '.codex');
+    const hooksPath = path.join(folder, 'hooks.json');
+    const original = '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"codegraph prompt-hook"}]}]}}';
+    fs.mkdirSync(folder);
+    fs.writeFileSync(hooksPath, original);
+
+    const installed = codex.install('local', { autoAllow: false, promptHook: true });
+    expect(installed.files).toContainEqual({ path: hooksPath, action: 'unchanged' });
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe(original);
+    const uninstalled = codex.uninstall('local');
+    expect(uninstalled.files.some((f) => f.path === hooksPath)).toBe(false);
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe(original);
+  });
+
+  it('codex: leaves an unreadable hook configuration in place', () => {
+    const codex = getTarget('codex')!;
+    const folder = path.join(tmpCwd, '.codex');
+    const hooksPath = path.join(folder, 'hooks.json');
+    fs.mkdirSync(folder);
+    fs.writeFileSync(hooksPath, '{"hooks":');
+
+    const result = codex.install('local', { autoAllow: false, promptHook: true });
+    expect(result.files).toContainEqual({ path: hooksPath, action: 'kept' });
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe('{"hooks":');
+
+    const uninstalled = codex.uninstall('local');
+    expect(uninstalled.files).toContainEqual({ path: hooksPath, action: 'kept' });
+    expect(uninstalled.notes?.join(' ')).toMatch(/Could not read the hook configuration/);
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe('{"hooks":');
+  });
+
+  it('codex: uninstall rewrites and preserves hooks.json as {} with updated status', () => {
+    const codex = getTarget('codex')!;
+    codex.install('local', { autoAllow: false, promptHook: true });
+    const hooksPath = path.join(tmpCwd, '.codex', 'hooks.json');
+
+    const [report] = uninstallTargets([codex], 'local');
+    expect(report.status).toBe('removed');
+    expect(report.removedPaths).not.toContain(hooksPath);
+    expect(report.updatedPaths).toContain(hooksPath);
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe('{}\n');
+
+    // Also when only hooks.json holds CodeGraph config: still reports updated and is idempotent after.
+    codex.install('local', { autoAllow: false, promptHook: true });
+    fs.unlinkSync(path.join(tmpCwd, '.codex', 'config.toml'));
+    fs.unlinkSync(path.join(tmpCwd, 'AGENTS.md'));
+    const [hooksOnly] = uninstallTargets([codex], 'local');
+    expect(hooksOnly.status).toBe('removed');
+    expect(hooksOnly.removedPaths).toEqual([]);
+    expect(hooksOnly.updatedPaths).toEqual([hooksPath]);
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe('{}\n');
+
+    const [second] = uninstallTargets([codex], 'local');
+    expect(second.status).toBe('not-configured');
+    expect(second.removedPaths).toEqual([]);
+    expect(second.updatedPaths).toEqual([]);
+  });
+
+  it('codex CLI: install reports Kept for unreadable hooks.json and uninstall reports updated when hooks.json is preserved', () => {
+    const bin = path.resolve(__dirname, '../dist/bin/codegraph.js');
+    const runCli = (args: string[]) => spawnSync(process.execPath, [bin, ...args], {
+      cwd: tmpCwd,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        HOME: tmpHome,
+        USERPROFILE: tmpHome,
+        CODEGRAPH_NO_DAEMON: '1',
+        CODEGRAPH_TELEMETRY: '0',
+        DO_NOT_TRACK: '1',
+        NO_COLOR: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 30_000,
+    });
+
+    const folder = path.join(tmpCwd, '.codex');
+    const hooksPath = path.join(folder, 'hooks.json');
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(hooksPath, '{"hooks":');
+
+    const badInstall = runCli(['install', '--target=codex', '--location=local', '--yes']);
+    expect(badInstall.status, badInstall.stdout + badInstall.stderr).toBe(0);
+    expect(badInstall.stdout).toMatch(/Codex CLI: Kept .*hooks\.json/);
+    expect(badInstall.stdout).not.toMatch(/Codex CLI: Updated .*hooks\.json/);
+    expect(badInstall.stdout).toContain('Could not read the hook configuration');
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe('{"hooks":');
+
+    // Clean install -> uninstall preserves empty {} rather than deleting hooks.json and logs updated.
+    fs.rmSync(folder, { recursive: true, force: true });
+    if (fs.existsSync(path.join(tmpCwd, 'AGENTS.md'))) fs.unlinkSync(path.join(tmpCwd, 'AGENTS.md'));
+    const cleanInstall = runCli(['install', '--target=codex', '--location=local', '--yes']);
+    expect(cleanInstall.status, cleanInstall.stdout + cleanInstall.stderr).toBe(0);
+    expect(cleanInstall.stdout).toMatch(/Codex CLI: Created .*hooks\.json/);
+
+    const cleanUninstall = runCli(['uninstall', '--target=codex', '--location=local', '--yes']);
+    expect(cleanUninstall.status, cleanUninstall.stdout + cleanUninstall.stderr).toBe(0);
+    expect(cleanUninstall.stdout).toMatch(/Codex CLI: updated .*hooks\.json/);
+    expect(cleanUninstall.stdout).not.toMatch(/Codex CLI: removed .*hooks\.json/);
+    expect(cleanUninstall.stdout).toMatch(/Codex CLI: removed .*config\.toml/);
+    expect(cleanUninstall.stdout).toMatch(/Codex CLI: removed .*AGENTS\.md/);
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe('{}\n');
+
+    // Uninstall alongside unrelated user hooks preserves them and reports updated.
+    const userHooks = {
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'echo user-prompt' }] }],
+        Stop: [{ hooks: [{ type: 'command', command: 'echo user-stop' }] }],
+      },
+    };
+    fs.mkdirSync(folder, { recursive: true });
+    fs.writeFileSync(hooksPath, JSON.stringify(userHooks, null, 2) + '\n');
+    const mergeInstall = runCli(['install', '--target=codex', '--location=local', '--yes']);
+    expect(mergeInstall.status, mergeInstall.stdout + mergeInstall.stderr).toBe(0);
+    expect(mergeInstall.stdout).toMatch(/Codex CLI: Updated .*hooks\.json/);
+
+    const mergeUninstall = runCli(['uninstall', '--target=codex', '--location=local', '--yes']);
+    expect(mergeUninstall.status, mergeUninstall.stdout + mergeUninstall.stderr).toBe(0);
+    expect(mergeUninstall.stdout).toMatch(/Codex CLI: updated .*hooks\.json/);
+    expect(mergeUninstall.stdout).not.toMatch(/Codex CLI: removed .*hooks\.json/);
+    expect(JSON.parse(fs.readFileSync(hooksPath, 'utf-8'))).toEqual(userHooks);
   });
 
   it('opencode: prefers .jsonc when both .json and .jsonc exist', () => {
