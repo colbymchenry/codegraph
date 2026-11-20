@@ -17,7 +17,7 @@
 import type CodeGraph from '../index';
 import type { Edge, Node, NodeKind } from '../types';
 import { isQueryNameToken, isTestPath } from '../search/query-utils';
-import { findAllSymbols } from '../graph/named-symbol-flow';
+import { findAllSymbols, lastQualifierPart } from '../graph/named-symbol-flow';
 import {
   collectReferenceSites,
   memberContainer,
@@ -88,20 +88,41 @@ export const MAX_ONE_SYMBOL_DEFINITIONS = 3;
 
 /**
  * What `name` defines: its hand-written, non-test definitions when it has any,
- * else all of them. Null for none, or more than {@link MAX_ONE_SYMBOL_DEFINITIONS}.
+ * else all of them. Null for none, for more than {@link MAX_ONE_SYMBOL_DEFINITIONS},
+ * or for a qualified name whose only exact matches live in test code while
+ * non-test code defines its last segment (#3428).
  */
-export function oneSymbolDefinitions(cg: CodeGraph, name: string): Node[] | null {
+export function oneSymbolDefinitions(
+  cg: CodeGraph,
+  name: string,
+  isTest: (node: Node) => boolean = (n) => isTestPath(n.filePath),
+): Node[] | null {
   const qualified = /[.\/]|::/.test(name);
   let nodes = (qualified ? findAllSymbols(cg, name).nodes : cg.getNodesByName(name))
     .filter((n) => DEFINITION_KINDS.has(n.kind));
   nodes = [...new Map(nodes.map((n) => [n.id, n])).values()];
   if (nodes.length === 0) return null;
+  const nonTest = nodes.filter((n) => !isTest(n));
+  if (nonTest.length > 0) nodes = nonTest;
   const isGenerated = cg.generatedFilePredicate(nodes.map((n) => n.filePath));
   const handWritten = nodes.filter((n) => !isGenerated(n.filePath));
   if (handWritten.length > 0) nodes = handWritten;
-  const nonTest = nodes.filter((n) => !isTestPath(n.filePath));
-  if (nonTest.length > 0) nodes = nonTest;
   if (nodes.length > MAX_ONE_SYMBOL_DEFINITIONS) return null;
+  if (nonTest.length === 0 && qualified) {
+    // Every qualified match lives in test code (for example a test's mock
+    // `var res = { send() {} }` matching `res.send`). When production defines
+    // the member's bare name (`lib/response.js`'s `res.send = function send`),
+    // answering with the mock alone hides the real definition — let explore's
+    // general path rank both instead (#3428).
+    const tail = lastQualifierPart(name);
+    if (
+      tail &&
+      tail !== name &&
+      cg.getNodesByName(tail).some((n) => DEFINITION_KINDS.has(n.kind) && !isTest(n))
+    ) {
+      return null;
+    }
+  }
   return nodes.sort((a, b) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine);
 }
 
