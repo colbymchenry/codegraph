@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- `codegraph_explore` no longer answers a dotted or qualified symbol query like `res.send` with only a test mock when production code defines that member name, falling back to the general exploration answer instead. (#3428)
 
 ## [1.6.4] - 2026-11-20
 

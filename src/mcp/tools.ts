@@ -8138,9 +8138,10 @@ export class ToolHandler {
     if (process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL === '0') return null;
     const name = oneSymbolQueryName(matchQuery);
     if (!name) return null;
+    const isTest = this.testCodeReading(cg);
     let defs: Node[] | null;
     try {
-      defs = oneSymbolDefinitions(cg, name);
+      defs = oneSymbolDefinitions(cg, name, isTest);
     } catch {
       return null;
     }
@@ -8166,7 +8167,6 @@ export class ToolHandler {
       return entry;
     };
 
-    const isTest = this.testCodeReading(cg);
     const rel = (p: string) => p.replace(/\\/g, '/');
     let answer: OneSymbolAnswer | null;
     try {
