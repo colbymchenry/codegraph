@@ -44,10 +44,24 @@ class SegmentedControl extends React.Component<Props> {
 module.exports = SegmentedControl;
 `;
 
+/**
+ * Flow lets a function type omit the parameter list's parentheses. TSX does
+ * not, and the parser loses the declaration around it — in React's
+ * `ReactFiberHooks.js` it swallowed the following 3,800 lines.
+ */
+const FLOW_FUNCTION_TYPE = `/** @flow */
+export type Handler = {
+  dispatch: (Event => mixed) | null,
+};
+
+function afterTheType() {}
+`;
+
 beforeAll(async () => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-flow-'));
   fs.mkdirSync(path.join(root, 'js'), { recursive: true });
   fs.writeFileSync(path.join(root, 'js/SegmentedControl.js'), FLOW);
+  fs.writeFileSync(path.join(root, 'js/Handler.js'), FLOW_FUNCTION_TYPE);
   fs.writeFileSync(path.join(root, 'js/plain.js'), `function plain() { return 1; }\nmodule.exports = plain;\n`);
   cg = await CodeGraph.init(root, { index: true });
 });
@@ -78,5 +92,22 @@ describe('Flow-typed JavaScript', () => {
     expect(out.length).toBe(FLOW.length);
     expect(out).not.toMatch(/\{\||\|\}|import\s+typeof|opaque\s+type|:\s*\?Array/);
     expect(blankFlowSyntax('const a = {| b |};', 'plain.js')).toBe('const a = {| b |};');
+  });
+
+  it('parenthesises a single-parameter function type, keeping offsets', () => {
+    const src = '// @flow\ntype Handler = { dispatch: (Event => mixed) | null };';
+    const out = blankFlowSyntax(src, 'js/Handler.js');
+    expect(out.length).toBe(src.length);
+    expect(out).toBe('// @flow\ntype Handler = { dispatch: ((Event)=>mixed) | null };');
+    // Already parenthesised, so nothing to do.
+    expect(blankFlowSyntax('// @flow\ntype F = (Event) => mixed;', 'js/Handler.js')).toBe(
+      '// @flow\ntype F = (Event) => mixed;',
+    );
+  });
+
+  it('indexes a single-parameter Flow function type and what follows it', () => {
+    const names = cg.getNodesInFile('js/Handler.js').map((n) => n.name);
+    expect(names).toContain('Handler');
+    expect(names).toContain('afterTheType');
   });
 });
