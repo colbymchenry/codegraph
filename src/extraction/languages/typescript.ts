@@ -54,8 +54,9 @@ export function classifyTsClassMember(node: SyntaxNode): 'method' | 'property' {
 /**
  * Flow's own syntax, blanked to spaces (offsets survive) so a Flow file reads
  * as TSX: exact object types `{| a: T |}`, a maybe type's `?` (`x: ?string`,
- * `Array<?T>`), an inexact object's `...`, `import typeof`, `opaque type`. Only files with the `@flow`
- * pragma — the ones `detectLanguage` sends here from `.js`.
+ * `Array<?T>`), an inexact object's `...`, `import typeof`, `opaque type`, and
+ * a single-parameter function type written `(A => mixed)`. Only files with the
+ * `@flow` pragma — the ones `detectLanguage` sends here from `.js`.
  */
 export function blankFlowSyntax(source: string, filePath?: string): string {
   if (!filePath || !/\.(?:jsx?|mjs|cjs)$/.test(filePath) || !hasFlowPragma(source)) return source;
@@ -66,7 +67,18 @@ export function blankFlowSyntax(source: string, filePath?: string): string {
     .replace(/\bimport\s+typeof\b/g, (m) => 'import' + ' '.repeat(m.length - 'import'.length))
     .replace(/\bopaque(?=\s+type\b)/g, '      ')
     // An inexact object type's bare `...` (`{a: T, ...}`) — never a value spread.
-    .replace(/\.\.\.(?=\s*[},])/g, '   ');
+    .replace(/\.\.\.(?=\s*[},])/g, '   ')
+    // A Flow function type may omit the parameter list's parentheses: `(A => mixed)`.
+    // TSX reads `A => mixed` as an expression, then fails to recover and drops the
+    // declaration around it — often everything after it too. Reuse the spaces TSX
+    // needs anyway, `(A => ` becoming `((A)=>`, so offsets survive and the type
+    // reads as `((A) => mixed)`. Prettier-formatted Flow leaves those spaces.
+    .replace(/\([ \t]*([A-Za-z_$][\w$]*)[ \t]*=>[ \t]*/g, (match, name: string) => {
+      const rewritten = `((${name})=>`;
+      return rewritten.length <= match.length
+        ? rewritten + ' '.repeat(match.length - rewritten.length)
+        : match;
+    });
 }
 
 /** Whether the file writes `export type *` anywhere: most files don't, and skip the rest. */
