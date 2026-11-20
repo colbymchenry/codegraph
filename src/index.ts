@@ -35,6 +35,11 @@ import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { logWarn } from './errors';
 import { QueryBuilder, type DeprioritizedPathMatcher } from './db/queries';
 import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
+import { loadHdlProfile } from './hdl/profile';
+import { hdlDependenciesChanged } from './hdl/index-context';
+import { buildHdlProfileStatus, type HdlProfileStatus } from './hdl/status';
+import { analyzeHdlSemantics, type HdlSemanticOptions, type HdlSemanticResult } from './hdl/semantics';
+export type { HdlSemanticOptions, HdlSemanticResult } from './hdl/semantics';
 import {
   isInitialized,
   createDirectory,
@@ -944,6 +949,8 @@ export class CodeGraph {
           }
         } catch { /* metadata is advisory — never fail an index over it */ }
 
+        if (result.success && result.filesErrored === 0) this.orchestrator.commitHdlProfile();
+
         // The time covers the whole run, like the totals above. The
         // orchestrator's covers extraction alone, and the summary printed it
         // as the run's, leaving out resolution and linking (#2334).
@@ -992,7 +999,9 @@ export class CodeGraph {
         // are stored, as indexAll and sync hold it: returned unawaited, the
         // promise left the `try` at once and the `finally` let the lock go as
         // soon as indexing started, so another process could write meanwhile.
-        return await this.orchestrator.indexFiles(filePaths).finally(() => this.resolver.clearCaches());
+        const result = await this.orchestrator.indexFiles(filePaths).finally(() => this.resolver.clearCaches());
+        if (result.success && result.filesErrored === 0) this.orchestrator.commitHdlProfile();
+        return result;
       } finally {
         this.fileLock.release();
       }
@@ -1785,6 +1794,9 @@ export class CodeGraph {
           if (before !== now) this.stampPythonRootFingerprint(now);
         }
 
+        // Access direction is signature-dependent even if no node name changed.
+        // Re-open typed and still-unclassified HDL argument sites in untouched files.
+        this.orchestrator.resurrectHdlCallArgumentEdges(result.changedFilePaths ?? [], result.filesRemoved > 0);
         // PHP's web root, which an include of `$_SERVER['DOCUMENT_ROOT'] .
         // '/x.php'` goes under when codegraph.json names none, is read from
         // every such include in the project and the files their paths name
@@ -1945,6 +1957,7 @@ export class CodeGraph {
           try { this.queries.setMetadata('index_state', 'complete'); } catch { /* advisory */ }
         }
 
+        this.orchestrator.commitHdlProfile();
         this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
 
         if (fullReconcile && result.filesChecked > 0) this.pendingFullReconcile = false;
@@ -2123,7 +2136,8 @@ export class CodeGraph {
       options,
       process.platform === 'win32'
         ? (filePath) => this.isIndexedFileStateCurrent(filePath)
-        : undefined
+        : undefined,
+      () => this.getHdlDependencyPaths()
     );
 
     // A watching graph detects frameworks again as files change: keep what
@@ -2278,6 +2292,36 @@ export class CodeGraph {
    * index built before stamping existed (treated as stale). See
    * `extraction-version.ts` and `isIndexStale()`.
    */
+  getHdlDependencyPaths(): string[] {
+    try {
+      const context = JSON.parse(this.queries.getMetadata('hdl_profile_context') ?? 'null');
+      return Array.isArray(context?.dependencies) ? context.dependencies.flatMap((d: unknown) =>
+        d && typeof d === 'object' && 'path' in d && typeof d.path === 'string' ? [d.path] : []) : [];
+    } catch { return []; }
+  }
+
+  /** Explicit optional compiler query; source graph remains available if compilation fails. */
+  async getHdlSemantics(options: HdlSemanticOptions): Promise<HdlSemanticResult> {
+    return analyzeHdlSemantics(this.projectRoot, options, {
+      profile: () => this.getHdlProfileStatus(), stale: () => this.isIndexStale(),
+      file: file => this.queries.getFileByPath(file), nodes: file => this.queries.getNodesByFile(file),
+    });
+  }
+
+  getHdlProfileStatus(): HdlProfileStatus | null {
+    const configuration = loadHdlProfile(this.projectRoot);
+    const metadata = { name: this.queries.getMetadata('hdl_profile_name') || null,
+      fingerprint: this.queries.getMetadata('hdl_profile_fingerprint'), context: this.queries.getMetadata('hdl_profile_context') };
+    const hasHdl = this.queries.hasLanguage('verilog');
+    if (!hasHdl && !metadata.name && configuration.status === 'invalid-config') return null;
+    const status = buildHdlProfileStatus(configuration, metadata, hasHdl);
+    if (status?.state === 'matches' && status.indexed.mode === 'profile' && hdlDependenciesChanged(this.projectRoot, metadata.context)) {
+      status.state = 'mismatch'; status.mismatch = true; status.reindexRecommended = true;
+      status.diagnostics.push('HDL include dependency changed since indexing.');
+    }
+    return status;
+  }
+
   getIndexBuildInfo(): { version: string | null; extractionVersion: number | null } {
     const version = this.queries.getMetadata('indexed_with_version');
     const ev = this.queries.getMetadata('indexed_with_extraction_version');

@@ -109,6 +109,7 @@ export const LANGUAGES = [
   'pascal',
   'scala',
   'lua',
+  'verilog',
   'luau',
   'objc',
   'r',
