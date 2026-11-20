@@ -5700,6 +5700,21 @@ export class QueryBuilder {
     }));
   }
 
+  /** Resolved instance-result calls that depend on a type's declaration set. */
+  getEdgesWithInstanceTypeOwner(): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> {
+    const rows = this.db.prepare(
+      `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
+         FROM edges e JOIN nodes src ON src.id = e.source
+        WHERE e.metadata LIKE '%"instanceTypeOwner"%'`
+    ).all() as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
+    return rows.map((row) => ({
+      ...rowToEdge(row),
+      edgeId: row.id,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
+    }));
+  }
+
   /** What the parameter-flow pass reads and writes. */
   get parameterFlows(): ParameterFlowQueries {
     return (this.flowQueries ??= new ParameterFlowQueries(this.db, this));

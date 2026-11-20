@@ -78,6 +78,11 @@ export function isModuleKey(key: string): boolean {
   return key.startsWith(MODULE_KEY);
 }
 
+/** A failed instance-result call waiting for an owner's merge to change; the module prefix also indexes its member name. */
+export function instanceTypeOwnerTail(name: string): string {
+  return `${MODULE_KEY}type-owner:${name}`;
+}
+
 /**
  * SQL for the tail a reference parked under its module (`module:*`) has by its
  * own name: what follows the name's last dot — `store.get` → 'get' — or the
