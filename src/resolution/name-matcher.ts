@@ -5609,7 +5609,9 @@ const DART_CONSTRUCTORS = new WeakMap<ResolutionContext, Map<string, boolean>>()
  * Foo.of(…)`, `const Foo.value(…)`, `const factory Foo.x() = _X;` — read from
  * its declaration. Dart reaches one only through its class (`Foo.value(…)`,
  * the tear-off `Foo.value`), never by a bare name: a parameter `value` passed
- * on is not `const BlocProvider.value(…)`.
+ * on is not `const BlocProvider.value(…)`. Dart 3.13 also writes one without
+ * its class: `new named(…)`, `factory make(…)`, and a primary constructor's
+ * `class Point.origin(…)`, whose method starts at `.origin` (#3270).
  */
 function isDartConstructor(n: Node, context: ResolutionContext): boolean {
   if (n.language !== 'dart' || n.kind !== 'method') return false;
@@ -5621,8 +5623,10 @@ function isDartConstructor(n: Node, context: ResolutionContext): boolean {
   const owner = cut > 0 ? n.qualifiedName.slice(0, cut).split('::').pop()! : '';
   const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
   const head = (lines[n.startLine - 1] ?? '').slice(n.startColumn);
-  const constructor = owner !== '' &&
-    new RegExp(String.raw`^(?:(?:const|factory|external)\s+)*${escapeRegExp(owner)}\s*\.\s*${escapeRegExp(n.name)}(?![\w$])`).test(head);
+  const name = escapeRegExp(n.name);
+  const constructor = owner !== '' && (
+    new RegExp(String.raw`^(?:(?:const|factory|external)\s+)*${escapeRegExp(owner)}\s*\.\s*${name}(?![\w$])`).test(head) ||
+    new RegExp(String.raw`^(?:(?:const|external)\s+)*(?:new|factory)\s+${name}(?![\w$])|^\.\s*${name}\s*\(`).test(head));
   memo.set(n.id, constructor);
   return constructor;
 }
@@ -16918,12 +16922,13 @@ function holderExtentOf(container: Node, lines: string[]): { lines: string[]; ex
 /**
  * The own members of the object literal a holder's `code` (see holderExtent)
  * initializes it with, as spans of that text, one per top-level comma;
- * undefined when the holder isn't written `name = { … }` (optionally inside
- * `Object.freeze(…)` / `Object.seal(…)`).
+ * undefined unless the holder is written `name = { … }` (optionally inside
+ * `Object.freeze(…)` / `Object.seal(…)`) or is the object a module
+ * default-exports, `export default { … }` (#3393).
  */
 function objectLiteralMemberSpans(code: string): Array<{ start: number; end: number }> | undefined {
   // Start at THIS declarator, including its columns, never a sibling on the same line.
-  const open = /^[^=]*=\s*(?:(?:Object\.(?:freeze|seal)\s*)?\(\s*)*\{/.exec(code);
+  const open = /^(?:export\s+default\s*|[^=]*=\s*)(?:(?:Object\.(?:freeze|seal)\s*)?\(\s*)*\{/.exec(code);
   if (!open) return undefined;
 
   const members: Array<{ start: number; end: number }> = [];

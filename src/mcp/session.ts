@@ -15,8 +15,10 @@
 import * as path from 'path';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
-import { tools } from './tools';
-import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server-instructions';
+import { NOT_STARTED, tools, type ToolDefinition } from './tools';
+import { PROMPT_EXPLORE_BUSY, PROMPT_EXPLORE_METHOD } from './prompt-explore';
+import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX, openCodeInstructions } from './server-instructions';
+import { isOpenCodeClient, withOpenCodeToolNames } from './opencode-tool-names';
 import { CodeGraphPackageVersion } from './version';
 import { resolveServerRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
@@ -81,6 +83,42 @@ export function initializeInstructions(base: string, notice: string | null = get
   );
 }
 
+/** Every tool this server defines, by name: the names a client's rewrite may touch. */
+const TOOL_NAMES: readonly string[] = tools.map((t) => t.name);
+
+/**
+ * The instructions `initialize` answers a client with: {@link initializeInstructions}
+ * of `base`, which an OpenCode client gets with our tool names the way OpenCode
+ * lists them (#1267). Exported so the proxy's local handshake gives the same
+ * client the IDENTICAL text; every other client gets today's bytes.
+ */
+export function instructionsForClient(base: string, clientName: string | undefined): string {
+  return initializeInstructions(isOpenCodeClient(clientName) ? openCodeInstructions(base, TOOL_NAMES) : base);
+}
+
+/**
+ * The `tools/list` answer for a client: `defs` as they are, except that an
+ * OpenCode client gets every description naming our tools the way OpenCode
+ * lists them (#1267). Each tool keeps its `name`, since OpenCode adds the
+ * prefix itself. Copies, never edits: the daemon serves every client from one
+ * tool handler, and `defs` may be the module's own definitions. Exported for
+ * the proxy, like {@link instructionsForClient}.
+ */
+export function toolsForClient(defs: ToolDefinition[], clientName: string | undefined): ToolDefinition[] {
+  if (!isOpenCodeClient(clientName)) return defs;
+  const rename = (text: string): string => withOpenCodeToolNames(text, TOOL_NAMES);
+  return defs.map((tool) => ({
+    ...tool,
+    description: rename(tool.description),
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: Object.fromEntries(
+        Object.entries(tool.inputSchema.properties).map(([key, prop]) => [key, { ...prop, description: rename(prop.description) }]),
+      ),
+    },
+  }));
+}
+
 /** MCP Protocol Version (latest the server claims). */
 export const PROTOCOL_VERSION = '2024-11-05';
 
@@ -106,6 +144,9 @@ export function toolCallArguments(params: { arguments?: unknown }): Record<strin
  * and falling back to the process cwd.
  */
 const ROOTS_LIST_TIMEOUT_MS = 5000;
+
+// The prompt hook's request (#3284); defined apart so the hook loads no server code.
+export { PROMPT_EXPLORE_METHOD, PROMPT_EXPLORE_BUSY } from './prompt-explore';
 
 /**
  * Convert a file:// URI to a filesystem path. Handles URL encoding and
@@ -219,6 +260,9 @@ export class MCPSession {
       case 'tools/call':
         if (isRequest) await this.handleToolsCall(message as JsonRpcRequest);
         break;
+      case PROMPT_EXPLORE_METHOD:
+        if (isRequest) await this.handlePromptExplore(message as JsonRpcRequest);
+        break;
       case 'ping':
         if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, {});
         break;
@@ -300,7 +344,7 @@ export class MCPSession {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
-      instructions: initializeInstructions(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX),
+      instructions: instructionsForClient(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX, this.clientInfo?.name),
     });
 
     if (explicitPath) {
@@ -323,9 +367,10 @@ export class MCPSession {
     // safe: a call against an un-indexed path returns SUCCESS-shaped guidance
     // ("pass projectPath / run codegraph init"), never `isError`, so it can't
     // teach the agent to abandon codegraph. `getTools()` returns the default
-    // surface even before a project is open.
+    // surface even before a project is open. The handler is shared by every
+    // client of a daemon; `toolsForClient` copies what it changes (#1267).
     this.transport.sendResult(request.id, {
-      tools: this.engine.getToolHandler().getTools(),
+      tools: toolsForClient(this.engine.getToolHandler().getTools(), this.clientInfo?.name),
     });
   }
 
@@ -376,6 +421,20 @@ export class MCPSession {
     // After the reply is on the wire — telemetry must never delay a tool
     // response (in-memory increment only; see src/telemetry).
     getTelemetry().recordUsage('mcp_tool', toolName, !result.isError, this.clientInfo);
+  }
+
+  private async handlePromptExplore(request: JsonRpcRequest): Promise<void> {
+    const query = (request.params as { query?: unknown } | undefined)?.query;
+    if (typeof query !== 'string') {
+      this.transport.sendError(request.id, ErrorCodes.InvalidParams, 'Missing query');
+      return;
+    }
+    await this.retryInitIfNeeded();
+    // Start now or say busy: the hook has its own explore to fall back on, so
+    // it should never wait behind the catch-up, a queue of agent calls or a
+    // daemon on its way out, nor inject what such a wait answers with.
+    const result = await this.engine.getToolHandler().execute('codegraph_explore', { query }, undefined, undefined, { startNow: true });
+    this.transport.sendResult(request.id, result === NOT_STARTED ? PROMPT_EXPLORE_BUSY : result);
   }
 
   /**

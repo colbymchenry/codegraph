@@ -15,6 +15,7 @@ import {
   CODEGRAPH_INSTRUCTIONS_BLOCK,
   CODEGRAPH_SECTION_START,
   CODEGRAPH_SECTION_END,
+  OPENCODE_INSTRUCTIONS_BLOCK,
 } from '../instructions-template';
 
 /**
@@ -445,16 +446,42 @@ export function replaceOrAppendMarkedSection(
  * block (#2506), and reports `unchanged` on byte-equal re-runs so
  * install stays idempotent. See `instructions-template.ts` for why this
  * block exists (#704: subagents + non-MCP harnesses never see the MCP
- * initialize instructions).
+ * initialize instructions). OpenCode passes its own `block` (#1267).
  */
-export function upsertInstructionsEntry(file: string): { path: string; action: 'created' | 'updated' | 'unchanged' } {
+export function upsertInstructionsEntry(
+  file: string,
+  block: string = CODEGRAPH_INSTRUCTIONS_BLOCK,
+): { path: string; action: 'created' | 'updated' | 'unchanged' } {
   const action = replaceOrAppendMarkedSection(
     file,
-    CODEGRAPH_INSTRUCTIONS_BLOCK,
+    blockToWrite(file, block),
     CODEGRAPH_SECTION_START,
     CODEGRAPH_SECTION_END,
   );
   return { path: file, action: action === 'appended' ? 'updated' : action };
+}
+
+/**
+ * `block`, unless it is the plain block and `file` already holds OpenCode's
+ * (#1267). Agents share instructions files — the project's AGENTS.md is read by
+ * Codex, Droid, Kimi, Pi and OpenCode, and dotfiles often link several agents'
+ * files to one — and OpenCode's block names the tool both ways, so it serves
+ * every agent reading the file. Keeping it settles a shared file on one block
+ * whatever order the agents install in; otherwise each install would rewrite
+ * the other agent's block.
+ */
+function blockToWrite(file: string, block: string): string {
+  if (block !== CODEGRAPH_INSTRUCTIONS_BLOCK) return block;
+  let content: string;
+  try {
+    content = fs.readFileSync(file, 'utf-8');
+  } catch {
+    return block;
+  }
+  const first = findMarkedSections(content, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END)[0];
+  if (!first) return block;
+  const existing = withLineBreaks(content.slice(first.start, first.end), '\n');
+  return existing === OPENCODE_INSTRUCTIONS_BLOCK ? OPENCODE_INSTRUCTIONS_BLOCK : block;
 }
 
 /** Inverse of `upsertInstructionsEntry`: strip the CodeGraph block from `file`, if it has one. */

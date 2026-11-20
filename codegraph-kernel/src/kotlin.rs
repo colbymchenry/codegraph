@@ -110,7 +110,8 @@ fn kotlin_receiver_chain(text: &str) -> Option<String> {
 }
 
 /// A property's CODE children: the named child right after the `=` token, a
-/// `property_delegate` (`by lazy { … }`), and an accessor the grammar nested
+/// `property_delegate` (`by lazy { … }`), an explicit backing field (`field =
+/// MutableStateFlow(S())`, Kotlin 2.x), and an accessor the grammar nested
 /// under the declaration (`val x: Int get() = compute()` — written on ONE line;
 /// an accessor on its own line parses as a SIBLING of the property and is not
 /// reachable from here). What stays unwalked is the declaration itself —
@@ -132,7 +133,7 @@ fn property_initializers<'t>(node: Node<'t>) -> Vec<Node<'t>> {
         if after_eq {
             out.push(c);
             after_eq = false;
-        } else if matches!(c.kind(), "property_delegate" | "getter" | "setter") {
+        } else if matches!(c.kind(), "property_delegate" | "getter" | "setter" | "backing_field") {
             out.push(c);
         }
     }
@@ -647,22 +648,22 @@ impl<'t> Walker<'t> {
         None
     }
 
-    /// getReceiverType — extension functions: the last user_type BEFORE a `.`
-    /// child; its FIRST type_identifier's text (qualified receivers take the
-    /// FIRST segment — the `com::qext` bug, preserve).
+    /// getReceiverType — extension functions: the `receiver_type` child's
+    /// user_type (a nullable or function-type receiver gives none); its FIRST
+    /// type_identifier's text (qualified receivers take the FIRST segment —
+    /// the `com::qext` bug, preserve).
     fn receiver_type_of(&self, node: Node<'t>) -> Option<String> {
-        let mut found_user_type: Option<Node> = None;
         for i in 0..node.child_count() {
             let Some(child) = node.child(i) else { continue };
             match child.kind() {
-                "user_type" => found_user_type = Some(child),
-                "." => {
-                    if let Some(ut) = found_user_type {
-                        let type_id = (0..ut.named_child_count())
-                            .filter_map(|j| ut.named_child(j))
-                            .find(|c| c.kind() == "type_identifier");
-                        return Some(self.text(type_id.unwrap_or(ut)).to_string());
-                    }
+                "receiver_type" => {
+                    let ut = (0..child.named_child_count())
+                        .filter_map(|j| child.named_child(j))
+                        .find(|c| c.kind() == "user_type")?;
+                    let type_id = (0..ut.named_child_count())
+                        .filter_map(|j| ut.named_child(j))
+                        .find(|c| c.kind() == "type_identifier");
+                    return Some(self.text(type_id.unwrap_or(ut)).to_string());
                 }
                 "simple_identifier" | "function_value_parameters" => break,
                 _ => {}

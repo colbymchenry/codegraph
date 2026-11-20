@@ -503,6 +503,7 @@ export class QueryBuilder {
     getNodesByFileAndName?: NodeStatement;
     getNodeIdentitiesByFile?: SqliteStatement;
     getFileNodesByNamePrefix?: SqliteStatement;
+    getPhpDocumentRootIncludes?: SqliteStatement;
     getNodesByQualifiedNameExact?: NodeStatement;
     getNodesByLowerName?: NodeStatement;
     hasFilesOfLanguage?: SqliteStatement;
@@ -1766,6 +1767,20 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getNodesByNamePrefix.all(prefix, prefix + '￿', limit) as NodeRow[];
     return rows.map(rowToNode);
+  }
+
+  /**
+   * The PHP includes built from `$_SERVER['DOCUMENT_ROOT']` (#3298): the import
+   * nodes the extractors name `prefix` + the path appended to the web root,
+   * each with its file. By index range scan, ordered for a stable reading.
+   */
+  getPhpDocumentRootIncludes(prefix: string): Array<{ filePath: string; name: string }> {
+    if (!this.stmts.getPhpDocumentRootIncludes) {
+      this.stmts.getPhpDocumentRootIncludes = this.db.prepare(
+        "SELECT file_path AS filePath, name FROM nodes WHERE name >= ? AND name < ? AND kind = 'import' AND language = 'php' ORDER BY name, file_path"
+      );
+    }
+    return this.stmts.getPhpDocumentRootIncludes.all(prefix, prefix + '￿') as Array<{ filePath: string; name: string }>;
   }
 
   /** File nodes whose basename starts with `prefix`, without a result cap. */
@@ -3665,15 +3680,22 @@ export class QueryBuilder {
    * decorates — exactly what {@link GraphTraverser.getImpactRadius} traverses.
    * `contains` is excluded: a parent containing a symbol does not *depend* on
    * it. One indexed query (idx_nodes_file_path + idx_edges_target_kind).
+   *
+   * `skipTiers` leaves out the edges the tier pass links across a process
+   * boundary (their metadata carries `tier`): a client's HTTP call onto its
+   * server's route, a queue job onto its consumer, an event onto its handler.
+   * Test selection wants that: a frontend's tests mock the backend they call,
+   * so a backend change doesn't affect them (#3320).
    */
-  getDependentFilePaths(filePath: string): string[] {
+  getDependentFilePaths(filePath: string, opts: { skipTiers?: boolean } = {}): string[] {
     const sql = `SELECT DISTINCT src.file_path AS fp
       FROM edges e
       JOIN nodes tgt ON tgt.id = e.target
       JOIN nodes src ON src.id = e.source
       WHERE tgt.file_path = ?
         AND e.kind != 'contains'
-        AND src.file_path != ?`;
+        AND src.file_path != ?${opts.skipTiers ? `
+        AND (e.metadata IS NULL OR json_extract(e.metadata, '$.tier') IS NULL)` : ''}`;
     const rows = this.db.prepare(sql).all(filePath, filePath) as Array<{ fp: string }>;
     return rows.map((r) => r.fp);
   }

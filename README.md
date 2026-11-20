@@ -333,6 +333,7 @@ CodeGraph detects web-framework routing files and emits `route` nodes linked by 
 | **Flask** | `@app.route('/path', methods=[...])`, blueprint routes |
 | **FastAPI** | `@app.get(...)`, `@router.post(...)`, all standard methods |
 | **Express** | `app.get(...)`, `router.post(...)` with middleware chains |
+| **Elysia** | `new Elysia({ prefix })` chains of `.get(...)`, `.post(...)`, `.route('TRACE', ...)` and `.ws(...)`, `.group()` and `.guard()` callbacks, functional plugins, and `.use(plugin)` prefixes composed across files |
 | **NestJS** | `@Controller` + `@Get/@Post/...` (with `RouterModule` prefixes, `setGlobalPrefix` and URI versioning), GraphQL `@Resolver` + `@Query/@Mutation`, `@MessagePattern`/`@EventPattern`, `@SubscribeMessage` |
 | **Laravel** | `Route::get()`, `Route::resource()`, `Controller@action`, tuple syntax |
 | **Drupal** | `*.routing.yml` routes (`_controller`, `_form`, entity handlers); `hook_*` implementations in `.module`/`.theme`/`.install`/`.inc` and `#[Hook]` methods; `*.services.yml` services, and calls through `\Drupal::service()`; plugin definitions, as attributes or annotations |
@@ -581,6 +582,7 @@ codegraph affected src/auth.ts --filter "e2e/*"     # Custom test file pattern
 | `-f, --filter <glob>` | Glob for the files that count as tests (see below) | auto-detect |
 | `-j, --json` | Output as JSON | `false` |
 | `-q, --quiet` | Output file paths only | `false` |
+| `--cross-tier` | Also follow links across a process boundary: a client's HTTP call to its server's route, a queue job to its consumer, an event to its handler | `false` |
 
 `--filter` matches the whole name. With no slash (`*_test.go`) it matches the file name at any depth, with a slash (`e2e/*.spec.ts`) that folder at any depth, and with a leading `/` (`/tests/**/*.py`) from the project root only. `**` also matches no folder, so `tests/**/*.py` includes `tests/test_x.py`. Without `--filter`, files with the usual test names and folders count as tests, Google-style `foo_unittest.cc` and `foo_unittest.py` included.
 
@@ -750,6 +752,28 @@ defaults and win on conflict, so you can also re-point a built-in (e.g.
 language or a malformed file is warned about and skipped — it never breaks
 indexing — and a project with no `codegraph.json` behaves exactly as before.
 Re-index (`codegraph index`) after adding or changing mappings.
+
+### PHP includes from the web root
+
+PHP code often loads files from the folder the web server serves, as in
+`require $_SERVER['DOCUMENT_ROOT'] . '/inc/header.php'`. That folder is set in
+the server's configuration, not in your code, so CodeGraph works it out from
+your includes: it's the folder under which their paths name files your project
+has. When they don't settle it (fewer than three different paths, or two
+folders that fit them about as well), name it in `codegraph.json`:
+
+```json
+{
+  "webRoot": "public"
+}
+```
+
+The folder is relative to the project root, like `"public"`, `"web"` or
+`"htdocs"`, or `"."` for the root itself, and a `webRoot` you set always wins.
+Without either, these includes link to nothing rather than to a guess, which
+could be a different file of the same name. The next sync applies a change.
+Includes built from the including file's own folder, like
+`__DIR__ . '/inc/a.php'`, need neither.
 
 ## Telemetry
 

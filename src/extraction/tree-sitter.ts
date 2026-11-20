@@ -27,7 +27,10 @@ import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { rustMacroArgRefs } from './languages/rust-macro-calls';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
-import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
+import {
+  dartMisparsedCtor, dartMisparsedCtorIn, dartMisparsedGenericCall, dartReceiverOf, dartTypeArgumentsType,
+  isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs,
+} from './languages/dart';
 import { cfmlConstructedComponent, cfmlCreatedComponent, isCfIncludeCall } from './languages/cfscript';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -505,6 +508,12 @@ const STATIC_OBJECT_KEY_TYPES: ReadonlySet<string> = new Set(['property_identifi
  * often `var self = this`, so `self.x = {…}` stays an ordinary path.)
  */
 const HOST_GLOBAL_ROOTS: ReadonlySet<string> = new Set(['window', 'globalThis']);
+/**
+ * A single-file component, whose script blocks the TS/JS extractor reads under
+ * the component's own path: what a Vue script default-exports is the component
+ * (#3393). Mirrored in the kernel (tsjs/extractors.rs), which never sees one.
+ */
+const SFC_SCRIPT_HOST_FILE = /\.(?:vue|svelte|astro)$/i;
 /** The field of a `this.<field>.<method>()` receiver: public or ES private (#1496, #1987). */
 const THIS_FIELD_PROPERTY_TYPES = new Set(['property_identifier', 'private_property_identifier']);
 /** A Swift receiver that is a path of types, `API.PackageController.GetRoute` — two segments or more, each capitalized. */
@@ -2034,23 +2043,16 @@ export class TreeSitterExtractor {
       const parentId = this.nodeStack[this.nodeStack.length - 1];
       if (parentId) this.emitReExportRefs(node, parentId);
     }
-    // Vuex MODULE default export — `export default { namespaced, actions: {…},
-    // mutations: {…} }` (the canonical Vuex module shape). Object-literal methods
-    // aren't otherwise extracted, so scan the config's actions/mutations/getters
-    // collections and extract their methods as nodes. Store-file gated (the
-    // ≥2-signal heuristic) so a plain default-exported object is untouched; skip
-    // the subtree afterward (the collection methods are now handled).
+    // `export default { … }` — a Vuex module, or any other object with
+    // function members (extractDefaultExportObject). Skip the subtree when it
+    // was handled.
     else if (
       nodeType === 'export_statement' &&
       (this.language === 'typescript' || this.language === 'tsx' ||
        this.language === 'javascript' || this.language === 'jsx') &&
-      this.looksLikeVueStoreFile()
+      this.extractDefaultExportObject(node)
     ) {
-      const exported = getChildByField(node, 'value');
-      if (exported && (exported.type === 'object' || exported.type === 'object_expression')) {
-        this.extractStoreCollectionMethods(exported);
-        skipChildren = true;
-      }
+      skipChildren = true;
     }
     // Check for function calls
     else if (this.extractor.callTypes.includes(nodeType)) {
@@ -2885,12 +2887,14 @@ export class TreeSitterExtractor {
 
     // C# primary-constructor parameter dependencies (`class Svc(IRepo r, …)`).
     this.extractCsharpPrimaryCtorParamRefs(node, classNode.id);
+    this.extractDartPrimaryCtorRefs(node, classNode.id);
 
     // Extract decorators applied to the class (`@Foo class X {}`).
     this.extractDecoratorsFor(node, classNode.id);
 
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
+    this.extractDartNamedPrimaryCtor(node, classNode.name);
     const body = resolvedBody ?? node;
 
     // Visit all children for methods and properties
@@ -3181,9 +3185,11 @@ export class TreeSitterExtractor {
 
     // Extract inheritance (e.g. Swift: enum AFError: Error)
     this.extractInheritance(node, enumNode.id);
+    this.extractDartPrimaryCtorRefs(node, enumNode.id);
 
     // Push to stack and visit body children (enum members, nested types, methods)
     this.nodeStack.push(enumNode.id);
+    this.extractDartNamedPrimaryCtor(node, enumNode.name);
 
     const memberTypes = this.extractor.enumMemberTypes;
     for (let i = 0; i < body.namedChildCount; i++) {
@@ -3646,6 +3652,44 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * `export default { … }` (TS/JS), read one of two ways; true when the
+   * statement's subtree is handled here:
+   * - A Vuex MODULE in a store file (the ≥2-signal heuristic), `export default
+   *   { namespaced, actions: {…}, mutations: {…} }`: the methods of its
+   *   actions/mutations/getters collections are extracted as nodes
+   *   (extractStoreCollectionMethods). A store file's default object with
+   *   neither a collection nor a function member is skipped, as before.
+   * - Any other object with function members owns them as a named literal
+   *   does (#2300, #3393): a Vuex module split into files (`actions.js` is
+   *   `export default { fetchUser() {…} }`), an API module. It has no name of
+   *   its own, so its owner is named for the export, `default`, as
+   *   `module.exports = {…}` is named for its own (#2966): the members read
+   *   `default::fetchUser`. The owner is the statement, a constant (the export
+   *   binding is never reassigned) and the module's default export; its
+   *   members are exported with it, and the rest of the literal is walked
+   *   under it, as a module-scope declaration's is (#693). A single-file
+   *   component's script is not read so: what it default-exports is the
+   *   component, whose options the Vue extractor names (vue-options-api).
+   * Mirrored in the kernel (tsjs/extractors.rs extract_default_export_object).
+   */
+  private extractDefaultExportObject(statement: SyntaxNode): boolean {
+    const value = getChildByField(statement, 'value');
+    if (value?.type !== 'object' && value?.type !== 'object_expression') return false;
+    if (this.looksLikeVueStoreFile() && this.extractStoreCollectionMethods(value)) return true;
+    const obj = SFC_SCRIPT_HOST_FILE.test(this.filePath) ? null : this.ownedObjectValue(value);
+    if (!obj) return this.looksLikeVueStoreFile();
+    const initValue = getNodeText(obj, this.source).slice(0, 100);
+    const owner = this.createNode('constant', 'default', statement, {
+      docstring: this.docstringFor(statement),
+      signature: `= ${initValue}${initValue.length >= 100 ? '...' : ''}`,
+      isExported: true,
+    });
+    if (!owner) return this.looksLikeVueStoreFile();
+    this.extractOwnedObjectMembers(obj, owner.id, true, false);
+    return true;
+  }
+
+  /**
    * The links of an assignment target written as plain names — `dw_page` →
    * `['dw_page']`, `window.App` → `['window', 'App']`, `App.utils.dom` →
    * `['App', 'utils', 'dom']`, `module.exports` (the module's export object,
@@ -4018,8 +4062,10 @@ export class TreeSitterExtractor {
   /** Extract the methods of a store-config object's `actions`/`mutations`/`getters`
    *  properties. Used for the canonical Vuex MODULE shape `export default {
    *  namespaced, actions: {…}, mutations: {…} }` — object-literal methods aren't
-   *  otherwise extracted, so the actions/mutations would never be nodes. */
-  private extractStoreCollectionMethods(configObj: SyntaxNode): void {
+   *  otherwise extracted, so the actions/mutations would never be nodes. Returns
+   *  whether the object has such a collection. */
+  private extractStoreCollectionMethods(configObj: SyntaxNode): boolean {
+    let found = false;
     for (let j = 0; j < configObj.namedChildCount; j++) {
       const member = configObj.namedChild(j);
       if (member?.type !== 'pair') continue;
@@ -4028,8 +4074,10 @@ export class TreeSitterExtractor {
       const value = getChildByField(member, 'value');
       if (value && (value.type === 'object' || value.type === 'object_expression')) {
         this.extractObjectLiteralFunctions(value);
+        found = true;
       }
     }
+    return found;
   }
 
   /** The SETUP function of a Pinia setup store (`defineStore('id', () => {…})`)
@@ -6973,6 +7021,9 @@ export class TreeSitterExtractor {
     if (this.language === 'dart') {
       if (node.type !== 'selector') return;
       if (node.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) return;
+      // So is `Map` in `List<Map<K, V>>.from(m)` when the grammar split the
+      // call into comparisons: the body walker references the call's types.
+      if (knownParent?.type === 'relational_expression' && dartMisparsedCtorIn(knownParent, node)) return;
       const prev = dartReceiverOf(node);
       if (prev?.type === 'identifier' && /^[A-Z][A-Za-z0-9_]*$/.test(prev.text)) {
         // `Map` in `x.read<Map<K, V>>(y)` parsed as comparisons is a type
@@ -6980,7 +7031,13 @@ export class TreeSitterExtractor {
         const before = knownParent?.type === 'relational_expression' ? prev.previousNamedSibling : null;
         if (before?.type === 'relational_operator' && dartMisparsedGenericCall(before)) return;
         this.pushStaticMemberRef(prev.text, ownerId, prev);
+        return;
       }
+      // The type a `<…>` follows is referenced as a type, `_Box` and `$Box`
+      // in `_Box<T>.named(…)` too, and `Box` after an import prefix in
+      // `p.Box<T>.named(…)`.
+      const type = dartTypeArgumentsType(node);
+      if (type && isDartTypeName(type)) this.pushStaticMemberRef(type.text, ownerId, type);
       return;
     }
 
@@ -7946,6 +8003,29 @@ export class TreeSitterExtractor {
             column: typeNode.startPosition.column,
           });
         }
+        // A generic constructor call the grammar read as comparisons and a dot
+        // shorthand, `(Future < void) > .delayed(d)`: the call, from where a
+        // parsed one starts, and the types it names (dartMisparsedCtor).
+        const ctor = nodeType === 'relational_expression' && ownerId ? dartMisparsedCtor(node) : undefined;
+        if (ctor && ownerId) {
+          this.unresolvedReferences.push({
+            fromNodeId: ownerId,
+            referenceName: `${ctor.type.text}.${ctor.name.text}`,
+            referenceKind: 'calls',
+            line: ctor.head.startPosition.row + 1,
+            column: ctor.head.startPosition.column,
+          });
+          for (const type of [ctor.type, ...ctor.typeArgs]) {
+            if (!isDartTypeName(type)) continue;
+            this.unresolvedReferences.push({
+              fromNodeId: ownerId,
+              referenceName: type.text,
+              referenceKind: 'references',
+              line: type.startPosition.row + 1,
+              column: type.startPosition.column,
+            });
+          }
+        }
       }
 
       // Local variable type annotations inside a body — `const items: Foo[] = []`,
@@ -8747,6 +8827,43 @@ export class TreeSitterExtractor {
         if (paramType) this.walkCsharpTypePosition(paramType, nodeId);
       }
     }
+  }
+
+  /**
+   * A Dart 3.13 primary constructor in a class or enum header, `class
+   * Point(final Offset origin, {Size? size})`: the types its parameters name
+   * are the type's, as a field's declared type is, since a `final` or `var`
+   * parameter declares one (#3270). The native kernel's
+   * `primary_ctor_type_refs` mirrors it.
+   */
+  private extractDartPrimaryCtorRefs(node: SyntaxNode, ownerId: string): void {
+    if (this.language !== 'dart') return;
+    const ctor = getChildByField(node, 'primary_constructor');
+    const parameters = ctor ? getChildByField(ctor, 'parameters') : null;
+    if (parameters) pushDartTypeRefs(parameters, ownerId, (ref) => this.unresolvedReferences.push(ref));
+  }
+
+  /**
+   * A named Dart 3.13 primary constructor, `class Point.origin(final int x)`,
+   * is the type's named constructor as `Point.origin(…)` in its body would
+   * be: a method named `origin` that returns the type, which a call
+   * `Point.origin(…)` links. An unnamed one, like `Point()`, mints no node
+   * (#3270). The native kernel's `named_primary_ctor` mirrors it.
+   */
+  private extractDartNamedPrimaryCtor(node: SyntaxNode, typeName: string): void {
+    if (this.language !== 'dart') return;
+    const ctor = getChildByField(node, 'primary_constructor');
+    const name = ctor ? getChildByField(ctor, 'name') : null;
+    if (!ctor || name?.type !== 'identifier') return;
+    const parameters = getChildByField(ctor, 'parameters');
+    const signature = parameters ? getNodeText(parameters, this.source).trim() : '';
+    this.createNode('method', getNodeText(name, this.source), ctor, {
+      signature: signature || undefined,
+      visibility: 'public',
+      isAsync: false,
+      isStatic: false,
+      returnType: typeName,
+    });
   }
 
   /**

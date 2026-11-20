@@ -18,6 +18,9 @@ import { dartDirectiveFile } from './dart-libraries';
 import { ambientModuleDeclares, declaringFileAnswers, findAmbientModuleExport, findAmbientModuleFile, inBlock, isDeclarationFile, isInModuleBlock, namespaceBlocks, type NamespaceBlock } from './ambient-modules';
 import { isTestFile } from '../search/query-utils';
 import { moduleReferenceKeys, moduleTail } from '../db/reference-tail';
+import { PHP_DOCUMENT_ROOT } from '../extraction/languages/php';
+import { loadWebRoot } from '../project-config';
+import { underWebRoot } from './php-web-root';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -172,11 +175,16 @@ const DEFAULT_BINDING_RE = /^([A-Za-z_$][\w$]*)\s*;?[ \t]*(?:\r?\n|$)/;
 /**
  * The value of the `export default` statement whose value starts at `at`, in
  * comment-stripped code: the name a declaration or a binding gives it,
- * `'anonymous'` for a function, class or arrow function without one, or null
- * for any other expression.
+ * `'anonymous'` for a function, class or arrow function without one, an
+ * object literal (named `default` by its owner, #3393), or null for any other
+ * expression.
  */
-function readDefaultExport(code: string, at: number): { name: string; nameAt: number; declared: boolean } | 'anonymous' | null {
+function readDefaultExport(
+  code: string,
+  at: number
+): { name: string; nameAt: number; declared: boolean; object?: true } | 'anonymous' | null {
   const rest = code.slice(at, at + 2048);
+  if (rest.startsWith('{')) return { name: 'default', nameAt: at, declared: true, object: true };
   const decl = DEFAULT_DECLARATION_RE.exec(rest);
   if (decl) {
     const name = decl[1] ?? decl[2];
@@ -214,12 +222,16 @@ function readDefaultExport(code: string, at: number): { name: string; nameAt: nu
  *   default () => …` — anonymous: no node is the default export, and any
  *   exported function beside it (or nested in it, which the extractor flags
  *   exported too) would be the wrong one.
- * Anything else — an expression (`memo(Card)`, `new Service()`, `{ … }`), a
- * binding the file doesn't declare, no statement at all, a non-JS file — is
- * `'unstated'`. Comments are stripped first. Strings are not masked: a
- * template whose `${…}` holds another template, or a regex with a backtick,
- * sets a masker out of step, and it blanked the real statement after it
- * (outline's 2,900-line styled-components `Styles.ts`). A statement must
+ * - `export default { fetchUser() {…} }` — the object's owner, the constant
+ *   `default` the extractor gives an object with function members, at the
+ *   statement (#3393).
+ * Anything else — an expression (`memo(Card)`, `new Service()`, an object
+ * with no function member, which has no owner), a binding the file doesn't
+ * declare, no statement at all, a non-JS file — is `'unstated'`. Comments are
+ * stripped first. Strings are not masked: a template whose `${…}` holds
+ * another template, or a regex with a backtick, sets a masker out of step,
+ * and it blanked the real statement after it (outline's 2,900-line
+ * styled-components `Styles.ts`). A statement must
  * name a node of the file instead, and of several statements, one that does
  * wins. A line of a template's text is no statement either, though it can
  * name one: a code generator's `export default App` names the file's own
@@ -250,7 +262,10 @@ function statedDefaultExport(filePath: string, idx: FileExportIndex, context: Re
       // the statement breaks before it (`export default\nfunction X`).
       const from = lineAt(m.index);
       const to = lineAt(value.nameAt);
-      const node = value.declared
+      // An object literal's owner is the statement itself (#3393).
+      const node = value.object
+        ? named.find((n) => n.kind === 'constant' && n.startLine === from)
+        : value.declared
         ? named.find((n) => DEFAULT_DECLARATION_KINDS.has(n.kind) && n.startLine >= from && n.startLine <= to)
         : moduleBindingsFirst(filePath, named
             .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
@@ -1386,7 +1401,7 @@ function resolveRelativeImport(
     if (relativePath === '' && !ext.startsWith('/')) continue;
     // A directory's `package.json` `main` comes before its index files, as
     // Node loads a directory (#2964).
-    if (ext.startsWith('/') && !mainTried) {
+    if (ext.startsWith('/') && !mainTried && FOLDER_MAIN_LANGUAGES.has(language)) {
       mainTried = true;
       const main = relativeDirectoryMain(relativePath, language, context);
       if (main) return main;
@@ -1406,21 +1421,38 @@ function resolveRelativeImport(
 }
 
 /**
- * The indexed file a directory's `package.json` names as `main`: fastify's
- * tests `require('..')` for the root's `"main": "fastify.js"`. Null when the
- * directory has no manifest, no `main`, or one outside the project.
+ * The importers whose relative import of a folder reads the folder's
+ * `package.json` `main`, as Node and the bundlers do. Nix (`/default.nix`),
+ * Python (`/__init__.py`) and the rest load a folder their own way.
  */
-function relativeDirectoryMain(dir: string, language: Language, context: ResolutionContext): string | null {
-  const manifest = context.readFile(dir === '' ? 'package.json' : `${dir}/package.json`);
-  if (!manifest) return null;
+const FOLDER_MAIN_LANGUAGES: ReadonlySet<Language> = new Set<Language>(['javascript', 'typescript', 'tsx', 'jsx']);
+
+/** A `package.json`'s `main`, trimmed; null when it has none or doesn't parse. A leading byte-order mark is skipped, as Node skips it. */
+export function packageJsonMain(text: string): string | null {
   let main: unknown;
   try {
-    main = (JSON.parse(manifest) as { main?: unknown } | null)?.main;
+    main = (JSON.parse(text.replace(/^\uFEFF/, '')) as { main?: unknown } | null)?.main;
   } catch {
     return null;
   }
-  if (typeof main !== 'string' || !main.trim()) return null;
-  const entry = path.posix.normalize(path.posix.join(dir, main.trim()));
+  return typeof main === 'string' && main.trim() ? main.trim() : null;
+}
+
+/**
+ * The indexed file a directory's `package.json` names as `main`: fastify's
+ * tests `require('..')` for the root's `"main": "fastify.js"`. Null when the
+ * directory has no manifest, no `main`, or one outside the project. A
+ * manifest it reads joins the module-config snapshot, so a sync after an
+ * edit to its `main` resolves the folder's importers again.
+ */
+function relativeDirectoryMain(dir: string, language: Language, context: ResolutionContext): string | null {
+  const manifestPath = dir === '' ? 'package.json' : `${dir}/package.json`;
+  const manifest = context.readFile(manifestPath);
+  if (!manifest) return null;
+  context.noteModuleConfigFile?.(manifestPath);
+  const main = packageJsonMain(manifest);
+  if (!main) return null;
+  const entry = path.posix.normalize(path.posix.join(dir, main));
   if (entry.startsWith('..') || entry === '.') return null;
   return indexedTarget(entry, language, context);
 }
@@ -1981,7 +2013,10 @@ export function isLuaRequireRef(ref: UnresolvedRef): boolean {
  *
  * PHP resolves includes relative to the including file's directory (the
  * common case for procedural codebases); php.ini `include_path` is not
- * modeled. Callers pass an already-extracted static literal path.
+ * modeled. Callers pass an already-extracted static path: a literal, or one
+ * appended to `__DIR__` / `dirname(__FILE__)`, which the extractor writes as
+ * `./x.php` or `../x.php` relative to the including file (#3298), or one
+ * appended to `$_SERVER['DOCUMENT_ROOT']`, written behind PHP_DOCUMENT_ROOT.
  */
 function resolvePhpIncludePath(
   includePath: string,
@@ -1989,10 +2024,27 @@ function resolvePhpIncludePath(
   context: ResolutionContext
 ): string | null {
   const projectRoot = context.getProjectRoot();
+  // The web server's root is in its own configuration, not the project's
+  // code (#3298): a `codegraph.json` `webRoot` names it, or the project's own
+  // includes show it clearly enough (php-web-root.ts). A guess at the project
+  // root would link `public/index.php`'s include of
+  // `$_SERVER['DOCUMENT_ROOT'] . '/config.php'` to the root's config.php,
+  // not the public/config.php PHP loads, so with neither it links nothing.
+  // Loaded exactly as written, like `./x`, and never outside the project.
+  if (includePath.startsWith(`${PHP_DOCUMENT_ROOT}/`)) {
+    const webRoot = context.getPhpWebRoot ? context.getPhpWebRoot(fromFile) : loadWebRoot(projectRoot);
+    if (webRoot === null) return null;
+    const target = underWebRoot(webRoot, includePath.slice(PHP_DOCUMENT_ROOT.length + 1));
+    return target !== null && context.fileExists(target) ? target : null;
+  }
   const fromDir = path.dirname(path.join(projectRoot, fromFile));
   const basePath = path.resolve(fromDir, includePath);
   const relativePath = path.relative(projectRoot, basePath).replace(/\\/g, '/');
   if (context.fileExists(relativePath)) return relativePath;
+  // A path anchored to the file's own directory (`./x`, `../x`, as the
+  // extractor writes `__DIR__ . '/x'`) is loaded exactly as written: PHP adds
+  // no extension, so `__DIR__ . '/settings.local'` is never settings.local.php.
+  if (includePath.startsWith('./') || includePath.startsWith('../')) return null;
   // The literal may omit the .php extension (e.g. include "config").
   for (const ext of EXTENSION_RESOLUTION.php ?? []) {
     if (context.fileExists(relativePath + ext)) return relativePath + ext;

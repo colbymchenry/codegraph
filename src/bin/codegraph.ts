@@ -1800,11 +1800,21 @@ program
           // keyword is signal enough.
           const tokenVerified = !keyworded && codeTokens.some((t) => cg.getNodesByName(t).length > 0);
           if (keyworded || tokenVerified) {
-            const { ToolHandler } = await import('../mcp/tools');
-            const handler = new ToolHandler(cg);
-            const result = await handler.execute('codegraph_explore', { query: prompt });
-            const text = result.content[0]?.text ?? '';
-            if (!result.isError && text.trim()) {
+            const exploreHere = async (): Promise<string> => {
+              const { ToolHandler } = await import('../mcp/tools');
+              const result = await new ToolHandler(cg).execute('codegraph_explore', { query: prompt });
+              return result.isError ? '' : result.content[0]?.text ?? '';
+            };
+            // A daemon already running for this project answers from memory
+            // what an explore here reads from disk again on every prompt
+            // (#3284). One that is exploring but has not answered by the
+            // deadline gets no second explore here, and nothing is injected.
+            const { exploreViaDaemon, promptHookDaemonTimeoutMs } = await import('../mcp/hook-client');
+            const viaDaemon = await exploreViaDaemon(plan.exploreRoot, prompt, promptHookDaemonTimeoutMs());
+            const text = viaDaemon.status === 'answered' ? viaDaemon.text
+              : viaDaemon.status === 'unavailable' ? await exploreHere()
+              : '';
+            if (text.trim()) {
               // Cap the injection so a large-repo explore can't flood the prompt.
               // Claude Code shows hook stdout inline only up to 10,000 characters;
               // above that it persists the output to a file and the model sees a
@@ -3000,7 +3010,8 @@ program
   .option('-f, --filter <glob>', 'Glob for the files that count as tests, matched against the whole name: "*_test.go" matches the file name at any depth, "e2e/*.spec.ts" that folder at any depth, "/tests/**/*.py" from the project root only')
   .option('-j, --json', 'Output as JSON')
   .option('-q, --quiet', 'Only output file paths, no decoration')
-  .action(async (fileArgs: string[], options: { path?: string; stdin?: boolean; depth?: string; filter?: string; json?: boolean; quiet?: boolean }) => {
+  .option('--cross-tier', "Also follow links across a process boundary: a client's HTTP call to its server's route, a queue job to its consumer, an event to its handler")
+  .action(async (fileArgs: string[], options: { path?: string; stdin?: boolean; depth?: string; filter?: string; json?: boolean; quiet?: boolean; crossTier?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -3076,7 +3087,9 @@ program
           const current = queue.shift()!;
           if (current.depth >= maxDepth) continue;
 
-          const dependents = cg.getFileDependents(current.file);
+          // A test on the other side of an HTTP call, queue or event mocks
+          // that boundary, so it isn't affected by default (#3320).
+          const dependents = cg.getFileDependents(current.file, { skipTiers: !options.crossTier });
           for (const dep of dependents) {
             if (visited.has(dep)) continue;
             visited.add(dep);

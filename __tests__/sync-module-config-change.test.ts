@@ -1,8 +1,9 @@
 /**
  * A sync follows a change to the files import resolution is configured by
  * (#2977): `tsconfig.json` / `jsconfig.json` `paths` and `baseUrl`, their
- * `extends` chain, a `go.mod` module path, Cargo manifests and a
- * `compile_commands.json`. The resolver read them once and
+ * `extends` chain, a `go.mod` module path, Cargo manifests, a
+ * `compile_commands.json`, and the PHP `webRoot` of a `codegraph.json`
+ * (#3298). The resolver read them once and
  * kept the maps for its lifetime, and the watcher follows source files only,
  * so an edit kept resolving imports by the old mapping — in the same process,
  * and in later ones too, since a sync re-resolves only the changed files.
@@ -126,6 +127,31 @@ function includeTarget(graph: CodeGraph, file: string): string[] {
     .map((e) => graph.getNode(e.target)!.filePath);
 }
 
+/** A site whose server serves public/, with a file of the same name at the project root. */
+const PHP_SITE: Files = {
+  'public/index.php': "<?php\nrequire_once $_SERVER['DOCUMENT_ROOT'] . '/config.php';\n",
+  'public/config.php': '<?php\nfunction public_config() {}\n',
+  'config.php': '<?php\nfunction private_config() {}\n',
+};
+
+/** A page that includes three files from the web root, which settle it once all three exist. */
+const PHP_THREE_INCLUDES = [
+  '<?php',
+  "require $_SERVER['DOCUMENT_ROOT'] . '/lib/a.php';",
+  "require $_SERVER['DOCUMENT_ROOT'] . '/lib/b.php';",
+  "require $_SERVER['DOCUMENT_ROOT'] . '/lib/c.php';",
+  '',
+].join('\n');
+
+/** The files a PHP file's includes link to. */
+function phpIncludeTargets(graph: CodeGraph, file: string): string[] {
+  return graph.getNodesInFile(file)
+    .flatMap((n) => graph.getOutgoingEdges(n.id))
+    .filter((e) => e.kind === 'imports' && graph.getNode(e.target)?.kind === 'file')
+    .map((e) => graph.getNode(e.target)!.filePath)
+    .sort();
+}
+
 /** What a full index of C_BEFORE holds under a compile database naming `dir`, which names the folder it's in. */
 async function fullIndexWithDb(dir: string): Promise<string[]> {
   const root = tempRoot();
@@ -159,6 +185,18 @@ describe('a sync follows a module-config change (#2977)', () => {
       'c.ts': "import { foo } from '@lib/u';\nexport function bar() { return foo() + 0; }\n",
     });
     expect(callTargets(graph, 'bar')).toEqual(['lib2/u.ts::foo']);
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
+  it("a folder's package.json main retargeted, the importer untouched (#2964)", async () => {
+    const before: Files = {
+      'lib/package.json': JSON.stringify({ main: 'a.js' }),
+      'lib/a.js': 'function a () { return 1 }\nmodule.exports = a\n',
+      'lib/b.js': 'function b () { return 2 }\nmodule.exports = b\n',
+      'app.js': "const lib = require('./lib')\nfunction go () { return lib() }\n",
+    };
+    const { root, graph, full } = await syncEdit(before, { 'lib/package.json': JSON.stringify({ main: 'b.js' }) });
+    expect(callTargets(graph, 'go')).toEqual(['lib/b.js::b']);
     expect(stateOf(root, graph)).toEqual(full);
   }, 120_000);
 
@@ -228,6 +266,92 @@ describe('a sync follows a module-config change (#2977)', () => {
     await graph.sync();
     expect(includeTarget(graph, 'src/a.c')).toEqual(['other/foo.h']);
     expect(stateOf(root, graph)).toEqual(await fullIndexWithDb('other'));
+  }, 120_000);
+
+  it("a codegraph.json webRoot appears, the PHP untouched (#3298)", async () => {
+    const { root, graph, full } = await syncEdit(PHP_SITE, { 'codegraph.json': JSON.stringify({ webRoot: 'public' }) });
+    expect(phpIncludeTargets(graph, 'public/index.php')).toEqual(['public/config.php']);
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
+  it('a webRoot moves to the project root, then goes away', async () => {
+    const { root, graph, full } = await syncEdit(
+      { ...PHP_SITE, 'codegraph.json': JSON.stringify({ webRoot: 'public' }) },
+      { 'codegraph.json': JSON.stringify({ webRoot: '.' }) }
+    );
+    expect(phpIncludeTargets(graph, 'public/index.php')).toEqual(['config.php']);
+    expect(stateOf(root, graph)).toEqual(full);
+    write(root, { 'codegraph.json': JSON.stringify({ deprioritize: ['scripts/'] }) });
+    await graph.sync();
+    expect(phpIncludeTargets(graph, 'public/index.php')).toEqual([]);
+    const fullRoot = tempRoot();
+    write(fullRoot, { ...PHP_SITE, 'codegraph.json': JSON.stringify({ deprioritize: ['scripts/'] }) });
+    expect(stateOf(root, graph)).toEqual(stateOf(fullRoot, await index(fullRoot)));
+  }, 120_000);
+
+  it('the web root the includes show appears when a sync adds the third file that settles it, and goes with it', async () => {
+    const before: Files = { 'index.php': PHP_THREE_INCLUDES, 'lib/a.php': '<?php\nfunction a() {}\n', 'lib/b.php': '<?php\nfunction b() {}\n' };
+    const { root, graph, full } = await syncEdit(before, { 'lib/c.php': '<?php\nfunction c() {}\n' });
+    // Two paths settle nothing; the third places the project root, so the
+    // unchanged index.php's parked includes of lib/a.php and lib/b.php link too.
+    expect(phpIncludeTargets(graph, 'index.php')).toEqual(['lib/a.php', 'lib/b.php', 'lib/c.php']);
+    expect(stateOf(root, graph)).toEqual(full);
+    fs.rmSync(path.join(root, 'lib/c.php'));
+    await graph.sync();
+    expect(phpIncludeTargets(graph, 'index.php')).toEqual([]);
+    const fullRoot = tempRoot();
+    write(fullRoot, before);
+    expect(stateOf(root, graph)).toEqual(stateOf(fullRoot, await index(fullRoot)));
+  }, 120_000);
+
+  it('an edit that leaves the inferred web root where it was re-opens nothing', async () => {
+    const root = tempRoot();
+    write(root, { 'index.php': PHP_THREE_INCLUDES, 'lib/a.php': '<?php\nfunction a() {}\n', 'lib/b.php': '<?php\nfunction b() {}\n', 'lib/c.php': '<?php\nfunction c() {}\n' });
+    const graph = await index(root);
+    expect(phpIncludeTargets(graph, 'index.php')).toEqual(['lib/a.php', 'lib/b.php', 'lib/c.php']);
+    const reopen = vi.spyOn(ExtractionOrchestrator.prototype, 'resurrectResolutionEdgesForLanguage');
+    try {
+      write(root, { 'lib/b.php': '<?php\nfunction b() { return 2; }\n', 'lib/d.php': '<?php\nfunction d() {}\n' });
+      await graph.sync();
+      expect(reopen).not.toHaveBeenCalled();
+    } finally {
+      reopen.mockRestore();
+    }
+    expect(phpIncludeTargets(graph, 'index.php')).toEqual(['lib/a.php', 'lib/b.php', 'lib/c.php']);
+  }, 120_000);
+
+  it('a page in a new folder takes the inferred web root and re-opens nothing else', async () => {
+    const root = tempRoot();
+    write(root, { 'index.php': PHP_THREE_INCLUDES, 'lib/a.php': '<?php\nfunction a() {}\n', 'lib/b.php': '<?php\nfunction b() {}\n', 'lib/c.php': '<?php\nfunction c() {}\n' });
+    const graph = await index(root);
+    const reopen = vi.spyOn(ExtractionOrchestrator.prototype, 'resurrectResolutionEdgesForLanguage');
+    try {
+      write(root, { 'news/item.php': "<?php\nrequire $_SERVER['DOCUMENT_ROOT'] . '/lib/a.php';\n" });
+      await graph.sync();
+      expect(reopen).not.toHaveBeenCalled();
+    } finally {
+      reopen.mockRestore();
+    }
+    expect(phpIncludeTargets(graph, 'news/item.php')).toEqual(['lib/a.php']);
+    expect(phpIncludeTargets(graph, 'index.php')).toEqual(['lib/a.php', 'lib/b.php', 'lib/c.php']);
+  }, 120_000);
+
+  it('a codegraph.json that sets no webRoot re-opens nothing, written or edited', async () => {
+    const root = tempRoot();
+    write(root, PHP_SITE);
+    const graph = await index(root);
+    const before = stateOf(root, graph);
+    const reopen = vi.spyOn(ExtractionOrchestrator.prototype, 'resurrectResolutionEdgesForLanguage');
+    try {
+      write(root, { 'codegraph.json': JSON.stringify({ deprioritize: ['scripts/'] }) });
+      await graph.sync();
+      write(root, { 'codegraph.json': JSON.stringify({ deprioritize: ['scripts/', 'tools/'] }) });
+      await graph.sync();
+      expect(reopen).not.toHaveBeenCalled();
+    } finally {
+      reopen.mockRestore();
+    }
+    expect(stateOf(root, graph)).toEqual(before);
   }, 120_000);
 
   it('a folder under a config\'s name is no config: it counts as absent, and the next candidate is read', async () => {

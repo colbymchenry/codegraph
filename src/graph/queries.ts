@@ -130,9 +130,10 @@ export class GraphQueryManager {
    * Returns all files that import from this file.
    *
    * @param filePath - Path to the file
+   * @param opts - `skipTiers`: leave out links across a process boundary (#3320)
    * @returns Array of file paths that depend on this file
    */
-  getFileDependents(filePath: string): string[] {
+  getFileDependents(filePath: string, opts: { skipTiers?: boolean } = {}): string[] {
     // Previously this only followed `imports` edges into the file node or its
     // exported symbols and returned 0 dependents for *every* file — because an
     // `imports` edge here connects a file to its own local import declarations
@@ -140,7 +141,7 @@ export class GraphQueryManager {
     // dependency signal is the resolved symbol graph (calls/references/
     // instantiates/extends/implements/...), which is what blast-radius /
     // `affected` need. Delegate to the indexed projection of that graph.
-    return this.queries.getDependentFilePaths(filePath);
+    return this.queries.getDependentFilePaths(filePath, opts);
   }
 
   /**

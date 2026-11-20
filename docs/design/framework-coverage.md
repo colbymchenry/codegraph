@@ -1,6 +1,6 @@
 # Framework & language coverage — what is done, what is left
 
-**Last verified: 2026-08-29** (Angular row: 2026-10-06; React Router row: 2026-10-19; Vue Router / Nuxt row: 2026-10-22; ASP.NET route nodes: 2026-11-17) against the build at that date. Re-verify with the
+**Last verified: 2026-08-29** (Angular row: 2026-10-06; React Router row: 2026-10-19; Vue Router / Nuxt row: 2026-10-22; ASP.NET route nodes: 2026-11-17; Elysia route nodes: 2026-11-18) against the build at that date. Re-verify with the
 queries in [Checking this file is still true](#checking-this-file-is-still-true)
 before trusting a row; this is a snapshot, not a live view.
 
@@ -110,9 +110,9 @@ table; the resolver half is one `Astro.redirect` reader.
 
 ### 2. Server-rendered frameworks — a redirect is a transition, not just a response
 
-**Fifteen frameworks** have route nodes and no navigation: Django, Flask,
-FastAPI, Express, NestJS, Laravel, CodeIgniter 3, Drupal, Rails, Spring, Play,
-Gin/chi/gorilla, Axum/actix/Rocket, ASP.NET, Vapor.
+**Sixteen frameworks** have route nodes and no navigation: Django, Flask,
+FastAPI, Express, Elysia, NestJS, Laravel, CodeIgniter 3, Drupal, Rails, Spring,
+Play, Gin/chi/gorilla, Axum/actix/Rocket, ASP.NET, Vapor.
 
 Be precise about what is missing. `redirect_to`, `HttpResponseRedirect`,
 `res.redirect`, PHP's `redirect()` are **already recognised as `response`
@@ -130,6 +130,7 @@ gets no Screens picture at all today:
 | Django | `redirect('profile')`, `reverse('profile')` | same — a route *name*, like Vue's `{ name }`, which `vue-router.ts` already shows how to index |
 | Laravel | `redirect()->route('home')`, `->view()` | route names again |
 | CodeIgniter 3 | `redirect('users/show')` | a controller path, which `routes.php` or the convention maps to a route |
+| Elysia | `redirect('/login')` in a handler that renders pages (ConvertX) | a literal path, but often behind a computed base (`` `${WEBROOT}/login` ``), and `redirect` comes destructured from the handler's context, not from an import |
 | Spring | `"redirect:/x"`, `RedirectView` | a literal inside a string return value |
 | ASP.NET | `RedirectToAction("Index", "Home")` | controller + action pair, not a path — needs the route table's reverse mapping |
 | Flask | `redirect(url_for('profile'))` | nested call; the name is `url_for`'s argument |
@@ -157,6 +158,40 @@ so a verb attribute with no template in a controller that has none anywhere
 still names `VERB /`; a template written as a constant (`[HttpGet(ApiRoutes.List)]`);
 an attribute-routed controller's actions that carry no routing attribute; and a
 base class's second template.
+
+**Elysia's route nodes** (`frameworks/elysia.ts`, #3255) read the chains Elysia
+registers routes with, from `new Elysia(…)`, from a name bound to one
+(`app.get(…)` as a statement), and from a parameter typed `Elysia` (a functional
+plugin, `(app: Elysia) => app.get(…)`): `.get` … `.connect` and `.all`,
+`.route('TRACE', …)` with any verb, and `.ws()` as `WS`. A route is named by its
+path within its file in Elysia's own order, the instance's literal `prefix`, then
+each `.group()` prefix (with or without a hook object; `.guard()` adds none),
+then its own path, which keeps Elysia's `:id`. `postExtract` puts each exported
+instance under the prefix of the `.use()` that mounts it, composed down the mount
+tree across files: an imported instance, through barrels, a functional plugin or
+a factory call, `import('./x')`, a binding that holds one
+(`const auth = on ? (await import('./auth')).default : null`), each plugin of a
+`.use([…])` array, and a plugin named as a `.group()`'s callback. A test suite's
+own `new Elysia().use(plugin)` mounts nothing; an instance mounted at two
+prefixes keeps its in-file names. The handler is the first argument after the
+path that is not an object literal (Elysia 1 writes the hook object after the
+handler, Elysia 2 before it): a named one is a `references` edge, an inline one
+lends the route its calls, as Express's does, read from code only, never from a
+string's text, and leaving out a bare call of the handler's own parameters
+(`({ close }) => close(1000)`) and a method an options object defines
+(`AI.ask({ onFinish() { … } })`). Validated on itsaplan's API (555 routes),
+appboard_backend (264, its controllers `.use()`d inside `.group('/api', …)`),
+ConvertX (24, plus 7 in its tests), PlanningSup (15), lufin (9), elysiajs/arona
+(4, Elysia 2), Elysia's own `example/` folder (185, where Express's content scan
+had named 10 of them wrongly), and two apps with named handlers (8 and 8): every
+string-path registration read but three, nothing changed in any graph but the
+routes and the edges from and to them, and express, gin and flask
+byte-identical. Not read yet: a
+function handed the app untyped (itsaplan's `mountMcp(app: any)`, those three), a
+factory's `prefix` parameter
+(`(prefix) => new Elysia({ prefix })`), a computed path or prefix
+(`prefix: WEBROOT` is left out), `.mount()`, and Eden Treaty clients
+(`api.users({ id }).get()` has no path string for the cross-tier pass to read).
 
 ### 3. Native UI — no route nodes at all
 
@@ -492,6 +527,14 @@ Each of these cost real debugging time; they are not hypothetical.
    in an indexed repository could hang the index. Checked against path-to-regexp
    on the 344 entries of 157 real proxies: 339 read, all agreeing on 27
    addresses, and 5 left unread, which link nothing.
+23. **Two readers, one registration.** Express's reader takes `app.get('/x', …)`
+   wherever the receiver is named `app` or `router`, and an Elysia `.group()`
+   callback's parameter usually is: on Elysia's own examples, where Express is
+   detected by its content scan, it named `GET /ok` a route Elysia serves under
+   `/v2`. A file that imports Elysia or makes an instance is the Elysia
+   resolver's, and Express reads no route in it. Elysia's own reader starts only
+   at an instance, a name bound to one or a parameter typed `Elysia`, so a
+   `db.query(…).get('/x')` or `headers.get('origin')` beside a route is no route.
 
 ---
 

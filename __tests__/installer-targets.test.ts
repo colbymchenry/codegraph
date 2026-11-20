@@ -29,10 +29,18 @@ import {
   CODEGRAPH_INSTRUCTIONS_BLOCK,
   CODEGRAPH_SECTION_END,
   CODEGRAPH_SECTION_START,
+  OPENCODE_INSTRUCTIONS_BLOCK,
 } from '../src/installer/instructions-template';
 
+/**
+ * A fresh temp folder, by its real path. On macOS `os.tmpdir()` is under
+ * `/var`, a link to `/private/var`, and a process that chdirs there reads its
+ * cwd back as `/private/var/…`. The installer's local paths come from
+ * `process.cwd()`, so a test that built expected paths from the unresolved
+ * folder compared `/var/…` with `/private/var/…` and failed on macOS alone.
+ */
 function mkTmpDir(label: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`)));
 }
 
 describe('standalone installer Windows shell guidance (#1294)', () => {
@@ -126,6 +134,11 @@ const LEGACY_BLOCK = [
   'Prefer `codegraph_search` / `codegraph_callers` over grep.',
   '<!-- CODEGRAPH_END -->',
 ].join('\n');
+
+/** The block target `id` writes: OpenCode's names the tool the way OpenCode lists it (#1267). */
+function blockFor(id: string): string {
+  return id === 'opencode' ? OPENCODE_INSTRUCTIONS_BLOCK : CODEGRAPH_INSTRUCTIONS_BLOCK;
+}
 
 describe('Installer targets — contract', () => {
   let tmpHome: string;
@@ -2428,13 +2441,109 @@ describe('Installer — install --refresh keeps each agent\'s instructions file 
       const report = refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === id)!;
       expect(report.status).toBe('refreshed');
       expect(report.changedPaths).toContain(file);
-      expect(fs.readFileSync(file, 'utf-8')).toBe(`${USER}${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+      expect(fs.readFileSync(file, 'utf-8')).toBe(`${USER}${blockFor(id)}\n`);
       expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === id)!.status).toBe('unchanged');
 
       target.uninstall('global');
       expect(fs.readFileSync(file, 'utf-8')).toBe(USER.trimEnd() + '\n');
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// OpenCode's block names the tool the way OpenCode lists it (#1267)
+//
+// OpenCode registers a direct MCP tool as `<server key>_<tool name>`, so under
+// the key the installer writes, `codegraph_explore` is
+// `codegraph_codegraph_explore` there, and the block's `codegraph_explore` sent
+// OpenCode's agents after a tool that doesn't exist. Every other agent keeps
+// its block; a file OpenCode shares with one settles on OpenCode's, which names
+// the tool both ways.
+// ---------------------------------------------------------------------------
+describe('Installer — OpenCode\'s instructions block names the tool as OpenCode lists it (#1267)', () => {
+  const dirs = useTmpDirs('oc1267');
+  const read = (file: string) => fs.readFileSync(file, 'utf-8');
+  const globalAgentsMd = () => path.join(dirs.home(), '.config', 'opencode', 'AGENTS.md');
+  const projectAgentsMd = () => path.join(dirs.cwd(), 'AGENTS.md');
+  const line = (block: string, prefix: string) => block.split('\n').find((l) => l.startsWith(prefix));
+  const BARE_EXPLORE = /(?<![A-Za-z0-9_])codegraph_explore(?![A-Za-z0-9_])/;
+  const actionOn = (result: { files: Array<{ path: string; action: string }> }, file: string) =>
+    result.files.find((f) => f.path === file)?.action;
+
+  it('names the MCP tool `codegraph_codegraph_explore`, keeps the shell line, and maps the name for other agents', () => {
+    const mcpLine = line(OPENCODE_INSTRUCTIONS_BLOCK, '- **MCP tool**');
+    expect(mcpLine).toContain('`codegraph_codegraph_explore` answers most code questions');
+    expect(mcpLine).not.toMatch(BARE_EXPLORE);
+    expect(line(OPENCODE_INSTRUCTIONS_BLOCK, '- **Shell**')).toBe(line(CODEGRAPH_INSTRUCTIONS_BLOCK, '- **Shell**'));
+    expect(line(OPENCODE_INSTRUCTIONS_BLOCK, '- **Shell**')).toContain('`codegraph explore "<symbol names or question>"`');
+    expect(OPENCODE_INSTRUCTIONS_BLOCK).toContain(
+      'lists this tool as `codegraph_codegraph_explore` where other agents list `codegraph_explore`; ' +
+      'if the server is registered under another key, that key replaces the first `codegraph_`.',
+    );
+    expect(OPENCODE_INSTRUCTIONS_BLOCK.startsWith(`${CODEGRAPH_SECTION_START}\n`)).toBe(true);
+    expect(OPENCODE_INSTRUCTIONS_BLOCK.endsWith(`\n${CODEGRAPH_SECTION_END}`)).toBe(true);
+    // The block every other agent writes is the one it always wrote.
+    expect(CODEGRAPH_INSTRUCTIONS_BLOCK).not.toContain('codegraph_codegraph_');
+  });
+
+  for (const [location, agentsMd] of [['global', globalAgentsMd], ['local', projectAgentsMd]] as const) {
+    it(`${location}: install writes OpenCode's block, and installing again changes nothing`, () => {
+      const opencode = getTarget('opencode')!;
+      expect(actionOn(opencode.install(location, { autoAllow: true }), agentsMd())).toBe('created');
+      expect(read(agentsMd())).toBe(`${OPENCODE_INSTRUCTIONS_BLOCK}\n`);
+      for (const f of opencode.install(location, { autoAllow: true }).files) expect(f.action, f.path).toBe('unchanged');
+    });
+
+    it(`${location}: the block an earlier version wrote is replaced, the user's text kept, and the next install is a no-op`, () => {
+      fs.mkdirSync(path.dirname(agentsMd()), { recursive: true });
+      const notes = '# My opencode rules\n\nAlways run the tests.\n\n';
+      fs.writeFileSync(agentsMd(), `${notes}${CODEGRAPH_INSTRUCTIONS_BLOCK}\n\n## More\n`);
+      const opencode = getTarget('opencode')!;
+
+      expect(actionOn(opencode.install(location, { autoAllow: true }), agentsMd())).toBe('updated');
+      expect(read(agentsMd())).toBe(`${notes}${OPENCODE_INSTRUCTIONS_BLOCK}\n\n## More\n`);
+      expect(actionOn(opencode.install(location, { autoAllow: true }), agentsMd())).toBe('unchanged');
+    });
+  }
+
+  it('the refresh `codegraph upgrade` runs moves an existing install onto the new block, once', () => {
+    getTarget('opencode')!.install('global', { autoAllow: true });
+    fs.writeFileSync(globalAgentsMd(), `${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+
+    const report = refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'opencode')!;
+    expect(report.status).toBe('refreshed');
+    expect(report.changedPaths).toEqual([globalAgentsMd()]);
+    expect(read(globalAgentsMd())).toBe(`${OPENCODE_INSTRUCTIONS_BLOCK}\n`);
+    expect(refreshTargets(ALL_TARGETS, 'global').find((r) => r.id === 'opencode')!.status).toBe('unchanged');
+  });
+
+  // Codex, Droid, Kimi and Pi read the project's AGENTS.md too.
+  for (const other of ['codex', 'droid', 'kimi', 'pi'] as const) {
+    it(`a project AGENTS.md shared with ${other} settles on OpenCode's block in either install order, and re-installs change nothing`, () => {
+      for (const order of [[other, 'opencode'], ['opencode', other]]) {
+        fs.rmSync(projectAgentsMd(), { force: true });
+        for (const id of order) getTarget(id)!.install('local', { autoAllow: true });
+        expect(read(projectAgentsMd()), order.join(' then ')).toBe(`${OPENCODE_INSTRUCTIONS_BLOCK}\n`);
+        for (const id of order) {
+          expect(actionOn(getTarget(id)!.install('local', { autoAllow: true }), projectAgentsMd()), `${id}, after ${order.join(' then ')}`)
+            .toBe('unchanged');
+        }
+      }
+    });
+  }
+
+  it('another agent leaves OpenCode\'s block in a CRLF file byte for byte', () => {
+    const content = `# Team rules\r\n\r\n${OPENCODE_INSTRUCTIONS_BLOCK.replace(/\n/g, '\r\n')}\r\n`;
+    fs.writeFileSync(projectAgentsMd(), content);
+    expect(actionOn(getTarget('codex')!.install('local', { autoAllow: true }), projectAgentsMd())).toBe('unchanged');
+    expect(read(projectAgentsMd())).toBe(content);
+  });
+
+  it('another agent still replaces any other block with its own', () => {
+    fs.writeFileSync(projectAgentsMd(), `${LEGACY_BLOCK}\n`);
+    expect(actionOn(getTarget('codex')!.install('local', { autoAllow: true }), projectAgentsMd())).toBe('updated');
+    expect(read(projectAgentsMd())).toBe(`${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2566,7 +2675,9 @@ describe.skipIf(!FILE_SYMLINKS)(`Installer — a symbolic link is written throug
     const read = (f: string) => fs.readFileSync(f, 'utf-8');
     expect(JSON.parse(read(files.claudeJson))).toMatchObject({ numStartups: 3, mcpServers: { codegraph: {} } });
     expect(read(files.claudeMd)).toBe(`# my claude notes\n\n${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
-    expect(read(files.agentsMd)).toBe(`# shared rules\n\nBe terse.\n\n${CODEGRAPH_INSTRUCTIONS_BLOCK}\n`);
+    // Codex and OpenCode share it: it settles on OpenCode's block, which names
+    // the tool both ways (#1267).
+    expect(read(files.agentsMd)).toBe(`# shared rules\n\nBe terse.\n\n${OPENCODE_INSTRUCTIONS_BLOCK}\n`);
     expect(read(files.codexToml)).toContain('model = "o3"');
     expect(read(files.codexToml)).toContain('[mcp_servers.codegraph]');
     expect(read(files.opencode)).toContain('// my theme');

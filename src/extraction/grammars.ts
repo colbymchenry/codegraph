@@ -433,22 +433,21 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // scanner's out-of-memory report uses stdio, which a wasm parser lacks) —
   // see that doc's .md.
   'swift',
-  // R7b (Kotlin kernel port prep): fwcd tree-sitter-kotlin 0.3.8 (tag
-  // e1a2d5a), parser.c/scanner.c sha-matched crate↔tag; behavior-IDENTICAL
-  // to the tree-sitter-wasms build (0 CST/error disagreements across the
-  // gate repos) — a reproducibility re-vendor, ABI stays 14. The crates.io
-  // crate is UNUSABLE by the kernel (pins tree-sitter <0.23) and
-  // tree-sitter-kotlin-ng is a different grammar — the kernel compiles the
-  // same vendored C sources instead (codegraph-kernel/grammars/kotlin).
-  // Both carry docs/grammars/tree-sitter-kotlin.patch (scanner: no automatic
-  // semicolon before a same-line `e` word, e.g. an `eq` infix call).
+  // fwcd/tree-sitter-kotlin main@d6af96d2e23e (untagged; 0.3.8, the newest
+  // tag, read a call named after a modifier keyword as a modifier, #3410),
+  // built unpatched from the commit's checked-in src/ with tree-sitter-cli
+  // 0.25.10 and emsdk 4.0.4 (docs/grammars/tree-sitter-kotlin.md); ABI 14.
+  // No crates.io release carries it and tree-sitter-kotlin-ng is a different
+  // grammar, so the kernel compiles the same C sources
+  // (codegraph-kernel/grammars/kotlin).
   'kotlin',
-  // R7b batch 4 (Dart kernel port prep): the byte-copied tree-sitter-wasms
-  // 0.1.13 artifact (sha256 7f5364e4…, built from UserNobody14/
-  // tree-sitter-dart master@d4d8f3e337d8). tree-sitter-wasms' dart dep is an
-  // UNPINNED github ref, so a routine tree-sitter-wasms update would have
-  // silently changed dart's grammar — vendoring kills that hazard. The
-  // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
+  // Built from UserNobody14/tree-sitter-dart master@0038280b774b (Dart 3.13
+  // primary constructors, #3270) with tree-sitter-cli 0.25.10 and emsdk 4.0.4
+  // (docs/grammars/tree-sitter-dart.md); it replaced R7b batch 4's byte-copy
+  // of the tree-sitter-wasms 0.1.13 artifact (d4d8f3e). tree-sitter-wasms'
+  // dart dep is an UNPINNED github ref, so a routine tree-sitter-wasms update
+  // would have silently changed dart's grammar — vendoring kills that hazard.
+  // The kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
   // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
   'dart',
 ]);
@@ -622,6 +621,10 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   if (lang === 'c' && ext === '.h' && source) {
     if (looksLikeCpp(source)) return 'cpp';
     if (looksLikeObjc(source)) return 'objc';
+    // A declaration-only C++ header (#3397) — checked after Objective-C,
+    // whose `NSArray<NSString *> *` generics and block parameter lists share
+    // its shapes.
+    if (findCppDeclarationSyntax(source) !== null) return 'cpp';
   }
 
   // `.inc` is PHP's include extension (Drupal) and Pascal/Delphi's too
@@ -781,6 +784,226 @@ function looksLikeCpp(source: string): boolean {
   // comments removed so a doc comment's prose (`struct foo: x, y`) can't
   // flip a C header.
   return CPP_BASE_CLAUSE_RE.test(source.replace(C_COMMENT_RE, ' '));
+}
+
+/**
+ * A code-only view of a header for {@link findCppDeclarationSyntax}: each
+ * comment and string or character literal becomes one space, and
+ * preprocessor directives — continuation lines included — are dropped, so
+ * prose, a format string or a macro body (`#define MIN(a, b) ((a) < (b) ? …)`,
+ * `#define REF(T) T &`) never reads as a declaration. One left-to-right pass
+ * over comments and literals, so a `//` in a string or a quote in a comment
+ * can't open the other. A comment is one space to the preprocessor too, so a
+ * block comment's newlines go with it. A backslash continues a line before
+ * `\n` or `\r\n`.
+ */
+const C_NOISE_RE = /\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:[^"\\\n]|\\(?:\r\n|[\s\S]))*"|'(?:[^'\\\n]|\\(?:\r\n|[\s\S]))*'/g;
+const C_DIRECTIVE_RE = /^[ \t]*#(?:[^\\\n]|\\(?:\r\n|[\s\S]))*/gm;
+
+function cDeclarationView(source: string): string {
+  return source.replace(C_NOISE_RE, ' ').replace(C_DIRECTIVE_RE, '');
+}
+
+const CPP_ID = String.raw`[A-Za-z_]\w*`;
+/**
+ * A possibly scoped name: `qstring`, `std::string`. Written without spaces or
+ * a leading `::`, so a run of names splits into tokens one way only — with
+ * either, `a :: b :: c …` splits combinatorially and the scan never ends.
+ */
+const CPP_QID = String.raw`${CPP_ID}(?:::${CPP_ID})*`;
+/**
+ * A template argument list of type-like tokens, nested one level:
+ * `<IDiaDataSource>`, `<std::string, int>`, `<std::vector<int>>`. No
+ * operators but `*` — a comparison chain such as `a < b && c > d` can't be one.
+ */
+const CPP_TEMPLATE_ARGS = String.raw`<[\w\s:*,]*(?:<[\w\s:*,]*>[\w\s:*,]*)*>`;
+/**
+ * Where a declaration can begin: the start of the code, or after the `;`,
+ * `{` or `}` that ends what came before. A line that merely continues an
+ * expression (`return a +⏎ b * f(c & d);`) never follows one.
+ */
+const C_STATEMENT_START = String.raw`(?:^|[;{}])\s*`;
+
+/**
+ * `const T &` / `T const &` — a reference to const, anywhere. In C, `const`
+ * is followed by a type and then a declarator, never by `&` (a cast's `)` or
+ * a pointer's `*` always comes between: `(const char *)&x`).
+ */
+const CPP_CONST_REF_RE = new RegExp(
+  String.raw`\bconst\s+(?:(?:unsigned|signed|short|long|struct|union|enum|class|typename)\s+)*` +
+    String.raw`${CPP_QID}(?:${CPP_TEMPLATE_ARGS})?(?:\s*\*)*\s*&(?![&=])|\bconst\s*&(?![&=])`
+);
+
+/**
+ * A declaration whose type is a template instantiation, at the start of a
+ * declaration: `extern CComPtr<IDiaDataSource> g_pDiaDataSource;`,
+ * `std::vector<int> &items();`. The `<` touches its name, and a declarator
+ * name follows the `>` — `a < b > c;` is no C statement anyone writes.
+ */
+const CPP_TEMPLATE_DECLARATION_RE = new RegExp(
+  C_STATEMENT_START +
+    String.raw`(?:(?:extern|static|inline|const|volatile|typedef|constexpr|thread_local|mutable)\s+)*` +
+    String.raw`${CPP_QID}${CPP_TEMPLATE_ARGS}[\s*&]*(?:const\b[\s*&]*)?${CPP_ID}\s*[;=(\[{]`
+);
+
+/**
+ * The head of a function declaration or definition: return-type tokens, then
+ * the declarator name and its `(`, at the start of a declaration
+ * (`HRESULT GetPath(`, `static qstring GetFileContext(`, `char *dup(`).
+ * Group 1 is the type tokens, group 2 the name.
+ */
+const CPP_FUNCTION_HEAD_RE = new RegExp(
+  C_STATEMENT_START + String.raw`((?:${CPP_QID}(?:${CPP_TEMPLATE_ARGS})?[\s*&]+){1,8})(${CPP_ID})\s*\(`,
+  'g'
+);
+
+/**
+ * Words of a statement, never of a declaration's type: `return f(a & b);`,
+ * `else g(x = 1);`, mimalloc's `if mi_unlikely(p != NULL)`, or a statement
+ * macro with no `;` before the next line's `return f(&x);`.
+ */
+const C_STATEMENT_KEYWORDS = new Set([
+  'return', 'else', 'if', 'while', 'for', 'switch', 'do', 'case', 'default', 'goto', 'break', 'continue',
+  'sizeof', 'asm', '__asm', '__asm__',
+]);
+/**
+ * Specifiers and qualifiers. A function head needs a type besides these, so a
+ * function-like macro declaring something (`static DECLARE_BITMAP(map, 1 << N);`)
+ * is not one.
+ */
+const C_DECL_SPECIFIERS = new Set([
+  'extern', 'static', 'inline', '__inline', '__inline__', 'const', 'volatile', 'register', 'typedef',
+  'restrict', '__restrict', '__extension__', 'thread_local', '_Thread_local', '__thread', 'constexpr',
+]);
+/** Names that a `(` follows without being a function's: keywords, operators and builtins. */
+const C_NOT_FUNCTION_NAMES = new Set([
+  'if', 'while', 'for', 'switch', 'return', 'sizeof', 'typeof', '__typeof', '__typeof__', 'typeof_unqual',
+  '_Alignof', 'alignof', '__alignof__', '_Alignas', 'alignas', '_Atomic', '_Generic', '_Static_assert',
+  'static_assert', '__attribute', '__attribute__', '__declspec', 'asm', '__asm', '__asm__', 'volatile',
+  '__volatile__', 'decltype', 'noexcept', 'throw', 'defined', '__builtin_offsetof', '__builtin_va_arg',
+]);
+
+/**
+ * What a parameter list holds at its top level — outside nested parentheses
+ * and brackets, so an array bound (`int a[N & M]`), an attribute or a function
+ * pointer's own parameters drop out. `open` is the list's `(`. Null when the
+ * list doesn't close within a few thousand characters or runs into a `;`, `{`
+ * or `}` — no C parameter list holds one, and stopping there means no stretch
+ * of the code is scanned twice — or when it holds none of the characters
+ * {@link hasCppParameterSyntax} looks for: the common case, kept to one scan
+ * with no string built.
+ */
+function topLevelParameters(code: string, open: number): string | null {
+  let depth = 0;
+  let nested = false;
+  let close = -1;
+  const end = Math.min(code.length, open + 4000);
+  for (let i = open + 1; i < end && close < 0; i++) {
+    const ch = code.charCodeAt(i);
+    if (ch === 0x3b /* ; */ || ch === 0x7b /* { */ || ch === 0x7d /* } */) return null;
+    if (ch === 0x28 /* ( */ || ch === 0x5b /* [ */) {
+      depth++;
+      nested = true;
+    } else if (ch === 0x29 /* ) */ || ch === 0x5d /* ] */) {
+      if (depth === 0) {
+        if (ch !== 0x29) return null;
+        close = i;
+      } else depth--;
+    }
+  }
+  if (close < 0) return null;
+  let params = code.slice(open + 1, close);
+  if (!/[&=<]/.test(params)) return null;
+  // Innermost groups first, until none is left.
+  while (nested && /[([]/.test(params)) {
+    const flat = params.replace(/\([^()[\]]*\)|\[[^()[\]]*\]/g, ' ');
+    if (flat === params) return null;
+    params = flat;
+  }
+  return params;
+}
+
+/**
+ * A reference declarator after its type, spaced the way references are and
+ * bitwise `&` isn't: `bstr_t& path`, `UInt64 &resPos`, `T*&`, unnamed `Foo&`.
+ * An address-of (`f(&x)`, `f(a, &b)`) has no type before it, and an operand
+ * pair spaced evenly (`x & mask`, `x&mask`) is left alone.
+ */
+const CPP_REFERENCE_PARAMETER_RE = /[\w>*]&(?=[\s,]|$)|[\w>*]\s+&(?=[A-Za-z_])|[\w>*]\s*&\s*(?:,|$)/;
+/** A default argument: a type, a name, then `=` (`int depth = 0`, `qvector<qstring>* p = nullptr`). */
+const CPP_DEFAULT_ARGUMENT_RE = new RegExp(
+  String.raw`(?:^|,)\s*(?:${CPP_QID}(?:${CPP_TEMPLATE_ARGS})?[\s*&]+)+${CPP_ID}\s*=(?!=)`
+);
+/** A parameter of template-instantiated type: `qvector<qstring>* paths`, `const std::map<K, V> &m`. */
+const CPP_TEMPLATE_PARAMETER_RE = new RegExp(
+  String.raw`(?:^|,)\s*(?:(?:const|volatile|struct|class|typename|enum)\s+)*${CPP_QID}${CPP_TEMPLATE_ARGS}`
+);
+
+/**
+ * Whether a function's top-level parameters use syntax only C++ has: a
+ * reference, a default argument or a template-instantiated type. A C
+ * parameter is a declaration — specifiers and a declarator — so none of
+ * these can appear in one.
+ */
+function hasCppParameterSyntax(params: string): boolean {
+  return (
+    CPP_REFERENCE_PARAMETER_RE.test(params) ||
+    CPP_DEFAULT_ARGUMENT_RE.test(params) ||
+    CPP_TEMPLATE_PARAMETER_RE.test(params)
+  );
+}
+
+/**
+ * Heuristic: does a .h file declare something with syntax that only C++ has
+ * (#3397)? A declaration-only C++ header — free function prototypes and
+ * `extern` variables, no `class`, `namespace` or `template` — gives
+ * {@link looksLikeCpp} nothing to see, so it went to the C grammar, whose
+ * error recovery dropped every symbol. Returns the declaration that decides
+ * it, for tests and diagnostics, or null.
+ *
+ * Three shapes, read from a code-only view ({@link cDeclarationView}) of the
+ * whole file:
+ * - a reference to const (`const qstring &name`) — {@link CPP_CONST_REF_RE};
+ * - a declaration whose type is a template instantiation
+ *   (`extern CComPtr<IDiaDataSource> g_p;`) — {@link CPP_TEMPLATE_DECLARATION_RE};
+ * - a function whose parameters hold a reference, a default argument or a
+ *   template type (`HRESULT f(bstr_t& p, T *q = nullptr);`) —
+ *   {@link hasCppParameterSyntax}. The function head is held to what a C
+ *   declaration looks like, so a call or an expression can't stand in for
+ *   one: it begins a declaration, carries a type besides specifiers and
+ *   qualifiers, and its name is neither a keyword (`if`, `sizeof`,
+ *   `__attribute__`) nor an ALL-CAPS macro (`static DEFINE_SPINLOCK(x);`).
+ *
+ * An Objective-C header — an `#import`, or an `@` anywhere in its code
+ * (`@interface`, `@"…"`, `@[…]`) — is left alone: its generics and block
+ * parameters look like C++, and {@link looksLikeObjc} only samples the head of
+ * the file. A C header that declares C++ this way in an `#ifdef __cplusplus`
+ * section reads as C++, as one with a class or a template there already does.
+ */
+export function findCppDeclarationSyntax(source: string): string | null {
+  if (/^[ \t]*#[ \t]*import\b/m.test(source)) return null;
+  const code = cDeclarationView(source);
+  if (code.includes('@')) return null;
+
+  const constRef = CPP_CONST_REF_RE.exec(code);
+  if (constRef) return constRef[0].trim();
+  const templateDecl = CPP_TEMPLATE_DECLARATION_RE.exec(code);
+  if (templateDecl) return templateDecl[0].replace(/^[;{}]/, '').trim();
+
+  CPP_FUNCTION_HEAD_RE.lastIndex = 0;
+  for (let m = CPP_FUNCTION_HEAD_RE.exec(code); m; m = CPP_FUNCTION_HEAD_RE.exec(code)) {
+    const name = m[2]!;
+    if (C_NOT_FUNCTION_NAMES.has(name) || /^_*[A-Z][A-Z0-9_]*$/.test(name)) continue;
+    const words = m[1]!.replace(/<[^<>]*(?:<[^<>]*>[^<>]*)*>/g, ' ').match(/[A-Za-z_]\w*/g) ?? [];
+    if (words.some((w) => C_STATEMENT_KEYWORDS.has(w))) continue;
+    if (words.every((w) => C_DECL_SPECIFIERS.has(w))) continue;
+    const open = m.index + m[0].length - 1;
+    const params = topLevelParameters(code, open);
+    if (params !== null && hasCppParameterSyntax(params)) {
+      return `${m[0].replace(/^[;{}]/, '').trim()}${params})`;
+    }
+  }
+  return null;
 }
 
 /**

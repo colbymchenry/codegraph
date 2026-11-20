@@ -129,6 +129,8 @@ export interface ResolutionContext {
   fileExists(filePath: string): boolean;
   /** Read file content */
   readFile(filePath: string): string | null;
+  /** Record a project-relative file resolution read its answer from, for sync to watch (see `getModuleConfigSnapshot`). */
+  noteModuleConfigFile?(filePath: string): void;
   /** `readFile(filePath)?.includes(needle) ?? false` for an ASCII `needle`, without decoding a file that lacks it. */
   fileContains?(filePath: string, needle: string): boolean;
   /**
@@ -254,6 +256,13 @@ export interface ResolutionContext {
    * `@/*`, a nested Vite app's `"baseUrl": "src"` — or null.
    */
   getNearestAliases?(fromFile: string): import('./path-aliases').AliasMap | null;
+  /**
+   * The folder `$_SERVER['DOCUMENT_ROOT']` names for a PHP include in
+   * `fromFile` (#3298): the project's `codegraph.json` `webRoot`, else the one
+   * the project's own includes agree on (see php-web-root.ts), else null.
+   * Project-relative, `/`-separated, '' for the project root.
+   */
+  getPhpWebRoot?(fromFile: string): string | null;
   /**
    * The project-relative directory (`/`-separated, `.` for the root) of
    * the Go package an import path names, when it is a package of one of the
