@@ -244,6 +244,11 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     for (const file of result.files) {
       if (file.action === 'created') sawCreated = true;
       if (file.action === 'updated') sawUpdated = true;
+      if (file.action === 'kept') {
+        clack.log.warn(`${target.displayName}: Kept ${tildify(file.path)}`);
+        continue;
+      }
+      if (file.action === 'not-found') continue;
       const verb = file.action === 'unchanged'
         ? 'Unchanged'
         : file.action === 'created' ? 'Created'
@@ -334,8 +339,10 @@ export interface UninstallReport {
   id: TargetId;
   displayName: string;
   status: UninstallStatus;
-  /** Absolute paths we actually edited/removed (action === 'removed'). */
+  /** Absolute paths we removed (action === 'removed'). */
   removedPaths: string[];
+  /** Absolute paths rewritten and preserved on disk (action === 'updated'). */
+  updatedPaths: string[];
   /** Verbatim notes from the target (rare for uninstall). */
   notes: string[];
 }
@@ -361,6 +368,7 @@ export function uninstallTargets(
         displayName: target.displayName,
         status: 'unsupported' as const,
         removedPaths: [],
+        updatedPaths: [],
         notes: [`no ${location} config — this agent is ${only}-only`],
       };
     }
@@ -368,11 +376,16 @@ export function uninstallTargets(
     const removedPaths = result.files
       .filter((f) => f.action === 'removed')
       .map((f) => f.path);
+    const updatedPaths = result.files
+      .filter((f) => f.action === 'updated')
+      .map((f) => f.path);
+    const touched = removedPaths.length > 0 || updatedPaths.length > 0;
     return {
       id: target.id,
       displayName: target.displayName,
-      status: removedPaths.length > 0 ? ('removed' as const) : ('not-configured' as const),
+      status: touched ? ('removed' as const) : ('not-configured' as const),
       removedPaths,
+      updatedPaths,
       notes: result.notes ?? [],
     };
   });
@@ -525,6 +538,9 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     if (r.status === 'removed') {
       for (const p of r.removedPaths) {
         clack.log.success(`${r.displayName}: removed ${tildify(p)}`);
+      }
+      for (const p of r.updatedPaths) {
+        clack.log.success(`${r.displayName}: updated ${tildify(p)}`);
       }
     } else if (r.status === 'not-configured') {
       clack.log.info(r.notes.length > 0 ? `${r.displayName}: nothing removed` : `${r.displayName}: not configured — nothing to remove`);

@@ -236,7 +236,7 @@ function updatePromptHook(loc: Location, enabled: boolean): WriteResult {
   if (Object.keys(hooks).length) json.hooks = hooks;
   else delete json.hooks;
   atomicWriteFileSync(file, JSON.stringify(json, null, 2) + '\n');
-  return { files: [{ path: file, action: 'removed' }] };
+  return { files: [{ path: file, action: 'updated' }] };
 }
 
 function buildCodegraphBlock(): string {

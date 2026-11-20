@@ -19,7 +19,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### New Features
 
 - The installer can now set up prompt-time CodeGraph context in Codex CLI. (#3335)
-
 - The Claude Code prompt hook now gets its context from the CodeGraph server already running for your project instead of loading the index again on every prompt, so structural prompts are answered sooner, most of all in large projects; with no server running, one that is busy, or one that can't prove it runs as you, the hook works it out itself as before. Thanks @aidenpan0x for the report, the measurements and the pull request. (#3284)
 - Elysia (Bun) backends now have their HTTP routes in the graph, named by the full path a request takes, with the prefixes of `new Elysia({ prefix })`, `.group()` and a `.use()` in another file included, and linked to their handlers, so `codegraph_explore` can follow a request from its route into your code. Thanks @ChampPABA for the report. (#3255)
 - PHP includes built from the web server's root, like `require $_SERVER['DOCUMENT_ROOT'] . '/inc/header.php'`, now link to their file: CodeGraph works out which folder the server serves from where your includes' paths name files, links nothing when they don't settle it rather than guess, and takes `"webRoot": "public"` in `codegraph.json` (or `"."` for the project root) when you'd rather name it yourself. Thanks @artisanya for the report. (#3298)
