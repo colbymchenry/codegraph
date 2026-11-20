@@ -35,6 +35,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import { readRegularFile } from '../file-limits';
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 
@@ -662,7 +663,7 @@ function projectInfo(file: string, context: ResolutionContext): VbProjectInfo {
     const abs = path.join(context.getProjectRoot(), dir);
     const project = fs.readdirSync(abs).find((e) => /\.vbproj$/i.test(e));
     if (project) {
-      const text = fs.readFileSync(path.join(abs, project), 'utf8');
+      const text = readRegularFile(path.join(abs, project), 'utf8');
       const root = /<RootNamespace>\s*([\w.]*)\s*<\/RootNamespace>/i.exec(text)?.[1] ?? project.replace(/\.vbproj$/i, '');
       info.root = root.toLowerCase().split('.').filter((s) => s !== '');
       for (const m of text.matchAll(/<Import\s+Include\s*=\s*"([\w.]+)"/gi)) info.imports.push(m[1]!.toLowerCase());

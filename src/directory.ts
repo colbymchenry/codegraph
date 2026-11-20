@@ -11,6 +11,7 @@ import * as path from 'path';
 import { isWslWindowsDrive } from './sync/watch-policy';
 import { loadNodeSqlite } from './db/node-sqlite';
 import { sensitiveDirectoryRefusal } from './utils';
+import { isNonRegularFile, readRegularFile } from './file-limits';
 
 /** The default per-project data directory name. */
 export const DEFAULT_CODEGRAPH_DIR = '.codegraph';
@@ -941,8 +942,10 @@ function isStaleDefaultGitignore(content: string): boolean {
  */
 function ensureGitignore(gitignorePath: string): boolean {
   let existing: string | null;
+  // Not a regular file (a FIFO, a directory): not ours to replace, and a write would wait on a FIFO.
+  if (isNonRegularFile(gitignorePath)) return false;
   try {
-    existing = fs.readFileSync(gitignorePath, 'utf-8');
+    existing = readRegularFile(gitignorePath, 'utf-8');
   } catch {
     existing = null; // absent (ENOENT) or unreadable — (re)create below
   }
@@ -998,8 +1001,9 @@ function isTrackedByGit(file: string): boolean {
 export function makeGitignoreLocalOnly(projectRoot: string): LocalOnlyGitignoreResult {
   const gitignorePath = path.join(getCodeGraphDir(projectRoot), '.gitignore');
   let existing: string | null;
+  if (isNonRegularFile(gitignorePath)) return 'customized';
   try {
-    existing = fs.readFileSync(gitignorePath, 'utf-8').replace(/\r\n/g, '\n');
+    existing = readRegularFile(gitignorePath, 'utf-8').replace(/\r\n/g, '\n');
   } catch {
     existing = null;
   }
