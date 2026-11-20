@@ -229,6 +229,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 - **What an Angular template uses is no longer dead code.** A signal, `computed` value, getter or method that a component's template calls from a property binding, an interpolation, a structural directive or a control-flow block — `[name]="icon()"`, `{{ label() }}`, `*matRowDef="let row; columns: displayedColumns()"`, `@if (loading())` — or hands to a child, like `[displayWith]="displayFn"`, now counts as reached, so it leaves the Dead code tab. Steps draws it as part of what the screen renders, not as something the user does. Re-index Angular projects after upgrading.
 
+- **Erlang's unit tests are no longer listed as dead code.** EUnit runs every `*_test` and `*_test_` function by its name, and Erlang keeps them in the source file they test, so the Dead code screen listed a project's own unit tests. They are now left off the list with the other tests.
+
 ## Entries whose graph and `codegraph_explore` half already shipped
 
 The release notes carry a reworded version of each of these. Keep only the viewer half at launch.
