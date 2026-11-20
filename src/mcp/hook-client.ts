@@ -19,7 +19,7 @@
 import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
-import { daemonOptOutSet, getDaemonSocketCandidates } from './daemon-paths';
+import { daemonOptOutSet, getDaemonSocketCandidates, othersCanReplaceIn } from './daemon-paths';
 import { daemonProofMatches, newDaemonChallenge, readDaemonKey } from './daemon-proof';
 import { PROMPT_EXPLORE_METHOD } from './prompt-explore';
 import { CodeGraphPackageVersion } from './version';
@@ -69,8 +69,7 @@ function boundByThisUser(socketPath: string): boolean {
     const uid = process.getuid?.();
     const socket = fs.lstatSync(socketPath);
     const folder = fs.statSync(path.dirname(socketPath));
-    const othersCanReplace = (folder.mode & 0o022) !== 0 && (folder.mode & 0o1000) === 0;
-    return socket.isSocket() && socket.uid === uid && (folder.uid === uid || folder.uid === 0) && !othersCanReplace;
+    return socket.isSocket() && socket.uid === uid && (folder.uid === uid || folder.uid === 0) && !othersCanReplaceIn(folder.mode);
   } catch {
     return false;
   }

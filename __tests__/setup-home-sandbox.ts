@@ -54,6 +54,22 @@ if (process.platform === 'win32') {
   delete process.env.LOCALAPPDATA;
 }
 process.env.XDG_CONFIG_HOME = path.join(home, '.config');
+// Where a daemon binds when a project's .codegraph/ is group-writable (#3417):
+// a private folder of the sandbox's, never the developer's real runtime dir.
+// Directly under /tmp, because a socket path must stay short and macOS's
+// tmpdir alone is over half the limit. Removed with the home, below.
+const runtimeDir = (() => {
+  if (process.platform === 'win32') return undefined;
+  for (const base of ['/tmp', os.tmpdir()]) {
+    try { return fs.realpathSync(fs.mkdtempSync(path.join(base, 'cg-run-'))); } catch { /* no /tmp: try the next */ }
+  }
+  return undefined;
+})();
+if (runtimeDir) {
+  fs.chmodSync(runtimeDir, 0o700);
+  process.env.XDG_RUNTIME_DIR = runtimeDir;
+  if (registry) fs.writeFileSync(path.join(registry, path.basename(runtimeDir)), runtimeDir);
+}
 for (const override of ['CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'COPILOT_HOME', 'HERMES_HOME', 'QWEN_HOME', 'DSH_HOME', 'GROK_HOME', 'KIMI_CODE_HOME', 'QODER_CONFIG_DIR', 'PI_CODING_AGENT_DIR']) {
   delete process.env[override];
 }
@@ -68,6 +84,10 @@ afterAll(() => {
   try {
     fs.rmSync(home, { recursive: true, force: true, maxRetries: 3 });
     if (registryEntry) fs.rmSync(registryEntry, { force: true });
+    if (runtimeDir) {
+      fs.rmSync(runtimeDir, { recursive: true, force: true, maxRetries: 3 });
+      if (registry) fs.rmSync(path.join(registry, path.basename(runtimeDir)), { force: true });
+    }
   } catch {
     /* a straggling child still holding a file there; the end of the run retries */
   }

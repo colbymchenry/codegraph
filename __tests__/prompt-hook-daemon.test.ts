@@ -201,6 +201,8 @@ describe.runIf(process.platform !== 'win32')('exploreViaDaemon — the sockets t
   // would read every prompt and write into the agent's context.
   it('never sends the prompt to a socket another user created', async () => {
     const root = await indexedProject();
+    // In-project, whatever the suite's umask (a group-writable one puts the socket in the runtime folder; #3417).
+    fs.chmodSync(path.join(root, '.codegraph'), 0o755);
     const seen = await fakeDaemon(root, CodeGraphPackageVersion, answer('FROM SOMEONE ELSE'));
     const mine = process.getuid!();
     vi.spyOn(process, 'getuid').mockReturnValue(mine + 1);
@@ -227,6 +229,8 @@ describe.runIf(process.platform !== 'win32')('exploreViaDaemon — the sockets t
   // /tmp carries, is what stops them: only a file's owner may remove it.
   it('never trusts a socket in a folder where others can replace it', async () => {
     const root = await indexedProject();
+    // In-project, whatever the suite's umask (a group-writable one puts the socket in the runtime folder; #3417).
+    fs.chmodSync(path.join(root, '.codegraph'), 0o755);
     const seen = await fakeDaemon(root, CodeGraphPackageVersion, answer('FROM THE DAEMON'));
     const folder = path.dirname(getDaemonSocketCandidates(root)[0]!);
     expect(folder.startsWith(root)).toBe(true);
@@ -238,6 +242,8 @@ describe.runIf(process.platform !== 'win32')('exploreViaDaemon — the sockets t
 
   it('trusts its own socket in a shared folder that has the sticky bit, like /tmp', async () => {
     const root = await indexedProject();
+    // In-project, whatever the suite's umask (a group-writable one puts the socket in the runtime folder; #3417).
+    fs.chmodSync(path.join(root, '.codegraph'), 0o755);
     await fakeDaemon(root, CodeGraphPackageVersion, answer('FROM THE DAEMON'));
     const folder = path.dirname(getDaemonSocketCandidates(root)[0]!);
     expect(folder.startsWith(root)).toBe(true);
