@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- A `.codegraphignore` file at the project root, or at an embedded repository's root, keeps paths out of the index with `.gitignore` syntax without changing what git tracks.
 
 ## [1.6.4] - 2026-11-20
 

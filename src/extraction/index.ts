@@ -25,6 +25,7 @@ import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
+import { readCodegraphIgnore } from './read-codegraph-ignore';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -453,6 +454,7 @@ function isValidUtf8(buf: Buffer): boolean {
  *
  * Either way a warning that NAMES the file is logged (the reporter couldn't tell
  * which `.gitignore` was at fault) and indexing continues instead of aborting.
+ * `.codegraphignore` is read through it too.
  * Returns '' when there's nothing usable.
  */
 function readGitignorePatterns(giPath: string): string {
@@ -466,7 +468,7 @@ function readGitignorePatterns(giPath: string): string {
   // catches the rest. Such a file isn't ignore patterns at all.
   if (buf.includes(0) || !isValidUtf8(buf)) {
     logWarn(
-      'Ignoring a .gitignore that is not valid UTF-8 text — it may have been encrypted ' +
+      'Ignoring an ignore file (.gitignore or .codegraphignore) that is not valid UTF-8 text — it may have been encrypted ' +
         'in place by endpoint-security software. Indexing continues without it.',
       { file: giPath },
     );
@@ -643,7 +645,8 @@ function listGitIgnoredDirectories(rootDir: string, sink?: string[]): string[] {
  * An `ignore` matcher seeded with the built-in defaults, merged with the project's
  * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default, plus
  * git's other root-relative exclude files (`.git/info/exclude`, `core.excludesFile`)
- * so watcher / FS-walk scope matches `git ls-files --exclude-standard` (#1728).
+ * so watcher / FS-walk scope matches `git ls-files --exclude-standard` (#1728),
+ * plus the root's `.codegraphignore` (same syntax), which can exclude more than git does.
  * Shared by both enumeration paths so behavior is identical with or without git —
  * and so the defaults apply to tracked files too (committing a dependency dir
  * doesn't make it project code; the explicit `.gitignore` negation is the only
@@ -662,6 +665,11 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
   if (extra) {
     ig.add(extra);
     projectRules.add(extra);
+  }
+  const codegraphIgnore = readCodegraphIgnore(rootDir, readGitignorePatterns);
+  if (codegraphIgnore) {
+    ig.add(codegraphIgnore);
+    projectRules.add(codegraphIgnore);
   }
   return excludeBuildOutputUnderSrc(ig, projectRules);
 }
@@ -1581,7 +1589,7 @@ function getGitVisibleFiles(rootDir: string, onManifestEvidence?: (evidence: Man
     collectGitFiles(rootDir, '', files, embeddedRoots, loadIncludeIgnoredMatcher(rootDir), gitlinks);
     // Apply built-in default ignores uniformly — to tracked files too, since
     // committing a dependency/build dir doesn't make it project code. A
-    // `.gitignore` negation (e.g. `!vendor/`) is the explicit opt-in. (issue #407)
+    // `.gitignore` (or `.codegraphignore`) negation (e.g. `!vendor/`) is the explicit opt-in. (issue #407)
     // Files inside an EMBEDDED repo are matched against that repo's own rules,
     // not the parent's: the parent's .gitignore hides the child repo from git,
     // not from the index. (#514)
@@ -2100,7 +2108,7 @@ function scanDirectoryWalk(
   }
 
   // Seed a base matcher with the built-in default ignores (merged with the root
-  // .gitignore so a negation can override). Nested .gitignores still layer per-dir.
+  // .gitignore and .codegraphignore so a negation can override). Nested .gitignores still layer per-dir.
   const baseMatchers: ScopedIgnore[] = [{ dir: rootDir, ig: buildDefaultIgnore(rootDir) }];
   // Project `codegraph.json` `exclude` patterns (#999), rooted at the project so
   // `isIgnored` matches them against root-relative paths — same coverage the
