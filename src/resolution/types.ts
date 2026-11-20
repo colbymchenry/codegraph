@@ -163,6 +163,8 @@ export interface ResolutionContext {
   getProjectRoot(): string;
   /** Get all files */
   getAllFiles(): string[];
+  /** The paths of the files indexed as `language`, by the files table's language index. */
+  getFilePathsOfLanguage?(language: Language): string[];
   /** Get nodes by lowercase name (O(1) lookup for fuzzy matching) */
   getNodesByLowerName(lowerName: string): Node[];
   /**

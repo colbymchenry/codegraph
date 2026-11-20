@@ -27,6 +27,8 @@ import { ambientModuleDeclarations, declaringFileAnswers, inBlock, isDeclaration
 import { leavesWorkspaceRoot } from './workspace-packages';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap, parsePackageName, parseTargetPaths, parseWorkspaceMembers } from './frameworks/cargo-workspace';
+import { isFsharpCandidateInScope, clearFsharpScopeCaches } from './fsharp-scope';
+import { clearDotnetLookupCaches } from './dotnet-lookup';
 import { blankRustCode, readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -197,6 +199,9 @@ const CODE_FAMILY: Record<string, string> = {
   python: 'python', go: 'go', rust: 'rust', php: 'php', ruby: 'ruby', dart: 'dart',
   lua: 'lua', luau: 'lua', r: 'r', erlang: 'erlang', pascal: 'pascal', solidity: 'solidity',
   nix: 'nix', cobol: 'cobol',
+  // F# is .NET code, so it shares C#'s boundary here; it is in no name pool above, because what a
+  // C# or Razor name means in F# is C#'s lookup to say (dotnet-lookup), never a name match.
+  fsharp: 'dotnet',
 };
 
 export function crossesCodeBoundary(a: string, b: string): boolean {
@@ -4500,6 +4505,9 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (ref.language === 'go' && candidate.language === 'go' &&
       (isGoExternalQualified(ref, context) || !isInGoQualifierPackage(candidate, ref, context))) return false;
   if ((ref.language === 'csharp' || ref.language === 'razor') && !csharpTypeArityFits(candidate, ref, context)) return false;
+  // An F# name is its file's above it, its enclosing namespace or module's, or an opened one's — in
+  // its own file too, which F# reads top to bottom. No other language's name means an F# declaration here.
+  if (!isFsharpCandidateInScope(candidate, ref, context)) return false;
   if (candidate.filePath === ref.filePath) return true;
   // A vendored minified bundle's names are mangled: healthchecks' 369 `$(…)`
   // (jQuery, a global) went to a one-letter helper inside bootstrap-native.min.js.
@@ -4566,6 +4574,9 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (lang === 'dart') {
     return candidate.visibility !== 'private' || (ref.language === 'dart' && dartPrivateVisible(ref.filePath, candidate.filePath, context));
   }
+  // An F# `private` is its enclosing module's, type's or namespace's — a namespace spans files —
+  // which isFsharpCandidateInScope, above, already decided.
+  if (lang === 'fsharp') return true;
   if (PRIVATE_IS_FILE_LOCAL.has(lang)) {
     // Only Kotlin's private type keeps its members in its file: a Scala
     // `private[pkg] class` (or one with a private constructor) is the package's,
@@ -16070,6 +16081,9 @@ export function matchByExactName(
     // tsdb's `[]*memSeries` is head.go's, not `tsdb/agent`'s, which scored the
     // same (a child package's directory shares as much of the path) and won.
     (n.language !== 'go' || isGoNameVisible(n, ref, context)) &&
+    // An F# name is its file's, its scope's, an opened or a qualified one: ahead of
+    // the ranking, so the namesake in reach wins over one in an unreached namespace.
+    isFsharpCandidateInScope(n, ref, context) &&
     dartExtensionDecl(n, context)?.named !== false &&
     // A Scala package object's member, only where it is in scope — ahead of
     // the ranking, so cats.laws' `Eq` can be the `cats` package object's.
@@ -16664,7 +16678,9 @@ export function matchByQualifiedName(
     };
   }
 
-  let candidates = cppQualifierSpecializationPool(cppSpecializationPool(keepForRef(context.getNodesByQualifiedName(ref.referenceName)), ref, context), ref, context);
+  let candidates = cppQualifierSpecializationPool(cppSpecializationPool(keepForRef(context.getNodesByQualifiedName(ref.referenceName)), ref, context), ref, context)
+    // A declaration the name cannot reach (an F# one, to another language's name) is no candidate to choose among.
+    .filter((n) => isFsharpCandidateInScope(n, ref, context));
   // A C# `using X.Y;` names a namespace: one the project declares, else it is
   // the file's own (external) using — never another file's using of that name.
   // That own using ends the lookup here, and resolveOne drops it (an import
@@ -24092,6 +24108,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CSHARP_ALIASES.delete(context);
   SWIFT_HIERARCHIES.delete(context);
   KOTLIN_FILE_SCOPES.delete(context);
+  clearFsharpScopeCaches(context);
+  clearDotnetLookupCaches(context);
   RUBY_ANCESTRY.delete(context);
   PHP_TYPE_METHODS.delete(context);
   PHP_ANCESTRIES.delete(context);

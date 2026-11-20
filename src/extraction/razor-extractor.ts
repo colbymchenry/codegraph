@@ -55,6 +55,22 @@ const BLAZOR_BUILTIN_COMPONENTS = new Set([
   'SectionOutlet', 'FocusOnNavigate', 'NavLink', 'Microsoft',
 ]);
 
+/** A C# block of a Razor file, as the extractor cuts it out of the markup. */
+export interface RazorCodeBlock {
+  content: string;
+  /** 0-indexed line of the content's first character. */
+  lineOffset: number;
+  /** Offset of the content's first character in the file. */
+  start: number;
+  /** `@{ … }` holds statements; `@code` / `@functions` hold the component's members. */
+  statements: boolean;
+}
+
+/** The C# blocks of a Razor source, where the extractor reads its references from. */
+export function razorCodeBlocks(source: string): RazorCodeBlock[] {
+  return new RazorExtractor('', source).codeBlocks();
+}
+
 export class RazorExtractor {
   private filePath: string;
   private source: string;
@@ -231,8 +247,8 @@ export class RazorExtractor {
   }
 
   /** `@code { … }` / `@functions { … }` (Blazor) and `@{ … }` (Razor) C# blocks. */
-  private extractCodeBlocks(): Array<{ content: string; lineOffset: number }> {
-    const blocks: Array<{ content: string; lineOffset: number }> = [];
+  codeBlocks(): RazorCodeBlock[] {
+    const blocks: RazorCodeBlock[] = [];
     const re = /@(?:code|functions)\b\s*\{|@\{/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(this.source)) !== null) {
@@ -243,7 +259,7 @@ export class RazorExtractor {
       const content = this.source.slice(openIdx + 1, close);
       // newlines before the content's first char → 0-indexed line of content start
       const lineOffset = (this.source.slice(0, openIdx + 1).match(/\n/g) || []).length;
-      blocks.push({ content, lineOffset });
+      blocks.push({ content, lineOffset, start: openIdx + 1, statements: m[0] === '@{' });
       re.lastIndex = close;
     }
     return blocks;
@@ -260,7 +276,7 @@ export class RazorExtractor {
    */
   private processCodeBlocks(componentId: string): void {
     if (!isLanguageSupported('csharp')) return;
-    for (const block of this.extractCodeBlocks()) {
+    for (const block of this.codeBlocks()) {
       if (!block.content.trim()) continue;
       let result: ExtractionResult;
       try {

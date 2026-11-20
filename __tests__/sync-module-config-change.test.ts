@@ -490,4 +490,75 @@ describe('a sync follows a module-config change (#2977)', () => {
     expect(stateOf(tsRoot, ts)).toEqual(tsBefore);
     expect(stateOf(goRoot, go)).toEqual(goBefore);
   }, 120_000);
+
+  const FSHARP_BEFORE: Files = {
+    'App.fsproj': '<Project><ItemGroup><Compile Include="Util.fs" /><Compile Include="Use.fs" /></ItemGroup></Project>',
+    'Util.fs': 'module Util\n\nlet helper () = 1\n',
+    'Use.fs': 'module Use\n\nlet run () = Util.helper ()\n',
+  };
+
+  it('an .fsproj that compiles a file later hides what it declares from the files before it', async () => {
+    const { root, graph, full } = await syncEdit(FSHARP_BEFORE, {
+      'App.fsproj': '<Project><ItemGroup><Compile Include="Use.fs" /><Compile Include="Util.fs" /></ItemGroup></Project>',
+    });
+    expect(callTargets(graph, 'Use::run')).toEqual([]);
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
+  it('an .fsi that appears beside an F# file hides what it leaves out, from F# and from C#', async () => {
+    const before: Files = {
+      ...FSHARP_BEFORE,
+      'Web.cs': 'namespace Web { class C { void M() { Util.helper(); } } }\n',
+    };
+    const { root, graph, full } = await syncEdit(before, { 'Util.fsi': 'module Util\n\nval other : int -> int\n' });
+    expect(callTargets(graph, 'Use::run')).toEqual([]);
+    expect(callTargets(graph, 'Web::C::M')).toEqual([]);
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
+  it('an .fsi that goes shows its .fs again, and an F# file without one adds nothing to the snapshot', async () => {
+    const root = tempRoot();
+    write(root, { ...FSHARP_BEFORE, 'Util.fsi': 'module Util\n\nval other : int -> int\n' });
+    const graph = await index(root);
+    expect(callTargets(graph, 'Use::run')).toEqual([]);
+    fs.rmSync(path.join(root, 'Util.fsi'));
+    await graph.sync();
+    expect(callTargets(graph, 'Use::run')).toEqual(['Util.fs::Util::helper']);
+    const fullRoot = tempRoot();
+    write(fullRoot, FSHARP_BEFORE);
+    expect(stateOf(root, graph)).toEqual(stateOf(fullRoot, await index(fullRoot)));
+    const db = DatabaseConnection.open(getDatabasePath(fullRoot));
+    try {
+      const stored = db.getDb().prepare("SELECT value FROM project_metadata WHERE key = 'module_config_snapshot'").get() as { value: string };
+      expect(Object.keys(JSON.parse(stored.value) as Record<string, string>).filter((rel) => rel.endsWith('.fsi'))).toEqual([]);
+    } finally {
+      db.close();
+    }
+  }, 120_000);
+
+  it('an .fsi edit that changes no name it declares re-opens nothing', async () => {
+    const root = tempRoot();
+    write(root, { ...FSHARP_BEFORE, 'Util.fsi': 'module Util\n\nval helper : unit -> int\n' });
+    const graph = await index(root);
+    const reopen = vi.spyOn(ExtractionOrchestrator.prototype, 'resurrectResolutionEdgesTouching');
+    write(root, { 'Util.fsi': 'module Util\n\n/// The answer.\nval helper : unit -> int\n' });
+    await graph.sync();
+    expect(reopen).not.toHaveBeenCalled();
+    reopen.mockRestore();
+    expect(callTargets(graph, 'Use::run')).toEqual(['Util.fs::Util::helper']);
+  }, 120_000);
+
+  it('F# under an extension codegraph.json maps to it is followed like `.fs`', async () => {
+    const { root, graph, full } = await syncEdit({
+      'codegraph.json': JSON.stringify({ extensions: { '.fsl': 'fsharp' } }),
+      'App.fsproj': '<Project><ItemGroup><Compile Include="Util.fsl" /><Compile Include="Use.fsl" /></ItemGroup></Project>',
+      'Util.fsl': 'module Util\n\nlet helper () = 1\n',
+      'Use.fsl': 'module Use\n\nlet run () = Util.helper ()\n',
+    }, {
+      'App.fsproj': '<Project><ItemGroup><Compile Include="Use.fsl" /><Compile Include="Util.fsl" /></ItemGroup></Project>',
+    });
+    expect(callTargets(graph, 'Use::run')).toEqual([]);
+    expect(stateOf(root, graph)).toEqual(full);
+  }, 120_000);
+
 });

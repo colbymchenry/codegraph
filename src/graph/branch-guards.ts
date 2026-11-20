@@ -215,7 +215,7 @@ async function parse(source: string, language: Language): Promise<Tree | null> {
     await loadGrammarsForLanguages([language]);
     const parser = getParser(language);
     if (!parser) return null;
-    return parseWithinBudget(parser, source);
+    return parseWithinBudget(parser, source, language);
   } catch {
     return null;
   }
@@ -295,7 +295,7 @@ export function guardsForFileSync(
     } catch {
       return out;
     }
-    const tree = parseWithinBudget(parser, source);
+    const tree = parseWithinBudget(parser, source, language);
     if (!tree) return out;
     cached = { key, tree, source };
     remember(absPath, cached);
