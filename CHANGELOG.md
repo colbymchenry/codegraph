@@ -34,6 +34,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Kotlin is now read with a newer version of its grammar, so code it used to misread, such as an annotated class whose methods showed up as top-level functions, a class that delegates `by` another object, or newer syntax like `when` guards and explicit backing fields, now has its classes, functions and calls in the graph where they belong. (#3410)
 - `codegraph_explore` now answers a question about one symbol, like "who calls `toValidURL`?" or "what is `MAX_RETRIES`?", with that symbol's source and every line that uses it, each with the function it sits in and the line's text, instead of filling its whole answer with files that only share words with the name, so these small questions cost less and leave nothing to search for afterwards. Thanks @GeorgeTaveras1231 for the measurements. (#3407)
 
+- **`codegraph_component` — a Vue component's contract in one call.** Ask for a component by name and get its props (with their types, defaults and the comments above them), emits, slots and exposed members, the child components it renders, and every parent `@event="handler"` binding attached to it — so changing an emit shows exactly which parent handlers break, without reading the SFC. Opt-in with `CODEGRAPH_MCP_TOOLS=component`; projects indexed before this change pick the data up as their files re-index.
+
+- **Vue props and emits are read across files.** When a component's `defineProps` / `defineEmits` types live in a shared types file — imported directly, reached through `extends` chains, or renamed on import — their members are pulled in and shown with the types and docs as written. A base reached through two branches of an inheritance diamond shows up once, tsconfig `paths` aliases (`@/types/props`) resolve exactly like relative imports, and an import this extractor cannot follow (a bare package) is skipped rather than guessed.
+
+- **Vue templates are indexed as wiring, not just text.** Every `@event="handler"` on a component tag becomes a real edge from the component to the function that handles it, so callers, impact and the new component view see which functions a template drives — including through kebab-case tags.
+
 ### Fixes
 
 #### Setup, the background server and the CLI
