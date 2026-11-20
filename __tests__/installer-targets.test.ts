@@ -196,6 +196,7 @@ describe('Installer targets — contract', () => {
             // and verify the sibling survives. Skip for Codex (TOML)
             // and any target with no JSON config — they get covered
             // by their own dedicated tests below.
+            if (target.id === 'codex') return;
             const paths = target.describePaths(location);
             // Match .json or .jsonc — opencode prefers .jsonc.
             const jsonPath = paths.find((p) => /\.jsonc?$/.test(p));
@@ -348,6 +349,86 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(codex.detect('global').alreadyConfigured).toBe(true);
     expect(fs.readFileSync(path.join(tmpHome, '.codex', 'config.toml'), 'utf-8'))
       .toContain('[mcp_servers.codegraph]');
+  });
+
+  it('codex: an opted-in project install creates the prompt hook in the project scope', () => {
+    const codex = getTarget('codex')!;
+    const result = codex.install('local', { autoAllow: false, promptHook: true });
+    const hooksPath = path.join(tmpCwd, '.codex', 'hooks.json');
+
+    expect(result.files).toContainEqual({ path: hooksPath, action: 'created' });
+    expect(JSON.parse(fs.readFileSync(hooksPath, 'utf-8'))).toMatchObject({
+      hooks: {
+        UserPromptSubmit: [{
+          hooks: [{
+            type: 'command',
+            command: 'codegraph prompt-hook',
+            commandWindows: 'codegraph.cmd prompt-hook',
+            statusMessage: 'Loading CodeGraph context',
+          }],
+        }],
+      },
+    });
+    expect(fs.existsSync(path.join(tmpHome, '.codex', 'hooks.json'))).toBe(false);
+  });
+
+  it('codex: reinstallation and removal preserve adjacent prompt hooks in an alternate user scope', () => {
+    const codex = getTarget('codex')!;
+    const profile = path.join(tmpHome, 'alternate-codex');
+    process.env.CODEX_HOME = profile;
+    const hooksPath = path.join(profile, 'hooks.json');
+    const userHook = { type: 'command', command: 'print codegraph prompt-hook' };
+    const settings = { hooks: { UserPromptSubmit: [{ hooks: [userHook] }] } };
+    fs.mkdirSync(profile);
+    fs.writeFileSync(hooksPath, JSON.stringify(settings));
+
+    codex.install('global', { autoAllow: false, promptHook: true });
+    const once = fs.readFileSync(hooksPath, 'utf-8');
+    const handlers = JSON.parse(once).hooks.UserPromptSubmit.flatMap(
+      (group: { hooks: unknown[] }) => group.hooks,
+    );
+    expect(handlers).toContainEqual(userHook);
+    expect(handlers).toContainEqual({
+      type: 'command',
+      command: 'codegraph prompt-hook',
+      commandWindows: 'codegraph.cmd prompt-hook',
+      statusMessage: 'Loading CodeGraph context',
+    });
+
+    codex.install('global', { autoAllow: false, promptHook: true });
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe(once);
+    codex.install('global', { autoAllow: false, promptHook: false });
+    expect(JSON.parse(fs.readFileSync(hooksPath, 'utf-8'))).toEqual(settings);
+    codex.install('global', { autoAllow: false, promptHook: true });
+    codex.uninstall('global');
+    expect(JSON.parse(fs.readFileSync(hooksPath, 'utf-8'))).toEqual(settings);
+    expect(fs.existsSync(path.join(tmpHome, '.codex', 'hooks.json'))).toBe(false);
+  });
+
+  it('codex: preserves an existing user-managed hook with the same command', () => {
+    const codex = getTarget('codex')!;
+    const folder = path.join(tmpCwd, '.codex');
+    const hooksPath = path.join(folder, 'hooks.json');
+    const original = '{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"codegraph prompt-hook"}]}]}}';
+    fs.mkdirSync(folder);
+    fs.writeFileSync(hooksPath, original);
+
+    codex.install('local', { autoAllow: false, promptHook: true });
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe(original);
+    codex.uninstall('local');
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe(original);
+  });
+
+  it('codex: leaves an unreadable hook configuration in place', () => {
+    const codex = getTarget('codex')!;
+    const folder = path.join(tmpCwd, '.codex');
+    const hooksPath = path.join(folder, 'hooks.json');
+    fs.mkdirSync(folder);
+    fs.writeFileSync(hooksPath, '{"hooks":');
+
+    const result = codex.install('local', { autoAllow: false, promptHook: true });
+    expect(result.files).toContainEqual({ path: hooksPath, action: 'kept' });
+    expect(fs.readFileSync(hooksPath, 'utf-8')).toBe('{"hooks":');
   });
 
   it('opencode: prefers .jsonc when both .json and .jsonc exist', () => {

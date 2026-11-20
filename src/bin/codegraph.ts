@@ -1711,7 +1711,7 @@ program
  */
 program
   .command('prompt-hook', { hidden: true })
-  .description('Claude UserPromptSubmit hook: inject CodeGraph context for structural prompts (reads {prompt,cwd} JSON on stdin)')
+  .description('UserPromptSubmit hook: inject CodeGraph context for structural prompts (reads {prompt,cwd} JSON on stdin)')
   .action(async () => {
     try {
       // Kill-switch: lets a user disable the nudge without uninstalling /

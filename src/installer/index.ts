@@ -208,21 +208,16 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
-  // Step 4¾: front-load prompt hook (Claude Code only). A UserPromptSubmit hook
-  // that runs `codegraph prompt-hook` — it injects codegraph_explore context on
-  // structural ("how / where / trace / impact") prompts so the agent reliably
-  // reaches for the graph instead of grepping. Opt-in, default-yes. Only Claude
-  // Code has UserPromptSubmit, so it's offered only when Claude is a target;
-  // other targets ignore the option. `undefined` (no Claude / not asked) leaves
-  // any existing hook untouched.
+  // Offer the UserPromptSubmit hook to the targets that can run it.
+  // An unspecified choice leaves an existing hook untouched.
   let promptHook: boolean | undefined;
-  if (targets.some((t) => t.id === 'claude')) {
+  if (targets.some((t) => t.id === 'claude' || t.id === 'codex')) {
     if (useDefaults) {
       promptHook = true; // --yes → on
     } else {
       const ans = await clack.confirm({
         message:
-          'Front-load CodeGraph on “how / where / trace” prompts? Auto-injects structural context so answers need fewer steps (adds a moment to those prompts; Claude Code only).',
+          'Front-load CodeGraph on “how / where / trace” prompts? Auto-injects structural context so answers need fewer steps (adds a moment to those prompts).',
         initialValue: true,
       });
       if (clack.isCancel(ans)) {
