@@ -32,6 +32,12 @@ export interface UnresolvedRef {
   /** The tail a ref that failed to resolve is parked under, when it is not
    * the one its name gives (see `importBindingTail`). */
   nameTail?: string;
+  /** Type whose instance member supplies a local call result, for sync invalidation. */
+  instanceTypeOwner?: string;
+  /** The instance result was declined because its owner has merged declarations. */
+  instanceTypeMerged?: boolean;
+  /** An imported factory result could become inferable when its declarations change. */
+  instanceTypePending?: string;
 }
 
 /**
@@ -288,6 +294,14 @@ export interface ResolutionContext {
    * re-export chains when this is provided.
    */
   getReExports?(filePath: string, language: Language): ReExport[];
+  /**
+   * Pre-computed bidirectional TypeScript import/export rename adjacency map
+   * (`A` ↔ `B` for `import/export { A as B }`), persisted in `project_metadata`
+   * and updated incrementally on sync so `tsRelatedInstanceTypeNames` avoids
+   * repository-wide disk scans. Returns `null` when unavailable so callers can
+   * fall back to scanning.
+   */
+  getTsInstanceAliases?(): ReadonlyMap<string, ReadonlySet<string>> | null;
   /**
    * List immediate subdirectories of `relativePath` (relative to the
    * project root). Returns an empty array when the path doesn't exist

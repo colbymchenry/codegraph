@@ -23,6 +23,7 @@ import {
 } from './types';
 import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustCallUnreachable, isRustTraitImplMember, isRustOtherTypesMethod, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoBuiltinReceiverCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isPythonImportStatementModule } from './name-matcher';
+import { extractTsRenameAliasPairs, tsRelatedInstanceTypeNames } from './name-matcher';
 import { isJsThisCall } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
@@ -69,6 +70,7 @@ import { aliasConfigFields, loadProjectAliases, type AliasMap } from './path-ali
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackagesAndManifests, workspaceFingerprint, workspacePackageDirOf, type ManifestDiscovery, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
+import { instanceTypeOwnerTail } from '../db/reference-tail';
 import { stripCommentsForRegex } from './strip-comments';
 import { lexicalPathWithinRoot } from '../utils';
 import type { CrossFileNodes, ReExport } from './types';
@@ -446,10 +448,12 @@ export function moduleConfigLanguages(changed: readonly string[]): Set<Language>
  * Orchestrates reference resolution using multiple strategies.
  */
 export class ReferenceResolver {
+  private static readonly TS_INSTANCE_ALIASES_KEY = 'ts_instance_aliases';
   private projectRoot: string;
   private queries: QueryBuilder;
   private context: ResolutionContext;
   private frameworks: FrameworkResolver[] = [];
+  private tsInstanceAliasesCache: Map<string, Set<string>> | null | undefined = undefined;
   /** `frameworks` narrowed to those that resolve each reference language (see getResolvingFrameworks). */
   private frameworksByLanguage = new Map<Language, FrameworkResolver[]>();
   // Chained static-factory/fluent call refs the first pass couldn't resolve,
@@ -619,6 +623,146 @@ export class ReferenceResolver {
       ? getAllFrameworkResolvers().filter((f) => frameworks.includes(f.name))
       : detectFrameworks(this.context);
     this.frameworksByLanguage.clear();
+  }
+
+  /** Names a TypeScript import or export rename can connect to these owners. */
+  relatedInstanceTypeNames(names: readonly string[]): string[] {
+    return tsRelatedInstanceTypeNames(names, this.context);
+  }
+
+  private static buildTsAliasAdjacency(files: Record<string, [string, string][]>): Map<string, Set<string>> {
+    const adj = new Map<string, Set<string>>();
+    for (const pairs of Object.values(files)) {
+      for (const [a, b] of pairs) {
+        if (a === b) continue;
+        let sa = adj.get(a);
+        if (!sa) adj.set(a, (sa = new Set()));
+        sa.add(b);
+        let sb = adj.get(b);
+        if (!sb) adj.set(b, (sb = new Set()));
+        sb.add(a);
+      }
+    }
+    return adj;
+  }
+
+  private static aliasPairsEqual(a: [string, string][] | undefined, b: [string, string][]): boolean {
+    if (!a) return b.length === 0;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i]![0] !== b[i]![0] || a[i]![1] !== b[i]![1]) return false;
+    }
+    return true;
+  }
+
+  private readStoredTsInstanceAliases(): { v: 1; files: Record<string, [string, string][]> } | null {
+    const raw = this.queries.getMetadata(ReferenceResolver.TS_INSTANCE_ALIASES_KEY);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as { v?: number; files?: Record<string, [string, string][]> };
+      if (parsed?.v === 1 && parsed.files && typeof parsed.files === 'object') {
+        return { v: 1, files: parsed.files };
+      }
+    } catch {
+      // Corrupt metadata falls back cleanly to rebuilding.
+    }
+    return null;
+  }
+
+  /**
+   * Read the persisted TypeScript import/export rename adjacency map from
+   * `project_metadata` (cached per resolver instance, cleared on `clearCaches`).
+   * Returns `null` when not yet persisted so callers can fall back to scanning.
+   */
+  getTsInstanceAliases(): ReadonlyMap<string, ReadonlySet<string>> | null {
+    if (this.tsInstanceAliasesCache !== undefined) return this.tsInstanceAliasesCache;
+    const stored = this.readStoredTsInstanceAliases();
+    if (!stored) {
+      this.tsInstanceAliasesCache = null;
+      return null;
+    }
+    this.tsInstanceAliasesCache = ReferenceResolver.buildTsAliasAdjacency(stored.files);
+    return this.tsInstanceAliasesCache;
+  }
+
+  /**
+   * Scan indexed TypeScript files once on full index (or one-time migration)
+   * to persist per-file import/export rename pairs in `project_metadata`.
+   * Both worker threads during `indexAll` and subsequent `sync` calls read
+   * this single metadata row instead of rescanning the repository.
+   */
+  buildTsInstanceAliases(): void {
+    const files: Record<string, [string, string][]> = {};
+    for (const file of this.queries.getAllFilePaths()) {
+      if (!/\.[cm]?tsx?$/.test(file)) continue;
+      const source = this.scanFile(file);
+      if (!source) continue;
+      const pairs = extractTsRenameAliasPairs(source);
+      if (pairs.length > 0) files[file] = pairs;
+    }
+    this.queries.setMetadata(ReferenceResolver.TS_INSTANCE_ALIASES_KEY, JSON.stringify({ v: 1, files }));
+    this.tsInstanceAliasesCache = ReferenceResolver.buildTsAliasAdjacency(files);
+  }
+
+  /**
+   * Incrementally update persisted TypeScript rename pairs for `changes`
+   * (map of project-relative path -> new file content, or `undefined` when
+   * removed). Returns:
+   * - `[]` when no file's rename pairs changed (zero metadata writes),
+   * - the connected component of affected type names across old and new alias
+   *   graphs when any rename pair was added, changed, or removed,
+   * - `null` only on a one-time upgrade of a pre-existing DB lacking the
+   *   `ts_instance_aliases` metadata key.
+   */
+  updateTsInstanceAliases(changes: ReadonlyMap<string, string | undefined>): string[] | null {
+    const stored = this.readStoredTsInstanceAliases();
+    if (!stored) {
+      this.buildTsInstanceAliases();
+      return null;
+    }
+    const seedNames = new Set<string>();
+    let dirty = false;
+    const oldFiles: Record<string, [string, string][]> = {};
+    for (const [filePath, content] of changes) {
+      const prev = stored.files[filePath];
+      const next = content !== undefined ? extractTsRenameAliasPairs(content) : [];
+      if (ReferenceResolver.aliasPairsEqual(prev, next)) continue;
+      if (!dirty) {
+        for (const [k, v] of Object.entries(stored.files)) oldFiles[k] = v;
+        dirty = true;
+      }
+      if (prev) {
+        for (const [a, b] of prev) {
+          seedNames.add(a);
+          seedNames.add(b);
+        }
+      }
+      for (const [a, b] of next) {
+        seedNames.add(a);
+        seedNames.add(b);
+      }
+      if (next.length > 0) stored.files[filePath] = next;
+      else delete stored.files[filePath];
+    }
+    if (!dirty) return [];
+    const oldAdj = ReferenceResolver.buildTsAliasAdjacency(oldFiles);
+    const newAdj = ReferenceResolver.buildTsAliasAdjacency(stored.files);
+    this.queries.setMetadata(ReferenceResolver.TS_INSTANCE_ALIASES_KEY, JSON.stringify(stored));
+    this.tsInstanceAliasesCache = newAdj;
+    const affected = new Set<string>(seedNames);
+    const queue = [...seedNames];
+    for (let i = 0; i < queue.length; i++) {
+      const cur = queue[i]!;
+      for (const adj of [oldAdj, newAdj]) {
+        for (const neighbor of adj.get(cur) ?? []) {
+          if (!affected.has(neighbor)) {
+            affected.add(neighbor);
+            queue.push(neighbor);
+          }
+        }
+      }
+    }
+    return [...affected];
   }
 
   /** The detected frameworks whose `resolve()` reads a reference written in `language`. */
@@ -849,6 +993,7 @@ export class ReferenceResolver {
     this.knownNames = null;
     this.knownLowerNames = null;
     this.knownFiles = null;
+    this.tsInstanceAliasesCache = undefined;
     this.goModules = null;
     this.goPackageDirs.clear();
     this.cachesWarmed = false;
@@ -1369,6 +1514,8 @@ export class ReferenceResolver {
         this.reExportCache.set(filePath, reExports);
         return reExports;
       },
+
+      getTsInstanceAliases: () => this.getTsInstanceAliases(),
 
       getCppIncludeDirs: () => {
         if (this.compileDbIncludeDirs === undefined) this.compileDbIncludeDirs = loadCppIncludeDirsFromCompileDB(this.projectRoot);
@@ -2439,7 +2586,8 @@ export class ReferenceResolver {
    */
   private parkable(ref: UnresolvedRef): UnresolvedRef {
     const read = this.lastResolved?.ref === ref ? this.lastResolved.context : this.context;
-    const tail = importBindingTail(ref, this.context, read);
+    const pending = ref.instanceTypePending ?? ref.instanceTypeOwner;
+    const tail = pending ? instanceTypeOwnerTail(pending) : importBindingTail(ref, this.context, read);
     if (tail) ref.nameTail = tail;
     return ref;
   }

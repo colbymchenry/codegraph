@@ -10,7 +10,7 @@ import { referenceNameTail, MEMBER_TAIL_SQL, MODULE_PARKED_SQL } from './referen
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 16;
+export const CURRENT_SCHEMA_VERSION = 17;
 
 /**
  * Migration definition
@@ -312,6 +312,16 @@ const migrations: Migration[] = [
       // schema.sql: the expression is MEMBER_TAIL_SQL.
       db.exec(`
         CREATE INDEX IF NOT EXISTS idx_unresolved_failed_module_member ON unresolved_refs(status, ${MEMBER_TAIL_SQL}) WHERE ${MODULE_PARKED_SQL};
+      `);
+    },
+  },
+  {
+    version: 17,
+    description: 'Index instance-result owner dependencies for incremental sync',
+    up: (db) => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_edges_instance_type_owner ON edges(id)
+          WHERE metadata LIKE '%"instanceTypeOwner"%';
       `);
     },
   },

@@ -34,7 +34,7 @@ beforeAll(() => {
 const WINDOW_INDEXES = [
   'idx_unresolved_from_node', 'idx_unresolved_name', 'idx_unresolved_file_path', 'idx_unresolved_from_name',
   'idx_unresolved_failed_tail', 'idx_edges_kind', 'idx_edges_source_kind', 'idx_edges_target_kind',
-  'idx_edges_provenance', 'idx_edges_synthesis_site',
+  'idx_edges_provenance', 'idx_edges_synthesis_site', 'idx_edges_instance_type_owner',
 ];
 
 const dirs: string[] = [];
@@ -59,7 +59,7 @@ afterEach(async () => {
 
 /**
  * A project whose index a killed run left inside the resolution phase's bulk
- * window: rows in place, the window's ten indexes dropped. `failed` refs keep a
+ * window: rows in place, the window's secondary indexes dropped. `failed` refs keep a
  * catch-up sync from resolving them again.
  */
 function interruptedProject(rows: { nodes: number; refs: number; edges: number }): { root: string; dbPath: string } {

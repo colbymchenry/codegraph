@@ -5301,6 +5301,61 @@ export class QueryBuilder {
       .all() as Array<{ key: string }>).map((row) => row.key);
   }
 
+  /** Owner-dependent calls parked until a TypeScript declaration changes. */
+  getFailedInstanceTypeOwnerKeys(): string[] {
+    return (this.db
+      .prepare(`SELECT DISTINCT name_tail AS key FROM unresolved_refs WHERE status = 'failed' AND name_tail GLOB 'module:type-owner:*'`)
+      .all() as Array<{ key: string }>).map((row) => row.key);
+  }
+
+  /**
+   * Distinct files that directly import any of `filePaths`, using indexed
+   * `nodes.file_path` + `edges.target` lookups.
+   */
+  getDirectImporterFiles(filePaths: readonly string[]): string[] {
+    if (filePaths.length === 0) return [];
+    const found = new Set<string>();
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT src.file_path AS filePath
+           FROM nodes tgt
+           JOIN edges e ON e.target = tgt.id AND e.kind = 'imports'
+           JOIN nodes src ON e.source = src.id
+           WHERE tgt.file_path IN (${placeholders})`
+        )
+        .all(...chunk) as Array<{ filePath: string }>;
+      for (const row of rows) found.add(row.filePath);
+    }
+    return [...found];
+  }
+
+  /**
+   * Distinct files directly imported by any of `filePaths`, using indexed
+   * `nodes.file_path` + `edges.source` lookups.
+   */
+  getDirectImportedFiles(filePaths: readonly string[]): string[] {
+    if (filePaths.length === 0) return [];
+    const found = new Set<string>();
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT tgt.file_path AS filePath
+           FROM nodes src
+           JOIN edges e ON e.source = src.id AND e.kind = 'imports'
+           JOIN nodes tgt ON e.target = tgt.id
+           WHERE src.file_path IN (${placeholders})`
+        )
+        .all(...chunk) as Array<{ filePath: string }>;
+      for (const row of rows) found.add(row.filePath);
+    }
+    return [...found];
+  }
+
   /**
    * Put failed refs back in the pending set, for the next resolution pass —
    * the sync's orphan sweep — to try again. Returns the number re-opened.
@@ -5692,6 +5747,21 @@ export class QueryBuilder {
           WHERE e.metadata LIKE '%"typeFrom"%'`
       )
       .all() as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
+    return rows.map((row) => ({
+      ...rowToEdge(row),
+      edgeId: row.id,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
+    }));
+  }
+
+  /** Resolved instance-result calls that depend on a type's declaration set, via the partial owner index. */
+  getEdgesWithInstanceTypeOwner(): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> {
+    const rows = this.db.prepare(
+      `SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
+         FROM edges e JOIN nodes src ON src.id = e.source
+        WHERE e.metadata LIKE '%"instanceTypeOwner"%'`
+    ).all() as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
     return rows.map((row) => ({
       ...rowToEdge(row),
       edgeId: row.id,

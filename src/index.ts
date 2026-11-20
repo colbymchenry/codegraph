@@ -34,7 +34,7 @@ import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { logWarn } from './errors';
 import { QueryBuilder, type DeprioritizedPathMatcher } from './db/queries';
-import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
+import { importPathKeys, instanceTypeOwnerTail, moduleReferenceKeys } from './db/reference-tail';
 import {
   isInitialized,
   createDirectory,
@@ -150,6 +150,10 @@ const WORKSPACE_METADATA_KEY = 'js_workspace_fingerprint';
 const WORKSPACE_MANIFESTS_METADATA_KEY = 'js_workspace_manifests';
 /** The tsconfig / jsconfig and go.mod files the index was resolved by, with a digest of each (#2977). */
 const MODULE_CONFIG_METADATA_KEY = 'module_config_snapshot';
+/** Metadata flag set while TS instance-type alias metadata is being updated so crashes self-heal on next sync. */
+const TS_INSTANCE_ALIASES_PENDING_KEY = 'ts_instance_aliases_pending';
+/** Matches actual TS re-export-from statements (`export * from`, `export * as X from`, `export { ... } from`). */
+const TS_REEXPORT_FROM_RE = /(?:^|[;{}])[ \t]*export[ \t]+(?:type[ \t]+)?(?:\*(?:[ \t]+as[ \t]+[A-Za-z_$][\w$]*)?|\{[^}]*\})[ \t]+from[ \t]+['"]/m;
 /** Metadata key: the frameworks (sorted JSON names) the last full index extracted every file with. */
 const FRAMEWORKS_AT_INDEX_KEY = 'frameworks_at_index';
 /**
@@ -708,7 +712,10 @@ export class CodeGraph {
         // mid-index (OOM, SIGKILL, the #850 liveness watchdog) leaves this
         // marker behind, so `codegraph status` can tell a truncated index
         // from a completed one instead of silently serving partial results.
-        try { this.queries.setMetadata('index_state', 'indexing'); } catch { /* metadata is advisory */ }
+        try {
+          this.queries.setMetadata('index_state', 'indexing');
+          this.queries.setMetadata(TS_INSTANCE_ALIASES_PENDING_KEY, '1');
+        } catch { /* metadata is advisory */ }
         // Segment vocabulary. On a fresh database it starts empty, and the node
         // write path fills it as every file indexes below. Over an existing
         // graph the store skips unchanged files, which never write their names
@@ -770,6 +777,8 @@ export class CodeGraph {
           // Cross-file finalization (e.g. NestJS RouterModule prefixes). Runs
           // before resolution so updated names show up in subsequent reads.
           this.resolver.runPostExtract();
+          this.resolver.buildTsInstanceAliases();
+          this.queries.setMetadata(TS_INSTANCE_ALIASES_PENDING_KEY, '0');
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolver-reinit: ${Date.now() - tReinit}ms`);
         }
 
@@ -1011,6 +1020,35 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   /** Indexed Python file paths — the before/after sets a sync diffs. */
+  private collectTransitiveTsBarrelTargets(startFiles: string[]): string[] {
+    const visited = new Set<string>(startFiles);
+    const targets = new Set<string>();
+    let frontier = startFiles;
+    for (let depth = 0; depth < 8 && frontier.length > 0 && targets.size < 256; depth++) {
+      const next = this.queries.getDirectImportedFiles(frontier);
+      const nextFrontier: string[] = [];
+      for (const file of next) {
+        if (visited.has(file)) continue;
+        visited.add(file);
+        targets.add(file);
+        if (!/\.[cm]?tsx?$/.test(file)) continue;
+        let isBarrel = false;
+        try {
+          const src = fs.readFileSync(path.join(this.projectRoot, file), 'utf8');
+          isBarrel = TS_REEXPORT_FROM_RE.test(src);
+        } catch {
+          // File may have been deleted in the same sync; fall back to DB node shape.
+          isBarrel = this.queries.getNodeNamesByFiles([file], ['export']).length > 0
+            || (this.queries.getNodeNamesByFiles([file], ['import']).length > 0
+              && this.queries.getNodeNamesByFiles([file], ['class', 'interface', 'type_alias', 'function']).length === 0);
+        }
+        if (isBarrel) nextFrontier.push(file);
+      }
+      frontier = nextFrontier;
+    }
+    return [...targets];
+  }
+
   private pythonFilePaths(): Set<string> {
     return new Set(this.queries.getAllFilePaths().filter((f) => f.endsWith('.py')));
   }
@@ -1263,9 +1301,43 @@ export class CodeGraph {
         const watchRoutes = this.resolver.hasNavigationRouters();
         let routesBefore = null as Node[] | null;
         const flowChange = this.resolver.trackParameterFlows();
+        const instanceOwnersBefore = new Set<string>();
+        const instancePendingBefore = new Set<string>();
+        const tsChangedContents = new Map<string, string | undefined>();
+        const tsDirectImportersBefore = new Set<string>();
+        const tsReexportTargetsBefore = new Set<string>();
+        const aliasesPendingBefore = this.queries.getMetadata(TS_INSTANCE_ALIASES_PENDING_KEY) === '1'
+          || (this.queries.getMetadata('ts_instance_aliases') === null && this.queries.getIndexRevision().fileCount > 0);
+        let aliasesPendingDirty = aliasesPendingBefore;
         const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure,
           (filePath, content) => {
             flowChange.before(filePath);
+            if (/\.[cm]?tsx?$/.test(filePath)) {
+              if (!aliasesPendingDirty) {
+                aliasesPendingDirty = true;
+                this.queries.setMetadata(TS_INSTANCE_ALIASES_PENDING_KEY, '1');
+              }
+              tsChangedContents.set(filePath, content);
+              for (const name of this.queries.getNodeNamesByFiles([filePath], ['class', 'interface', 'type_alias'])) {
+                instanceOwnersBefore.add(name);
+              }
+              for (const name of this.queries.getNodeNamesByFiles([filePath], ['constant', 'variable'])) {
+                instancePendingBefore.add(name);
+              }
+              for (const importer of this.queries.getDirectImporterFiles([filePath])) {
+                tsDirectImportersBefore.add(importer);
+              }
+              const isBarrel = content === undefined
+                || TS_REEXPORT_FROM_RE.test(content)
+                || this.queries.getNodeNamesByFiles([filePath], ['export']).length > 0
+                || (this.queries.getNodeNamesByFiles([filePath], ['import']).length > 0
+                  && this.queries.getNodeNamesByFiles([filePath], ['class', 'interface', 'type_alias', 'function']).length === 0);
+              if (isBarrel) {
+                for (const target of this.collectTransitiveTsBarrelTargets([filePath])) {
+                  tsReexportTargetsBefore.add(target);
+                }
+              }
+            }
             if (watchRoutes && routesBefore === null) routesBefore = this.queries.getNodesByKind('route');
             if (!refreshSynthesis && (this.queries.hasSynthesizedEdgesTouchingFile(filePath) ||
               this.queries.wasSynthesisInput(filePath) ||
@@ -1313,6 +1385,13 @@ export class CodeGraph {
         // pre-removal graph.)
         if (result.filesAdded > 0 || result.filesModified > 0 || result.filesRemoved > 0) {
           this.resolver.runPostExtract();
+        }
+        let changedAliasOwners: string[] | null = [];
+        if (aliasesPendingBefore) {
+          this.resolver.buildTsInstanceAliases();
+          changedAliasOwners = null;
+        } else if (tsChangedContents.size > 0) {
+          changedAliasOwners = this.resolver.updateTsInstanceAliases(tsChangedContents);
         }
 
         // A route that appeared, went away or was renamed changes what a
@@ -1870,13 +1949,57 @@ export class CodeGraph {
         if (process.env.CODEGRAPH_NO_REBIND !== '1') {
           const touched = [...(result.changedFilePaths ?? []), ...(result.removedFilePaths ?? [])];
           const touchedPy = touched.filter((p) => /\.pyi?$/.test(p));
-          if (touched.length > 0) {
+          if (touched.length > 0 || aliasesPendingBefore) {
             const tTypes = Date.now();
-            const reopenedFiles = this.orchestrator.resurrectTypeDependentEdges(touched, result.changedFilePaths ?? []);
+            const reopenedFiles = touched.length > 0
+              ? this.orchestrator.resurrectTypeDependentEdges(touched, result.changedFilePaths ?? [])
+              : [];
+            const tsChanged = (result.changedFilePaths ?? []).filter((p) => /\.[cm]?tsx?$/.test(p));
+            const tsTouchedFiles = touched.filter((p) => /\.[cm]?tsx?$/.test(p));
+            const reexportAfterFiles = tsChanged.filter((p) => {
+              const c = tsChangedContents.get(p);
+              return c !== undefined && TS_REEXPORT_FROM_RE.test(c);
+            });
+            const reexportTargets = [...new Set([
+              ...tsReexportTargetsBefore,
+              ...(reexportAfterFiles.length > 0 ? this.collectTransitiveTsBarrelTargets(reexportAfterFiles) : []),
+            ])];
+            const reexportOwnerNames = reexportTargets.length > 0
+              ? this.queries.getNodeNamesByFiles(reexportTargets, ['class', 'interface', 'type_alias'])
+              : [];
+            const names = [...new Set([
+              ...instanceOwnersBefore,
+              ...(changedAliasOwners ?? []),
+              ...this.queries.getNodeNamesByFiles(tsChanged, ['class', 'interface', 'type_alias']),
+              ...reexportOwnerNames,
+            ])];
+            const owners = names.length > 0 ? this.resolver.relatedInstanceTypeNames(names) : names;
+            const ownerFiles = this.orchestrator.resurrectInstanceTypeEdges(
+              changedAliasOwners === null ? null : owners,
+              result.changedFilePaths ?? [],
+            );
+            const importerFiles = tsTouchedFiles.length > 0
+              ? [...new Set([...tsDirectImportersBefore, ...this.queries.getDirectImporterFiles(tsTouchedFiles)])]
+              : [];
+            const pendingNames = tsTouchedFiles.length > 0
+              ? [...new Set([
+                  ...instancePendingBefore,
+                  ...this.queries.getNodeNamesByFiles(tsChanged, ['constant', 'variable']),
+                  ...(importerFiles.length > 0 ? this.queries.getNodeNamesByFiles(importerFiles, ['constant', 'variable']) : []),
+                ])]
+              : [];
+            const failedOwnerTails = changedAliasOwners === null
+              ? this.queries.getFailedInstanceTypeOwnerKeys()
+              : [...new Set([...owners, ...pendingNames])].map(instanceTypeOwnerTail);
+            const ownerRefs = failedOwnerTails.length > 0
+              ? this.queries.getRetryableFailedReferences(failedOwnerTails, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER)
+              : [];
+            this.queries.reopenFailedReferences(ownerRefs.flatMap((ref) => ref.rowId === undefined ? [] : [ref.rowId]));
             // CODEGRAPH_PY_ATTR_RETRY_CEILING overrides the candidate ceiling (tests).
             const ceiling = Number(process.env.CODEGRAPH_PY_ATTR_RETRY_CEILING ?? '') || 2000;
             const failed = touchedPy.length > 0 ? this.resolver.pythonAttrRetryCandidates(touchedPy, ceiling) : [];
-            const retry = [...this.queries.getUnresolvedReferencesByFiles(reopenedFiles), ...(failed ?? [])];
+            const retryFiles = [...new Set([...reopenedFiles, ...ownerFiles, ...ownerRefs.flatMap((ref) => ref.filePath ? [ref.filePath] : [])])];
+            const retry = [...this.queries.getUnresolvedReferencesByFiles(retryFiles), ...(failed ?? [])];
             if (retry.length > 0) await this.resolver.resolveAndPersistListYielding(retry);
             if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
               console.error(
@@ -1884,6 +2007,9 @@ export class CodeGraph {
               );
             }
           }
+        }
+        if (aliasesPendingDirty) {
+          this.queries.setMetadata(TS_INSTANCE_ALIASES_PENDING_KEY, '0');
         }
 
         if (filesChanged || orphanCount > 0) {
