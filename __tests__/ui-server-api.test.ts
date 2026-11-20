@@ -1047,11 +1047,16 @@ export default app;
 
 /**
  * The acceptance bar from the issue, against the engine's OWN index rather than
- * a fixture: `LRUCache.get` in `src/resolution/lru-cache.ts`, a hub with
- * hundreds of callers — past the 300-row cap, which is what this checks. (It
- * had 500+ when the bar was set; sharper resolution has since taken away
- * `get` calls on maps and caches that were never LRUCache's, so the count is
- * held to the cap, not to that number.)
+ * a fixture: `CodeGraph.init` in `src/index.ts`, a hub with hundreds of
+ * distinct callers — past the 300-row cap, which is what this checks.
+ *
+ * It was `LRUCache.get` in `src/resolution/lru-cache.ts`, with 500+ callers
+ * when the bar was set. Sharper resolution has since taken away the `get`
+ * calls on maps and caches that were never LRUCache's, so it sits under the
+ * 300-row cap now: the cap and truncation assertions passed trivially, and the
+ * timing check timed a request that answers in single-digit milliseconds
+ * instead of a hub's. `CodeGraph.init` keeps hundreds of distinct callers
+ * (most of the test files call it), so every assertion below bites again.
  *
  * `.codegraph/` is gitignored, so this only runs on a machine that has indexed
  * this repository. The fixture test above covers the same properties in CI; this
@@ -1084,12 +1089,12 @@ describe.runIf(CodeGraph.isInitialized(path.resolve(__dirname, '..')))(
 
     it('answers in under 100 ms with grouped, capped lists and correct counts', async () => {
       const search = JSON.parse(
-        (await repoGet('/api/search?q=' + encodeURIComponent('LRUCache.get'))).body
+        (await repoGet('/api/search?q=' + encodeURIComponent('CodeGraph.init'))).body
       );
       const hit = search.results.items.find(
-        (r: any) => r.name === 'get' && r.file.endsWith('src/resolution/lru-cache.ts')
+        (r: any) => r.name === 'init' && r.kind === 'method' && r.file === 'src/index.ts'
       );
-      expect(hit, 'LRUCache.get should be in the engine\'s own index').toBeTruthy();
+      expect(hit, 'CodeGraph.init should be in the engine\'s own index').toBeTruthy();
 
       await repoGet(`/api/node/${hit.id}`); // warm
 
