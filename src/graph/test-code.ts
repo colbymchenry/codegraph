@@ -11,7 +11,9 @@
  * `#[cfg(test)] mod tests;` in `src/store.rs`, which only the parent shows.
  */
 
+import { readFileSync } from 'fs';
 import type { Node } from '../types';
+import { validatePathWithinRoot } from '../utils';
 import { blankRustCode } from '../resolution/rust-scopes';
 import { isTestFile } from '../search/query-utils';
 import { isTestScope } from './dead-code';
@@ -30,6 +32,34 @@ export function isTestCode(node: Node, readSource?: SourceReader): boolean {
   const source = readSource(node.filePath);
   if (source !== undefined && inCfgTestModule(source, node.startLine)) return true;
   return inCfgTestFile(node.filePath.replace(/\\/g, '/'), readSource);
+}
+
+/**
+ * {@link isTestCode} for the nodes of one answer, over the project at
+ * `projectRoot`. A Rust unit test is told by its file's source (an inline
+ * `#[cfg(test)]` module, or the parent's `#[cfg(test)] mod tests;`), so each
+ * file is read once, and only from inside the project. The CLI and the MCP
+ * tools both read through this, so the two never disagree on what a test is.
+ */
+export function testCodeReading(projectRoot: string): (node: Node) => boolean {
+  const sources = new Map<string, string | undefined>();
+  const readSource: SourceReader = (filePath) => {
+    if (!sources.has(filePath)) {
+      let text: string | undefined;
+      try {
+        const abs = validatePathWithinRoot(projectRoot, filePath);
+        text = abs === null ? undefined : readFileSync(abs, 'utf-8');
+      } catch { /* unreadable → not known to be test code */ }
+      sources.set(filePath, text);
+    }
+    return sources.get(filePath);
+  };
+  const verdicts = new Map<string, boolean>();
+  return (node) => {
+    let v = verdicts.get(node.id);
+    if (v === undefined) verdicts.set(node.id, (v = isTestCode(node, readSource)));
+    return v;
+  };
 }
 
 /**
