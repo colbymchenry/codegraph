@@ -1,6 +1,6 @@
 {
   "name": "@colbymchenry/codegraph",
-  "version": "1.6.2",
+  "version": "1.6.4",
   "description": "Supercharge AI coding agents with semantic code intelligence — surgical context, fewer tool calls, faster answers. 100% local.",
   "repository": {
     "type": "git",
@@ -19,8 +19,15 @@
   "workspaces": [
     "ui"
   ],
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": ">=22.12.0",
+      "onFail": "error"
+    }
+  },
   "scripts": {
-    "build": "tsc && npm run copy-assets && npm run build:ui && node -e \"require('fs').chmodSync('dist/bin/codegraph.js', 0o755)\"",
+    "build": "tsc && tsc --emitDeclarationOnly --noCheck --removeComments false && npm run copy-assets && npm run build:ui && node -e \"require('fs').chmodSync('dist/bin/codegraph.js', 0o755)\"",
     "build:ui": "cd ui && npm run build && cd .. && node scripts/check-ui-build.mjs",
     "build:lib": "cd ui && npm run build:lib",
     "preuninstall": "node dist/bin/uninstall.js",
@@ -46,7 +53,7 @@
     "commander": "^14.0.2",
     "fast-string-width": "^3.0.2",
     "fast-wrap-ansi": "^0.2.0",
-    "ignore": "^7.0.5",
+    "ignore": "^7.0.14",
     "jsonc-parser": "^3.3.1",
     "picomatch": "^4.0.3",
     "sisteransi": "^1.0.5",
@@ -54,13 +61,12 @@
     "web-tree-sitter": "^0.25.3"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^4.0.4",
-    "@types/better-sqlite3": "^7.6.0",
+    "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@types/node": "^20.19.30",
     "@types/picomatch": "^4.0.2",
     "jsdom": "^25.0.1",
     "typescript": "^5.0.0",
-    "vitest": "^2.1.9"
+    "vitest": "^4.1.11"
   },
   "engines": {
     "node": ">=20.0.0 <25.0.0"

@@ -25,7 +25,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { randomUUID } from 'crypto';
+
+/** Loaded on use, not at the top: every CLI command loads this file (see mcp/daemon-paths.ts). */
+const randomUUID = (): string => (require('crypto') as typeof import('crypto')).randomUUID();
 
 export const TELEMETRY_ENDPOINT = 'https://telemetry.getcodegraph.com/v1/events';
 export const TELEMETRY_DOCS = 'https://github.com/colbymchenry/codegraph/blob/main/TELEMETRY.md';

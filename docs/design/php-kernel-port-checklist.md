@@ -481,11 +481,32 @@ extractImport, hook-first (:3176). Four php shapes:
    `from=namespace:…`), referenceName: the path, line/col of the include node}
    (:3183-3194). Import NODES likewise get their contains edge from the
    namespace and a namespace-prefixed qualifiedName
-   (`App::App\Contracts\Logger`). Dynamic (`require __DIR__ . '/x'`, variables)
-   → hook null → falls THROUGH the php grouped branch (include nodes never
-   match it) → `if (this.extractor.extractImport) return;` (:3350) → **nothing
+   (`App::App\Contracts\Logger`). **A path built from the file's own
+   directory (#3298)**: an arg that is a `binary_expression` goes to
+   phpDirectoryIncludePath — the `.` concatenation's parts left to right (any
+   non-`.` link → null); the head's text, JS whitespace removed, must match
+   PHP_OWN_DIRECTORY (`__DIR__`, `\?dirname(__FILE__|__DIR__[, N][,])`, ASCII
+   case-insensitive, N a decimal ≥1); every other part a pure literal or
+   `DIRECTORY_SEPARATOR` (`/`); the appended text starts with `/`, doesn't end
+   with one, and the result `./x` or `../`×(levels−1)`x` (levels ≤16) has no
+   empty segment. An unqualified `dirname` head is dropped when
+   phpShadowsDirname finds, ONCE per file over every node of the tree, a
+   `use function` that imports a non-global `dirname` (text-normalized: JS
+   whitespace runs → one space, the space beside `\ { } ,` dropped) or a
+   `function dirname` in a file with a namespace. **A path built from the web
+   server's root (#3298)**: a head that is `$_SERVER['DOCUMENT_ROOT']` (a
+   `subscript_expression` of exactly two named children, the `variable_name`
+   `$_SERVER` and a pure literal `DOCUMENT_ROOT`, either quote) takes the same
+   appended path, written behind PHP_DOCUMENT_ROOT:
+   `$_SERVER['DOCUMENT_ROOT']/inc/c.php`, no shadow check. Other dynamic forms
+   (variables, interpolation, `$_ENV[…]`, `$GLOBALS['_SERVER'][…]`) → hook
+   null → falls THROUGH the php grouped branch (include nodes never match it)
+   → `if (this.extractor.extractImport) return;` (:3350) → **nothing
    emitted**. Consumed by resolveIncludePath (import-resolver.ts:682-758) —
-   suffix/relative file matching, `.php` appended if missing.
+   suffix/relative file matching, `.php` appended if missing, except for a
+   `./` or `../` path, which loads exactly as written, and a
+   `$_SERVER['DOCUMENT_ROOT']/` one, which loads exactly as written under the
+   project's `codegraph.json` `webRoot` and links nothing without one.
 2. **Single `use`** (incl. `use function`/`use const`/aliased): hook finds
    `namespace_use_clause` → its `qualified_name` (full text, e.g.
    `App\Contracts\Logger` — alias NOT included) else its `name` (bare

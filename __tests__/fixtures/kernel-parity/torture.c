@@ -188,3 +188,50 @@ static int declared_types_local(void) {
   static struct { int hits; } local_stats;
   return ++local_stats.hits + current_mode;
 }
+
+/* members: the types each is declared with are references from its holder, or
+   from the alias they are named through */
+typedef struct member_s member_t;
+typedef enum { PAUSE_OFF, PAUSE_ON } pause_mode;
+typedef union { int i; float f; } member_value;
+typedef void (*member_cb)(member_t *m, word_t w);
+typedef word_t *word_ptr;
+
+struct member_s {
+  member_t *next;
+  struct member_s *prev;
+  word_t by_value;
+  word_t by_array[4];
+  const word_t *by_pointer;
+  word_t **by_pointers;
+  struct parse_state *tagged, second, third[2];
+  union packet_hdr header;
+  enum hdr_kind kind;
+  pause_mode mode;
+  member_value (*make)(member_t *from, const struct parse_state *state);
+  void *(*table[2])(word_t w);
+  unsigned long mask;
+  int bits : 3;
+#ifdef MEMBER_EXTRA
+  word_t extra;
+#elif defined(MEMBER_OTHER)
+  member_value other;
+#else
+  pause_mode fallback;
+#endif
+  union { word_t in_anonymous; int raw; };
+  struct { member_value in_unnamed; } named_member;
+  struct member_inner { word_t deep; } nested;
+  enum { MEMBER_ON, MEMBER_OFF } state;
+  enum member_level { MEMBER_LOW, MEMBER_HIGH } level;
+};
+
+typedef struct self_list {
+  struct self_list *next;
+  word_t value;
+} self_list;
+
+typedef union {
+  word_t a;
+  struct { self_list *b; } c;
+} wrapped_member;

@@ -71,6 +71,13 @@ export interface MCPEngineOptions {
    * not just the later file watcher.
    */
   writerLockRoot?: string;
+  /**
+   * Called once, the first time this engine starts work that can hold the
+   * main thread: opening a project, or serving a tool call. A direct session
+   * arms its liveness watchdog here rather than at startup, so a session that
+   * only lists the tools never starts a watchdog process (#3250).
+   */
+  onWorkBegins?: () => void;
 }
 
 /**
@@ -91,21 +98,27 @@ export class MCPEngine {
   // Throttle for the retry path's sub-project down-scan (#1606) — the scan is
   // bounded but shouldn't run on every tool call in the no-default state.
   private lastRetrySubScanAt = 0;
+  // The default-root refusal last written to stderr, so the retry on every
+  // tool call doesn't repeat it.
+  private loggedRootRefusal: string | null = null;
   private watcherStarted = false;
   /** Set when this engine holds writer.pid (#1740). */
   private writerLockRoot: string | null = null;
   // Retained synchronization ownership for each cached explicit project.
   private explicitProjects = new Map<CodeGraph, ProjectLease>();
   private defaultLease: ProjectLease | null = null;
-  private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot' | 'queryPoolDefaultMax'>> & Pick<MCPEngineOptions, 'queryPoolDefaultMax'>;
+  private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot' | 'queryPoolDefaultMax' | 'onWorkBegins'>> & Pick<MCPEngineOptions, 'queryPoolDefaultMax'>;
   private closed = false;
   private stopPromise: Promise<void> | null = null;
   // Off-loop read-tool pool. Workers each hold their own WAL read connections;
   // sessions without a default index open projects lazily via projectPath.
   private queryPool: QueryPool | null = null;
+  /** {@link MCPEngineOptions.onWorkBegins}, cleared once it has been called. */
+  private onWorkBegins: (() => void) | null;
 
   constructor(opts: MCPEngineOptions = {}) {
     this.opts = { readOnly: opts.readOnly ?? false, watch: opts.watch ?? true, queryPool: opts.queryPool ?? false, queryPoolDefaultMax: opts.queryPoolDefaultMax };
+    this.onWorkBegins = opts.onWorkBegins ?? null;
     this.toolHandler = new ToolHandler(null);
     this.toolHandler.setProjectLifecycle({
       open: (root, open) => {
@@ -200,6 +213,22 @@ export class MCPEngine {
   }
 
   /**
+   * A session is about to serve a tool call: work begins, whether or not a
+   * project is open yet (#3250).
+   */
+  noteToolCall(): void {
+    this.workBegins();
+  }
+
+  /** Call {@link MCPEngineOptions.onWorkBegins} the first time only. */
+  private workBegins(): void {
+    const begins = this.onWorkBegins;
+    if (!begins || this.closed) return;
+    this.onWorkBegins = null;
+    begins();
+  }
+
+  /**
    * Walk up from `searchFrom` to find the nearest `.codegraph/` and open it.
    * Idempotent: concurrent callers share one in-flight init; subsequent
    * callers after success are no-ops.
@@ -247,9 +276,13 @@ export class MCPEngine {
       this.lastRetrySubScanAt = Date.now();
       if (!res.root) this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
     }
+    // An up-walk alone can't clear a refusal the throttled down-scan found.
+    if (scanDue || res.refusal) this.noteRootRefusal(res.refusal);
     const resolvedRoot = res.root;
     if (!resolvedRoot) return;
     if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
+    // Opening a project, and the catch-up after it, is work (#3250).
+    this.workBegins();
     try {
       // Close any previously failed instance to avoid leaking resources.
       if (this.cg) {
@@ -373,15 +406,18 @@ export class MCPEngine {
     // only by knowing to look for a missing ~/.codegraph/daemons/ entry.
     const res = resolveServerRoot(searchFrom);
     const resolvedRoot = res.root;
+    this.noteRootRefusal(res.refusal);
     if (!resolvedRoot) {
       // Sessions may still discover a project later via roots/list, and the
       // per-call retry re-resolves — this state is recoverable, hence stderr
       // (not a failure) + candidates surfaced through the tool-call error.
       this.projectPath = searchFrom;
       this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
-      process.stderr.write(
-        `[CodeGraph MCP] No .codegraph/ at or above ${searchFrom}: no default project, live sync disabled until an indexed project is accessed via projectPath.\n`
-      );
+      if (!res.refusal) {
+        process.stderr.write(
+          `[CodeGraph MCP] No .codegraph/ at or above ${searchFrom}: no default project, live sync disabled until an indexed project is accessed via projectPath.\n`
+        );
+      }
       if (res.candidates.length > 0) {
         const rels = res.candidates.map((c) => path.relative(searchFrom, c) || '.');
         process.stderr.write(
@@ -394,6 +430,8 @@ export class MCPEngine {
     if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
 
     this.projectPath = resolvedRoot;
+    // Opening a project, and the catch-up after it, is work (#3250).
+    this.workBegins();
     try {
       assertNoRebuild(resolvedRoot);
       const opened = await loadCodeGraph().open(resolvedRoot, { readOnly: this.opts.readOnly });
@@ -409,6 +447,21 @@ export class MCPEngine {
       // The agent otherwise hears only "no project loaded" (#995).
       this.toolHandler.setDefaultOpenFailure(reportableOpenFailure(err));
     }
+  }
+
+  /**
+   * Record why the default project is refused (a sensitive folder, #2929's
+   * guard), or clear that. Tool calls without a projectPath say why there is
+   * no default project, and stderr says it once per reason, since every such
+   * call re-resolves.
+   */
+  private noteRootRefusal(refusal: string | null): void {
+    this.toolHandler.setDefaultRootRefusal(refusal);
+    if (!refusal || refusal === this.loggedRootRefusal) return;
+    this.loggedRootRefusal = refusal;
+    process.stderr.write(
+      `[CodeGraph MCP] ${refusal} — no default project, live sync disabled. Tool calls can still pass projectPath for a project elsewhere.\n`
+    );
   }
 
   /** One stderr line when the default project came from the down-scan (#1606). */

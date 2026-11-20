@@ -38,8 +38,10 @@
  * declaration, stepped over by the decorator scan; TortureDirectives.dart /
  * TorturePartOfName.dart: `part` as an import of the part's file, `part of`
  * as nothing, and the arguments of annotated directives;
- * TortureTypedefs.dart: the types a typedef aliases, in every form) and
- * their CRLF variants (derived in-memory — #1329), plus defer and
+ * TortureTypedefs.dart: the types a typedef aliases, in every form;
+ * TorturePrimaryCtors.dart: Dart 3.13's primary and concise constructors and
+ * the generic named-constructor calls tree-sitter-dart 0038280 misparses —
+ * #3270) and their CRLF variants (derived in-memory — #1329), plus defer and
  * generated-file pins.
  *
  * The full-repo sweeps live in scripts/kernel-parity.mjs (shelf/bloc/flutter
@@ -174,6 +176,13 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     // the typedef's own and a generic function type's — skipped, prefixed,
     // annotated, commented and wrapped declarations.
     ['TortureTypedefs.dart', 40],
+    // Dart 3.13 (#3270): primary constructors in class and enum headers (their
+    // parameter types the class's), concise constructors, a primary
+    // constructor's body part; and the named constructors called with type
+    // arguments that tree-sitter-dart 0038280 reads as comparisons and a dot
+    // shorthand, in every position, split at a comma, after an import prefix,
+    // under a prefix operator, and the arrow it can end before a generic call.
+    ['TorturePrimaryCtors.dart', 20],
   ] as const;
 
   for (const [file, minNodes] of FIXTURES) {
@@ -222,21 +231,24 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     expect(viaKernel!.edges.some((e) => e.metadata?.valueRef === true)).toBe(false);
   });
 
-  it('empty object patterns defer (the dominant dart-3 error class)', () => {
-    const broken = 'int f(Object x) => switch (x) { Init() => 1, _ => 0 };\n';
+  it('a file with parse errors defers (an augmentation, a template brick)', () => {
+    const broken = 'augment class Foo {\n  void f() {}\n}\n';
     process.env.CODEGRAPH_KERNEL_LANGS = 'all';
     delete process.env.CODEGRAPH_KERNEL;
-    expect(tryKernelExtract('lib/pat.dart', broken, 'dart')).toBeNull();
+    expect(tryKernelExtract('lib/aug.dart', broken, 'dart')).toBeNull();
+    expect(tryKernelExtract('lib/brick.dart', 'class {{name.pascalCase()}}Page {}\n', 'dart')).toBeNull();
     process.env.CODEGRAPH_KERNEL = '0';
-    const viaWasm = extractFromSource('lib/pat.dart', broken, 'dart');
+    const viaWasm = extractFromSource('lib/aug.dart', broken, 'dart');
     delete process.env.CODEGRAPH_KERNEL;
     expect(viaWasm.nodes.some((n) => n.kind === 'file')).toBe(true);
   });
 
-  it('unnamed `library;` defers', () => {
-    const broken = '/// Doc.\nlibrary;\n\nvoid f() {}\n';
-    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
-    delete process.env.CODEGRAPH_KERNEL;
-    expect(tryKernelExtract('lib/lib.dart', broken, 'dart')).toBeNull();
+  // The two error classes d4d8f3e left most often, which the kernel deferred:
+  // tree-sitter-dart 0038280 parses them (#3270).
+  it.each([
+    ['empty object patterns', 'int f(Object x) => switch (x) { Init() => 1, _ => 0 };\n'],
+    ['an unnamed `library;`', '/// Doc.\nlibrary;\n\nvoid f() {}\n'],
+  ])('%s: parity', (_label, source) => {
+    assertParity('lib/fixed.dart', source, 1);
   });
 });

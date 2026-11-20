@@ -150,9 +150,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
     parser
         .set_language(&grammar)
         .map_err(|e| format!("set_language(java) failed: {e}"))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| "parser returned null tree".to_string())?;
+    let tree = crate::parse_budget::parse(&mut parser, source)?;
     if tree.root_node().has_error() {
         return Err("defer: parse tree contains errors — wasm recovery is canonical".to_string());
     }
@@ -429,6 +427,10 @@ impl<'t> Walker<'t> {
     }
 
     fn is_static(&self, node: Node) -> bool {
+        // An interface constant is implicitly `public static final`.
+        if node.kind() == "constant_declaration" {
+            return true;
+        }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 if child.kind() == "modifiers" && self.text(child).contains("static") {
@@ -441,6 +443,9 @@ impl<'t> Walker<'t> {
 
     /// javaExtractor.isConst: `static final` field → constant.
     fn is_const(&self, node: Node) -> bool {
+        if node.kind() == "constant_declaration" {
+            return true;
+        }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 if child.kind() == "modifiers" {
@@ -510,7 +515,7 @@ impl<'t> Walker<'t> {
         } else if kind == "enum_declaration" {
             self.extract_enum(node);
             skip_children = true;
-        } else if kind == "field_declaration" && self.inside_class_like() {
+        } else if (kind == "field_declaration" || kind == "constant_declaration") && self.inside_class_like() {
             // The initializers extract_field walked under their fields took
             // their own candidates; the scan covers the rest.
             let walked = self.extract_field(node);
@@ -959,8 +964,21 @@ impl<'t> Walker<'t> {
             .or_else(|| node.child_by_field_name("type"))
             .or_else(|| node.child_by_field_name("name"))
             .or_else(|| node.named_child(0));
-        let mut type_name = type_node.map(|t| self.text(t).to_string()).unwrap_or_else(|| "Object".to_string());
-        type_name = strip_generic_and_qualifier(&type_name);
+        let raw = type_node.map(|t| self.text(t).to_string()).unwrap_or_else(|| "Object".to_string());
+        // The supertype as written (`Api.Listener` for `new Api.Listener() {…}`),
+        // type arguments cut from the first `<` past index 0, trimmed — the
+        // `extends` ref's name. The anon class's own name keeps the last segment.
+        let mut written = raw.clone();
+        if let Some(lt) = written.find('<') {
+            if lt > 0 {
+                written.truncate(lt);
+            }
+        }
+        let mut written = written.trim().to_string();
+        if written.is_empty() {
+            written = "Object".to_string();
+        }
+        let mut type_name = strip_generic_and_qualifier(&raw);
         if type_name.is_empty() {
             type_name = "Object".to_string();
         }
@@ -975,7 +993,7 @@ impl<'t> Walker<'t> {
             Some(t) => (t.start_position().row as u32, self.col_of(t)),
             None => (node.start_position().row as u32, self.col_of(node)),
         };
-        self.push_ref(row, &type_name, edge_kind_index("extends").unwrap(), line, column);
+        self.push_ref(row, &written, edge_kind_index("extends").unwrap(), line, column);
 
         self.stack.push(Scope { row, kind: "class", name: anon_name });
         for i in 0..body.named_child_count() {
@@ -1315,6 +1333,26 @@ impl<'t> Walker<'t> {
 
     // --- value references ------------------------------------------------------------
 
+    /// isForeignJavaField: `InferenceString.PARSER` reads that class's constant,
+    /// not the `PARSER` of the file reading it.
+    fn is_foreign_field(&self, n: Node<'t>, target_row: u32) -> bool {
+        let Some(access) = n.parent() else { return false };
+        if access.kind() != "field_access" {
+            return false;
+        }
+        let Some(object) = access.child_by_field_name("object") else { return false };
+        if access.child_by_field_name("field").map(|f| f.start_byte()) != Some(n.start_byte()) {
+            return false;
+        }
+        let written = self.text(object);
+        let qualifier = written.rsplit('.').next().unwrap_or("").trim();
+        if qualifier == "this" {
+            return false;
+        }
+        let qualified = &self.nodes_meta[target_row as usize].qualified_name;
+        qualified.rsplit("::").nth(1) != Some(qualifier)
+    }
+
     fn flush_value_refs(&mut self, root: Node<'t>) {
         let scopes = std::mem::take(&mut self.value_scopes);
         let mut targets = std::mem::take(&mut self.fs_values);
@@ -1380,6 +1418,7 @@ impl<'t> Walker<'t> {
                         if target_id != self.node_ids[scope.row as usize]
                             && ref_name != scope.name
                             && !seen.contains(&target_id)
+                            && !self.is_foreign_field(n, target_row)
                         {
                             seen.insert(target_id);
                             let meta = self.arena.put(r#"{"valueRef":true}"#);

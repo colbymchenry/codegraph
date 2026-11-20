@@ -31,6 +31,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { logDebug } from '../errors';
+import { escapesRoot } from '../utils';
 
 /** A single alias pattern from `compilerOptions.paths`. */
 export interface AliasPattern {
@@ -186,13 +187,15 @@ function resolveExtendsTarget(spec: string, fromDir: string): string | null {
 function loadEffectiveOptions(
   filePath: string,
   stack: Set<string>,
-  depth: number
+  depth: number,
+  read?: Set<string>
 ): EffectiveOptions | null {
   const abs = path.resolve(filePath);
   if (stack.has(abs) || depth > MAX_EXTENDS_DEPTH) {
     logDebug('path-aliases: extends chain cycle or too deep', { filePath: abs, depth });
     return null;
   }
+  read?.add(abs);
   const raw = readTsconfigLike(abs);
   if (!raw) return null;
 
@@ -208,7 +211,7 @@ function loadEffectiveOptions(
       logDebug('path-aliases: unresolved extends', { from: abs, spec });
       continue;
     }
-    const inherited = loadEffectiveOptions(target, stack, depth + 1);
+    const inherited = loadEffectiveOptions(target, stack, depth + 1, read);
     if (!inherited) continue;
     if (inherited.baseUrl !== undefined) effective.baseUrl = inherited.baseUrl;
     if (inherited.paths !== undefined) {
@@ -240,6 +243,19 @@ function readTsconfigLike(filePath: string): RawTsconfig | null {
   }
 }
 
+/**
+ * What {@link loadProjectAliases} reads from one config file, its `extends`,
+ * `compilerOptions.baseUrl` and `compilerOptions.paths`, as one string, or
+ * `null` for a file it can't read. A sync compares it to tell an edit that
+ * moves the alias map from one that doesn't, like a `strict` flag (#2977).
+ */
+export function aliasConfigFields(filePath: string): string | null {
+  const raw = readTsconfigLike(path.resolve(filePath));
+  if (!raw) return null;
+  const co = raw.compilerOptions ?? {};
+  return JSON.stringify([raw.extends ?? null, co.baseUrl ?? null, co.paths ?? null]);
+}
+
 function splitWildcard(pattern: string): {
   prefix: string;
   suffix: string;
@@ -260,9 +276,11 @@ function splitWildcard(pattern: string): {
  * `baseUrl`.
  *
  * Cheap to call repeatedly — caching is the caller's job (the
- * resolver does it via {@link aliasCache}).
+ * resolver does it via {@link aliasCache}). `read` collects the absolute
+ * path of every config file the load read, the `extends` chain included, so
+ * the caller can tell when one of them changes (#2977).
  */
-export function loadProjectAliases(projectRoot: string): AliasMap | null {
+export function loadProjectAliases(projectRoot: string, read?: Set<string>): AliasMap | null {
   // `tsconfig.base.json` comes last on purpose: when a root `tsconfig.json`
   // exists it stays authoritative and reaches the base through `extends`.
   // The fallback is for the Nx layouts where that never happens — a
@@ -274,7 +292,7 @@ export function loadProjectAliases(projectRoot: string): AliasMap | null {
   for (const name of candidates) {
     const p = path.join(projectRoot, name);
     if (!fs.existsSync(p)) continue;
-    const opts = loadEffectiveOptions(p, new Set(), 0);
+    const opts = loadEffectiveOptions(p, new Set(), 0, read);
     if (!opts) continue;
     // Remember the first readable config so a `paths`-less project still
     // logs the file it was judged on, but keep looking: a config that
@@ -372,8 +390,9 @@ export function applyAliases(
       const absolute = path.resolve(aliases.baseUrl, filled);
       const relative = path.relative(projectRoot, absolute);
       // Skip if the rewrite escapes the project root (unsafe + can't
-      // be looked up via the file index anyway).
-      if (relative.startsWith('..')) continue;
+      // be looked up via the file index anyway). A folder named like
+      // `..generated` is inside it.
+      if (escapesRoot(relative)) continue;
       out.push(relative.replace(/\\/g, '/'));
     }
     return out;
@@ -395,7 +414,7 @@ export function aliasAndBaseUrlCandidates(
   const out = applyAliases(importPath, aliases, projectRoot);
   if (aliases.declaresBaseUrl) {
     const relative = path.relative(projectRoot, path.resolve(aliases.baseUrl, importPath));
-    if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+    if (relative && !escapesRoot(relative)) {
       out.push(relative.replace(/\\/g, '/'));
     }
   }

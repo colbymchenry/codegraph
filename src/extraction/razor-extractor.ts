@@ -1,7 +1,9 @@
-import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference } from '../types';
+import { Node, Edge, ExtractionResult, ExtractionError, Language, UnresolvedReference } from '../types';
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
+import { SFC_SCRIPT_ELEMENT, sfcScriptLanguage } from './sfc-script';
+import { blankRazorComments, blankRazorInScript, isJavaScriptBlock } from './razor-script';
 
 /**
  * RazorExtractor — extracts code relationships from ASP.NET Razor (`.cshtml`)
@@ -16,6 +18,12 @@ import { isLanguageSupported } from './grammars';
  *  - `@typeof(MainLayout)`                → the referenced type
  *  - `<MyComponent .../>` (Blazor only)   → the component class (.razor or `.cs : ComponentBase`)
  *  - `<Grid TItem="CatalogItem">`         → the generic type argument
+ *
+ * It also links what a view's `<script>` blocks call to the JavaScript that
+ * defines it. An MVC view keeps its front-end logic there, so a helper used only
+ * from views would look unused, and changing it would look safe. Those references
+ * stay `javascript` / `typescript`, never `razor`: `razor` is in the `dotnet`
+ * family, and the name matcher's family gate would keep them from a `.js` symbol.
  *
  * Risk mitigations (see docs/design/template-markup-parser.md):
  *  - Only PascalCase (`[A-Z]`-initial) tags are treated as components — HTML
@@ -75,6 +83,7 @@ export class RazorExtractor {
       // this is where component logic uses services/DTOs, so it covers the types
       // referenced only from component code.
       this.processCodeBlocks(componentId);
+      this.processScriptBlocks(componentId);
     } catch (error) {
       this.errors.push({
         message: `Razor extraction error: ${error instanceof Error ? error.message : String(error)}`,
@@ -273,6 +282,51 @@ export class RazorExtractor {
           column: ref.column,
           filePath: this.filePath,
           language: 'razor',
+        });
+      }
+    }
+  }
+
+  /**
+   * Hand each inline `<script>` to the JavaScript or TypeScript extractor and
+   * keep what it references, as the view's: one component node per file, as for
+   * `@code`. What the view's blocks declare for themselves is nobody else's, so a
+   * call to their own `save()` must not go looking for another file's. A
+   * `<script src>` has no body, and a `type="text/html"` template or a JSON island
+   * is no script.
+   */
+  private processScriptBlocks(componentId: string): void {
+    const source = blankRazorComments(this.source);
+    const blocks: Array<{ result: ExtractionResult; language: Language; lineOffset: number }> = [];
+    const elements = new RegExp(SFC_SCRIPT_ELEMENT);
+    let match: RegExpExecArray | null;
+    while ((match = elements.exec(source)) !== null) {
+      const content = match.groups?.content;
+      const attrs = match[1] ?? '';
+      if (!content?.trim() || !isJavaScriptBlock(attrs)) continue;
+      const language = sfcScriptLanguage(attrs, 'razor');
+      if (!isLanguageSupported(language)) continue;
+      const lineOffset = (source.slice(0, match.index + match[0].indexOf('>') + 1).match(/\n/g) || []).length;
+      try {
+        const result = new TreeSitterExtractor(this.filePath, blankRazorInScript(content), language).extract();
+        blocks.push({ result, language, lineOffset });
+      } catch {
+        // grammar not loaded / parse failure — skip this block
+      }
+    }
+    const own = new Set<string>();
+    for (const { result } of blocks) {
+      for (const node of result.nodes) if (node.kind !== 'file' && node.kind !== 'import') own.add(node.name);
+    }
+    for (const { result, language, lineOffset } of blocks) {
+      for (const ref of result.unresolvedReferences) {
+        if (own.has(ref.referenceName.split('.')[0]!)) continue;
+        this.unresolvedReferences.push({
+          ...ref,
+          fromNodeId: componentId,
+          line: ref.line + lineOffset,
+          filePath: this.filePath,
+          language,
         });
       }
     }

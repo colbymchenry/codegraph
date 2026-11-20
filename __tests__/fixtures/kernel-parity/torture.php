@@ -16,6 +16,13 @@ require_once('lib/parens.php');
 include 'lib/inc.php';
 include_once 'lib/inc_once.php';
 require __DIR__ . '/dynamic.php';
+require_once dirname(__FILE__) . "/lib/dir_file.php";
+include(__DIR__ . DIRECTORY_SEPARATOR . 'lib' . '/dir_sep.php');
+include_once \dirname(__DIR__, 2) . '/shared/up_two.php';
+require DIRNAME( __FILE__ , 2 , ) . '/../up_args.php';
+require __DIR__ . 'lib/no_slash.php';
+require dirname(__FILE__, 0) . '/lib/zero.php';
+require $_SERVER['DOCUMENT_ROOT'] . '/lib/docroot.php';
 
 const TOP_LEVEL_MAX = 10;
 
@@ -23,6 +30,9 @@ const TOP_LEVEL_MAX = 10;
 function top_helper(?Logger $log, User|PostAlias $u, Logger&Countable $lc, (Foo&Bar)|Baz $dnf, \App\Models\User $qual, string $s, int ...$rest): UserModel
 {
     top_body_call();
+    require_once 'lib/in_function.php';
+    require __DIR__ . '/lib/in_function_dir.php';
+    include $dynamicInFunction;
     return new UserModel();
 }
 

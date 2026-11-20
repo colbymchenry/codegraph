@@ -4,11 +4,28 @@ import * as path from 'path';
 import type { Socket } from 'net';
 import type CodeGraph from '../index';
 import { canonicalProjectRoot, getCodeGraphDir, isInitialized } from '../directory';
-import { LockUnavailableError, watchDisabledReason } from '../sync';
+import { LockUnavailableError } from '../errors';
+import { watchDisabledReason } from '../sync/watch-policy';
 import { getDaemonSocketCandidates } from './daemon-paths';
 import { addWatchdogProgressPaths } from './liveness-watchdog';
 import { connectWithHello } from './proxy';
 import { markWriterReady, readWriterLock, releaseWriterLock, tryAcquireWriterLock } from './writer-lock';
+
+/**
+ * How long a catch-up the WAL valve stopped waits before it starts again, and
+ * the most it waits; the wait doubles after each stop in a row (#3273).
+ */
+export const VALVE_RETRY_BASE_MS = 5_000;
+export const VALVE_RETRY_MAX_MS = 5 * 60_000;
+
+/**
+ * The WAL valve stopped the sync: a reader, typically a tool call served
+ * from the query pool, kept every checkpoint from catching up (#1539). The
+ * code is the valve's own (`WalValveAbortError`), read without importing it.
+ */
+function isWalValveAbort(err: unknown): boolean {
+  return !!err && typeof err === 'object' && (err as { code?: unknown }).code === 'WAL_VALVE_ABORT';
+}
 
 interface Project {
   /** Identity key: one entry however the root is spelled (#2278). */
@@ -24,6 +41,10 @@ interface Project {
   options: Parameters<CodeGraph['watch']>[0];
   /** Drops the index files from the liveness watchdog's progress; set while this process writes them (#2404). */
   dropProgress: (() => void) | null;
+  /** No catch-up starts before this time: the WAL valve stopped the last one (#3273). */
+  retryAt: number;
+  /** The wait {@link retryAt} was set with; 0 when the last catch-up wasn't stopped. */
+  retryDelayMs: number;
 }
 
 export interface ProjectLease {
@@ -46,7 +67,7 @@ export function acquireProject(
   if (!project) {
     const cg = open();
     project = { key, cg, refs: 0, owner: false, caughtUp: false, retirement: null, gate: null, socket: null, options,
-      dropProgress: null, timer: setInterval(() => { void ready(root, project!); }, 1000) };
+      dropProgress: null, retryAt: 0, retryDelayMs: 0, timer: setInterval(() => { void ready(root, project!); }, 1000) };
     project.timer.unref();
     projects.set(key, project);
   }
@@ -104,11 +125,27 @@ function ready(root: string, project: Project): Promise<void> {
   if (project.refs === 0 || (project.owner && project.caughtUp) || (project.socket && !project.socket.destroyed)) {
     return Promise.resolve();
   }
-  const gate = activate(root, project).catch((err) => {
+  // The WAL valve stopped the last catch-up. Every access and the timer below
+  // would start it again at once, so a session's tool calls kept the readers
+  // that stopped it coming while each retry scanned the project again and
+  // grew the WAL a little more (#3273). Wait it out; calls meanwhile are
+  // served without waiting for a catch-up, as after the gate's timeout.
+  if (Date.now() < project.retryAt) return Promise.resolve();
+  const gate = activate(root, project).then(() => {
+    project.retryAt = 0;
+    project.retryDelayMs = 0;
+  }, (err) => {
     // A CLI/indexer can hold codegraph.lock even while we own writer.pid.
     // Leave caughtUp false so the next access or timer retries quietly (#1361).
     if (err instanceof LockUnavailableError) return;
-    process.stderr.write(`[CodeGraph MCP] Catch-up sync failed for ${root}: ${err instanceof Error ? err.message : String(err)}\n`);
+    const message = err instanceof Error ? err.message : String(err);
+    if (isWalValveAbort(err)) {
+      project.retryDelayMs = Math.min(project.retryDelayMs > 0 ? project.retryDelayMs * 2 : VALVE_RETRY_BASE_MS, VALVE_RETRY_MAX_MS);
+      project.retryAt = Date.now() + project.retryDelayMs;
+      process.stderr.write(`[CodeGraph MCP] Catch-up sync failed for ${root}: ${message} Trying again in ${Math.round(project.retryDelayMs / 1000)}s.\n`);
+      return;
+    }
+    process.stderr.write(`[CodeGraph MCP] Catch-up sync failed for ${root}: ${message}\n`);
   }).finally(() => {
     if (project.gate === gate) project.gate = null;
   });

@@ -78,7 +78,10 @@ identical graph still picked a different candidate.
   edges targeting a symbol of that name whose source is in an *unchanged* file,
   and re-inserts each as the reference that created it (the `metadata.refName`
   stamp). The existing orphan sweep then resolves them against the post-sync
-  graph — the same input a rebuild resolves from. Kill switch:
+  graph — the same input a rebuild resolves from.
+- Failed references parked under a delta name go back to pending for the same
+  sweep: a call that failed only because a second definition shared its name
+  links once that definition is deleted or renamed away. Kill switch for both:
   `CODEGRAPH_NO_REBIND=1`.
 
 The delta is compared **per file**, not as one name set over the whole batch: a

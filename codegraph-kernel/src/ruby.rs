@@ -140,9 +140,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
     parser
         .set_language(&grammar)
         .map_err(|e| format!("set_language(ruby) failed: {e}"))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| "parser returned null tree".to_string())?;
+    let tree = crate::parse_budget::parse(&mut parser, source)?;
     if tree.root_node().has_error() {
         return Err("defer: parse tree contains errors — wasm recovery is canonical".to_string());
     }
@@ -211,6 +209,21 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
 impl<'t> Walker<'t> {
     fn text(&self, node: Node) -> &'t str {
         &self.src[node.byte_range()]
+    }
+    /// rubyConstructedClass (tree-sitter.ts): the class a call receiver
+    /// constructs, as written — `Foo` for `Foo.new(key)`, `Billing::Card` for
+    /// `Billing::Card.new`, `::Foo` for `::Foo.new`; None for any other
+    /// receiver, a `new` on a value (`klass.new`) among them.
+    fn constructed_class(&self, receiver: Node) -> Option<&'t str> {
+        if receiver.kind() != "call" {
+            return None;
+        }
+        let method = receiver.child_by_field_name("method")?;
+        let made = receiver.child_by_field_name("receiver")?;
+        if self.text(method) != "new" || !is_constant_path(made) {
+            return None;
+        }
+        Some(self.text(made))
     }
     fn line_of(&self, node: Node) -> u32 {
         node.start_position().row as u32 + 1
@@ -826,6 +839,10 @@ impl<'t> Walker<'t> {
         let skip = matches!(receiver_name, "self" | "super");
         let callee = if skip {
             method_name.to_string()
+        } else if let Some(class_name) = self.constructed_class(receiver) {
+            // A call on what `Foo.new(…)` made: `new Foo().m`, not the
+            // receiver's text with its arguments in it (#684).
+            format!("new {class_name}().{method_name}")
         } else {
             format!("{receiver_name}.{method_name}")
         };

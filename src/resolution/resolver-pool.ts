@@ -14,6 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import type { Edge, UnresolvedReference } from '../types';
+import type { ProjectScans } from './project-scans';
 import type { ResolvedRef, UnresolvedRef } from './types';
 import { memoryBudgetBytes } from './memory-budget';
 import { terminateOnceStarted, workerStarted } from '../worker-teardown';
@@ -81,13 +82,67 @@ export function shouldEngageAdaptively(projectedMs: number, remainingRefs: numbe
   return remainingRefs >= ADAPTIVE_ENGAGE_MIN_REFS && projectedMs >= barMs;
 }
 
+/**
+ * The most workers a run takes, however large the project. The main thread saves
+ * every batch itself, in order, and that keeps about this many busy: a further
+ * worker mostly waits, and meanwhile costs a second or two of CPU to load, warm
+ * up and compile the hot code in its own isolate, a share of what the others
+ * would have found in their caches, and a few hundred MB. On rocksdb, 4 workers
+ * finish with 6 for a seventh less CPU and memory.
+ */
+const MAX_RESOLVE_WORKERS = 4;
+
+/**
+ * What a further worker has to take off the time resolving would take alone to
+ * be worth starting, in ms: on tokio, 3 workers finish with 6 for a fifth less
+ * CPU and a quarter less memory.
+ */
+const RESOLVE_WORK_PER_WORKER_MS = 2000;
+
+/** The workers resolving is worth, from what it would take alone, in ms. */
+export function resolveWorkersWorthStarting(projectedMs: number): number {
+  return Math.ceil(projectedMs / RESOLVE_WORK_PER_WORKER_MS);
+}
+
+/**
+ * The longest a run that starts the pool before its first batch waits for it, in
+ * ms. A full index's workers are up in a second or two; a sync's detect the
+ * project's frameworks for themselves, which can read every source file. Past
+ * this the run goes on on its own thread, as it would with no pool, and takes the
+ * pool up if it does come.
+ */
+export const POOL_START_WAIT_MS = 30_000;
+
+/** Waits for a pool's start to settle, however it goes, for at most POOL_START_WAIT_MS. */
+export async function poolStartSettled(start: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    start.catch(() => undefined),
+    new Promise<void>((resolve) => { timer = setTimeout(resolve, POOL_START_WAIT_MS); }),
+  ]);
+  clearTimeout(timer);
+}
+
+/**
+ * What a resolver worker's heap may hold of new objects. Resolving keeps many
+ * of them alive for a while, so V8 grows this space as far as it may: 192 MB a
+ * worker on Node 24, where it was the larger part of a big repo's peak memory,
+ * and 48 MB on Node 22. At 48 MB the peak is about a quarter lower and CPU time
+ * doesn't move.
+ */
+const WORKER_YOUNG_GENERATION_MB = 48;
+
 export class ResolverPool {
   private workers: PoolWorker[] = [];
+  /** The worker that last resolved references of a file. */
+  private fileWorkers = new Map<string | undefined, PoolWorker>();
   private nextId = 0;
   private waiters = new Map<number, { resolve: (r: ChunkResult) => void; reject: (e: Error) => void }>();
   private synthWaiters = new Map<number, { resolve: (r: SynthPassResult) => void; reject: (e: Error) => void }>();
   private recycleWaiters = new Map<number, () => void>();
   private failed: Error | null = null;
+  /** Fail the workers still starting: a failure is a pool that will never be ready. */
+  private failStarts: Array<(err: Error) => void> = [];
 
   /**
    * Pool size from CPU headroom, memory headroom, and the explicit override.
@@ -97,7 +152,7 @@ export class ResolverPool {
    * enumerates the host's CPUs and sized SIX workers inside a 2-CPU cpuset,
    * §7a.1's false-premise finding), minus one for the persisting main thread,
    * floored at 2 so a true 2-core box keeps the pool's ~2× on synthesis,
-   * capped at the long-standing 6.
+   * capped at MAX_RESOLVE_WORKERS.
    *
    * Memory term: workers hold real heap at scale (~1GB each against a 4.6GB
    * kernel-scale DB — six of them OOM-killed a 7GB container once real
@@ -111,6 +166,8 @@ export class ResolverPool {
     availableParallelism: number;
     memoryBudget: number;
     dbSizeBytes: number;
+    /** The workers the work is worth; left out, as many as the machine can carry. */
+    worth?: number;
   }): number | null {
     if (opts.explicit !== undefined && opts.explicit !== '') {
       const n = Number.parseInt(opts.explicit, 10);
@@ -124,11 +181,11 @@ export class ResolverPool {
     // 1,150s pooled-6-on-2 (§7a.1), and synthesis is Amdahl-bound by its
     // dominant pass (cFnPtrEdges 306s of 358s) so pooling it bought nothing.
     // ap−1 < 2 ⇒ sequential is the fast path, not a fallback.
-    const cpuCap = Math.min(opts.availableParallelism - 1, 6);
+    const cpuCap = Math.min(opts.availableParallelism - 1, MAX_RESOLVE_WORKERS);
     const perWorker = Math.min(Math.max(opts.dbSizeBytes * 0.2, 256 * 1024 * 1024), 1.5 * 1024 * 1024 * 1024);
     const memCap = Math.floor((opts.memoryBudget * 0.7) / perWorker);
     const size = Math.min(cpuCap, memCap);
-    return size >= 2 ? size : null;
+    return size >= 2 ? Math.min(size, Math.max(2, opts.worth ?? size)) : null;
   }
 
   /**
@@ -138,7 +195,7 @@ export class ResolverPool {
    * otherwise. `CODEGRAPH_RESOLVE_WORKERS` overrides the computed size
    * (0 disables the pool; values are capped at 16).
    */
-  static tryCreate(dbPath: string, projectRoot: string): ResolverPool | null {
+  static tryCreate(dbPath: string, projectRoot: string, frameworks?: readonly string[], worth?: number): ResolverPool | null {
     if (process.env.CODEGRAPH_NO_PARALLEL_RESOLVE === '1') return null;
     const workerScript = path.join(__dirname, 'resolver-worker.js');
     if (!fs.existsSync(workerScript)) return null;
@@ -153,6 +210,7 @@ export class ResolverPool {
       availableParallelism: ap,
       memoryBudget: budget,
       dbSizeBytes,
+      worth,
     });
     // Both outcomes log under SYNTH_TIMINGS — a silent null is how §7a.1's
     // diagnostic run hid the memory-term misfire for a whole 25-minute cycle.
@@ -163,15 +221,15 @@ export class ResolverPool {
     }
     if (size === null) return null;
     try {
-      return new ResolverPool(workerScript, dbPath, projectRoot, size);
+      return new ResolverPool(workerScript, dbPath, projectRoot, size, frameworks);
     } catch {
       return null;
     }
   }
 
-  private constructor(workerScript: string, dbPath: string, projectRoot: string, size: number) {
+  private constructor(workerScript: string, dbPath: string, projectRoot: string, size: number, frameworks?: readonly string[]) {
     for (let i = 0; i < size; i++) {
-      const worker = new Worker(workerScript);
+      const worker = new Worker(workerScript, { resourceLimits: { maxYoungGenerationSizeMb: WORKER_YOUNG_GENERATION_MB } });
       const started = workerStarted(worker);
       let readyResolve!: () => void;
       let readyReject!: (e: Error) => void;
@@ -179,6 +237,10 @@ export class ResolverPool {
         readyResolve = resolve;
         readyReject = reject;
       });
+      // A failure reaches whoever calls ready(). A pool torn down first has no one
+      // to tell: terminating a worker that hasn't said ready exits it with code 1.
+      ready.catch(() => undefined);
+      this.failStarts.push(readyReject);
       const pw: PoolWorker = { worker, ready, started, busy: 0 };
       worker.on('message', (msg: { type: string; id?: number; message?: string; edges?: Edge[]; ms?: number } & Partial<ChunkResult>) => {
         if (msg.type === 'ready') {
@@ -224,18 +286,18 @@ export class ResolverPool {
         readyReject(this.failed!);
       });
       worker.on('exit', (code) => {
-        if (code !== 0) {
-          this.fail(new Error(`resolver worker exited with code ${code}`));
-          readyReject(this.failed!);
-        }
+        if (code !== 0) this.fail(new Error(`resolver worker exited with code ${code}`));
+        // (Gone before it said ready, it never will. Once it has, this does nothing.)
+        readyReject(this.failed ?? new Error('resolver worker exited before it was ready'));
       });
-      worker.postMessage({ type: 'open', dbPath, projectRoot });
+      worker.postMessage({ type: 'open', dbPath, projectRoot, frameworks });
       this.workers.push(pw);
     }
   }
 
   private fail(err: Error): void {
     if (!this.failed) this.failed = err;
+    for (const failStart of this.failStarts) failStart(this.failed);
     for (const [, waiter] of this.waiters) waiter.reject(this.failed);
     this.waiters.clear();
     for (const [, waiter] of this.synthWaiters) waiter.reject(this.failed);
@@ -244,6 +306,11 @@ export class ResolverPool {
     // owns rejection, and the recycle caller checks this.failed next round.
     for (const [, done] of this.recycleWaiters) done();
     this.recycleWaiters.clear();
+  }
+
+  /** Give every worker what the main thread read from the whole project, ahead of any reference it is sent. */
+  shareScans(scans: ProjectScans): void {
+    for (const pw of this.workers) pw.worker.postMessage({ type: 'scans', scans });
   }
 
   /** Number of workers — how many passes the synthesis fan-out keeps in flight. */
@@ -272,8 +339,14 @@ export class ResolverPool {
       const id = this.nextId++;
       // Least-busy dispatch keeps workers evenly loaded regardless of chunk
       // cost variance; result order is fixed by the promise array, not by
-      // completion order.
-      const pw = this.workers.reduce((a, b) => (b.busy < a.busy ? b : a));
+      // completion order. A chunk that goes on with a file stays on the worker
+      // that has that file's lines, nodes and scans in its caches, unless that
+      // would leave it behind the others. References come file by file, so a
+      // file of 2,000 used to be read and scanned by four workers.
+      const least = this.workers.reduce((a, b) => (b.busy < a.busy ? b : a));
+      const holder = this.fileWorkers.get(chunk[0]!.filePath);
+      const pw = holder && holder.busy <= least.busy + 1 ? holder : least;
+      this.fileWorkers.set(chunk[chunk.length - 1]!.filePath, pw);
       pw.busy++;
       chunkPromises.push(
         new Promise<ChunkResult>((resolve, reject) => {

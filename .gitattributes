@@ -1,0 +1,9 @@
+# Third-party tree-sitter grammars that the native kernel compiles from source
+# (codegraph-kernel/build.rs). Keep all of them out of GitHub's language
+# statistics, and collapse only the generated parser.c files in pull-request
+# diffs. The hand-written scanner.c files are where C gets patched or added,
+# so they stay expanded for review.
+# The /** is needed: an attributes pattern that names a directory does not
+# reach the files inside it.
+codegraph-kernel/grammars/** linguist-vendored
+codegraph-kernel/grammars/**/parser.c linguist-generated

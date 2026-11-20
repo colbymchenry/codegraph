@@ -4,11 +4,13 @@
  * Manages the .codegraph/ directory structure for CodeGraph data.
  */
 
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { isWslWindowsDrive } from './sync/watch-policy';
 import { loadNodeSqlite } from './db/node-sqlite';
+import { sensitiveDirectoryRefusal } from './utils';
 
 /** The default per-project data directory name. */
 export const DEFAULT_CODEGRAPH_DIR = '.codegraph';
@@ -453,6 +455,12 @@ export interface ServerRootResolution {
    * what IS reachable (#1607).
    */
   candidates: string[];
+  /**
+   * Why the root that was found is not served: it, or the path the search
+   * started from, is a sensitive folder (`~/.ssh`, `~/.config`, `/etc`, …),
+   * refused as a tool call's `projectPath` is. `root` is then null.
+   */
+  refusal: string | null;
 }
 
 /**
@@ -484,19 +492,37 @@ function eligibleForSubprojectScan(base: string): boolean {
  *
  * `opts.subprojectScan: false` skips the down-scan entirely (the per-tool-call
  * retry path throttles it; the up-walk always runs).
+ *
+ * The default project gets the sensitive-folder refusal a tool call's
+ * `projectPath` gets: on the path searched from when it exists, and on the
+ * root the search lands on. A refused root resolves to null, with the reason
+ * in `refusal`: the server has no default project, so nothing there is opened,
+ * watched or synced. Sub-projects below a refused path aren't listed either;
+ * a tool call would refuse them.
  */
 export function resolveServerRoot(
   searchFrom: string,
   opts: { subprojectScan?: boolean } = {},
 ): ServerRootResolution {
+  const found = findServerRoot(searchFrom, opts);
+  if (!found.root && found.candidates.length === 0) return found;
+  const startRefusal = fs.existsSync(searchFrom) ? sensitiveDirectoryRefusal(searchFrom) : null;
+  if (!found.root) return startRefusal ? { ...found, candidates: [] } : found;
+  const refusal = startRefusal ?? sensitiveDirectoryRefusal(found.root);
+  return refusal ? { root: null, viaSubScan: false, candidates: [], refusal } : found;
+}
+
+/** {@link resolveServerRoot} before the sensitive-folder refusal. */
+function findServerRoot(searchFrom: string, opts: { subprojectScan?: boolean }): ServerRootResolution {
+  const none: ServerRootResolution = { root: null, viaSubScan: false, candidates: [], refusal: null };
   const up = findNearestCodeGraphRoot(searchFrom);
-  if (up) return { root: up, viaSubScan: false, candidates: [] };
-  if (opts.subprojectScan === false) return { root: null, viaSubScan: false, candidates: [] };
+  if (up) return { root: up, viaSubScan: false, candidates: [], refusal: null };
+  if (opts.subprojectScan === false) return none;
   const base = path.resolve(searchFrom);
-  if (!eligibleForSubprojectScan(base)) return { root: null, viaSubScan: false, candidates: [] };
+  if (!eligibleForSubprojectScan(base)) return none;
   const subs = findIndexedSubprojectRoots(base);
-  if (subs.length === 1) return { root: subs[0]!, viaSubScan: true, candidates: subs };
-  return { root: null, viaSubScan: false, candidates: subs };
+  if (subs.length === 1) return { root: subs[0]!, viaSubScan: true, candidates: subs, refusal: null };
+  return { ...none, candidates: subs };
 }
 
 /**
@@ -928,6 +954,62 @@ function ensureGitignore(gitignorePath: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The local-only `.codegraph/.gitignore` (#910): the wildcard alone, which
+ * ignores this file too, so nothing of CodeGraph's shows in `git status` and
+ * nothing asks to be committed. It carries no header, so `ensureGitignore`
+ * treats it as the user's own and leaves it alone from then on.
+ */
+const LOCAL_ONLY_GITIGNORE_CONTENT = '*\n';
+
+/** What `makeGitignoreLocalOnly` did. */
+export type LocalOnlyGitignoreResult =
+  /** The file is local-only now. */
+  | 'written'
+  /** It already was. */
+  | 'unchanged'
+  /** It holds rules CodeGraph didn't write, so it was left alone. */
+  | 'customized'
+  /** It is committed, so rewriting it would show up as a change. Left alone. */
+  | 'tracked';
+
+/** Whether git tracks `file`. False outside a repository, or without git. */
+function isTrackedByGit(file: string): boolean {
+  try {
+    execFileSync('git', ['ls-files', '--error-unmatch', '--', path.basename(file)], {
+      cwd: path.dirname(file),
+      stdio: 'ignore',
+      windowsHide: true,
+      timeout: 10_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Make `.codegraph/.gitignore` local-only, for `codegraph init --local-only`.
+ * Only a file CodeGraph generated is replaced: anything else, or one a project
+ * has committed to share the rule, stays as it is and the caller says why.
+ */
+export function makeGitignoreLocalOnly(projectRoot: string): LocalOnlyGitignoreResult {
+  const gitignorePath = path.join(getCodeGraphDir(projectRoot), '.gitignore');
+  let existing: string | null;
+  try {
+    existing = fs.readFileSync(gitignorePath, 'utf-8').replace(/\r\n/g, '\n');
+  } catch {
+    existing = null;
+  }
+  if (existing === LOCAL_ONLY_GITIGNORE_CONTENT) return 'unchanged';
+  if (existing !== null) {
+    if (existing !== GITIGNORE_CONTENT && !isStaleDefaultGitignore(existing)) return 'customized';
+    if (isTrackedByGit(gitignorePath)) return 'tracked';
+  }
+  fs.writeFileSync(gitignorePath, LOCAL_ONLY_GITIGNORE_CONTENT, 'utf-8');
+  return 'written';
 }
 
 /**

@@ -1,3 +1,5 @@
+import { withOpenCodeToolNames } from './opencode-tool-names';
+
 /**
  * Server-level instructions emitted in the MCP `initialize` response.
  *
@@ -16,6 +18,10 @@
  * DEFAULT_MCP_TOOLS in tools.ts) — reference only that tool here. The other
  * tools (node/search/callers/…) stay defined and are re-enablable via
  * CODEGRAPH_MCP_TOOLS, but they are NOT listed to agents, so don't name them.
+ *
+ * An OpenCode client gets this text with each tool named the way OpenCode lists
+ * it (`codegraph_codegraph_explore`, #1267): see {@link openCodeInstructions}.
+ * Write tool names here as the tools are named; the rewrite is applied for it.
  */
 export const SERVER_INSTRUCTIONS = `# Codegraph — code intelligence over an indexed knowledge graph
 
@@ -113,3 +119,26 @@ default project — but the tools are available and work **per project**:
   if it comes up they can run \`codegraph init\` in a project to enable codegraph
   there (a new index is picked up live, no restart).
 `;
+
+/**
+ * The sentence an OpenCode client gets under the instructions' title (#1267):
+ * why every tool name starts with the server's key, and what changes when the
+ * server is registered under a key other than the one `codegraph install` writes.
+ */
+export const OPENCODE_SERVER_KEY_NOTE =
+  "In OpenCode each tool's name starts with this server's key, so the tool names below begin with " +
+  '`codegraph_codegraph_`; if the server is registered under another key, that key replaces the first `codegraph_`.';
+
+/**
+ * What an OpenCode client gets in place of `instructions` (#1267): the same
+ * text, with each of `toolNames` written the way OpenCode lists it and
+ * {@link OPENCODE_SERVER_KEY_NOTE} under the title. Nothing else changes, so
+ * the `codegraph` CLI commands and `CODEGRAPH_*` variables read as they do for
+ * every other client. See `./opencode-tool-names`.
+ */
+export function openCodeInstructions(instructions: string, toolNames: readonly string[]): string {
+  const renamed = withOpenCodeToolNames(instructions, toolNames);
+  const titleEnd = renamed.indexOf('\n');
+  if (titleEnd === -1) return `${renamed}\n\n${OPENCODE_SERVER_KEY_NOTE}`;
+  return `${renamed.slice(0, titleEnd + 1)}\n${OPENCODE_SERVER_KEY_NOTE}\n${renamed.slice(titleEnd + 1)}`;
+}

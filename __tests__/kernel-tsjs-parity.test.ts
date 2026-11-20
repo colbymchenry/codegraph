@@ -120,9 +120,95 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
       expect(result.nodes.map((n) => n.qualifiedName)).toEqual(expect.arrayContaining([
         'Api::read', 'Api::close', 'Api::gen', 'Api::quoted-key', 'Exported::save', 'Local::run', 'window.WS',
         'window.WS::ws', 'App.utils::pad', 'dw_page::start', 'ns.late::go', 'self.handlers::click',
+        'module.exports::cjs',
       ]));
       // A plain name reassigned inside a function is a local, not a namespace.
-      for (const name of ['cjs', 'proto', 'ephemeral', 'data', 'on']) expect(result.nodes.some((n) => n.name === name), name).toBe(false);
+      for (const name of ['proto', 'ephemeral', 'data', 'on']) expect(result.nodes.some((n) => n.name === name), name).toBe(false);
+    }
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('a constructor\'s prototype and static functions are its methods: %s (#2966)', (ext, language) => {
+    const source = [
+      '/* é😀 */ function Hooks() { this.validate(); }',
+      '/** Checks a hook. */',
+      'Hooks.prototype.validate = function (hook) { return check(hook); };',
+      'Hooks.prototype.add = async function add(hook) { this.validate(hook); };',
+      'Hooks.prototype.size = () => 0;',
+      'Hooks.prototype.each = function* () { yield 1; };',
+      'Hooks.create = function build() { return new Hooks(); };',
+      'class Widget {}',
+      'Widget.prototype.render = function () { return 1; };',
+      '(function () { function Queue() {} Queue.prototype.push = function (x) { return x; }; })();',
+      'function factory() { function Stack() {} Stack.prototype.peek = function () { return 1; }; return Stack; }',
+      'app.use = function use() {};',
+      'exports.handle = function () {};',
+      'Later.prototype.early = function () {};',
+      'function Later() {}',
+      "Later.prototype['computed'] = function () {};",
+      'const proto = module.exports = { inspect() { return this.toJSON(); }, toJSON() { return {}; } };',
+      'function check(h) { return h; }',
+      '',
+    ].join('\n');
+    for (const ending of ['\n', '\r\n']) {
+      const result = assertParity(`proto.${ext}`, source.replace(/\n/g, ending), language);
+      const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => `${n.qualifiedName}${n.isStatic ? ' static' : ''}`);
+      expect(methods.sort()).toEqual([
+        'Hooks::add', 'Hooks::create static', 'Hooks::each', 'Hooks::size', 'Hooks::validate',
+        'Queue::push', 'Widget::render', 'factory::Stack::peek',
+      ]);
+      expect(result.nodes.filter((n) => n.qualifiedName.startsWith('module.exports::')).map((n) => `${n.name} ${n.isExported}`))
+        .toEqual(['inspect true', 'toJSON true']);
+      for (const name of ['build', 'early', 'computed']) expect(result.nodes.some((n) => n.name === name), name).toBe(false);
+      expect(result.nodes.find((n) => n.qualifiedName === 'Hooks::validate')?.docstring).toContain('Checks a hook');
+    }
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('a default-exported object owns its members: %s (#3393)', (ext, language) => {
+    const source = [
+      'import { helper } from "./helper";',
+      '/** The é😀 actions. */',
+      'export default {',
+      '  fetchUser() { return helper(); },',
+      '  async save() { return this.fetchUser(); },',
+      '  close: () => helper(),',
+      '  gen: function* () { yield 1; },',
+      "  'quoted-key': function () {},",
+      '  [dyn()]() { helper(); },',
+      '  eager: helper(),',
+      '  alias: helper,',
+      '  helper,',
+      '  nested: { inner() { helper(); } },',
+      '};',
+      '',
+    ].join('\n');
+    // A store file (the Vuex vocabulary): a whole module keeps its
+    // collections' functions and gets no owner; a split one gets its owner;
+    // one with neither is left unwalked.
+    const whole = 'export default {\n  namespaced: true,\n  state: () => ({ n: helper() }),\n  actions: { inc({ commit }) { commit("INC"); } },\n  mutations: { INC(state) { state.n++; } },\n};\nfunction helper() { return 0; }\n';
+    const split = '// Vuex actions, read with getters.\nexport default {\n  async load({ commit, getters }) { commit("SET", await api.get(getters.id)); },\n};\nfunction other() {}\n';
+    const neither = '// Vuex: namespaced actions.\nimport actions from "./actions";\nexport default { namespaced: true, state: { n: count() }, actions };\nfunction count() { return 0; }\nfunction more() {}\n';
+    for (const ending of ['\n', '\r\n']) {
+      const result = assertParity(`actions.${ext}`, source.replace(/\n/g, ending), language);
+      const owner = result.nodes.find((n) => n.qualifiedName === 'default');
+      expect(owner?.kind).toBe('constant');
+      expect(owner?.isExported).toBe(true);
+      expect(owner?.docstring).toContain('actions');
+      expect(result.nodes.filter((n) => n.qualifiedName.startsWith('default::')).map((n) => `${n.name} ${n.isExported}`).sort())
+        .toEqual(['close true', 'fetchUser true', 'gen true', 'quoted-key true', 'save true']);
+      expect(result.nodes.some((n) => n.name === 'inner')).toBe(false);
+
+      const wholeResult = assertParity(`module.${ext}`, whole.replace(/\n/g, ending), language);
+      expect(wholeResult.nodes.map((n) => n.qualifiedName)).toEqual(expect.arrayContaining(['inc', 'INC']));
+      expect(wholeResult.nodes.some((n) => n.qualifiedName === 'default' || n.name === 'state')).toBe(false);
+      const splitResult = assertParity(`split.${ext}`, split.replace(/\n/g, ending), language);
+      expect(splitResult.nodes.map((n) => n.qualifiedName)).toEqual(expect.arrayContaining(['default', 'default::load']));
+      const neitherResult = assertParity(`index.${ext}`, neither.replace(/\n/g, ending), language);
+      expect(neitherResult.nodes.some((n) => n.qualifiedName === 'default')).toBe(false);
+      expect(neitherResult.unresolvedReferences.some((r) => r.referenceName === 'count')).toBe(false);
     }
   });
 
@@ -466,6 +552,25 @@ class Consumer:
     const names = result.unresolvedReferences.filter(r => r.referenceKind === 'function_ref').map(r => r.referenceName);
     expect(names.sort()).toEqual(['Store.Fetch', 'c.Fetch', 'c.store.Fetch']);
     expect(result.unresolvedReferences.some(r => r.referenceKind === 'calls' && r.referenceName === 'c.Fetch')).toBe(true);
+  });
+
+  it('Go calls on new(T) and make(T) keep the type; on append, the bare method name (#3237)', () => {
+    const result = assertParity('builtins.go', `package demo
+type Route struct{}
+func (r *Route) Host(h string) *Route { return r }
+type Set map[string]struct{}
+type List []int
+func use(list List) *Route {
+	make(Set).Add("k")
+	_ = append(list, 1).Len()
+	_ = New().Host("y")
+	return new(Route).
+		Host("x").
+		Path("/p")
+}
+`, 'go');
+    const names = result.unresolvedReferences.filter(r => r.referenceKind === 'calls').map(r => r.referenceName);
+    expect(names.sort()).toEqual(['Len', 'New', 'New().Host', 'Path', 'append', 'make', 'make(Set).Add', 'new', 'new(Route).Host']);
   });
 
   it.each(['LF', 'CRLF'])('Go selector values stoplist the whole name, not the field (%s)', (ending) => {

@@ -59,6 +59,12 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
     }
     case 'event-emitter':
       return hop(`event ${quoted(m.event, 'an event')}`);
+    case 'tauri-command':
+      return hop(`Tauri command ${quoted(m.command, 'a command')}`, " — the frontend's invoke onto its Rust handler");
+    case 'tauri-event': {
+      const direction = m.tier === 'server→client' ? ' → frontend' : m.tier === 'client→server' ? ' → Rust' : '';
+      return hop(`Tauri event ${quoted(m.event, 'an event')}`, direction);
+    }
     case 'react-render':
       return hop('React re-render via setState');
     case 'jsx-render':
@@ -75,6 +81,13 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
       return hop(`fn-pointer ${m.via ? String(m.via) : ''}`);
     case 'goframe-route':
       return hop(`GoFrame route ${m.route ? String(m.route) : ''}`);
+    case 'next-proxy':
+      return hop(m.matcher ? `Next proxy, matcher ${quoted(m.matcher, '')}` : 'Next proxy, on every request');
+    case 'const-alias':
+      return hop(`const alias of ${quoted(m.via, 'a function')}`);
+    case 'cpp-template-argument':
+      // C++: a call through a template parameter; the wiring site writes the argument.
+      return hop(`template argument ${quoted(m.argument, 'a class')} for ${quoted(m.via, 'a parameter')}`);
     case 'go-func-field':
       // Go: a call through a struct field holding a function, `d.refreshf(ctx)`;
       // `via` is the field it was copied from, which the wiring site writes.

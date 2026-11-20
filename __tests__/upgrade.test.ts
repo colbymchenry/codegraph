@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { CODEGRAPH_INSTRUCTIONS_BLOCK } from '../src/installer/instructions-template';
+import { CODEGRAPH_INSTRUCTIONS_BLOCK, OPENCODE_INSTRUCTIONS_BLOCK } from '../src/installer/instructions-template';
 import {
   detectInstallMethod,
   deriveInstallDir,
@@ -302,10 +302,13 @@ describe('version helpers', () => {
     expect(parseLatestTagFromLocation('https://github.com/o/r/releases')).toBeNull();
   });
 
-  it('reindexAdvisory mentions the refresh commands', () => {
+  it('reindexAdvisory names the one command that picks up a new engine', () => {
+    // sync leaves unchanged files as the old engine read them, and index's -f
+    // only allows a home or root folder.
     const a = reindexAdvisory();
-    expect(a).toContain('codegraph sync');
-    expect(a).toContain('codegraph index -f');
+    expect(a).toContain('codegraph index');
+    expect(a).not.toContain('codegraph sync');
+    expect(a).not.toContain('codegraph index -f');
   });
 
   it('buildWindowsUpgradeScript targets the right asset per arch', () => {
@@ -513,7 +516,7 @@ describe('runUpgrade', () => {
     expect(calls.runs[0].args[1]).toContain('curl -fsSL');
     expect(calls.runs[0].args[1]).toContain('| sh');
     expect(calls.runs[0].env?.CODEGRAPH_INSTALL_DIR).toBe('/h/.codegraph');
-    expect(calls.logs.join('\n')).toMatch(/codegraph sync/); // re-index advisory printed
+    expect(calls.logs.join('\n')).toMatch(/codegraph index/); // re-index advisory printed
   });
 
   it('unix bundle: falls back to wget, and errors when neither downloader exists', async () => {
@@ -1065,7 +1068,8 @@ describe('post-upgrade refresh keeps the user\'s instructions files (#2506)', ()
     const refresh = calls.runs[calls.runs.length - 1];
     expect(refresh?.cmd).toBe('codegraph');
     expect(refresh?.args).toEqual(['install', '--refresh']);
-    expect(fs.readFileSync(agentsMd, 'utf-8')).toBe(notes + CODEGRAPH_INSTRUCTIONS_BLOCK + '\n');
+    // OpenCode's own block, naming the tool as OpenCode lists it (#1267).
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toBe(notes + OPENCODE_INSTRUCTIONS_BLOCK + '\n');
   }, 90_000);
 });
 

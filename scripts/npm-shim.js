@@ -57,6 +57,18 @@ async function main() {
     process.stderr.write('codegraph: ' + res.error.message + '\n');
     process.exit(1);
   }
+  if (res.signal) {
+    // The bundled runtime was killed by a signal, most often the kernel's
+    // out-of-memory killer. Say so and exit as a shell would, 128 plus the
+    // signal's number (137 for SIGKILL), so a script can tell a kill from a
+    // failure; a bare exit 1 said neither (issue #3277). The CLI's own
+    // relaunch (src/extraction/wasm-runtime-flags.ts) does the same.
+    process.stderr.write(res.signal === 'SIGKILL'
+      ? 'codegraph: the process was killed by SIGKILL; the system may have run out of memory.\n'
+      : 'codegraph: the process was stopped by ' + res.signal + '.\n');
+    var signo = os.constants.signals[res.signal];
+    process.exit(typeof signo === 'number' ? 128 + signo : 1);
+  }
   process.exit(res.status === null ? 1 : res.status);
 }
 
@@ -100,10 +112,11 @@ function launcherIn(dir) {
 // launcher already passes it; on Windows we invoke node.exe directly so add it.
 // --disable-warning=ExperimentalWarning mutes node:sqlite's per-thread
 // "experimental feature" warning, which otherwise prints once per parse worker
-// mid-index, shredding the progress UI. The bundled node.exe is always new
-// enough for both flags.
+// mid-index, shredding the progress UI. --max-semi-space-size=16 keeps V8's
+// space for new objects at Node 22's size in every thread. The bundled node.exe
+// is always new enough for all three flags.
 function liftoff(entry) {
-  return ['--liftoff-only', '--disable-warning=ExperimentalWarning', entry].concat(process.argv.slice(2));
+  return ['--liftoff-only', '--disable-warning=ExperimentalWarning', '--max-semi-space-size=16', entry].concat(process.argv.slice(2));
 }
 
 // Download + cache the platform bundle from GitHub Releases. Returns

@@ -131,6 +131,53 @@ fn is_prefixed(kind: &str) -> bool {
     matches!(kind, "unary_expression" | "await_expression")
 }
 
+/// DART_OPERATOR_EXPRESSIONS (dart.ts) — the expressions an arrow function's
+/// body can end in with the operand on the right last.
+fn is_operator_expression(kind: &str) -> bool {
+    matches!(
+        kind,
+        "equality_expression"
+            | "relational_expression"
+            | "logical_and_expression"
+            | "logical_or_expression"
+            | "if_null_expression"
+            | "additive_expression"
+            | "multiplicative_expression"
+            | "bitwise_and_expression"
+            | "bitwise_or_expression"
+            | "bitwise_xor_expression"
+            | "shift_expression"
+            | "unary_expression"
+            | "await_expression"
+    )
+}
+
+/// DART_LISTS (dart.ts) — the nodes that list the expressions a generic
+/// constructor call can be split across.
+fn is_dart_list(kind: &str) -> bool {
+    matches!(kind, "arguments" | "list_literal" | "set_or_map_literal" | "record_literal")
+}
+
+/// A generic constructor call tree-sitter-dart parsed as comparisons and a
+/// dot shorthand (dartMisparsedCtor in dart.ts).
+#[derive(Clone, Copy)]
+struct MisparsedCtor<'t> {
+    /// Where the call starts, as a parsed one does: the type's name, or its
+    /// import prefix.
+    head: Node<'t>,
+    /// The identifier naming the type (`Future` in `Future<void>.delayed(d)`).
+    type_name: Node<'t>,
+    /// The constructor's name (`delayed`).
+    name: Node<'t>,
+    /// The identifiers naming a type argument the grammar read as an
+    /// expression: one, or two when the call is split at their comma.
+    type_args: [Option<Node<'t>>; 2],
+    /// The `>` closing the type arguments.
+    gt: Node<'t>,
+    /// The relational expression where the type arguments start (`X<A`).
+    start: Node<'t>,
+}
+
 /// DART_COMMENTS (dart.ts) — line and block comments, and dartdoc.
 fn is_comment(node: Node) -> bool {
     matches!(node.kind(), "comment" | "documentation_comment")
@@ -230,9 +277,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
     parser
         .set_language(&grammar)
         .map_err(|e| format!("set_language(dart) failed: {e}"))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| "parser returned null tree".to_string())?;
+    let tree = crate::parse_budget::parse(&mut parser, source)?;
     if tree.root_node().has_error() {
         return Err("defer: parse tree contains errors — wasm recovery is canonical".to_string());
     }
@@ -509,6 +554,25 @@ impl<'t> Walker<'t> {
             .filter(|c| c.kind() == "identifier")
             .collect();
         let class_name = self.enclosing_type_name(node)?;
+        // Dart 3.13's concise constructors leave the class out: `new()`,
+        // `new named()`, `const new()`, `factory()` and `factory make()`
+        // declare what `Foo()`, `Foo.named()`, `const Foo()`, `factory Foo()`
+        // and `factory Foo.make()` do (#3270).
+        let factory = matches!(
+            ctor.kind(),
+            "factory_constructor_signature" | "redirecting_factory_constructor_signature"
+        );
+        let concise = if factory {
+            ids.first().map(|n| self.text(*n)) != Some(class_name)
+        } else {
+            let mut nc = ctor.walk();
+            let has_new = ctor.children(&mut nc).any(|c| c.kind() == "new");
+            has_new
+        };
+        if concise {
+            let ctor_name = ids.first().map(|n| self.text(*n)).unwrap_or(class_name);
+            return Some((class_name.to_string(), ctor_name.to_string()));
+        }
         let first = ids.first()?;
         if self.text(*first) != class_name {
             return None; // misparsed method, not a ctor
@@ -540,6 +604,13 @@ impl<'t> Walker<'t> {
     /// and a `const` ctor / redirecting factory that names no enclosing type
     /// (error recovery's).
     fn is_misparsed_function(&self, node: Node<'t>) -> bool {
+        // The part of a Dart 3.13 primary constructor written in the class
+        // body, `this : y = x + 1 { … }`, belongs to the constructor the
+        // header declares: its body runs as the unnamed constructor's does.
+        let mut cursor = node.walk();
+        if node.named_children(&mut cursor).any(|c| c.kind() == "primary_constructor_body_signature") {
+            return true;
+        }
         match self.ctor_info(node) {
             Some((class_name, ctor_name)) => ctor_name == class_name,
             None => is_bodiless_ctor(node.kind()),
@@ -585,6 +656,12 @@ impl<'t> Walker<'t> {
     /// constructor is public (the unwrap misses ctor signatures / the name
     /// FIELD is the class identifier).
     fn visibility_of(&self, node: Node<'t>) -> u8 {
+        // A `const` constructor is public, as d4d8f3e's grammar gave it no
+        // `name` field: 0038280 names its class there (`_Impl` in `const
+        // _Impl.named()`), which says nothing of the constructor's own.
+        if node.kind() == "constant_constructor_signature" {
+            return 1;
+        }
         let name_node = if node.kind() == "method_signature" {
             let mut cursor = node.walk();
             let inner = node.named_children(&mut cursor).find(|c| {
@@ -996,8 +1073,10 @@ impl<'t> Walker<'t> {
         let Some(row) = row else { return };
         self.extract_inheritance(node, row);
         // extractCsharpPrimaryCtorParamRefs — csharp-gated no-op.
+        self.primary_ctor_type_refs(node, row);
         self.extract_decorators_for(node, row);
         self.stack.push(Scope { row, kind: "class", name });
+        self.named_primary_ctor(node);
         let body = resolved_body.unwrap_or(node);
         let mut cursor = body.walk();
         let children: Vec<Node<'t>> = body.named_children(&mut cursor).collect();
@@ -1028,8 +1107,10 @@ impl<'t> Walker<'t> {
         // Enum `with` mixins are a DIRECT child (no superclass wrapper) →
         // no clause matches; `interfaces` DOES → implements only.
         self.extract_inheritance(node, row);
+        self.primary_ctor_type_refs(node, row);
         // No extractDecoratorsFor on the enum path.
         self.stack.push(Scope { row, kind: "enum", name });
+        self.named_primary_ctor(node);
         let mut cursor = body.walk();
         let children: Vec<Node<'t>> = body.named_children(&mut cursor).collect();
         for child in children {
@@ -1040,6 +1121,50 @@ impl<'t> Walker<'t> {
             }
         }
         self.stack.pop();
+    }
+
+    /// extractDartPrimaryCtorRefs (tree-sitter.ts) — a Dart 3.13 primary
+    /// constructor in a class or enum header, `class Point(final Offset
+    /// origin, {Size? size})`: the types its parameters name are the type's,
+    /// as a field's declared type is (#3270).
+    fn primary_ctor_type_refs(&mut self, node: Node<'t>, row: u32) {
+        let params = node
+            .child_by_field_name("primary_constructor")
+            .and_then(|c| c.child_by_field_name("parameters"));
+        if let Some(params) = params {
+            self.type_refs_dart(params, row);
+        }
+    }
+
+    /// extractDartNamedPrimaryCtor (tree-sitter.ts) — a named Dart 3.13
+    /// primary constructor, `class Point.origin(final int x)`, is the type's
+    /// named constructor: a method named `origin` returning the type (on top
+    /// of the stack), which a call `Point.origin(…)` links (#3270).
+    fn named_primary_ctor(&mut self, node: Node<'t>) {
+        let Some(ctor) = node.child_by_field_name("primary_constructor") else { return };
+        let Some(name) = ctor.child_by_field_name("name").filter(|n| n.kind() == "identifier") else {
+            return;
+        };
+        let type_name = self.stack.last().map(|s| s.name.clone());
+        let signature = ctor
+            .child_by_field_name("parameters")
+            .map(|p| self.text(p).trim().to_string())
+            .filter(|s| !s.is_empty());
+        let name = self.text(name).to_string();
+        self.create_node(
+            "method",
+            &name,
+            ctor,
+            Extra {
+                docstring: None,
+                signature,
+                visibility: 1,
+                is_async: Some(false),
+                is_static: Some(false),
+                return_type: type_name,
+                end_line_override: None,
+            },
+        );
     }
 
     /// extractEnumMembers (:1958) — one enum_member per constant, positioned
@@ -1287,7 +1412,14 @@ impl<'t> Walker<'t> {
             .and_then(|p| p.named_child(p.named_child_count().checked_sub(1)?));
         match body {
             Some(body) if body.kind() == "function_expression_body" => {
-                body.named_child(body.named_child_count().checked_sub(1)?)
+                // The arrow can end on an operator's operand, which is the
+                // receiver: `(s) => s.id == context.read<Cubit>().id` comes
+                // out as `((s) => s.id == context).read<Cubit>()…`.
+                let mut end = body.named_child(body.named_child_count().checked_sub(1)?);
+                while let Some(e) = end.filter(|e| is_operator_expression(e.kind())) {
+                    end = e.named_child(e.named_child_count().checked_sub(1)?);
+                }
+                end
             }
             _ => prev,
         }
@@ -1447,18 +1579,27 @@ impl<'t> Walker<'t> {
             after = u.next_named_sibling();
             up = if after.is_some() { None } else { u.parent() };
         }
-        if let Some(a) = after {
-            if a.kind() == "relational_operator" && self.misparsed_generic_call(a).is_some() {
+        if let Some(a) = after.filter(|a| a.kind() == "relational_operator") {
+            if self.misparsed_generic_call(a).is_some() {
                 return true;
             }
+            // `p.Box<int>.named(…)`, under an `await` too: the `<` after the prefix.
+            if let Some(rel) = a.parent() {
+                if self.misparsed_ctor_in(rel, receiver) {
+                    return true;
+                }
+            }
         }
-        if parent.map(|p| p.kind()) != Some("relational_expression") {
+        let Some(parent) = parent.filter(|p| p.kind() == "relational_expression") else {
             return false;
-        }
-        receiver
+        };
+        let in_generic_call = receiver
             .prev_named_sibling()
             .map(|b| b.kind() == "relational_operator" && self.misparsed_generic_call(b).is_some())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        // So do the import prefix and a prefixed type argument of a misparsed
+        // generic constructor call.
+        in_generic_call || self.misparsed_ctor_in(parent, receiver)
     }
 
     /// dartCalleeOfArgPart (dart.ts:100-116).
@@ -1500,6 +1641,14 @@ impl<'t> Walker<'t> {
     /// `BlocProvider<CounterCubit>.value(…)`, when `selector` is the `<…>`
     /// between the type and `.value`. Only a constructor is called that way.
     fn type_arguments_receiver(&self, selector: Node<'t>) -> Option<&'t str> {
+        self.type_arguments_type(selector).map(|t| self.text(t))
+    }
+
+    /// dartTypeArgumentsType (dart.ts) — the identifier naming the type that
+    /// the type-arguments-only `selector` follows: `BlocProvider` in
+    /// `BlocProvider<CounterCubit>.value(…)`, and `Box` in
+    /// `p.Box<int>.named(…)`, whose import prefix reads as a receiver.
+    fn type_arguments_type(&self, selector: Node<'t>) -> Option<Node<'t>> {
         if selector.kind() != "selector" || selector.named_child_count() != 1 {
             return None;
         }
@@ -1507,10 +1656,243 @@ impl<'t> Walker<'t> {
             return None;
         }
         let type_node = prev_named(selector)?;
-        if type_node.kind() != "identifier" {
+        if type_node.kind() == "identifier" {
+            return Some(type_node);
+        }
+        self.prefixed_type_name(type_node)
+    }
+
+    /// dartPrefixedTypeName (dart.ts) — the type `X` that the selector `.X`
+    /// names after an import prefix, when a type's `<…>` follows it: a member
+    /// access to an UpperCamelCase name, on a plain name.
+    fn prefixed_type_name(&self, selector: Node<'t>) -> Option<Node<'t>> {
+        if selector.kind() != "selector" || selector.named_child_count() != 1 {
             return None;
         }
-        Some(self.text(type_node))
+        let accessor = selector.named_child(0)?;
+        if accessor.kind() != "unconditional_assignable_selector" {
+            return None;
+        }
+        let mut ac = accessor.walk();
+        let name = accessor.named_children(&mut ac).find(|c| c.kind() == "identifier")?;
+        if !is_upper_camel(self.text(name)) {
+            return None;
+        }
+        (prev_named(selector)?.kind() == "identifier").then_some(name)
+    }
+
+    /// dartTypeArgPart (dart.ts) — a type argument the grammar read as an
+    /// expression, starting at `node`: `T`, `p.T`, `T<…>` or `p.T<…>`. The
+    /// identifier naming the type, and the node after the argument (None at
+    /// the end of its parent). A type is UpperCamelCase, or one of Dart's
+    /// lowercase built-ins (`int`, `void`).
+    fn type_arg_part(&self, node: Option<Node<'t>>) -> Option<(Node<'t>, Option<Node<'t>>)> {
+        let node = node.filter(|n| n.kind() == "identifier")?;
+        let mut name = node;
+        let mut rest = node.next_named_sibling();
+        if let Some(sel) = rest {
+            let accessor = sel.named_child(0).filter(|a| a.kind() == "unconditional_assignable_selector");
+            if sel.kind() == "selector" && sel.named_child_count() == 1 {
+                if let Some(accessor) = accessor {
+                    let mut ac = accessor.walk();
+                    let id = accessor.named_children(&mut ac).find(|c| c.kind() == "identifier");
+                    name = id?;
+                    rest = sel.next_named_sibling();
+                }
+            }
+        }
+        if let Some(sel) = rest {
+            let only_type_args = sel.named_child_count() == 1
+                && sel.named_child(0).map(|t| t.kind() == "type_arguments").unwrap_or(false);
+            if sel.kind() == "selector" && only_type_args {
+                rest = sel.next_named_sibling();
+            }
+        }
+        let text = self.text(name);
+        if !is_upper_camel(text) && !is_lowercase_type(text) {
+            return None;
+        }
+        Some((name, rest))
+    }
+
+    /// dartCtorCallee (dart.ts) — the type a misparsed generic constructor
+    /// call names, from the `<` that opens its type arguments inside `rel`:
+    /// `X` in `X<T>`, or `p.X` with its import prefix. The callee is all of
+    /// `rel` before the `<`, under an `await` or a prefix operator too, and
+    /// the `<` is written against it.
+    fn ctor_callee(&self, rel: Node<'t>, lt: Node<'t>) -> Option<(Node<'t>, Node<'t>)> {
+        let before = lt.prev_named_sibling()?;
+        if before.end_byte() != lt.start_byte() {
+            return None;
+        }
+        // `await Future<void>.delayed(d)` and `await p.Box<int>.named(…)` put
+        // the callee under the `await`.
+        let mut last = before;
+        if is_prefixed(before.kind()) {
+            if rel.named_child(0)? != before {
+                return None;
+            }
+            while is_prefixed(last.kind()) {
+                last = last.named_child(last.named_child_count().checked_sub(1)?)?;
+            }
+        }
+        let (head, type_name) = if last.kind() == "selector" {
+            // `p.X<T>.named(…)`: the import prefix, then the type.
+            let accessor = last.named_child(0)?;
+            if last.named_child_count() != 1 || accessor.kind() != "unconditional_assignable_selector" {
+                return None;
+            }
+            let mut ac = accessor.walk();
+            let type_name = accessor.named_children(&mut ac).find(|c| c.kind() == "identifier")?;
+            (last.prev_named_sibling()?, type_name)
+        } else {
+            (last, last)
+        };
+        if head.kind() != "identifier" {
+            return None;
+        }
+        // Written as it is, the callee is all of `rel` before the `<`.
+        if last == before && rel.named_child(0)? != head {
+            return None;
+        }
+        if !is_upper_camel(self.text(type_name)) {
+            return None;
+        }
+        Some((head, type_name))
+    }
+
+    /// dartCtorTypeArgsStart (dart.ts) — the `<` of a relational expression
+    /// that opens a misparsed call's type arguments: its only operator.
+    fn ctor_type_args_start(&self, rel: Node<'t>) -> Option<Node<'t>> {
+        if rel.kind() != "relational_expression" {
+            return None;
+        }
+        let mut cursor = rel.walk();
+        let mut ops = rel.named_children(&mut cursor).filter(|c| c.kind() == "relational_operator");
+        let op = ops.next()?;
+        if ops.next().is_some() || op.child(0)?.kind() != "<" {
+            return None;
+        }
+        Some(op)
+    }
+
+    /// dartPrevListedExpression (dart.ts) — the expression before the one
+    /// `expr` stands for in a list of arguments, list or map elements, or
+    /// record fields, where tree-sitter-dart splits a generic constructor
+    /// call at the comma between its type arguments.
+    fn prev_listed_expression(&self, expr: Node<'t>) -> Option<Node<'t>> {
+        let parent = expr.parent();
+        let item = match parent {
+            Some(p) if matches!(p.kind(), "argument" | "record_field") => p,
+            _ => expr,
+        };
+        if !is_dart_list(item.parent()?.kind()) {
+            return None;
+        }
+        let prev = prev_named(item)?;
+        match prev.kind() {
+            "pair" => prev.child_by_field_name("value"),
+            "argument" | "record_field" | "named_argument" => {
+                prev.named_child(prev.named_child_count().checked_sub(1)?)
+            }
+            _ => Some(prev),
+        }
+    }
+
+    /// dartMisparsedCtor (dart.ts) — a generic constructor call
+    /// tree-sitter-dart parsed as comparisons and a dot shorthand, found from
+    /// the relational expression `tail` that holds its `>`: `(Future < void) >
+    /// .delayed(d)`, or, with two type arguments in a list, `Map < String`
+    /// then `int > .of(m)` in the next item. Recovered when laid out as a call:
+    /// `<` against the type, a type in each argument, `>` against the `.name`.
+    fn misparsed_ctor(&self, tail: Node<'t>) -> Option<MisparsedCtor<'t>> {
+        if tail.kind() != "relational_expression" {
+            return None;
+        }
+        let mut cursor = tail.walk();
+        let kids: Vec<Node<'t>> = tail.named_children(&mut cursor).collect();
+        let dot_at = kids.iter().position(|c| c.kind() == "dot_shorthand")?;
+        if dot_at < 2 {
+            return None;
+        }
+        let dot = kids[dot_at];
+        let gt = kids[dot_at - 1];
+        if gt.kind() != "relational_operator" || gt.child(0)?.kind() != ">" || gt.end_byte() != dot.start_byte() {
+            return None;
+        }
+        let call = kids.get(dot_at + 1)?;
+        let mut cc = call.walk();
+        if call.kind() != "selector" || !call.named_children(&mut cc).any(|c| c.kind() == "argument_part") {
+            return None;
+        }
+        let name = dot.named_child(0).filter(|n| n.kind() == "identifier" && dot.named_child_count() == 1)?;
+        let first = kids[0];
+        // One type argument: `(X < T) > .name(…)`.
+        if dot_at == 2 && first.kind() == "relational_expression" {
+            let lt = self.ctor_type_args_start(first)?;
+            let (head, type_name) = self.ctor_callee(first, lt)?;
+            let (arg, next) = self.type_arg_part(lt.next_named_sibling())?;
+            if next.is_some() {
+                return None;
+            }
+            return Some(MisparsedCtor { head, type_name, name, type_args: [Some(arg), None], gt, start: first });
+        }
+        // Two, split at their comma: `X < A`, then `B > .name(…)` in the next item.
+        let (last, last_next) = self.type_arg_part(Some(first))?;
+        if last_next != Some(gt) {
+            return None;
+        }
+        let start = self.prev_listed_expression(tail)?;
+        let lt = self.ctor_type_args_start(start)?;
+        let (head, type_name) = self.ctor_callee(start, lt)?;
+        let (arg, next) = self.type_arg_part(lt.next_named_sibling())?;
+        if next.is_some() {
+            return None;
+        }
+        Some(MisparsedCtor { head, type_name, name, type_args: [Some(arg), Some(last)], gt, start })
+    }
+
+    /// dartMisparsedCtorIn (dart.ts) — whether the relational expression `rel`
+    /// holds part of a misparsed generic constructor call before its `>`,
+    /// where `node` is: its import prefix and a prefixed type argument read no
+    /// member, and the call's types are referenced by the body walker.
+    fn misparsed_ctor_in(&self, rel: Node<'t>, node: Node<'t>) -> bool {
+        if let Some(own) = self.misparsed_ctor(rel) {
+            return node.end_byte() <= own.gt.start_byte();
+        }
+        // The `X < T` of `(X < T) > .name(…)`, or the `X < A` a split call
+        // starts with: laid out as one before looking up from it
+        // (`a.length < b.length` is not).
+        let Some(lt) = self.ctor_type_args_start(rel) else { return false };
+        if self.ctor_callee(rel, lt).is_none() {
+            return false;
+        }
+        match self.type_arg_part(lt.next_named_sibling()) {
+            Some((_, None)) => {}
+            _ => return false,
+        }
+        if let Some(outer) = rel.parent().filter(|o| o.kind() == "relational_expression") {
+            if outer.named_child(0) == Some(rel) {
+                return self.misparsed_ctor(outer).map(|c| c.start == rel).unwrap_or(false);
+            }
+        }
+        self.next_listed_ctor(rel).is_some()
+    }
+
+    /// dartNextListedCtor (dart.ts) — the split constructor call that `start`
+    /// begins (`X < A`), from the next item of its list.
+    fn next_listed_ctor(&self, start: Node<'t>) -> Option<MisparsedCtor<'t>> {
+        self.ctor_type_args_start(start)?;
+        let item = match start.parent() {
+            Some(p) if matches!(p.kind(), "pair" | "argument" | "record_field" | "named_argument") => p,
+            _ => start,
+        };
+        let next = next_named(item)?;
+        let tail = if matches!(next.kind(), "argument" | "record_field") { next.named_child(0)? } else { next };
+        if tail.kind() != "relational_expression" {
+            return None;
+        }
+        self.misparsed_ctor(tail).filter(|c| c.start == start)
     }
 
     // --- extractStaticMemberRef — the dart branch (:4759-4767) ------------
@@ -1527,8 +1909,15 @@ impl<'t> Walker<'t> {
         if node.named_children(&mut cursor).any(|c| c.kind() == "argument_part") {
             return;
         }
-        let Some(prev) = self.receiver_of(node) else { return };
-        if prev.kind() == "identifier" && cap_ident_re().is_match(self.text(prev)) {
+        // So is `Map` in `List<Map<K, V>>.from(m)` when the grammar split the
+        // call into comparisons: the body walker references the call's types.
+        if let Some(parent) = node.parent().filter(|p| p.kind() == "relational_expression") {
+            if self.misparsed_ctor_in(parent, node) {
+                return;
+            }
+        }
+        let prev = self.receiver_of(node);
+        if let Some(prev) = prev.filter(|p| p.kind() == "identifier" && cap_ident_re().is_match(self.text(*p))) {
             // `Map` in `x.read<Map<K, V>>(y)` parsed as comparisons is a type
             // argument, which the body walker references as a type.
             if let Some(before) = prev.prev_named_sibling() {
@@ -1540,6 +1929,14 @@ impl<'t> Walker<'t> {
             // NO callee-of-call skip — `ConfigT.load()` double-emits
             // (references + calls). Position = the IDENTIFIER (receiver).
             self.push_ref_at(owner_row, &name, "references", prev);
+            return;
+        }
+        // The type a `<…>` follows is referenced as a type, `_Box` and `$Box`
+        // in `_Box<T>.named(…)` too, and `Box` after an import prefix in
+        // `p.Box<T>.named(…)`.
+        if let Some(type_node) = self.type_arguments_type(node).filter(|t| self.is_type_name_dart(*t)) {
+            let name = self.text(type_node).to_string();
+            self.push_ref_at(owner_row, &name, "references", type_node);
         }
     }
 
@@ -1845,6 +2242,10 @@ impl<'t> Walker<'t> {
                     return;
                 }
             }
+            // `p.Box` in `p.Box<int>.named(…)` is a type, after its import prefix.
+            if self.type_arguments_type(next) == Some(member) {
+                return;
+            }
         }
         // The callee of a generic call the grammar read as comparisons
         // (`ref.read<Repo>(p)`) is called; a prefixed type argument names a type.
@@ -1889,6 +2290,23 @@ impl<'t> Walker<'t> {
             let name = self.text(type_node).to_string();
             let owner = self.top_row();
             self.push_ref_at(owner, &name, "references", type_node);
+        }
+        // A generic constructor call the grammar read as comparisons and a
+        // dot shorthand, `(Future < void) > .delayed(d)`: the call, from where
+        // a parsed one starts, and the types it names (dartMisparsedCtor).
+        if kind == "relational_expression" && !self.stack.is_empty() {
+            if let Some(ctor) = self.misparsed_ctor(node) {
+                let owner = self.top_row();
+                let callee = format!("{}.{}", self.text(ctor.type_name), self.text(ctor.name));
+                self.push_ref_at(owner, &callee, "calls", ctor.head);
+                let [first, second] = ctor.type_args;
+                for type_node in [Some(ctor.type_name), first, second].into_iter().flatten() {
+                    if self.is_type_name_dart(type_node) {
+                        let name = self.text(type_node).to_string();
+                        self.push_ref_at(owner, &name, "references", type_node);
+                    }
+                }
+            }
         }
 
         if kind == "function_signature" {

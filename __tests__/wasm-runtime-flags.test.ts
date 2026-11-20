@@ -20,6 +20,8 @@ import {
   nodeRuntimeFlagsFor,
   processHasWasmRuntimeFlags,
   buildRelaunchArgv,
+  signalExitCode,
+  signalKillMessage,
 } from '../src/extraction/wasm-runtime-flags';
 
 describe('WASM_RUNTIME_FLAGS', () => {
@@ -57,6 +59,17 @@ describe('NODE_RUNTIME_FLAGS', () => {
     );
     expect(res.status, res.stderr).toBe(0);
     expect(res.stderr).not.toMatch(/ExperimentalWarning/);
+  });
+
+  it('keeps a thread\'s space for new objects at 16 MB a semi-space', () => {
+    expect(NODE_RUNTIME_FLAGS).toContain('--max-semi-space-size=16');
+    const res = spawnSync(
+      process.execPath,
+      [...NODE_RUNTIME_FLAGS, '-e', 'let a = []; for (let i = 0; i < 4e6; i++) { a.push({ i }); if (a.length > 2e5) a = []; } console.log(require("v8").getHeapSpaceStatistics().find((s) => s.space_name === "new_space").space_size)'],
+      { encoding: 'utf8' }
+    );
+    expect(res.status, res.stderr).toBe(0);
+    expect(Number(res.stdout)).toBeLessThanOrEqual(33 * 1024 * 1024);
   });
 
   it('is empty on nodes too old for --disable-warning (fatal "bad option" there)', () => {
@@ -126,5 +139,65 @@ describe('buildRelaunchArgv', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * A relaunched process killed by a signal (an out-of-memory kill, most often)
+ * made `codegraph` exit 1 and print nothing, so a script couldn't tell a kill
+ * from a failure (#3277). It now names the signal on stderr and exits as a
+ * shell would, 128 plus the signal's number.
+ */
+describe('a relaunched process killed by a signal (#3277)', () => {
+  it('maps a signal to the exit code a shell gives it', () => {
+    expect(signalExitCode('SIGKILL')).toBe(137);
+    expect(signalExitCode('SIGTERM')).toBe(143);
+    expect(signalExitCode('SIGNOTREAL')).toBe(1);
+    expect(signalKillMessage('SIGKILL')).toMatch(/killed by SIGKILL.*out of memory/);
+    expect(signalKillMessage('SIGTERM')).toBe('codegraph: the process was stopped by SIGTERM.');
+  });
+
+  /** Run a script through the real relaunch; its relaunched copy ends as `how` says (a signal, or an exit code). */
+  function relaunchEndingWith(how: string): { status: number | null; signal: string | null; stderr: string } {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-relaunch-signal-'));
+    try {
+      const harness = path.join(dir, 'harness.cjs');
+      fs.writeFileSync(harness, [
+        `const { relaunchWithWasmRuntimeFlagsIfNeeded } = require(${JSON.stringify(path.resolve(__dirname, '../dist/extraction/wasm-runtime-flags.js'))});`,
+        'if (process.env.CODEGRAPH_WASM_RELAUNCHED) {',
+        '  const how = process.env.CG_TEST_RELAUNCHED_ENDS;',
+        "  if (how.startsWith('SIG')) process.kill(process.pid, how); else process.exit(Number(how));",
+        '}',
+        'relaunchWithWasmRuntimeFlagsIfNeeded(__filename);',
+        "process.stdout.write('not relaunched');",
+      ].join('\n'));
+      const env: NodeJS.ProcessEnv = { ...process.env, CG_TEST_RELAUNCHED_ENDS: how };
+      delete env.CODEGRAPH_WASM_RELAUNCHED;
+      delete env.CODEGRAPH_NO_RELAUNCH;
+      const res = spawnSync(process.execPath, [harness], { encoding: 'utf8', env });
+      return { status: res.status, signal: res.signal, stderr: res.stderr };
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('passes an exit code through unchanged, with nothing on stderr', () => {
+    const res = relaunchEndingWith('3');
+    expect(res.status).toBe(3);
+    expect(res.stderr).not.toContain('codegraph:');
+  });
+
+  // Windows has no signals: a process ended from outside has an exit code, so
+  // the relaunch's parent never sees one.
+  it.runIf(process.platform !== 'win32')('names SIGKILL as a likely out-of-memory kill and exits 137', () => {
+    const res = relaunchEndingWith('SIGKILL');
+    expect(res.status).toBe(137);
+    expect(res.stderr).toContain('codegraph: the process was killed by SIGKILL; the system may have run out of memory.');
+  });
+
+  it.runIf(process.platform !== 'win32')('names another signal and exits 128 plus its number', () => {
+    const res = relaunchEndingWith('SIGTERM');
+    expect(res.status).toBe(143);
+    expect(res.stderr).toContain('codegraph: the process was stopped by SIGTERM.');
   });
 });

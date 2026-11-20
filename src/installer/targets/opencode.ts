@@ -65,6 +65,7 @@ import {
 import {
   CODEGRAPH_SECTION_END,
   CODEGRAPH_SECTION_START,
+  OPENCODE_INSTRUCTIONS_BLOCK,
 } from '../instructions-template';
 
 function globalConfigDir(): string {
@@ -178,8 +179,10 @@ class OpencodeTarget implements AgentTarget {
 
     // AGENTS.md gets the short marker-fenced CodeGraph block (#704):
     // subagents and non-MCP harnesses read AGENTS.md but never the MCP
-    // initialize instructions. Upsert self-heals a stale pre-#529 block.
-    files.push(upsertInstructionsEntry(instructionsPath(loc)));
+    // initialize instructions. Upsert self-heals a stale pre-#529 block, and
+    // the plain block an earlier install wrote. OpenCode's block names the
+    // tool as OpenCode lists it, `codegraph_codegraph_explore` (#1267).
+    files.push(upsertInstructionsEntry(instructionsPath(loc), OPENCODE_INSTRUCTIONS_BLOCK));
 
     // Self-heal a pre-#535 install that wrote to %APPDATA%/opencode —
     // opencode never reads it, so anything of ours there is stale.

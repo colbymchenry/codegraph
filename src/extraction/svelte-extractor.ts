@@ -2,7 +2,7 @@ import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference, Lan
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
-import { foldScriptResult, sfcFileNode, sfcScriptLanguage } from './sfc-script';
+import { foldScriptResult, sfcFileNode, sfcScriptLanguage, SFC_SCRIPT_ELEMENT, sfcBlockLineRanges } from './sfc-script';
 
 /** Svelte 5 rune names — compiler builtins, not real functions */
 const SVELTE_RUNES = new Set([
@@ -125,12 +125,16 @@ export class SvelteExtractor {
       isTypeScript: boolean;
     }> = [];
 
-    const scriptRegex = /<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/g;
+    // A self-closing `<script ... />` (e.g. a third-party script in
+    // `<svelte:head>`) has no body; match it on its own so it cannot run on to
+    // the next `</script>`.
+    const scriptRegex = new RegExp(SFC_SCRIPT_ELEMENT);
     let match;
 
     while ((match = scriptRegex.exec(this.source)) !== null) {
+      if (match.groups?.content === undefined) continue;
       const attrs = match[1] || '';
-      const content = match.groups?.content || match[2] || '';
+      const content = match.groups.content;
 
       // Detect TypeScript from lang attribute
       const isTypeScript = sfcScriptLanguage(attrs, 'svelte') === 'typescript';
@@ -200,17 +204,10 @@ export class SvelteExtractor {
     componentNodeId: string,
     _scriptBlocks: Array<{ content: string; startLine: number }>
   ): void {
-    // Build a set of line ranges covered by <script> and <style> blocks so we skip them
-    const coveredRanges: Array<[number, number]> = [];
-
-    // Find all <script>...</script> and <style>...</style> ranges
-    const tagRegex = /<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
-    let tagMatch;
-    while ((tagMatch = tagRegex.exec(this.source)) !== null) {
-      const startLine = (this.source.substring(0, tagMatch.index).match(/\n/g) || []).length;
-      const endLine = startLine + (tagMatch[0].match(/\n/g) || []).length;
-      coveredRanges.push([startLine, endLine]);
-    }
+    // Line ranges covered by <script> and <style> blocks, so we skip them. A
+    // self-closing tag covers nothing: its attributes
+    // (`src={assetUrl('/analytics.js')}`) are template expressions.
+    const coveredRanges = sfcBlockLineRanges(this.source);
 
     // Find template expressions: {...} outside of script/style blocks
     // Matches curly-brace expressions, excluding Svelte block syntax ({#if}, {:else}, {/if}, {@html}, {@render})
@@ -259,14 +256,7 @@ export class SvelteExtractor {
    */
   private extractTemplateComponents(componentNodeId: string): void {
     // Build ranges covered by <script> and <style> blocks to skip them
-    const coveredRanges: Array<[number, number]> = [];
-    const tagRegex = /<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g;
-    let tagMatch;
-    while ((tagMatch = tagRegex.exec(this.source)) !== null) {
-      const startLine = (this.source.substring(0, tagMatch.index).match(/\n/g) || []).length;
-      const endLine = startLine + (tagMatch[0].match(/\n/g) || []).length;
-      coveredRanges.push([startLine, endLine]);
-    }
+    const coveredRanges = sfcBlockLineRanges(this.source);
 
     const lines = this.source.split('\n');
     // Match PascalCase opening/self-closing tags (closing tags </Foo> start with </ so won't match)

@@ -464,16 +464,20 @@ export class LiquidExtractor {
    * declarations as variables
    */
   private extractAssignments(fileNodeId: string): void {
+    // A name is word characters and `-`, as Liquid reads it: `title-text` is one
+    // name. One that goes on with `.` gets no node rather than a cut-short one.
+    const name = `\\w[\\w-]*`;
     // Both spellings. Most of a modern theme's assigns are the bare kind.
-    for (const match of this.findTagOccurrences('assign', `(\\w+)\\s*=`)) {
+    for (const match of this.findTagOccurrences('assign', `(${name})\\s*=`)) {
       this.addVariable(fileNodeId, match.groups[1]!, match);
     }
     // A capture declares its name as an assign does, and Liquid reads a quoted
-    // name (`{% capture 'title' %}`) as the name inside the quotes. A name that
-    // goes on with `-` or `.`, which the assign rule doesn't read either, gets
-    // no node rather than a cut-short one. Captures come after assigns, so an
-    // assign keeps its id when a capture of the same name shares its line.
-    for (const match of this.findTagOccurrences('capture', `(?:'(\\w+)'|"(\\w+)"|(\\w+))(?=\\s|-?%\\}|$)`)) {
+    // name (`{% capture 'title' %}`) as the name inside the quotes. A bare name
+    // ends at the first whitespace or at the tag's end, `-%}` included: in
+    // `{% capture title-%}` the `-` trims whitespace, so the name is `title`.
+    // Captures come after assigns, so an assign keeps its id when a capture of
+    // the same name shares its line.
+    for (const match of this.findTagOccurrences('capture', `(?:'(${name})'|"(${name})"|(${name}?))(?=\\s|-?%\\}|$)`)) {
       const [, singleQuoted, doubleQuoted, bare] = match.groups;
       this.addVariable(fileNodeId, (singleQuoted ?? doubleQuoted ?? bare)!, match);
     }

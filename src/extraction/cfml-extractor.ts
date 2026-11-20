@@ -3,6 +3,7 @@ import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference, Lan
 import { generateNodeId, NodeIdAllocator } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { getParser } from './grammars';
+import { indexParseBudgetMs, parseTimeoutMessage, parseWithinBudget } from './parse-budget';
 
 /** Tags whose own children include an expression: `<cfset …>`, `<cfif …>`, `<cfelseif …>`, `<cfreturn …>`, and `#…#`. */
 const TAG_EXPRESSION_PARENTS: ReadonlySet<string> = new Set([
@@ -157,10 +158,12 @@ export class CfmlExtractor {
       return;
     }
 
-    const tree = parser.parse(this.source);
+    // Within the file's budget, as every indexing parse (#3274).
+    const budgetMs = indexParseBudgetMs(this.source.length);
+    const tree = parseWithinBudget(parser, this.source, budgetMs);
     if (!tree) {
       this.errors.push({
-        message: 'Failed to parse CFML source',
+        message: parseTimeoutMessage(budgetMs),
         severity: 'error',
         code: 'parse_error',
       });

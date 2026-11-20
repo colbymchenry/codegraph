@@ -5,6 +5,8 @@
  */
 
 export { GraphTraverser } from './traversal';
+export type { CallSiteRow } from './traversal';
+export { callSiteLines, formatCallSiteLines } from './call-sites';
 export { GraphQueryManager } from './queries';
 export {
   buildTypeHierarchy,

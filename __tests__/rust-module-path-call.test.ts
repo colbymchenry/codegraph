@@ -30,9 +30,73 @@ mod twice;
 mod inline_reexport;
 mod fs;
 mod uses_std;
+mod b;
+mod x;
+mod types;
+mod type_;
+mod decoy_list;
+mod uses_config;
+mod walks;
+mod plat;
+
+pub struct Config;
+
+pub fn root_fn() -> usize {
+    0
+}
 
 pub fn via_self() -> usize {
     self::util::take(1)
+}
+`,
+    // `super::x` and `crate::x`, with no module between them and the item.
+    'src/b/mod.rs': 'pub mod c;\npub fn helper() -> usize {\n    1\n}\n',
+    'src/b/c.rs': 'pub fn helper() -> usize {\n    2\n}\npub fn via_bare_super() -> usize {\n    super::helper()\n}\npub fn via_bare_crate() -> usize {\n    crate::root_fn()\n}\n',
+    // `super` in an inline `mod tests { }` is the file's own module, not its directory's parent.
+    'src/x/mod.rs': 'pub mod tested;\npub mod shared;\npub struct Config;\npub fn root_fn() -> usize {\n    9\n}\n',
+    'src/x/shared.rs': 'pub fn helper() -> usize {\n    3\n}\n',
+    'src/x/tested.rs': `mod shared;
+
+pub fn tested_helper() -> usize {
+    4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tested_helper;
+
+    fn via_inline_super() -> usize {
+        super::shared::helper() + tested_helper()
+    }
+}
+`,
+    'src/x/tested/shared.rs': 'pub fn helper() -> usize {\n    5\n}\n',
+    // A module's item it passes on: a `pub use`, a `pub use …::*`.
+    'src/types/mod.rs': 'mod list;\npub use self::list::make_list;\n',
+    'src/types/list.rs': 'pub fn make_list() -> usize {\n    6\n}\n',
+    'src/decoy_list.rs': 'pub fn make_list() -> usize {\n    7\n}\n',
+    'src/type_/mod.rs': 'pub mod prelude;\npub use prelude::*;\n\npub struct Type;\n\nimpl Type {\n    pub fn list() -> usize {\n        8\n    }\n}\n',
+    'src/type_/prelude.rs': 'pub fn list() -> usize {\n    9\n}\n',
+    'src/uses_config.rs': 'use crate::{Config};\n',
+    // A re-export written in a macro's braces, as `cfg_if!` takes them, is the module's.
+    'src/plat/mod.rs': 'cfg_if::cfg_if! {\n    if #[cfg(unix)] {\n        mod unix;\n        pub use self::unix::open;\n    }\n}\n',
+    'src/plat/unix.rs': 'pub fn open() -> usize {\n    10\n}\n',
+    'src/decoy_open.rs': 'pub fn open() -> usize {\n    11\n}\n',
+    'src/walks.rs': `pub fn via_reexport() -> usize {
+    crate::types::make_list()
+}
+
+pub fn via_glob() -> usize {
+    crate::type_::list()
+}
+
+pub fn via_macro_reexport() -> usize {
+    crate::plat::open()
+}
+
+pub fn via_block_std() {
+    use std::fs;
+    let _ = fs::read("config.toml");
 }
 `,
     // A namesake in an inline module, before the module's own item.
@@ -219,5 +283,35 @@ describe('Rust calls through a module path', () => {
   it('leave a path through a module a `use` takes from the standard library to it', () => {
     // `fs::read` under `use std::fs;` is std's, not `src/fs/mod.rs`'s `read`.
     expect(callsFrom('src/uses_std.rs', 'loads')).toEqual([]);
+    expect(callsFrom('src/walks.rs', 'via_block_std')).toEqual([]);
+  });
+
+  it('reach the item of the module `super` and `crate` name, with no module between', () => {
+    expect(callsFrom('src/b/c.rs', 'via_bare_super')).toEqual(['function helper src/b/mod.rs:2']);
+    expect(callsFrom('src/b/c.rs', 'via_bare_crate')).toEqual(['function root_fn src/lib.rs:23']);
+  });
+
+  it('read `super` in an inline module as the module of its file', () => {
+    expect(callsFrom('src/x/tested.rs', 'via_inline_super').sort()).toEqual([
+      'function helper src/x/tested/shared.rs:1',
+      'function tested_helper src/x/tested.rs:3',
+    ]);
+    const ids = cg.getNodesInFile('src/x/tested.rs').map((n) => n.id);
+    const imported = cg.getOutgoingEdgesFrom(ids).filter((e) => e.kind === 'imports')
+      .map((e) => cg.getNode(e.target)!).map((t) => `${t.kind} ${t.qualifiedName} ${t.filePath}:${t.startLine}`);
+    expect(imported).toEqual(['function tested_helper src/x/tested.rs:3']);
+  });
+
+  it('reach an item the module passes on with a `pub use`, or a glob of one', () => {
+    expect(callsFrom('src/walks.rs', 'via_reexport')).toEqual(['function make_list src/types/list.rs:1']);
+    expect(callsFrom('src/walks.rs', 'via_glob')).toEqual(['function list src/type_/prelude.rs:1']);
+    expect(callsFrom('src/walks.rs', 'via_macro_reexport')).toEqual(['function open src/plat/unix.rs:1']);
+  });
+
+  it('bind a `use crate::{Item}` to the crate root\'s item', () => {
+    const ids = cg.getNodesInFile('src/uses_config.rs').map((n) => n.id);
+    const imported = cg.getOutgoingEdgesFrom(ids).filter((e) => e.kind === 'imports')
+      .map((e) => cg.getNode(e.target)!).map((t) => `${t.kind} ${t.qualifiedName} ${t.filePath}:${t.startLine}`);
+    expect(imported).toEqual(['struct Config src/lib.rs:21']);
   });
 });

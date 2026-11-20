@@ -21,10 +21,14 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
+import { cargoManifestFields, isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustCallUnreachable, isRustTraitImplMember, isRustOtherTypesMethod, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoBuiltinReceiverCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
+import { isPythonImportStatementModule } from './name-matcher';
+import { isJsThisCall } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
-import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
+import { isRefusedDeepThisTarget } from './name-matcher';
+import { isLexicalBindingOfJsThisCall } from './name-matcher';
+import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
@@ -34,28 +38,39 @@ import {
 } from './pascal-scope';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
+import { preferPythonImplementation, clearPythonOverloadMemos } from './python-overloads';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
+import { adoptProjectScans, readProjectScans, type ProjectScans } from './project-scans';
 import { clearCppIncluderMemos } from './cpp-includers';
+import { clearCMacroRenames } from './c-macro-renames';
+import { isObjcDeclaredTypeRef, matchByExactName } from './name-matcher';
+import { pythonSelfCallReaches } from './name-matcher';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
-import { matchRubyConstantPathRef } from './ruby-constant-paths';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
+import { clearRubyConstantPathMemos, matchRubyConstantPathRef } from './ruby-constant-paths';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, CPP_COMPILE_DB_FILES, loadCppIncludeDirsFromCompileDB, loadCppIncludeDirsHeuristic, readCompileDbIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName, packageJsonMain } from './import-resolver';
+import { ResolverPool, minRefsForPool, poolStartSettled, resolveWorkersWorthStarting, shouldEngageAdaptively } from './resolver-pool';
 import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
 import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
 import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
-import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
-import { detectFrameworks, getResolvingFrameworks } from './frameworks';
+import { readCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
+import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } from './frameworks';
 import { clearDeclaredDependencies } from './frameworks/package-deps';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
+import { loadWebRoot, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { folderOf, inferPhpWebRoots, phpWebRootSnapshot, phpWebRootsMoved } from './php-web-root';
+import { PHP_DOCUMENT_ROOT } from '../extraction/languages/php';
 import { createYielder, type MaybeYield } from './cooperative-yield';
-import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
-import { loadProjectAliases, type AliasMap } from './path-aliases';
+import { FlowChange, planParameterFlows } from './parameter-flow';
+import { MAX_SOURCE_FILE_SIZE_BYTES, readSourceText } from '../file-limits';
+import { createHash } from 'crypto';
+import { aliasConfigFields, loadProjectAliases, type AliasMap } from './path-aliases';
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
-import { loadWorkspacePackages, workspaceFingerprint, workspacePackageDirOf, type WorkspacePackages } from './workspace-packages';
+import { loadWorkspacePackagesAndManifests, workspaceFingerprint, workspacePackageDirOf, type ManifestDiscovery, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import { stripCommentsForRegex } from './strip-comments';
 import { lexicalPathWithinRoot } from '../utils';
@@ -94,6 +109,9 @@ const RESOLUTION_READ_EDGE_KINDS: Edge['kind'][] = ['implements', 'extends'];
  */
 const CHAIN_LANGUAGES = new Set(['java', 'kotlin', 'csharp', 'swift', 'rust', 'go', 'scala', 'dart', 'objc', 'pascal']);
 const SCOPED_CHAIN_LANGUAGES = new Set(['rust']);
+
+/** Languages whose `this.m()` the extractor records by the bare method name (isJsThisCall). */
+const JS_SELF_CALL_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx', 'vue', 'svelte', 'astro']);
 
 /** The extractor's chained-receiver encoding: `<inner>().<method>`. */
 const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
@@ -141,6 +159,38 @@ const PYTHON_BUILT_INS = new Set([
   'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple',
   'open', 'input', 'type', 'isinstance', 'hasattr', 'getattr', 'setattr',
   'super', 'self', 'cls', 'None', 'True', 'False',
+]);
+
+/**
+ * The rest of Python's builtins: functions, types, constants and the exception
+ * and warning classes. Unlike PYTHON_BUILT_INS, a name here is the builtin only
+ * where the file can't mean anything else by it (isUnboundPythonBuiltin):
+ * projects define their own `TimeoutError`, `ConnectionError`, `format` or
+ * `filter` all the time.
+ */
+const PYTHON_BUILTIN_NAMES = new Set([
+  'abs', 'aiter', 'all', 'anext', 'any', 'ascii', 'bin', 'bool', 'breakpoint', 'bytearray', 'bytes',
+  'callable', 'chr', 'classmethod', 'compile', 'complex', 'delattr', 'dict', 'dir', 'divmod', 'enumerate',
+  'eval', 'exec', 'filter', 'float', 'format', 'frozenset', 'getattr', 'globals', 'hasattr', 'hash', 'help',
+  'hex', 'id', 'input', 'int', 'isinstance', 'issubclass', 'iter', 'len', 'list', 'locals', 'map', 'max',
+  'memoryview', 'min', 'next', 'object', 'oct', 'open', 'ord', 'pow', 'print', 'property', 'range', 'repr',
+  'reversed', 'round', 'set', 'setattr', 'slice', 'sorted', 'staticmethod', 'str', 'sum', 'super', 'tuple',
+  'type', 'vars', 'zip', '__import__', 'Ellipsis', 'NotImplemented', 'exit', 'quit', 'copyright', 'credits',
+  'license',
+  'BaseException', 'BaseExceptionGroup', 'Exception', 'ExceptionGroup', 'GeneratorExit', 'KeyboardInterrupt',
+  'SystemExit', 'ArithmeticError', 'FloatingPointError', 'OverflowError', 'ZeroDivisionError', 'AssertionError',
+  'AttributeError', 'BufferError', 'EOFError', 'ImportError', 'ModuleNotFoundError', 'LookupError', 'IndexError',
+  'KeyError', 'MemoryError', 'NameError', 'UnboundLocalError', 'OSError', 'EnvironmentError', 'IOError',
+  'WindowsError', 'BlockingIOError', 'ChildProcessError', 'ConnectionError', 'BrokenPipeError',
+  'ConnectionAbortedError', 'ConnectionRefusedError', 'ConnectionResetError', 'FileExistsError',
+  'FileNotFoundError', 'InterruptedError', 'IsADirectoryError', 'NotADirectoryError', 'PermissionError',
+  'ProcessLookupError', 'TimeoutError', 'ReferenceError', 'RuntimeError', 'NotImplementedError',
+  'PythonFinalizationError', 'RecursionError', 'StopAsyncIteration', 'StopIteration', 'SyntaxError',
+  'IndentationError', 'TabError', 'SystemError', 'TypeError', 'ValueError', 'UnicodeError',
+  'UnicodeDecodeError', 'UnicodeEncodeError', 'UnicodeTranslateError',
+  'Warning', 'BytesWarning', 'DeprecationWarning', 'EncodingWarning', 'FutureWarning', 'ImportWarning',
+  'PendingDeprecationWarning', 'ResourceWarning', 'RuntimeWarning', 'SyntaxWarning', 'UnicodeWarning',
+  'UserWarning',
 ]);
 
 const PYTHON_BUILT_IN_TYPES = new Set([
@@ -250,6 +300,150 @@ const CPP_BUILT_INS = new Set([
 ]);
 
 /**
+ * The module-config files at the project root a resolver reads, present or not
+ * (#2977): `codegraph.json` for its PHP `webRoot` (#3298).
+ */
+const MODULE_CONFIG_ROOT_FILES = ['tsconfig.json', 'jsconfig.json', 'tsconfig.base.json', 'go.mod', 'Cargo.toml', ...CPP_COMPILE_DB_FILES, PROJECT_CONFIG_FILENAME] as const;
+
+/**
+ * Project-relative config path → `<digest>@<stamp>`: a digest of what
+ * resolution reads from it (see `moduleConfigDigest`) and the stamp of the file
+ * it was read from (see `moduleConfigEntry`), 'absent' for one not there. An
+ * older engine wrote the digest alone.
+ */
+export type ModuleConfigSnapshot = Record<string, string>;
+
+/** A stored snapshot's files (see `getModuleConfigSnapshot`); an index without one, or one an older engine wrote, has none. */
+export function parseModuleConfigSnapshot(stored: string | null): ModuleConfigSnapshot {
+  if (!stored) return {};
+  try {
+    const parsed = JSON.parse(stored) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed as Record<string, unknown>).filter(([, v]) => typeof v === 'string')) as ModuleConfigSnapshot;
+  } catch {
+    return {};
+  }
+}
+
+/** Each of `files` (absolute) as the project sees it now, keyed by its project-relative path. */
+function moduleConfigSnapshot(projectRoot: string, files: Iterable<string>, previous: ModuleConfigSnapshot): ModuleConfigSnapshot {
+  const snapshot: ModuleConfigSnapshot = {};
+  for (const abs of files) {
+    const rel = path.relative(projectRoot, abs).replace(/\\/g, '/');
+    // A config outside the project (an `extends` into node_modules or a parent
+    // folder) is read where it is; the key stays relative so the index moves.
+    snapshot[rel] = moduleConfigEntry(abs, previous[rel], projectRoot);
+  }
+  return snapshot;
+}
+
+/**
+ * One file's snapshot entry. Every sync looks at these files, so one whose
+ * modified time and size haven't moved keeps the digest it has and isn't read:
+ * a compile database runs to megabytes, and a Cargo workspace to a manifest per
+ * crate.
+ */
+function moduleConfigEntry(abs: string, previous: string | undefined, projectRoot: string): string {
+  let stat: fs.Stats | undefined;
+  try {
+    stat = fs.statSync(abs, { throwIfNoEntry: false });
+  } catch { /* a file that can't be looked at is not there */ }
+  // (A FIFO under one of these names would park the read.)
+  if (!stat?.isFile()) return 'absent';
+  const stamp = `${stat.mtimeMs}:${stat.size}`;
+  return previous?.endsWith(`@${stamp}`) ? previous : `${moduleConfigDigest(abs, projectRoot)}@${stamp}`;
+}
+
+/**
+ * A digest of what resolution reads from one config file: a go.mod's module
+ * path, a tsconfig / jsconfig's `extends`, `baseUrl` and `paths`, what a Cargo
+ * manifest declares (see `cargoManifestFields`), the include directories a
+ * compile database names. Not of its bytes: a dependency bump, a `strict` flag
+ * or a build that writes its database again moves no import, and would re-open
+ * every one.
+ */
+function moduleConfigDigest(abs: string, projectRoot: string): string {
+  const file = path.basename(abs);
+  // A codegraph.json counts for its `webRoot` alone, which places a PHP
+  // include of `$_SERVER['DOCUMENT_ROOT'] . '/x.php'` (#3298). One that sets
+  // none reads as no file, so writing one to `exclude` a folder, or a snapshot
+  // from before it counted, re-opens nothing.
+  if (file === PROJECT_CONFIG_FILENAME) {
+    const webRoot = loadWebRoot(path.dirname(abs));
+    return webRoot === null ? 'absent' : createHash('sha256').update(`webRoot=${webRoot}`).digest('hex').slice(0, 16);
+  }
+  const read = file === 'go.mod' ? loadGoModule(path.dirname(abs))?.modulePath ?? ''
+    : file === 'Cargo.toml' ? cargoManifestDigestText(abs)
+    : file === 'compile_commands.json' ? (readCompileDbIncludeDirs(abs, projectRoot) ?? []).join('\n')
+    : file === 'package.json' ? packageJsonMainOf(abs)
+    : aliasConfigFields(abs) ?? '';
+  return createHash('sha256').update(read).digest('hex').slice(0, 16);
+}
+
+/**
+ * A package.json as an object, read past a byte order mark; null when it is
+ * missing, not a regular file (a FIFO or a device would block or flood the
+ * read), over the source size limit, or not a JSON object.
+ */
+function readPackageJson(abs: string): Record<string, unknown> | null {
+  try {
+    const text = readSourceText(abs);
+    if (text === null) return null;
+    const json = JSON.parse(text.replace(/^\uFEFF/, '')) as unknown;
+    return json && typeof json === 'object' && !Array.isArray(json) ? json as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A dependency spec that takes the package from the project: a protocol, or npm's bare local path. */
+const LOCAL_DEPENDENCY_SPEC = /^(?:(?:workspace|file|link|portal):|\.{1,2}\/|~\/|\/)/;
+
+/** A folder's `package.json` `main`, which a relative import of the folder loads (see `relativeDirectoryMain`). */
+function packageJsonMainOf(abs: string): string {
+  try {
+    return packageJsonMain(fs.readFileSync(abs, 'utf-8')) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function cargoManifestDigestText(abs: string): string {
+  try {
+    return cargoManifestFields(fs.readFileSync(abs, 'utf-8'));
+  } catch {
+    return '';
+  }
+}
+
+/** The files of `now` whose digest differs from `was`'s; a stamp alone moved nothing. */
+export function changedModuleConfigs(was: ModuleConfigSnapshot, now: ModuleConfigSnapshot): string[] {
+  const digest = (entry: string): string => entry.split('@')[0]!;
+  // A snapshot from before manifests and compile databases counted says nothing about them.
+  const buildFilesKnown = 'Cargo.toml' in was;
+  return Object.keys(now).filter((rel) =>
+    (buildFilesKnown || !/(?:^|\/)(?:Cargo\.toml|compile_commands\.json)$/.test(rel)) &&
+    digest(was[rel] ?? 'absent') !== digest(now[rel]!));
+}
+
+/**
+ * The languages whose imports a changed config file governs: the ES-module
+ * family for a tsconfig / jsconfig, Go for a go.mod, Rust for a Cargo manifest,
+ * C and C++ for a compile database.
+ */
+export function moduleConfigLanguages(changed: readonly string[]): Set<Language> {
+  const languages = new Set<Language>();
+  for (const rel of changed) {
+    if (/(?:^|\/)go\.mod$/.test(rel)) languages.add('go');
+    else if (rel === PROJECT_CONFIG_FILENAME) languages.add('php');
+    else if (/(?:^|\/)Cargo\.toml$/.test(rel)) languages.add('rust');
+    else if (/(?:^|\/)compile_commands\.json$/.test(rel)) for (const language of ['c', 'cpp'] as const) languages.add(language);
+    else for (const language of ESM_IMPORT_LANGUAGES) languages.add(language);
+  }
+  return languages;
+}
+
+/**
  * Reference Resolver
  *
  * Orchestrates reference resolution using multiple strategies.
@@ -348,6 +542,19 @@ export class ReferenceResolver {
   private projectAliases: AliasMap | null | undefined = undefined;
   // Per directory: the aliases of the nearest non-root tsconfig declaring `paths` or `baseUrl`.
   private dirAliases = new Map<string, AliasMap | null>();
+  // Per folder holding a `$_SERVER['DOCUMENT_ROOT']` include: the PHP web root
+  // the project's includes agree on, or null (#3298, php-web-root.ts). Read
+  // from the graph, so it lives for one pass: clearCaches drops it.
+  private phpWebRoots: Map<string, string | null> | null = null;
+  // The Cargo workspace's crates and the include directories a compile
+  // database names (null: the project has none). Same lazy convention: read
+  // once, whatever the size of the workspace or the database, and dropped by
+  // resetModuleConfig when the module-config snapshot says they moved.
+  private cargoCrates: Map<string, string> | undefined = undefined;
+  private compileDbIncludeDirs: string[] | null | undefined = undefined;
+  // The include directories of a project with no compile database, found by
+  // listing its top folders: read again when files come or go (getModuleConfigSnapshot).
+  private layoutIncludeDirs: string[] | undefined = undefined;
   // Per project-relative directory ('' = the root): the module of the nearest
   // go.mod at or above it, up to the project root. Same lazy/immutable
   // convention as dirAliases.
@@ -361,6 +568,13 @@ export class ReferenceResolver {
   private goPackageDirs = new Map<string, string | null>();
   // Monorepo workspace member packages. Same lazy/immutable convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
+  // The walk that found the manifests the map above was read from, or null
+  // when it was read from a list a sync knew (see refreshWorkspacePackages).
+  private workspaceDiscovery: ManifestDiscovery | null = null;
+  // The tsconfig / jsconfig files (their `extends` chains included) and go.mod
+  // files the maps above were read from, as absolute paths. A sync compares
+  // what they say now with what the index was resolved by (#2977).
+  private moduleConfigFiles = new Set<string>();
 
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
@@ -387,17 +601,26 @@ export class ReferenceResolver {
   }
 
   /**
-   * Initialize the resolver (detect frameworks, etc.)
+   * Initialize the resolver (detect frameworks, etc.). `frameworks` are the
+   * names detection gave in the process's main thread, for a worker starting
+   * on the same index: a detector may read every source file (Spring, in a
+   * project with none of it), and each worker doing that again added up.
    */
-  initialize(): void {
+  initialize(frameworks?: readonly string[]): void {
     // A full index resolves by the package.json files on disk now, as the
     // fingerprint it stamps says, even in a process that read them earlier.
     this.workspacePackages = undefined;
+    this.workspaceDiscovery = null;
+    this.cargoCrates = undefined;
+    this.compileDbIncludeDirs = undefined;
+    this.layoutIncludeDirs = undefined;
     // Detection reads through the caches (file contents, existence probes,
     // declared dependencies): clear them first, or a process that read the
     // manifests earlier detects by what they said then (#2519).
     this.clearCaches();
-    this.frameworks = detectFrameworks(this.context);
+    this.frameworks = frameworks
+      ? getAllFrameworkResolvers().filter((f) => frameworks.includes(f.name))
+      : detectFrameworks(this.context);
     this.frameworksByLanguage.clear();
   }
 
@@ -571,6 +794,16 @@ export class ReferenceResolver {
     this.cachesWarmed = true;
   }
 
+  /** What this resolver has read from the whole project, or reads now, for the workers (see ./project-scans). */
+  private projectScans(): ProjectScans {
+    return readProjectScans(this.context, this.queries, this.fileExistsMemo);
+  }
+
+  /** Take another thread's reads of the whole project instead of making them here. */
+  adoptProjectScans(scans: ProjectScans): void {
+    adoptProjectScans(this.context, scans, this.fileExistsMemo);
+  }
+
   /** `queries.getNodeById` through the resolver's own id → node cache. */
   private nodeById(id: string): Node | null {
     const cached = this.nodeByIdCache.get(id);
@@ -609,17 +842,26 @@ export class ReferenceResolver {
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
     this.manifestScopes.clear();
+    this.installedPackages.clear();
+    this.directoryListings.clear();
+    this.searchedModules.clear();
+    this.realModulesDirs.clear();
+    this.ownPackageNames = null;
+    this.phpWebRoots = null;
+    this.installedNames.clear();
     this.knownNames = null;
     this.knownLowerNames = null;
     this.knownFiles = null;
     this.goModules = null;
     this.goPackageDirs.clear();
     this.cachesWarmed = false;
+    this.pythonFileBindings = null;
     // The import-resolver's and name-matcher's per-context memos assume the
     // same stable window as the caches above — drop them together.
     if (this.context) {
       clearImportResolverMemos(this.context);
       clearNameMatcherMemos(this.context);
+      clearRubyConstantPathMemos(this.context);
       clearCppMacroVisibility(this.context);
       clearSwiftTypeVisibility(this.context);
       clearDartLibraryMemos(this.context);
@@ -630,8 +872,10 @@ export class ReferenceResolver {
       clearCppTypeAliasMemos(this.context);
       clearCppSupertypeMemos(this.context);
       clearCppIncluderMemos(this.context);
+      clearCMacroRenames(this.context);
       clearCFeatureVariantMemos(this.context);
       clearAmbientModuleMemos(this.context);
+      clearPythonOverloadMemos(this.context);
       clearDeclaredDependencies(this.context);
     }
   }
@@ -649,6 +893,7 @@ export class ReferenceResolver {
       if (found !== undefined) break;
       walked.push(dir);
       found = loadGoModule(path.join(this.projectRoot, dir));
+      if (found) this.moduleConfigFiles.add(path.join(this.projectRoot, dir, 'go.mod'));
       if (found || dir === '') break;
       dir = goDirOf(dir);
     }
@@ -689,12 +934,7 @@ export class ReferenceResolver {
       // Import resolvers may follow package metadata to an archive (`file:*.har`,
       // for example). Reject anything extraction would not accept before UTF-8
       // decoding can multiply a large binary blob into gigabytes of V8 heap.
-      const stats = fs.statSync(fullPath);
-      if (!stats.isFile() || stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
-        this.fileCache.set(filePath, null);
-        return null;
-      }
-      const content = fs.readFileSync(fullPath, 'utf-8');
+      const content = readSourceText(fullPath);
       this.fileCache.set(filePath, content);
       return content;
     } catch (error) {
@@ -718,6 +958,16 @@ export class ReferenceResolver {
       return fs.readFileSync(fullPath).includes(needle);
     } catch {
       return false;
+    }
+  }
+
+  /** The text a walk over the indexed files reads: see ResolutionContext.scanFile. */
+  private scanFile(filePath: string): string | null {
+    if (this.fileCache.has(filePath)) return this.fileCache.get(filePath) ?? null;
+    try {
+      return readSourceText(path.join(this.projectRoot, filePath), 'latin1');
+    } catch {
+      return null;
     }
   }
 
@@ -746,7 +996,8 @@ export class ReferenceResolver {
         if (!isExternalImport(source, language, this.context, { aliasPrefixes: false, fromFile })) return false;
         const resolved = resolveImportPath(source, fromFile, language, this.context);
         if (resolved !== null && this.isIndexedFile(resolved)) return false;
-        return this.isDeclaredOutsidePackage(source, fromFile);
+        return this.isDeclaredOutsidePackage(source, fromFile) ||
+          (ESM_IMPORT_LANGUAGES.has(language) && this.isInstalledPackage(source, fromFile));
       },
       resolveModuleFile: (source, fromFile, language) =>
         resolveImportPath(source, fromFile, language, this.context),
@@ -872,10 +1123,8 @@ export class ReferenceResolver {
       fileExists: (filePath: string) => {
         // Check pre-built known files set first (O(1))
         if (this.knownFiles) {
-          const normalized = filePath.replace(/\\/g, '/');
-          if (this.knownFiles.has(filePath) || this.knownFiles.has(normalized)) {
-            return true;
-          }
+          if (this.knownFiles.has(filePath)) return true;
+          if (filePath.includes('\\') && this.knownFiles.has(filePath.replace(/\\/g, '/'))) return true;
         }
         // Fall back to filesystem for files not yet indexed. `path.join` does
         // not clamp, and relative-import resolution hands us paths carrying
@@ -908,8 +1157,12 @@ export class ReferenceResolver {
       },
 
       readFile: (filePath: string) => this.readFileCached(filePath),
+      noteModuleConfigFile: (filePath: string) => {
+        this.moduleConfigFiles.add(path.join(this.projectRoot, filePath));
+      },
 
       fileContains: (filePath: string, needle: string) => this.fileContains(filePath, needle),
+      scanFile: (filePath: string) => this.scanFile(filePath),
 
       getFileLines: (filePath: string) => {
         const cached = this.fileLinesCache.get(filePath);
@@ -1046,7 +1299,7 @@ export class ReferenceResolver {
 
       getProjectAliases: () => {
         if (this.projectAliases === undefined) {
-          this.projectAliases = loadProjectAliases(this.projectRoot);
+          this.projectAliases = loadProjectAliases(this.projectRoot, this.moduleConfigFiles);
         }
         return this.projectAliases;
       },
@@ -1064,7 +1317,7 @@ export class ReferenceResolver {
           walked.push(dir);
           const abs = path.join(this.projectRoot, dir);
           if (['tsconfig.json', 'jsconfig.json'].some((name) => fs.existsSync(path.join(abs, name)))) {
-            const aliases = loadProjectAliases(abs);
+            const aliases = loadProjectAliases(abs, this.moduleConfigFiles);
             if (aliases) {
               found = aliases;
               break;
@@ -1075,6 +1328,8 @@ export class ReferenceResolver {
         for (const d of walked) this.dirAliases.set(d, found);
         return found;
       },
+
+      getPhpWebRoot: (fromFile: string) => this.phpWebRootOf(fromFile),
 
       getGoPackageDir: (importPath: string, fromFile?: string) => {
         const own = fromFile === undefined ? null : this.nearestGoModule(goDirOf(fromFile));
@@ -1089,7 +1344,9 @@ export class ReferenceResolver {
 
       getWorkspacePackages: () => {
         if (this.workspacePackages === undefined) {
-          this.workspacePackages = loadWorkspacePackages(this.projectRoot);
+          const { packages, discovery } = loadWorkspacePackagesAndManifests(this.projectRoot);
+          this.workspacePackages = packages;
+          this.workspaceDiscovery = discovery;
         }
         return this.workspacePackages;
       },
@@ -1117,8 +1374,11 @@ export class ReferenceResolver {
       },
 
       getCppIncludeDirs: () => {
-        return loadCppIncludeDirs(this.projectRoot);
+        if (this.compileDbIncludeDirs === undefined) this.compileDbIncludeDirs = loadCppIncludeDirsFromCompileDB(this.projectRoot);
+        return this.compileDbIncludeDirs ?? (this.layoutIncludeDirs ??= loadCppIncludeDirsHeuristic(this.projectRoot));
       },
+
+      getCargoCrates: () => this.readCargoCrates(),
 
       getCppIncludeNodes: () => this.queries.getCppIncludeNodes(),
     };
@@ -1414,8 +1674,13 @@ export class ReferenceResolver {
     const unviewed = this.classExpressionFreeBases.get(outer) ?? outer;
     const base = unviewed === this.mocklessContext && this.mocklessBase ? this.mocklessBase : unviewed;
     const mockless = this.mocklessContextFor(ref, base) ?? base;
-    return this.resolveOneWith(this.classExpressionFreeContextFor(ref, mockless) ?? mockless, ref);
+    const context = this.classExpressionFreeContextFor(ref, mockless) ?? mockless;
+    this.lastResolved = { ref, context };
+    return this.resolveOneWith(context, ref);
   }
+
+  /** The reference resolveOne read last and the context it read it through, for parkable. */
+  private lastResolved: { ref: UnresolvedRef; context: ResolutionContext } | null = null;
 
   /** resolveOneIn with every strategy reading the graph through `context`. */
   private resolveOneWith(context: ResolutionContext, ref: UnresolvedRef): ResolvedRef | null {
@@ -1430,6 +1695,9 @@ export class ReferenceResolver {
   }
 
   private resolveOneIn(ref: UnresolvedRef): ResolvedRef | null {
+    if (ref.referenceKind === 'function_ref' && ref.language === 'rust' && ref.referenceName.includes('::')) {
+      return this.resolveRustPathValue(ref);
+    }
     // A Rust call kept with its receiver chain — `self.services.store.put`,
     // `self.store().put` (#2836) — resolves as the call by its method's name
     // did before the extractor kept the chain: every strategy and gate reads
@@ -1462,24 +1730,35 @@ export class ReferenceResolver {
     const scoped = this.gateRustScope(candidate, ref);
     // A Go name its package defines once per build target is the definition
     // the reference's file builds with (see preferGoBuildTwin).
-    const resolved = preferGoBuildTwin(this.gateSuperSelfCall(
+    // A Python name declared with typing.overload runs the def below its stubs (#2963).
+    const resolved = preferPythonImplementation(preferGoBuildTwin(this.gateSuperSelfCall(
       scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),
       ref,
-    ), ref, this.context);
+    ), ref, this.context), ref, this.context);
     // A Dart class whose field holds its own type (`class Node { Node? next; }`)
     // names itself: a self-edge that says nothing (#2327).
     if (resolved && ref.language === 'dart' && ref.referenceKind === 'references' &&
         resolved.targetNodeId === ref.fromNodeId) return null;
-    if (resolved && isPythonFromImportModule(ref, this.context)) {
+    // The module an import statement names is a module, never a symbol (#2584, #3239).
+    if (resolved && (isPythonFromImportModule(ref, this.context) || isPythonImportStatementModule(ref, this.context))) {
       const module = this.nodeById(resolved.targetNodeId);
       if (module && module.kind !== 'file' && module.kind !== 'module') return null;
     }
     if (resolved && (resolved.byName || resolved.resolvedBy === 'exact-match' || resolved.resolvedBy === 'fuzzy') &&
         isGuessedRecordAccessor(resolved, ref, this.context)) return null;
+    // A guess by name stops at a monorepo's own edge. (Asked of the winner: taking
+    // a candidate out of the pool leaves a lone one, and a lone one is an answer.)
+    if (resolved && (resolved.byName || resolved.resolvedBy === 'exact-match' || resolved.resolvedBy === 'fuzzy')) {
+      const target = this.nodeById(resolved.targetNodeId);
+      if (target && crossesWorkspaceRoot(target, ref, this.context)) return null;
+    }
     // A name the calling JS/TS function binds itself (a parameter, a local) in
     // scope at the reference is that binding even when the file imports the
     // name, which the import resolver answers before the matcher's own check.
     if (resolved && resolved.resolvedBy === 'import' && isImportShadowedByJsBinding(resolved, ref, this.context)) return null;
+    // A call two or more fields deep from `this` is matched by its name alone:
+    // never a property, a field or an import, nor a built-in method name (#2948).
+    if (resolved && isRefusedDeepThisTarget(resolved, ref, this.context)) return null;
     // A declaration of a declaration file's `declare module 'x'` is reached
     // through an import of `x`, never by its bare name from a file that
     // reaches no `x` (see reachesAmbientModule).
@@ -1488,6 +1767,13 @@ export class ReferenceResolver {
       const declaringFile = specifier === undefined ? undefined : this.nodeById(resolved.targetNodeId)?.filePath;
       if (declaringFile !== undefined && declaringFile !== ref.filePath &&
           !reachesAmbientModule(ref, specifier!, declaringFile, this.context)) return null;
+    }
+    // A Python `self.x()` / `cls.x()` names a member of the instance or the class:
+    // never a module-level function of another file, nor what a binding of the
+    // attribute doesn't name (#2958).
+    if (resolved && ref.language === 'python' && ref.referenceKind === 'calls' && resolved.resolvedBy !== 'framework') {
+      const target = this.nodeById(resolved.targetNodeId);
+      if (target && !pythonSelfCallReaches(target, ref, this.context)) return null;
     }
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
     // A Pascal call to data runs only a routine the data holds, in scope, and
@@ -1511,6 +1797,25 @@ export class ReferenceResolver {
     }, ref);
   }
 
+  /**
+   * A Rust function passed through its path (`map(Graph::counts)`, #3254)
+   * names what the same path written as a call names, gates included: the
+   * call's module, `use` and `Self` rules decide, and a std type that only
+   * shares a project type's name reaches nothing. Only a function, an
+   * inherent method or a trait's own method counts, never one in an `impl
+   * Trait for T` block (isRustTraitImplMember), nor another project type's
+   * inherent method (isRustOtherTypesMethod).
+   */
+  private resolveRustPathValue(ref: UnresolvedRef): ResolvedRef | null {
+    const asCall = this.resolveOneIn({ ...ref, referenceKind: 'calls' });
+    const target = asCall ? this.nodeById(asCall.targetNodeId) : undefined;
+    if (!asCall || !target || (target.kind !== 'function' && target.kind !== 'method')) return null;
+    if (isRustTraitImplMember(target, this.context)) return null;
+    const segments = ref.referenceName.split('::');
+    if (isRustOtherTypesMethod(target, segments[segments.length - 2]!.replace(/^r#/, ''), this.context)) return null;
+    return { original: ref, targetNodeId: target.id, confidence: asCall.confidence, resolvedBy: 'function-ref' };
+  }
+
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
     // A local C++ object construction (`T obj(args)`, ref `ns::T::T/1`)
     // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
@@ -1520,6 +1825,12 @@ export class ReferenceResolver {
     // which a framework's heuristics or name matching would take (see
     // ./cpp-supertypes).
     if (isCppSupertypeRef(ref)) return matchCppSupertype(ref, this.context);
+    // So is the type a member of one or an alias is declared with, which only
+    // a type can be: a function or macro of that name is no candidate.
+    if (isCppDeclaredTypeRef(ref, this.context)) return matchCppDeclaredType(ref, this.context);
+    // In Objective-C it is the type of that name the file can see: a function
+    // or variable is no candidate, and neither is a guess by any other strategy.
+    if (isObjcDeclaredTypeRef(ref)) return matchByExactName(ref, this.context);
 
     // A Pascal name written without parentheses (#2514) links only to a
     // routine its scope reaches, or through a receiver to a method of the
@@ -1549,6 +1860,10 @@ export class ReferenceResolver {
     // to nothing the project declares.
     const asserted = matchGoAssertedCall(ref, this.context);
     if (asserted !== undefined) return asserted;
+    // So is one on what `new(T)` or `make(T, …)` makes (`new(Route).Host("x")`,
+    // which the extractor keeps with its T): to a method of T, or nothing.
+    const builtin = matchGoBuiltinReceiverCall(ref, this.context);
+    if (builtin !== undefined) return builtin;
     // So is one on an indexed element (`schemas[ix].ValidateBytes(data)`,
     // deepcopy's `(*in)[i].DeepCopyInto(…)`): to a method of the element type.
     const indexed = matchGoIndexedCall(ref, this.context);
@@ -1578,6 +1893,14 @@ export class ReferenceResolver {
     // library one. An untyped chain resolves as the bare method name, the ref
     // the extractor emitted before it kept the chain.
     if (ref.language === 'kotlin' && ref.referenceKind === 'calls') {
+      // A chain rooted at an imported declaration, `JUtil.Nested.deep()` after
+      // `import p.JUtil`, walks that declaration's nested types whichever JVM
+      // language declares them; a chain through its properties is typed below.
+      const root = ref.referenceName.slice(0, ref.referenceName.indexOf('.'));
+      if (root && this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === root)) {
+        const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
+        if (viaImport) return viaImport;
+      }
       const chain = matchKotlinReceiverChain(ref, this.context);
       if (chain && 'method' in chain) {
         const bare = this.resolveOneInner({ ...ref, referenceName: chain.method });
@@ -1653,6 +1976,14 @@ export class ReferenceResolver {
     const rubyPath = matchRubyConstantPathRef(ref, this.context);
     if (rubyPath !== undefined) return this.gateLanguage(rubyPath, ref);
 
+    // A bare Rust name a `use` renames (`use crate::util::take as consume;
+    // consume()`) is the item its path names, which no declaration carries by
+    // that name — the pre-filter below would drop it — and a call to a name a
+    // local binds where it is written (a parameter, a `let`, a closure's) is
+    // to that local, whatever the file imports (see matchRustUseBoundName).
+    const rustBound = matchRustUseBoundName(ref, this.context);
+    if (rustBound !== undefined) return this.gateLanguage(rustBound, ref);
+
     // Fast pre-filter: skip if no symbol with this name exists anywhere
     // AND the name doesn't match a local import. The import escape is
     // necessary because re-export rename chains (`import { login }
@@ -1720,11 +2051,12 @@ export class ReferenceResolver {
       if (ref.referenceName.startsWith('this.')) {
         return this.gateLanguage(this.resolveThisMemberFnRef(ref), ref);
       }
-      if ((ref.language === 'python' || ref.language === 'go') && ref.referenceName.includes('.')) {
+      if ((ref.language === 'python' || ref.language === 'go' || ref.language === 'csharp') && ref.referenceName.includes('.')) {
         return this.gateLanguage(matchFunctionRef(ref, this.context), ref);
       }
       const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
-      if (viaImport) {
+      // A local of the name in scope is the value handed on, which matchFunctionRef finds (#2949).
+      if (viaImport && !isImportShadowedByJsBinding(viaImport, ref, this.context)) {
         const target = this.nodeById(viaImport.targetNodeId);
         if (
           target &&
@@ -1841,11 +2173,18 @@ export class ReferenceResolver {
 
     const tImp = this.profileStages ? process.hrtime.bigint() : 0n;
     // `self.get_ip()` is a method call on the instance even when the file
-    // also imports a function named `get_ip`: the import never names it.
-    const selfCall = ref.language === 'python' && ref.referenceKind === 'calls' &&
+    // also imports a function named `get_ip`: the import never names it. Nor
+    // does TS/JS's `this.findAll()` name the file's `import { findAll }` (#2954).
+    const selfCall = ref.referenceKind === 'calls' &&
+      (ref.language === 'python' || JS_SELF_CALL_LANGUAGES.has(ref.language)) &&
       this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === ref.referenceName) &&
-      isPythonSelfCall(ref, this.context);
-    const importResult = selfCall ? null : this.gateLanguage(resolveViaImport(ref, this.context), ref);
+      (isPythonSelfCall(ref, this.context) || isJsThisCall(ref, this.context));
+    let importResult = selfCall ? null : this.gateLanguage(resolveViaImport(ref, this.context), ref);
+    // A name the calling code binds in scope at the reference — a parameter, a
+    // local, a nested function, in the calling function or one around it — is
+    // that binding, which the name match below finds (#2949), and so is the
+    // receiver of `stream.onAbort()` (#2953).
+    if (importResult && isImportShadowedByJsBinding(importResult, ref, this.context)) importResult = null;
     if (this.profileStages) this.stageAdd('viaImport', ref, !!importResult, tImp);
     if (importResult) {
       if (importResult.confidence >= 0.9) return importResult;
@@ -2094,10 +2433,13 @@ export class ReferenceResolver {
    * that is not the one its name gives: a reference through an import
    * binding the module doesn't declare by that name waits for the module
    * (see importBindingTail). Decided here, where the file's import mappings
-   * are still cached from the attempt — in a resolver-pool worker too.
+   * are still cached from the attempt — in a resolver-pool worker too. A
+   * receiver's type is read through the context the attempt read it in,
+   * whose readings it reuses.
    */
   private parkable(ref: UnresolvedRef): UnresolvedRef {
-    const tail = importBindingTail(ref, this.context);
+    const read = this.lastResolved?.ref === ref ? this.lastResolved.context : this.context;
+    const tail = importBindingTail(ref, this.context, read);
     if (tail) ref.nameTail = tail;
     return ref;
   }
@@ -2514,6 +2856,11 @@ export class ReferenceResolver {
     // a 22GB WAL on a 4.6GB DB (migration plan §7a.1).
     parallel?: {
       dbPath: string;
+      /**
+       * A full index: the workers may take this resolver's frameworks, detected
+       * on this same index, and its reads of files the parse has just read.
+       */
+      shareFrameworks?: boolean;
       bulkEdgeLoad?: {
         begin: () => void;
         end: () => void | Promise<void>;
@@ -2561,11 +2908,16 @@ export class ReferenceResolver {
       byMethod: {} as Record<string, number>,
     };
 
-    // Parallel pool, started immediately but never awaited up front: early
-    // batches run sequentially while the workers boot (module load + readonly
-    // DB open + framework detect + cache warm ≈ hundreds of ms), and the loop
-    // switches to fan-out the moment the pool reports ready — so pool boot
-    // costs zero wall-clock. Any failure downgrades to sequential permanently.
+    // Parallel pool. A run large enough to start one up front waits for it to
+    // boot (module load + readonly DB open + framework detect + cache warm ≈
+    // hundreds of ms) rather than resolve on this thread meanwhile: the first
+    // batch is the prerequisites, and in C++ the first qualified base class reads
+    // every source file for the project's namespace aliases, one synchronous
+    // stretch on the thread the liveness watchdog watches (#1091), 20 s or more
+    // on a project the size of LLVM. The wait is bounded and a failure ends it
+    // (poolStartSettled), and any failure downgrades to sequential permanently.
+    // A pool engaged mid-loop keeps the loop running while it boots: a run under
+    // that bar is too small for the first batch to matter.
     let pool: ResolverPool | null = null;
     let poolReady = false;
     // True once pool creation has been attempted by EITHER engage site (the
@@ -2574,10 +2926,15 @@ export class ReferenceResolver {
     // tryCreate's sizing probes shouldn't re-run every batch on hosts that
     // declined.
     let poolEngageTried = false;
-    const createPool = (t0: number, why: string): ResolverPool | null => {
+    const createPool = (t0: number, why: string, worth?: number): ResolverPool | null => {
       poolEngageTried = true;
       if (!parallel) return null;
-      const p = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot);
+      const p = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot, parallel.shareFrameworks ? this.getDetectedFrameworks() : undefined, worth);
+      if (p && parallel.shareFrameworks) {
+        const scans = this.projectScans();
+        if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] project scans: ${scans.cpp ? 'shared' : 'none'}`);
+        if (scans.cpp) p.shareScans(scans);
+      }
       p?.ready().then(
         () => {
           poolReady = true;
@@ -2592,6 +2949,7 @@ export class ReferenceResolver {
     };
     if (parallel && total >= minRefsForPool()) {
       pool = createPool(Date.now(), 'ref-count');
+      if (pool) await poolStartSettled(pool.ready());
     }
     // Adaptive engagement bar (see the batch-loop hook): projected remaining
     // sequential settle above this boots the pool mid-loop. Boot is async and
@@ -2710,6 +3068,8 @@ export class ReferenceResolver {
     // phase boundary before cleanup without re-reading the current batch.
     let prerequisites = true;
     let afterRowId = 0;
+    // Was the batch read last past the prerequisites?
+    let readDependents = false;
     const readNextBatch = (): UnresolvedReference[] => {
       let next = this.queries.getUnresolvedReferencesBatchAfter(afterRowId, batchSize, prerequisites);
       if (next.length === 0 && prerequisites) {
@@ -2718,11 +3078,13 @@ export class ReferenceResolver {
         next = this.queries.getUnresolvedReferencesBatchAfter(afterRowId, batchSize, prerequisites);
       }
       if (next.length > 0) afterRowId = next[next.length - 1]!.rowId!;
+      readDependents = !prerequisites;
       return next;
     };
     tLp = Date.now();
     let batch = readNextBatch();
     lp('read', tLp);
+    let batchIsDependents = readDependents;
     let inFlight: InFlight | null = batch.length > 0 ? beginBatch(batch) : null;
     while (batch.length > 0 && inFlight) {
       // Prefetch the NEXT batch before this one persists: this batch's rows
@@ -2733,6 +3095,20 @@ export class ReferenceResolver {
       tLp = Date.now();
       const nextBatch = readNextBatch();
       lp('read', tLp);
+      const nextIsDependents = readDependents;
+
+      // Past the prerequisites a batch makes no edge resolving reads (see
+      // RESOLUTION_READ_EDGE_KINDS below), so the next one can queue behind it
+      // right away: the workers go from one to the other, rather than waiting on
+      // the batch's slowest chunk with nothing to do. Should it make one after
+      // all, this start is dropped and the batch starts again after the edges
+      // are in. Not when the workers' connections are due for a recycle, which
+      // needs them idle.
+      let nextInFlight: InFlight | null = null;
+      if (batchIsDependents && inFlight.mode === 'pool' && nextBatch.length > 0 && batchesSinceRecycle + 1 < RECYCLE_EVERY_BATCHES) {
+        const ahead = beginBatch(nextBatch);
+        if (ahead.mode === 'pool') nextInFlight = ahead;
+      }
 
       const tBatch = Date.now();
       const result = await settleBatch(inFlight, batch);
@@ -2757,7 +3133,7 @@ export class ReferenceResolver {
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(`[pool-timing] adaptive engage: projected ${Math.round(projectedMs)}ms sequential settle over ${remaining} remaining refs`);
           }
-          pool = createPool(Date.now(), 'adaptive');
+          pool = createPool(Date.now(), 'adaptive', resolveWorkersWorthStarting(projectedMs));
         }
       }
 
@@ -2767,8 +3143,10 @@ export class ReferenceResolver {
       // are all between statements — so the backfill completes, readers
       // re-enter at SQLite's backfilled mark, and the next persist commit
       // WRAPS the WAL instead of growing it. No-op (one fstat) under the cap.
+      // With a batch queued ahead the pool isn't idle, so this waits for the
+      // next batch that has none, which the recycle's cadence guarantees.
       tLp = Date.now();
-      const bp = parallel?.backpressure?.();
+      const bp = nextInFlight ? null : parallel?.backpressure?.();
       if (bp) await bp;
       lp('backpressure', tLp);
 
@@ -2823,7 +3201,8 @@ export class ReferenceResolver {
       const edges = this.createEdges(result.resolved);
       lp('createEdges', tLp);
       const readEdge = edges.some((e) => RESOLUTION_READ_EDGE_KINDS.includes(e.kind));
-      let nextInFlight = !readEdge && nextBatch.length > 0 ? beginBatch(nextBatch) : null;
+      if (readEdge) nextInFlight = null;
+      else if (!nextInFlight && nextBatch.length > 0) nextInFlight = beginBatch(nextBatch);
       tLp = Date.now();
       for (let i = 0; i < edges.length; i += PERSIST_CHUNK) {
         this.queries.insertEdges(edges.slice(i, i + PERSIST_CHUNK));
@@ -2924,6 +3303,7 @@ export class ReferenceResolver {
       // Advance the pipeline: the prefetched batch (already fanned out when
       // the pool is on) becomes the current one.
       batch = nextBatch;
+      batchIsDependents = nextIsDependents;
       inFlight = nextInFlight;
     }
     } finally {
@@ -2999,6 +3379,51 @@ export class ReferenceResolver {
     };
   }
 
+  /** What a sync has to tell the parameter-flow pass of the files it changes. */
+  trackParameterFlows(): FlowChange {
+    return new FlowChange(this.queries);
+  }
+
+  /**
+   * Move each call on a parameter whose class its call sites settle to that
+   * class's method, and put back through resolution a call whose flow is gone
+   * (see ./parameter-flow). The last pass on `calls` edges, once every call has
+   * an answer and the resolver pool is gone: what it holds is off the index's
+   * peak. A sync hands in what it changed, and the pass goes only as far as
+   * that reaches.
+   */
+  async resolveParameterFlows(change?: FlowChange): Promise<number> {
+    const t0 = Date.now();
+    let changed = 0;
+    try {
+      const flows = this.queries.parameterFlows;
+      for (const { retarget, drop, restore, stats, language, record } of await planParameterFlows(this.queries, this.context, change)) {
+        flows.retargetCalls(
+          retarget.flatMap((r) => (r.edgeId === undefined ? [] : [r.edgeId])),
+          retarget.flatMap((r) => (r.rowId === undefined ? [] : [r.rowId])),
+          this.createEdges(retarget.map((r) => r.resolved)),
+        );
+        flows.replaceEdgesWithFlowMarkedRefs(drop.map((d) => d.edgeId), drop.map((d) => d.reference));
+        if (retarget.length + drop.length > 0) flows.noteParameterFlows();
+        if (restore.length > 0) {
+          flows.restoreCalls(
+            restore.flatMap((r) => (r.edgeId === undefined ? [] : [r.edgeId])),
+            restore.flatMap((r) => (r.rowId === undefined ? [] : [r.rowId])),
+            restore.map((r) => r.reference),
+          );
+          const files = new Set(restore.flatMap((r) => (r.reference.filePath === undefined ? [] : [r.reference.filePath])));
+          await this.resolveAndPersistListYielding(this.queries.getUnresolvedReferencesByFiles([...files]));
+        }
+        flows.setRecord(language, record);
+        changed += retarget.length + drop.length + restore.length;
+        if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] parameter-flow: ${Date.now() - t0}ms ${JSON.stringify(stats)}`);
+      }
+    } catch (error) {
+      logDebug('Parameter flows failed', { error: String(error) });
+    }
+    return changed;
+  }
+
   /** Replace synthesis only after every base-resolution pass has finished. */
   async refreshSynthesis(
     dbPath: string,
@@ -3036,8 +3461,12 @@ export class ReferenceResolver {
    * resolver takes the new one and drops every memo resolved through the old
    * one, and the caller re-opens what was linked by it.
    */
-  refreshWorkspacePackages(): string {
-    const fresh = loadWorkspacePackages(this.projectRoot);
+  refreshWorkspacePackages(knownManifests?: readonly string[]): string {
+    // `knownManifests`: where the manifests are, when the caller can tell that
+    // a walk would find the ones it found last time (see trustedManifestList).
+    // Each is read again all the same, so an edit to one is seen.
+    const { packages: fresh, discovery } = loadWorkspacePackagesAndManifests(this.projectRoot, knownManifests);
+    if (discovery) this.workspaceDiscovery = discovery;
     const fingerprint = workspaceFingerprint(fresh);
     if (this.workspacePackages === undefined || workspaceFingerprint(this.workspacePackages) !== fingerprint) {
       this.workspacePackages = fresh;
@@ -3046,9 +3475,105 @@ export class ReferenceResolver {
     return fingerprint;
   }
 
+  /** The walk the workspace map was last read by (see ManifestDiscovery), or null before any. */
+  getWorkspaceDiscovery(): ManifestDiscovery | null {
+    return this.workspaceDiscovery;
+  }
+
+  /**
+   * The module-config files the index was resolved by, with a digest of each
+   * (see `moduleConfigSnapshot`): every tsconfig / jsconfig this resolver read
+   * (`extends` chains included), every go.mod, and the root's candidates
+   * whether present or not, so one that appears is seen too. `previous` is the
+   * snapshot the index was stamped with; its files are read again, so a config
+   * this process never loaded still counts. `treeMoved` says files came or went
+   * since this resolver last looked: a crate under a `crates/*` member names no
+   * file the snapshot holds, and a new top folder of headers can be an include
+   * directory, so what is read from the tree's layout is read again. A
+   * snapshot from before manifests counted has its members to learn too.
+   */
+  getModuleConfigSnapshot(previous: string | null, treeMoved = false): ModuleConfigSnapshot {
+    const was = parseModuleConfigSnapshot(previous);
+    if (treeMoved || !('Cargo.toml' in was)) {
+      this.cargoCrates = undefined;
+      this.layoutIncludeDirs = undefined;
+      this.readCargoCrates();
+    }
+    const files = new Set<string>(this.moduleConfigFiles);
+    for (const name of MODULE_CONFIG_ROOT_FILES) files.add(path.join(this.projectRoot, name));
+    for (const rel of Object.keys(was)) files.add(path.join(this.projectRoot, rel));
+    return moduleConfigSnapshot(this.projectRoot, files, was);
+  }
+
+  /** The Cargo workspace's crates, read from disk the first time; every member's manifest joins the snapshot. */
+  private readCargoCrates(): Map<string, string> {
+    if (!this.cargoCrates) {
+      this.cargoCrates = readCargoWorkspaceCrateMap(this.diskContext());
+      for (const dir of this.cargoCrates.values()) this.moduleConfigFiles.add(path.join(this.projectRoot, dir, 'Cargo.toml'));
+    }
+    return this.cargoCrates;
+  }
+
+  /**
+   * Forget the tsconfig / jsconfig alias maps, the go.mod modules, the Cargo
+   * crates and the compile database's directories this resolver read, and
+   * every memo resolved through them, so the next reference reads the files as
+   * they are now (#2977). The caller re-opens the imports the old maps resolved.
+   */
+  resetModuleConfig(): void {
+    this.projectAliases = undefined;
+    this.dirAliases.clear();
+    this.goModuleByDir.clear();
+    this.goPackageDirs.clear();
+    this.cargoCrates = undefined;
+    this.compileDbIncludeDirs = undefined;
+    this.moduleConfigFiles.clear();
+    this.clearCaches();
+    // Its manifests stay in the snapshot, whatever this sync resolves.
+    this.readCargoCrates();
+  }
+
   /** The fingerprint of the workspace map this resolver resolves by (see `workspaceFingerprint`). */
   getWorkspaceFingerprint(): string {
     return workspaceFingerprint(this.context.getWorkspacePackages?.() ?? null);
+  }
+
+  /**
+   * The folder `$_SERVER['DOCUMENT_ROOT']` names for a PHP include in
+   * `fromFile` (#3298): the project's `codegraph.json` `webRoot`, else the one
+   * the project's own includes agree on for the file's folder (see
+   * php-web-root.ts), else null.
+   */
+  phpWebRootOf(fromFile: string): string | null {
+    const configured = loadWebRoot(this.projectRoot);
+    if (configured !== null) return configured;
+    return this.inferredPhpWebRoots().get(folderOf(fromFile)) ?? null;
+  }
+
+  /** Every folder holding a `$_SERVER['DOCUMENT_ROOT']` include → the web root inferred for it, read once a pass. */
+  private inferredPhpWebRoots(): Map<string, string | null> {
+    if (this.phpWebRoots === null) {
+      const prefix = `${PHP_DOCUMENT_ROOT}/`;
+      const includes = this.queries.getPhpDocumentRootIncludes(prefix)
+        .map((row) => ({ filePath: row.filePath, written: row.name.slice(prefix.length) }));
+      this.phpWebRoots = includes.length === 0
+        ? new Map()
+        : inferPhpWebRoots(includes, (relPath) => this.context.fileExists(relPath));
+    }
+    return this.phpWebRoots;
+  }
+
+  /**
+   * The web roots PHP's `$_SERVER['DOCUMENT_ROOT']` includes go under now,
+   * for a sync to compare with the index's (#3298; see phpWebRootSnapshot).
+   */
+  getPhpWebRootSnapshot(): string {
+    return phpWebRootSnapshot(loadWebRoot(this.projectRoot), this.inferredPhpWebRoots());
+  }
+
+  /** Whether files a sync never touched must take another web root (see phpWebRootsMoved). */
+  phpWebRootsMoved(before: string, now: string): boolean {
+    return phpWebRootsMoved(before, now);
   }
 
   /** The folder of the workspace package or path dependency `file` is in (see `workspacePackageDirOf`), or null. */
@@ -3062,6 +3587,11 @@ export class ReferenceResolver {
     return pythonReopenScope(this.diskContext(), changedFiles);
   }
 
+  /** What a sync must re-open after these Python files were edited (see `pythonScriptModuleScope`). */
+  getPythonScriptModuleScope(editedFiles: string[]): ReturnType<typeof pythonScriptModuleScope> {
+    return pythonScriptModuleScope(this.context, editedFiles);
+  }
+
   /** Importers of Python packages whose `__init__.py` was edited, with the names they bind (see `pythonPackageImporters`). */
   getPythonPackageImporters(initFiles: string[]): Map<string, Map<string, string | null>> {
     return pythonPackageImporters(this.context, initFiles);
@@ -3073,7 +3603,8 @@ export class ReferenceResolver {
       ...this.context,
       readFile: (filePath: string) => {
         try {
-          return fs.readFileSync(path.join(this.projectRoot, filePath), 'utf-8');
+          const abs = path.join(this.projectRoot, filePath);
+          return fs.statSync(abs).isFile() ? fs.readFileSync(abs, 'utf-8') : null;
         } catch {
           return null;
         }
@@ -3322,9 +3853,20 @@ export class ReferenceResolver {
    * Resolving the specifier is the same question resolveViaImport will ask
    * next, so a receiver that passes here is one the qualified path can actually
    * serve; anything else stays a silent miss rather than a wrong edge.
+   *
+   * Asked of the binding the reference reads, as resolveViaImport asks it, for
+   * a receiver the file imports at all: an `import a.b as receiver` inside the
+   * calling function (#2600), or the file's imports of the name unless the
+   * function binds it itself — a parameter or local named like the module
+   * (`def save(store): store.write()`) is a value, and its builtin-named call
+   * stays filtered.
    */
   private isPythonProjectModule(ref: UnresolvedRef, receiver: string): boolean {
-    for (const imp of this.context.getImportMappings(ref.filePath, ref.language)) {
+    const imports = this.context.getImportMappings(ref.filePath, ref.language);
+    if (!imports.some((imp) => imp.localName === receiver)) return false;
+    const local = pythonFunctionModuleAlias(receiver, ref, this.context);
+    if (local) return resolveImportPath(local, ref.filePath, ref.language!, this.context) !== null;
+    for (const imp of pythonImportsInScope(ref, imports, this.context)) {
       if (imp.localName !== receiver) continue;
       // `import pkg.mod` / `import pkg.mod as m` binds the module `source`
       // names. `from pkg import mod` binds `pkg.mod`, and `from . import mod`
@@ -3348,6 +3890,32 @@ export class ReferenceResolver {
     const dot = ref.referenceName.indexOf('.');
     return dot > 0 && PYTHON_BUILT_IN_METHODS.has(ref.referenceName.slice(dot + 1)) &&
       !PYTHON_BUILT_IN_TYPES.has(ref.referenceName.slice(0, dot));
+  }
+
+  /**
+   * The file isUnboundPythonBuiltin read last: every name its nodes have and
+   * its imports bind, and whether it star-imports a module. References arrive
+   * grouped by file, so one slot serves them all.
+   */
+  private pythonFileBindings: { filePath: string; names: Set<string>; star: boolean } | null = null;
+
+  /**
+   * Whether a Python reference to a builtin's name (PYTHON_BUILTIN_NAMES) can
+   * only mean the builtin: written bare (`self.format()` and `errors.Timeout`
+   * name a member), in a file that defines nothing of that name, imports
+   * nothing under it and star-imports no module that might export it.
+   */
+  private isUnboundPythonBuiltin(ref: UnresolvedRef): boolean {
+    const line = (this.context.getFileLines?.(ref.filePath) ?? this.context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+    if (line === undefined || !line.startsWith(ref.referenceName, ref.column) || /\.\s*$/.test(line.slice(0, ref.column))) return false;
+    let file = this.pythonFileBindings;
+    if (file?.filePath !== ref.filePath) {
+      const names = new Set(this.context.getNodesInFile(ref.filePath).map((n) => n.name));
+      for (const m of this.context.getImportMappings(ref.filePath, 'python')) names.add(m.localName);
+      const star = /^[ \t]*from[ \t]+[\w.]+[ \t]+import[ \t(]*\*/m.test(this.context.readFile(ref.filePath) ?? '');
+      this.pythonFileBindings = file = { filePath: ref.filePath, names, star };
+    }
+    return !file.star && !file.names.has(ref.referenceName);
   }
 
   /**
@@ -3396,6 +3964,13 @@ export class ReferenceResolver {
 
     // Python built-ins (bare calls only — dotted calls like console.print are method calls)
     if (ref.language === 'python' && PYTHON_BUILT_INS.has(name)) {
+      return true;
+    }
+    // The rest of them, `raise TimeoutError(…)` or `sorted(xs)`, written bare in
+    // a file that neither defines nor imports the name, nor star-imports a module
+    // that could: there it can only be the builtin, never a project class or
+    // function of that name in a file it doesn't import (#3232).
+    if (ref.language === 'python' && PYTHON_BUILTIN_NAMES.has(name) && this.isUnboundPythonBuiltin(ref)) {
       return true;
     }
 
@@ -4010,6 +4585,10 @@ export class ReferenceResolver {
       // through its package; as a struct here it read as an instantiation.
       if (target && ref.language === 'go' && GO_TYPE_KINDS.has(target.kind) &&
           !ref.referenceName.includes('.') && !isGoBareName(ref, this.context)) return null;
+      // A JS/TS call written on `this` reads a property of the object: a
+      // `const`/`let`/`var` or a `function` declaration is a lexical binding,
+      // never what `this.cast()` names (see isLexicalBindingOfJsThisCall).
+      if (target && isLexicalBindingOfJsThisCall(target, ref, this.context)) return null;
     }
 
     // A TypeScript interface or type alias is no value: nothing calls one or
@@ -4062,7 +4641,7 @@ export class ReferenceResolver {
       if (!type) return null;
       result = { ...result, targetNodeId: type.id };
     }
-    if (isBoundToOutOfRepoImport(ref, this.context)) return null;
+    if (isBoundToOutOfRepoImport(ref, this.context, target)) return null;
     // A Go type embedded through a package (`clientv3.KV`) is that package's.
     // When the package is none of the file's imports as indexed (clientv3
     // imported unaliased as `go.etcd.io/etcd/client/v3`), a type found by its
@@ -4118,6 +4697,10 @@ export class ReferenceResolver {
     if (bare && !isRustNameInScope(target, ref, this.context)) return null;
     if (ref.referenceKind !== 'calls') return result;
     if (!bare && !isRustPathCallReachable(target, ref, this.context)) return null;
+    // What the name alone can't reach: an associated function by a method
+    // call, an outside trait's impl or another type's method by a guess (#3252).
+    const guessed = result.byName === true || result.resolvedBy === 'exact-match' || result.resolvedBy === 'fuzzy';
+    if (isRustCallUnreachable(target, ref, guessed, this.context)) return null;
     return isRustForeignImplCallable(target, ref, this.context) ? result : null;
   }
 
@@ -4356,6 +4939,18 @@ export class ReferenceResolver {
   /** The repository's own package name, from its root package.json; null without one. */
   /** Per directory: the package names its package.json and every enclosing one own and depend on. */
   private manifestScopes = new Map<string, { own: Set<string>; deps: Set<string> }>();
+  /** isRegistryCopy's answers, by `node_modules` folder and package name; undefined: not there. */
+  private installedPackages = new Map<string, boolean | undefined>();
+  /** Per absolute directory: the names of what it holds, exactly as spelled; null when it can't be listed. */
+  private directoryListings = new Map<string, Set<string> | null>();
+  /** Per importing directory: the `node_modules` folders Node searches from it, nearest first. */
+  private searchedModules = new Map<string, string[]>();
+  /** Per `node_modules` folder: its real path. */
+  private realModulesDirs = new Map<string, string>();
+  /** The package names the project's own manifests give (see projectPackageNames). */
+  private ownPackageNames: Set<string> | null = null;
+  /** The name an installed package's own package.json gives, by `node_modules` folder and import name ('' for none). */
+  private installedNames = new Map<string, string>();
 
   /**
    * Is `source` a package from outside the repository? Only when the importing
@@ -4376,6 +4971,156 @@ export class ReferenceResolver {
     // unless this repository is that framework.
     const provider = source.startsWith('astro:') ? 'astro' : /^\$(?:app|env|service-worker)(?:\/|$)/.test(source) ? '@sveltejs/kit' : null;
     return provider !== null && !scope.own.has(provider) && !this.context.getWorkspacePackages?.()?.byName.has(provider);
+  }
+
+  /**
+   * Is `source`, a package name no manifest declares, one the project has
+   * installed? A dependency the manifest doesn't list is still a package when
+   * it sits in a `node_modules` folder the import would search: hoisted in a
+   * monorepo, or pulled in by another package (#3271). An alias this resolver
+   * doesn't read (a bundler's `ui`, an import map's `helpers`) has no such
+   * folder, so it keeps the project's. So does a package of the project's
+   * own: one a `node_modules` entry links to (see isRegistryCopy), or a copy
+   * of one (see projectPackageNames). Only a valid npm package name
+   * qualifies, so `$lib/…`, `~/…`, `@/…` and `#…` keep the project's.
+   */
+  private isInstalledPackage(source: string, fromFile: string): boolean {
+    const segments = source.split('/');
+    const name = source.startsWith('@') ? segments.slice(0, 2).join('/') : segments[0]!;
+    // Capitals only in a name npm accepted before it stopped, like `JSONStream`:
+    // the folder listing below matches the spelling exactly.
+    if (!/^(?:@[A-Za-z0-9][\w.~-]*\/)?[A-Za-z0-9][\w.~-]*$/.test(name)) return false;
+    const normalized = fromFile.replace(/\\/g, '/');
+    const fromDir = normalized.includes('/') ? normalized.slice(0, normalized.lastIndexOf('/')) : '';
+    const scope = this.manifestScope(fromDir);
+    if (scope.own.has(name) || this.context.getWorkspacePackages?.()?.byName.has(name)) return false;
+    for (const modules of this.modulesSearchedFrom(fromDir)) {
+      // Not there at all: no answer to keep for it.
+      if (this.listing(modules) === null) continue;
+      const copy = this.isRegistryCopy(modules, name);
+      if (copy !== undefined) return copy && !this.isProjectPackageCopy(modules, name);
+    }
+    return false;
+  }
+
+  /**
+   * Is the package `name` installed in `modules` a copy of one of the
+   * project's own packages? It is when a project manifest names it (see
+   * projectPackageNames), under the name it is imported by or under the name
+   * its own package.json gives, which differs when an install put it under
+   * another name (`"kit": "file:../libs/lib"`).
+   */
+  private isProjectPackageCopy(modules: string, name: string): boolean {
+    const own = this.projectPackageNames();
+    if (own.has(name)) return true;
+    const key = modules + '\0' + name;
+    let installedAs = this.installedNames.get(key);
+    if (installedAs === undefined) {
+      const json = readPackageJson(path.join(modules, name, 'package.json'));
+      installedAs = typeof json?.name === 'string' ? json.name : '';
+      this.installedNames.set(key, installedAs);
+    }
+    return installedAs !== '' && own.has(installedAs);
+  }
+
+  /**
+   * The names of the project's own packages: the `name` of every package.json
+   * at or above a directory the index holds files in, and every dependency
+   * one of them takes from the project (`workspace:`, `file:`, `link:`,
+   * `portal:`, which can install it under another name). An installed copy of
+   * one stays the project's: an install that copies a sibling instead of
+   * linking it (yarn's `file:`, npm's install-links), or a project that lives
+   * inside a `node_modules` folder. Read only when a name would otherwise
+   * count as installed.
+   */
+  private projectPackageNames(): Set<string> {
+    if (this.ownPackageNames) return this.ownPackageNames;
+    const names = new Set<string>();
+    const dirs = new Set<string>();
+    for (const file of this.knownFiles ?? this.queries.getAllFilePaths()) {
+      let dir = file.replace(/\\/g, '/');
+      do {
+        dir = dir.includes('/') ? dir.slice(0, dir.lastIndexOf('/')) : '';
+        if (dirs.has(dir)) break;
+        dirs.add(dir);
+      } while (dir !== '');
+    }
+    for (const dir of dirs) {
+      // Read directly: a sweep of every directory would push source text out of the read cache.
+      const json = readPackageJson(path.join(this.projectRoot, dir, 'package.json'));
+      if (!json) continue;
+      if (typeof json.name === 'string') names.add(json.name);
+      for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+        const deps = json[field];
+        if (!deps || typeof deps !== 'object') continue;
+        for (const [dep, version] of Object.entries(deps)) {
+          if (typeof version === 'string' && LOCAL_DEPENDENCY_SPEC.test(version)) names.add(dep);
+        }
+      }
+    }
+    this.ownPackageNames = names;
+    return names;
+  }
+
+  /**
+   * The `node_modules` folders Node would search from project directory
+   * `dir`, nearest first: one in every directory at or above where `dir`
+   * really is, past the project root too (a subdirectory indexed on its own
+   * installs into its parent). Paths only; the caller lists each one as it
+   * gets to it, so a nearer answer leaves the rest unread.
+   */
+  private modulesSearchedFrom(dir: string): string[] {
+    const memo = this.searchedModules.get(dir);
+    if (memo) return memo;
+    let real = path.resolve(this.projectRoot, dir);
+    try { real = fs.realpathSync(real); } catch { /* searched where it is written */ }
+    const found: string[] = [];
+    for (let at = real; ; at = path.dirname(at)) {
+      if (path.basename(at) !== 'node_modules') found.push(path.join(at, 'node_modules'));
+      if (path.dirname(at) === at) break;
+    }
+    this.searchedModules.set(dir, found);
+    return found;
+  }
+
+  /**
+   * Is the package `name` in the `modules` folder a copy from a registry?
+   * True for a folder there, or a link into a `node_modules` folder (pnpm's
+   * `.pnpm` store); false for a link to any other folder, which is a sibling
+   * package wherever the project's real path puts it (a package linked in
+   * from a checkout elsewhere, as `npm link` does, counts as one too, and so
+   * keeps today's behaviour); undefined when `modules` doesn't hold it, or
+   * holds a broken link, so Node looks further up.
+   */
+  private isRegistryCopy(modules: string, name: string): boolean | undefined {
+    const key = modules + '\0' + name;
+    if (this.installedPackages.has(key)) return this.installedPackages.get(key);
+    let answer: boolean | undefined;
+    const scope = name.startsWith('@') ? name.slice(0, name.indexOf('/')) : null;
+    const listed = scope
+      ? this.listing(modules)?.has(scope) && this.listing(path.join(modules, scope))?.has(name.slice(scope.length + 1))
+      : this.listing(modules)?.has(name);
+    if (listed) {
+      try {
+        let realModules = this.realModulesDirs.get(modules);
+        if (realModules === undefined) {
+          realModules = fs.realpathSync(modules);
+          this.realModulesDirs.set(modules, realModules);
+        }
+        const rel = path.relative(path.dirname(realModules), fs.realpathSync(path.join(modules, name)));
+        answer = rel.split(path.sep).includes('node_modules');
+      } catch { /* a broken link */ }
+    }
+    this.installedPackages.set(key, answer);
+    return answer;
+  }
+
+  private listing(dir: string): Set<string> | null {
+    if (this.directoryListings.has(dir)) return this.directoryListings.get(dir)!;
+    let names: Set<string> | null = null;
+    try { names = new Set(fs.readdirSync(dir)); } catch { /* not a readable directory */ }
+    this.directoryListings.set(dir, names);
+    return names;
   }
 
   private manifestScope(dir: string): { own: Set<string>; deps: Set<string> } {

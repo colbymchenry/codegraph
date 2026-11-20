@@ -17,9 +17,30 @@ codegraph affected src/auth.ts --filter "e2e/*"      # custom test-file pattern
 |---|---|---|
 | `--stdin` | Read the file list from stdin | `false` |
 | `-d, --depth <n>` | Max dependency traversal depth | `5` |
-| `-f, --filter <glob>` | Custom glob to identify test files | auto-detect |
+| `-f, --filter <glob>` | Custom glob for the files that count as tests ([see below](#custom-test-patterns)) | auto-detect |
 | `-j, --json` | Output as JSON | `false` |
 | `-q, --quiet` | Output file paths only | `false` |
+| `-p, --path <path>` | Project path | current project |
+| `--cross-tier` | Also follow links across a process boundary: a client's HTTP call to its server's route, a queue job to its consumer, an event to its handler ([see below](#across-a-process-boundary)) | `false` |
+
+## What counts as a test
+
+Without `--filter`, `affected` uses the same test detection as search and `codegraph_explore`. A file is a test when its name says so — `test_foo.py`, `foo_test.go`, `foo.test.ts`, `foo.spec.ts`, `FooTest.java`, or Google-style `foo_unittest.cc` and `foo_unittest.py` — or when it sits in a test folder such as `tests/`, `test/`, `__tests__/`, `spec/`, `e2e/` or `unittests/`. A folder named just `unittest/` isn't one: Python's own `unittest` package lives in one.
+
+## Custom test patterns
+
+`--filter <glob>` replaces that detection, and the glob has to match a whole name, not part of one:
+
+- **No `/`** (`*_test.go`, `test_*.py`): the file name, in any folder.
+- **With a `/`** (`e2e/*.spec.ts`): the path from any folder down, so it also matches `apps/web/e2e/login.spec.ts`.
+- **Starting with `/`** (`/tests/**/*.py`): from the project root only.
+- **Ending with `/`** (`tests/`): everything under that folder.
+
+So `tests/**/*.py` also takes `tests/x.py`, directly in `tests/`, and `tests/*.py` doesn't take `tests/x.py.bak`.
+
+## Across a process boundary
+
+CodeGraph links a client's HTTP call to the route that serves it, a queue job to its consumer and an event to its handler, so `codegraph_explore` can follow a request from one side to the other. `affected` stops at those links: a test on the other side mocks the boundary, the way an Angular service's spec stubs its HTTP client, so a change to the Spring controller the service calls doesn't affect that spec. Pass `--cross-tier` to follow them too, when your tests make the real call, as end-to-end tests do.
 
 ## CI / hook example
 

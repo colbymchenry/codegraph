@@ -7,13 +7,27 @@
  * the chosen limits per cache type.
  *
  * Eviction is plain LRU: on `set`, if the cache is full, the
- * least-recently-used entry (the first one in iteration order) is
- * evicted. Touching via `get` moves the entry to the most-recently-used
- * position so hot keys survive eviction passes.
+ * least-recently-used entry is evicted. Touching via `get` moves the
+ * entry to the most-recently-used position so hot keys survive eviction
+ * passes.
+ *
+ * Recency is a doubly linked list threaded through the entries, oldest
+ * first. Moving an entry is a few pointer writes: doing it by deleting and
+ * re-inserting the Map key made a cache hit the single hottest line of
+ * resolution, and left the Map's table to rehash as the deleted slots piled up.
  */
+interface LRUEntry<K, V> {
+  key: K;
+  value: V;
+  older: LRUEntry<K, V> | null;
+  newer: LRUEntry<K, V> | null;
+}
+
 export class LRUCache<K, V> {
   private readonly max: number;
-  private readonly store = new Map<K, V>();
+  private readonly store = new Map<K, LRUEntry<K, V>>();
+  private oldest: LRUEntry<K, V> | null = null;
+  private newest: LRUEntry<K, V> | null = null;
 
   constructor(max: number) {
     if (!Number.isFinite(max) || max <= 0) {
@@ -27,16 +41,10 @@ export class LRUCache<K, V> {
   }
 
   get(key: K): V | undefined {
-    const value = this.store.get(key);
-    if (value === undefined) {
-      // Distinguish "missing" from "stored undefined" by checking has().
-      // We don't store undefined in practice, but be defensive.
-      return this.store.has(key) ? value : undefined;
-    }
-    // Refresh recency by re-inserting.
-    this.store.delete(key);
-    this.store.set(key, value);
-    return value;
+    const entry = this.store.get(key);
+    if (entry === undefined) return undefined;
+    this.touch(entry);
+    return entry.value;
   }
 
   has(key: K): boolean {
@@ -44,19 +52,43 @@ export class LRUCache<K, V> {
   }
 
   set(key: K, value: V): void {
-    if (this.store.has(key)) {
-      this.store.delete(key);
-    } else if (this.store.size >= this.max) {
-      // Evict the oldest entry — first key in iteration order.
-      const oldest = this.store.keys().next().value;
-      if (oldest !== undefined) {
-        this.store.delete(oldest);
-      }
+    const entry = this.store.get(key);
+    if (entry !== undefined) {
+      entry.value = value;
+      this.touch(entry);
+      return;
     }
-    this.store.set(key, value);
+    if (this.store.size >= this.max && this.oldest !== null) {
+      this.store.delete(this.oldest.key);
+      this.unlink(this.oldest);
+    }
+    const added: LRUEntry<K, V> = { key, value, older: this.newest, newer: null };
+    if (this.newest !== null) this.newest.newer = added;
+    else this.oldest = added;
+    this.newest = added;
+    this.store.set(key, added);
   }
 
   clear(): void {
     this.store.clear();
+    this.oldest = null;
+    this.newest = null;
+  }
+
+  /** Make an entry the most recently used. */
+  private touch(entry: LRUEntry<K, V>): void {
+    if (entry === this.newest) return;
+    this.unlink(entry);
+    entry.older = this.newest;
+    entry.newer = null;
+    this.newest!.newer = entry;
+    this.newest = entry;
+  }
+
+  private unlink(entry: LRUEntry<K, V>): void {
+    if (entry.older !== null) entry.older.newer = entry.newer;
+    else this.oldest = entry.newer;
+    if (entry.newer !== null) entry.newer.older = entry.older;
+    else this.newest = entry.older;
   }
 }

@@ -253,12 +253,13 @@ pub fn make() {
 `,
     });
     // Only variants: the enum's own `count` and every reader of `Mode::ALL` /
-    // `Limits::MAX` stay off, and `Limits::new` links the function, not the type.
+    // `Limits::MAX` stay off, and `Limits::new` links the function, not the type:
+    // called, and passed as a value (`let _f = Limits::new`, #3254).
     expect(referencers(enumIn('mode.rs').id)).toEqual(['mode.rs:current', 'mode.rs:takes']);
     const limits = cg!.getNodesByKind('struct').find((n) => n.name === 'Limits')!;
     expect(referencers(limits.id)).toEqual([]);
     const make = cg!.getNodesByKind('function').find((n) => n.name === 'make')!;
-    expect(cg!.getOutgoingEdges(make.id).map((e) => `${e.kind}:${cg!.getNode(e.target)!.qualifiedName}`)).toEqual(['calls:Limits::new']);
+    expect(cg!.getOutgoingEdges(make.id).map((e) => `${e.kind}:${cg!.getNode(e.target)!.qualifiedName}`).sort()).toEqual(['calls:Limits::new', 'references:Limits::new']);
   });
 
   it('std and prelude enums never reach a same-named project enum', async () => {

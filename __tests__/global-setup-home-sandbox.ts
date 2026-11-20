@@ -11,7 +11,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { GlobalSetupContext } from 'vitest/node';
+import type { TestProject } from 'vitest/node';
 
 declare module 'vitest' {
   export interface ProvidedContext {
@@ -20,7 +20,7 @@ declare module 'vitest' {
   }
 }
 
-export default function setup({ provide }: GlobalSetupContext): () => void {
+export default function setup({ provide }: TestProject): () => void {
   const registry = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-test-homes-'));
   provide('homeSandboxRegistry', registry);
   return () => {

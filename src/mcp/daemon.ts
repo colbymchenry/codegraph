@@ -55,6 +55,7 @@ import {
   getDaemonSocketPath,
 } from './daemon-paths';
 import { CodeGraphPackageJsonPath, CodeGraphPackageVersion } from './version';
+import { MAX_CHALLENGE_LENGTH, daemonKey, daemonProof } from './daemon-proof';
 import {
   releaseWriterLock,
   swapWriterLock,
@@ -123,6 +124,55 @@ const DEFAULT_CLIENT_SWEEP_MS = 30_000;
 /** How often the daemon checks that the install it runs from is still in place (#2335). */
 const DEFAULT_INSTALL_CHECK_MS = 30_000;
 
+/** How often the daemon checks that the project it serves is still there (#3245). */
+const DEFAULT_ROOT_CHECK_MS = 5_000;
+
+/**
+ * How long the project must stay gone before the daemon exits (#3245). A
+ * folder on a network share or a removable drive can be out of reach for a
+ * moment, and a healthy daemon that exited then would cost the next session
+ * a cold start.
+ */
+const DEFAULT_ROOT_GONE_GRACE_MS = 30_000;
+
+/** A missing path, as opposed to one that could not be read right now. */
+function isMissing(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+/**
+ * Why the project a daemon serves is gone, or null while it is still there
+ * (#3245). A git worktree removed, or a project folder deleted, under a running
+ * daemon left it serving, watching and registered until its last client went
+ * and the idle timeout passed. Gone means:
+ * - the project folder, or its `.codegraph/` folder, no longer exists; or
+ * - its lock file (`daemon.pid`) is gone or names another process. On Windows
+ *   the daemon's own open database keeps `.codegraph/` from being deleted with
+ *   the rest of the folder (`rd /s /q`, `git worktree remove`), but the lock
+ *   file, which nothing holds open, goes; and a lock that names another
+ *   process means another daemon has taken the project over.
+ * Any other failure to read answers null: the next check looks again, as does
+ * a lock file caught mid-write. Exported for testing.
+ */
+export function projectGoneReason(projectRoot: string, pidPath: string, pid: number): string | null {
+  for (const dir of [projectRoot, path.dirname(pidPath)]) {
+    try {
+      if (!fs.statSync(dir).isDirectory()) return `${dir} is no longer a folder`;
+    } catch (err) {
+      return isMissing(err) ? `${dir} was removed` : null;
+    }
+  }
+  let raw: string;
+  try {
+    raw = fs.readFileSync(pidPath, 'utf8');
+  } catch (err) {
+    return isMissing(err) ? `its lock file ${pidPath} was removed` : null;
+  }
+  const holder = decodeLockInfo(raw)?.pid;
+  return holder === undefined || holder === pid ? null : `its lock file ${pidPath} now names pid ${holder}`;
+}
+
 /**
  * Why the install this daemon was started from no longer matches it, or null
  * while it still does. An upgrade replaces or deletes the package directory
@@ -184,6 +234,21 @@ export interface DaemonClientHello {
   codegraph_client: 1;
   pid: number;             // the proxy process's own pid
   hostPid: number | null;  // the MCP host pid (past any launcher shim), if known
+  /**
+   * A fresh random string from a client that wants this user's daemon to prove
+   * it is one before the client sends anything: the prompt hook and the MCP
+   * proxy (#3284). The daemon answers with one `{"codegraph_proof": …}` line
+   * before the session starts; a client-hello without it gets no such line.
+   * See `./daemon-proof`.
+   */
+  challenge?: string;
+}
+
+/** What a client-hello tells the daemon about the client. */
+interface ClientHelloPeers {
+  pid: number | null;
+  hostPid: number | null;
+  challenge?: string;
 }
 
 export interface DaemonStartResult {
@@ -218,6 +283,10 @@ export class Daemon {
   private maxIdleTimer: NodeJS.Timeout | null = null;
   private clientSweepTimer: NodeJS.Timeout | null = null;
   private installCheckTimer: NodeJS.Timeout | null = null;
+  private rootCheckTimer: NodeJS.Timeout | null = null;
+  /** When the project was first found gone, in the current run of checks (#3245). */
+  private projectGoneSince: number | null = null;
+  private rootGoneGraceMs: number;
   private engine: MCPEngine;
   private stopping = false;
   private socketPath: string;
@@ -227,13 +296,14 @@ export class Daemon {
 
   constructor(
     private projectRoot: string,
-    opts: { idleTimeoutMs?: number; maxIdleMs?: number; handoverFrom?: number | null } = {},
+    opts: { idleTimeoutMs?: number; maxIdleMs?: number; handoverFrom?: number | null; rootGoneGraceMs?: number } = {},
   ) {
     this.socketPath = getDaemonSocketPath(projectRoot);
     this.pidPath = getDaemonPidPath(projectRoot);
     this.idleTimeoutMs = opts.idleTimeoutMs ?? resolveIdleTimeoutMs();
     this.maxIdleMs = opts.maxIdleMs ?? resolveMaxIdleMs();
     this.handoverFrom = opts.handoverFrom ?? null;
+    this.rootGoneGraceMs = opts.rootGoneGraceMs ?? resolveRootGoneGraceMs();
     // Daemon mode serves many concurrent clients on one event loop, so off-load
     // read-tool dispatch to a worker pool — otherwise concurrent explores
     // serialize and starve the MCP transport (clients time out). Direct mode
@@ -409,6 +479,10 @@ export class Daemon {
       clearInterval(this.installCheckTimer);
       this.installCheckTimer = null;
     }
+    if (this.rootCheckTimer) {
+      clearInterval(this.rootCheckTimer);
+      this.rootCheckTimer = null;
+    }
     process.stderr.write(`[CodeGraph daemon] Shutting down (${reason}; clients=${this.clients.size}).\n`);
     for (const session of [...this.clients]) {
       try { session.stop(); } catch { /* best-effort */ }
@@ -422,7 +496,9 @@ export class Daemon {
     }
     await this.engine.stop();
     this.cleanupLockfile();
-    deregisterDaemon(this.projectRoot);
+    // Only this daemon's record: one that found another daemon serving its
+    // project leaves that one's record in place (#3245).
+    deregisterDaemon(this.projectRoot, process.pid);
     if (process.platform !== 'win32') {
       try { fs.unlinkSync(this.socketPath); } catch { /* may already be gone */ }
     }
@@ -450,8 +526,10 @@ export class Daemon {
     // peer pids, then hand the socket to the session. Fail-safe: any problem —
     // timeout, a non-hello first line, an early close — yields null pids and we
     // fall back to the socket-close lifecycle exactly as before (#692).
-    void readClientHello(socket).then((peers) => {
+    void readClientHello(socket).then(({ challenge, ...peers }) => {
       if (this.stopping || socket.destroyed) { socket.destroy(); return; }
+      // A client that asked gets its proof before the session's first byte.
+      if (challenge !== undefined) this.answerChallenge(socket, challenge);
       const transport = new SocketTransport(socket);
       const session = new MCPSession(transport, this.engine, {
         explicitProjectPath: this.projectRoot,
@@ -466,6 +544,18 @@ export class Daemon {
       // unshifted client-hello tail reaches the transport intact.
       socket.on('data', () => { this.lastActivityAt = Date.now(); });
     });
+  }
+
+  /**
+   * Answer a client-hello's challenge with this user's proof (see
+   * `./daemon-proof`), so the client can tell this daemon from a stand-in at
+   * its socket before it sends anything. `null` when no key only this user can
+   * read can be had: the client then treats this daemon as none.
+   */
+  private answerChallenge(socket: net.Socket, challenge: string): void {
+    const key = daemonKey();
+    const proof = key ? daemonProof(key, challenge, this.socketPath) : null;
+    try { socket.write(JSON.stringify({ codegraph_proof: proof }) + '\n'); } catch { /* the client hung up */ }
   }
 
   private dropClient(session: MCPSession): void {
@@ -535,6 +625,40 @@ export class Daemon {
       this.installCheckTimer = setInterval(() => { this.checkInstall(); }, installMs);
       this.installCheckTimer.unref?.();
     }
+    const rootMs = resolveRootCheckMs();
+    if (rootMs > 0) {
+      this.rootCheckTimer = setInterval(() => { this.checkProject(); }, rootMs);
+      this.rootCheckTimer.unref?.();
+    }
+  }
+
+  /**
+   * Exit once the project this daemon serves has stayed gone for the grace
+   * period (#3245; see {@link projectGoneReason}): the daemon stops watching,
+   * closes the index and removes its registry record, instead of lingering
+   * until its last client leaves and the idle timeout passes. A project back
+   * within the grace period, like a network share that dropped out for a
+   * moment, keeps it running. Returns whether the daemon is exiting. The
+   * check and the clock are injected for tests; the timer passes the real ones.
+   */
+  checkProject(
+    gone: () => string | null = () => projectGoneReason(this.projectRoot, this.pidPath, process.pid),
+    now: number = Date.now(),
+  ): boolean {
+    if (this.stopping) return false;
+    const reason = gone();
+    if (!reason) {
+      this.projectGoneSince = null;
+      return false;
+    }
+    if (this.projectGoneSince === null) {
+      this.projectGoneSince = now;
+      process.stderr.write(`[CodeGraph daemon] The project looks gone (${reason}); exiting if it is still gone in ${Math.round(this.rootGoneGraceMs / 1000)}s.\n`);
+    }
+    if (now - this.projectGoneSince < this.rootGoneGraceMs) return false;
+    process.stderr.write(`[CodeGraph daemon] The project is gone (${reason}); exiting.\n`);
+    void this.stop('project removed');
+    return true;
   }
 
   /**
@@ -935,6 +1059,24 @@ function resolveInstallCheckMs(): number {
   return Math.floor(parsed); // 0 disables the check
 }
 
+/** `CODEGRAPH_DAEMON_ROOT_CHECK_MS`: how often the project's presence is checked (#3245); 0 disables it. */
+function resolveRootCheckMs(): number {
+  const raw = process.env.CODEGRAPH_DAEMON_ROOT_CHECK_MS;
+  if (raw === undefined || raw === '') return DEFAULT_ROOT_CHECK_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_ROOT_CHECK_MS;
+  return Math.floor(parsed);
+}
+
+/** `CODEGRAPH_DAEMON_ROOT_GRACE_MS`: how long the project must stay gone before the daemon exits (#3245). */
+function resolveRootGoneGraceMs(): number {
+  const raw = process.env.CODEGRAPH_DAEMON_ROOT_GRACE_MS;
+  if (raw === undefined || raw === '') return DEFAULT_ROOT_GONE_GRACE_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_ROOT_GONE_GRACE_MS;
+  return Math.floor(parsed);
+}
+
 /**
  * Parse one client-hello line. Returns the peer pids if `line` is a well-formed
  * client-hello (carries the `codegraph_client` marker), or null otherwise — in
@@ -942,13 +1084,20 @@ function resolveInstallCheckMs(): number {
  */
 export function parseClientHelloLine(
   line: string,
-): { pid: number; hostPid: number | null } | null {
+): { pid: number; hostPid: number | null; challenge?: string } | null {
   let parsed: unknown;
   try { parsed = JSON.parse(line); } catch { return null; }
   if (!parsed || typeof parsed !== 'object') return null;
   const o = parsed as Record<string, unknown>;
   if (o.codegraph_client !== 1 || typeof o.pid !== 'number') return null;
-  return { pid: o.pid, hostPid: typeof o.hostPid === 'number' ? o.hostPid : null };
+  const peers: { pid: number; hostPid: number | null; challenge?: string } = {
+    pid: o.pid,
+    hostPid: typeof o.hostPid === 'number' ? o.hostPid : null,
+  };
+  if (typeof o.challenge === 'string' && o.challenge.length > 0 && o.challenge.length <= MAX_CHALLENGE_LENGTH) {
+    peers.challenge = o.challenge;
+  }
+  return peers;
 }
 
 /**
@@ -977,13 +1126,13 @@ export function peerIsDead(
  */
 function readClientHello(
   socket: net.Socket,
-): Promise<{ pid: number | null; hostPid: number | null }> {
+): Promise<ClientHelloPeers> {
   return new Promise((resolve) => {
     let chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
     const finish = (
-      peers: { pid: number | null; hostPid: number | null },
+      peers: ClientHelloPeers,
       putBack?: Buffer,
     ) => {
       if (settled) return;

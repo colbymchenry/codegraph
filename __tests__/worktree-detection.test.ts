@@ -20,6 +20,7 @@ import {
   detectWorktreeIndexMismatch,
   nestedRepositoryBelow,
   worktreeMismatchWarning,
+  worktreeMismatchNotice,
   gitWorktreeRoot,
   gitCommonDir,
 } from '../src/sync/worktree';
@@ -102,9 +103,28 @@ describe('detectWorktreeIndexMismatch (issue #155)', () => {
     const msg = worktreeMismatchWarning(detectWorktreeIndexMismatch(worktree, mainRepo)!);
     expect(msg).toContain(real(worktree));
     expect(msg).toContain(real(mainRepo));
-    expect(msg).toContain('codegraph init');
+    expect(msg).toContain('Run "codegraph init" in this worktree');
+    expect(msg).not.toContain('init -i');
+  });
+
+  it('words the fix as the user\'s option when an agent reads it', () => {
+    const m = detectWorktreeIndexMismatch(worktree, mainRepo)!;
+    expectAgentAdvice(worktreeMismatchWarning(m, 'agent'));
+    expectAgentAdvice(worktreeMismatchNotice(m));
   });
 });
+
+/**
+ * What an agent is told about a borrowed index. Indexing is the user's
+ * decision (the server instructions tell the agent not to run `codegraph init`
+ * itself), so the text says the user can build a worktree-local index, never
+ * tells the agent to, and doesn't name the `-i` flag, which does nothing now.
+ */
+function expectAgentAdvice(text: string): void {
+  expect(text).toContain('The user can run "codegraph init" in this worktree');
+  expect(text).not.toContain('Run "codegraph init');
+  expect(text).not.toContain('init -i');
+}
 
 /**
  * Windows spells one directory several ways. VS Code and Cursor pass a
@@ -220,7 +240,7 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
     expect(res.isError).toBeFalsy();
     expect(text).toContain('different git worktree');
     expect(text).toContain(real(worktree));
-    expect(text).toContain('codegraph init');
+    expectAgentAdvice(text);
   });
 
   it('does NOT prefix when the default project is the main checkout itself', async () => {
@@ -235,6 +255,7 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
     const text = res.content[0].text;
     expect(text).toContain('different git working tree');
     expect(text).toContain(real(worktree));
+    expectAgentAdvice(text);
   });
 
   it('caches detection — a later tool call needs no further git spawn', async () => {
@@ -337,7 +358,7 @@ describe('worktree mismatch verdict re-resolves when the index root changes (iss
  * super-repo descends into its submodules and gitlinked clones, so a query run
  * from inside one resolves up to the parent index — which genuinely contains
  * that nested repo's symbols. The warning's premise is false there, and its
- * "run codegraph init -i" advice would fragment the unified index. (#1031, #1033)
+ * "codegraph init" advice would fragment the unified index. (#1031, #1033)
  */
 describe('detectWorktreeIndexMismatch — nested repos covered by the parent index (#1031, #1033)', () => {
   let parent: string;     // super-repo that owns the .codegraph index
