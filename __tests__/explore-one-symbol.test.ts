@@ -365,6 +365,7 @@ describe('the answer for one Rust function with unit tests', () => {
   it('counts a caller in a #[cfg(test)] module as a test, and production callers apart', async () => {
     const text = await explore(rs!, 'create_note');
     expect(text).toMatch(/\*\*Called by\*\* \(1 site, 1 file\)\n- `handler` — `src\/api\.rs:2`/);
-    expect(text).toMatch(/\*\*In tests\*\* \(1 site, 1 file\)\n- `src\/store\.rs`: 7/);
+    // Each test by name with its lines: "who calls it?" about tests is a list of tests.
+    expect(text).toMatch(/\*\*In tests\*\* \(1 site, 1 file\)\n- `src\/store\.rs`: `checks_create_note` \(7\)/);
   });
 });

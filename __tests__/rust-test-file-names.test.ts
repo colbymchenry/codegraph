@@ -61,7 +61,7 @@ describe('codegraph_explore with a Rust file named like no identifier', () => {
     expect(res.isError ?? false).toBe(false);
     const text = res.content[0]!.text as string;
     expect(text).toMatch(/\*\*Called by\*\*[^\n]*\n- `odd_caller` — `src\/store\/odd\(name\.rs:2`/);
-    expect(text).toMatch(/\*\*In tests\*\*[^\n]*\n- `src\/store\/tests\.rs`: 3/);
+    expect(text).toMatch(/\*\*In tests\*\*[^\n]*\n- `src\/store\/tests\.rs`: `checks_create_note` \(3\)/);
 
     // The ranked answer's blast radius, which a one-name query still reaches
     // when the name has several definitions, reads them the same way.

@@ -142,7 +142,8 @@ export interface OneSymbolAnswer {
 interface Caps {
   sites: number;
   testFiles: number;
-  testLinesPerFile: number;
+  /** Tests named across all test files. */
+  testOwners: number;
   unlinked: number;
   holders: number;
   holderSites: number;
@@ -151,9 +152,12 @@ interface Caps {
 }
 
 const FULL_CAPS: Caps = {
-  sites: 40, testFiles: 12, testLinesPerFile: 8, unlinked: 10,
+  sites: 40, testFiles: 12, testOwners: 60, unlinked: 10,
   holders: 3, holderSites: 8, callees: 12, members: 80,
 };
+
+/** Lines listed for one test before "+N more". */
+const MAX_LINES_PER_TEST = 5;
 
 /** Languages that write a member path with `::` (everyone else reads `.`). */
 const DOUBLE_COLON_LANGUAGES = new Set(['rust', 'cpp', 'c', 'php', 'perl']);
@@ -234,7 +238,7 @@ export function renderOneSymbolAnswer(ctx: OneSymbolContext, name: string, defs:
 function halve(c: Caps): Caps {
   const h = (n: number, min: number) => Math.max(min, Math.floor(n / 2));
   return {
-    sites: h(c.sites, 5), testFiles: h(c.testFiles, 3), testLinesPerFile: h(c.testLinesPerFile, 3),
+    sites: h(c.sites, 5), testFiles: h(c.testFiles, 3), testOwners: h(c.testOwners, 10),
     unlinked: h(c.unlinked, 3), holders: h(c.holders, 1), holderSites: h(c.holderSites, 3),
     callees: h(c.callees, 4), members: h(c.members, 15),
   };
@@ -371,11 +375,29 @@ function renderDefinition(
       byFile.set(s.filePath, list);
     }
     out.push(`**In tests** (${plural(tests.length, 'site')}, ${plural(byFile.size, 'file')})`);
+    // Each test by name with its lines, in line order, while the answer has
+    // room: "who calls X?" about a function only tests call is a list of them.
+    let named = 0;
     for (const [filePath, sites] of [...byFile].sort(([a], [b]) => a.localeCompare(b)).slice(0, caps.testFiles)) {
-      const nums = [...new Set(sites.filter((s) => s.line > 0).map((s) => s.line))].sort((a, b) => a - b);
-      const shownNums = nums.slice(0, caps.testLinesPerFile).join(', ');
-      const owners = new Set(sites.map((s) => s.owner?.id).filter(Boolean)).size;
-      out.push(`- \`${filePath}\`${nums.length > 0 ? `: ${shownNums}${nums.length > caps.testLinesPerFile ? `, +${nums.length - caps.testLinesPerFile} more` : ''}` : ''}${owners > 1 ? ` (${owners} tests)` : ''}`);
+      const byOwner = new Map<string, { owner: Node | null; lines: number[] }>();
+      for (const s of [...sites].sort((a, b) => a.line - b.line)) {
+        const key = s.owner && s.owner.kind !== 'file' ? s.owner.id : '';
+        const entry = byOwner.get(key) ?? { owner: key ? s.owner : null, lines: [] };
+        if (s.line > 0 && !entry.lines.includes(s.line)) entry.lines.push(s.line);
+        byOwner.set(key, entry);
+      }
+      const entries = [...byOwner.values()];
+      const shownEntries = entries.slice(0, Math.max(0, caps.testOwners - named));
+      named += shownEntries.length;
+      const lineList = (lines: number[]) =>
+        `${lines.slice(0, MAX_LINES_PER_TEST).join(', ')}${lines.length > MAX_LINES_PER_TEST ? `, +${lines.length - MAX_LINES_PER_TEST} more` : ''}`;
+      const shown = shownEntries
+        .map((e) => (e.owner ? `\`${displayName(e.owner)}\`${e.lines.length > 0 ? ` (${lineList(e.lines)})` : ''}` : lineList(e.lines)))
+        .filter(Boolean)
+        .join(', ');
+      const rest = entries.length - shownEntries.length;
+      const more = rest > 0 ? `${shown ? ', ' : ''}+${rest} more` : '';
+      out.push(`- \`${filePath}\`${shown || more ? `: ${shown}${more}` : ''}`);
     }
     if (byFile.size > caps.testFiles) out.push(`- +${plural(byFile.size - caps.testFiles, 'more file')}`);
     out.push('');
