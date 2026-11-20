@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- `codegraph callers` and `codegraph_callers` list callers outside tests before tests, so a symbol called mostly from tests no longer shows only tests under the default limit while its real callers are cut.
+
 
 ## [1.6.4] - 2026-11-20
 
