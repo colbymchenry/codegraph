@@ -27,7 +27,7 @@ A new CodeGraph release often reads code better than the last, and an index buil
 
 ```
 ⚠️ This project's CodeGraph index predates the running extraction engine. It was built
-with CodeGraph v1.6.2 (extraction 27); the running engine is CodeGraph v1.6.3 (extraction 28).
+with CodeGraph v1.6.3 (extraction 28); the running engine is CodeGraph v1.6.4 (extraction 29).
 Answers can miss symbols and relationships this engine adds. Indexing is the user's decision:
 they can run `codegraph index` in the project to rebuild it.
 ```
@@ -85,8 +85,8 @@ When your editor / agent (re)connects to the MCP server, codegraph runs a fast f
 codegraph_status →
   **CodeGraph Status**
   …
-  **Index built with:** CodeGraph v1.6.3 (extraction 28)
-  **Running CodeGraph:** v1.6.3 (extraction 28)
+  **Index built with:** CodeGraph v1.6.4 (extraction 29)
+  **Running CodeGraph:** v1.6.4 (extraction 29)
   **Re-index recommended:** no
   …
   **Pending sync:**

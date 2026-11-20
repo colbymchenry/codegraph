@@ -96,6 +96,8 @@ function    report
 
 On a very heavily referenced symbol, `impact` stops at a safety limit and says the answer was truncated (`"truncated": true` with `--json`). Narrow it with `--file` or a smaller `--depth`.
 
+`callers`, `callees` and `impact` warn when a file in the answer changed on disk after it was last indexed, since its line numbers may be off, and say to run `codegraph sync`. With `--json` the warning goes to stderr, so the output stays parseable, and the answer lists those files under `changedOnDisk`.
+
 ### files
 
 `codegraph files --format package` lists files by the package that owns them: the nearest `package.json` or `composer.json` above each file that names one. A monorepo splits into its workspace members with no setup, and files nothing claims get a section of their own. The other formats are `tree` (the default), `flat` and `grouped` (by language).
@@ -124,7 +126,7 @@ A very large hierarchy is cut off with a note that more exist. `--json` gives th
 
 ## affected
 
-Traces import dependencies transitively to find which test files are affected by changed source files. `--filter` replaces the built-in test detection with a glob matched against the whole path, so `tests/**/*.py` also takes the files directly in `tests/`. See [Affected Tests in CI](/codegraph/guides/affected-tests/) for options and a CI example.
+Traces import dependencies transitively to find which test files are affected by changed source files. It stops at a process boundary (an HTTP call, a queue or an event), since a test on the other side mocks that boundary: a change to a Spring controller doesn't select the specs of the Angular app that calls it. `--cross-tier` follows those links too. `--filter` replaces the built-in test detection with a glob matched against the whole path, so `tests/**/*.py` also takes the files directly in `tests/`. See [Affected Tests in CI](/codegraph/guides/affected-tests/) for options and a CI example.
 
 ## cycles
 

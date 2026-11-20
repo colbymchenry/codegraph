@@ -12,7 +12,7 @@ Each agent's `--target` id is in parentheses, followed by where the installer wr
 - **Claude Code** (`claude`) — `~/.claude.json`, or `.mcp.json` in a project; with `CLAUDE_CONFIG_DIR` set, `$CLAUDE_CONFIG_DIR/.claude.json`
 - **Cursor** (`cursor`) — `~/.cursor/mcp.json`, or `.cursor/mcp.json` in a project
 - **Codex CLI** (`codex`) — the Codex IDE extension reads the same config: a global install writes `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`), and a local install writes `.codex/config.toml`, which Codex uses only in a project you've marked as trusted
-- **opencode** (`opencode`) — `opencode.jsonc` in `~/.config/opencode` (under `$XDG_CONFIG_HOME` when that's set), or in the project; an `opencode.json` already there is used instead
+- **opencode** (`opencode`) — `opencode.jsonc` in `~/.config/opencode` (under `$XDG_CONFIG_HOME` when that's set), or in the project; an `opencode.json` already there is used instead; OpenCode puts the server's key in front of each tool's name, listing `codegraph_explore` as `codegraph_codegraph_explore`, and CodeGraph's instructions for OpenCode use that name
 - **Hermes Agent** (`hermes`) — global only: `$HERMES_HOME/config.yaml` (default `~/.hermes`)
 - **Gemini CLI** (`gemini`) — `~/.gemini/settings.json`, or `.gemini/settings.json` in a project
 - **Antigravity IDE** (`antigravity`) — global only: `~/.gemini/config/mcp_config.json`, or `~/.gemini/antigravity/mcp_config.json` for an Antigravity that hasn't moved its config there yet

@@ -33,7 +33,10 @@ Reach for `codegraph explore` first — a natural-language question or a bag of 
 
 ```bash
 codegraph explore "how does login work"
+codegraph explore "who calls handleRequest?"
 ```
+
+A question about one symbol, like the second, gets that symbol's source and every line that uses it, each with the function it sits in.
 
 For narrower, scriptable lookups there are focused commands:
 
