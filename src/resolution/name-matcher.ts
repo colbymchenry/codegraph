@@ -859,6 +859,39 @@ export function pythonReceiverBinding(name: string, ref: UnresolvedRef, context:
   return 'module';
 }
 
+type PythonInnermostBinding =
+  | { kind: 'module' }
+  | { kind: 'statement' }
+  | { kind: 'local'; scope: Node; nestedDef: boolean }
+  | { kind: 'module_import' }
+  | { kind: 'from_import'; source: string; exportedName: string };
+
+/**
+ * The exact innermost binding scope for bare Python `name` at `ref`:
+ * statement-local (comprehension/lambda), a specific enclosing function's local
+ * binding (noting whether that scope directly declares a nested `def`/`class`
+ * of `name`), a function-local `import ... as name`, a function-local
+ * `from ... import`, or module scope.
+ */
+function pythonInnermostBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): PythonInnermostBinding {
+  if (ref.language !== 'python' || !/^[A-Za-z_]\w*$/.test(name)) return { kind: 'module' };
+  if (pythonStatementBindsAt(name, ref, context)) return { kind: 'statement' };
+  const { functions, innermost, parent } = pythonFunctionIndex(ref.filePath, context);
+  for (let i = innermost[ref.line] ?? -1; i >= 0; i = parent[i]!) {
+    const scope = functions[i]!;
+    const binding = pythonNameScan(context, `binding\0${scope.id}\0${name}`, () => pythonScopeBinding(scope, name, context));
+    if (binding === null) continue;
+    if (binding === 'module') return { kind: 'module' };
+    if (binding === 'local') {
+      const { nested } = pythonScopeText(scope, context);
+      return { kind: 'local', scope, nestedDef: nested.includes(name) };
+    }
+    if ('module' in binding) return { kind: 'module_import' };
+    return { kind: 'from_import', source: binding.source, exportedName: binding.exportedName };
+  }
+  return { kind: 'module' };
+}
+
 /**
  * A file's functions and methods, the innermost one around each line (-1 for
  * none) and the one around each function's own `def` line, built once per file.
@@ -1723,12 +1756,37 @@ export function matchFunctionRef(
     // A Dart constructor is torn off through its class, never by a bare name.
     !isDartConstructor(n, context));
   if (candidates.length === 0) return null;
-  // A Python name the function around it binds — a parameter, an assignment —
-  // is that local's value: httpx's `auth_flow(self, request)` handing `request`
-  // on is not the package's `request()` function. A pytest fixture is what a
-  // test's parameter of its name receives.
-  if (ref.language === 'python' && !candidates.some((n) => isFixtureInReach(n, ref.filePath, context)) &&
-      isPythonLocallyBound(ref.referenceName, ref, context)) return null;
+  // A Python name the function around it binds — a parameter, an assignment,
+  // a loop/`as`/walrus target, a comprehension variable, a lambda parameter,
+  // a function-local `import ... as name`, or a nested `def`/`class` — is that
+  // local's value, never a module-level namesake or import (#2219, #3430). A
+  // pytest fixture is what a test's parameter of its name receives, and a
+  // nested `def`/`class` stays reachable only when its own enclosing function
+  // is the innermost binding scope for the name.
+  if (ref.language === 'python') {
+    const innermost = pythonInnermostBinding(ref.referenceName, ref, context);
+    if (innermost.kind === 'statement' || innermost.kind === 'module_import') {
+      return null;
+    }
+    if (innermost.kind === 'local') {
+      candidates = candidates.filter(
+        (n) =>
+          isFixtureInReach(n, ref.filePath, context) ||
+          (innermost.nestedDef &&
+            n.filePath === ref.filePath &&
+            n.qualifiedName === `${innermost.scope.qualifiedName}::${n.name}` &&
+            n.startLine > innermost.scope.startLine &&
+            n.endLine <= innermost.scope.endLine),
+      );
+      if (candidates.length === 0) return null;
+    }
+    if (
+      !candidates.some((n) => isFixtureInReach(n, ref.filePath, context)) &&
+      isPythonLocallyBound(ref.referenceName, ref, context)
+    ) {
+      return null;
+    }
+  }
   // Likewise a JS/TS parameter or local: lodash's `baseHas(object, key)` passes its own `object`.
   const jsLocal = jsFunctionLocalScope(ref.referenceName, ref, context);
   if (jsLocal) {
@@ -15214,6 +15272,31 @@ function jsForStatementOpenAtEnd(code: string, at: number): boolean {
     const c = code[i];
     if (c === '(' || c === '[' || c === '{') depth++;
     else if ((c === ')' || c === ']' || c === '}') && --depth < 0) return c === ')' && jsBodyOpenAtEnd(code, i + 1);
+  }
+  return true;
+}
+
+/**
+ * Whether an import-resolved `result` for a bare Python `function_ref` is
+ * shadowed by a local binding (parameter, assignment, loop/`as`/walrus target,
+ * nested `def`/`class`, comprehension variable, lambda parameter, or
+ * function-local `import ... as name`) in an enclosing function rather than
+ * reading the module's import (#3430). A pytest fixture in reach stays linked
+ * when bound as a test parameter.
+ */
+export function isImportShadowedByPythonBinding(
+  result: ResolvedRef,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): boolean {
+  if (ref.language !== 'python' || ref.referenceKind !== 'function_ref') return false;
+  if (!/^[A-Za-z_]\w*$/.test(ref.referenceName)) return false;
+  const binding = pythonReceiverBinding(ref.referenceName, ref, context);
+  if (binding === 'module') return false;
+  if (typeof binding === 'object') return 'module' in binding;
+  const target = context.getNodeById?.(result.targetNodeId);
+  if (target && isFixtureInReach(target, ref.filePath, context) && !pythonStatementBindsAt(ref.referenceName, ref, context)) {
+    return false;
   }
   return true;
 }
