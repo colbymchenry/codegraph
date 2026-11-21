@@ -139,6 +139,7 @@ export const DEAD_CODE_ALLOWED_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>(
   'constant',
   'property',
   'field',
+  'event',
   'enum_member',
   'namespace',
   'module',

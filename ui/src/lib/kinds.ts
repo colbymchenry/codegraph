@@ -32,6 +32,7 @@ export const KIND_LETTER: Record<string, string> = {
   parameter: 'pm',
   import: 'im',
   export: 'ex',
+  event: 'ev',
 };
 
 /** Kinds drawn with a --press fill (they contain other symbols, or are types). */

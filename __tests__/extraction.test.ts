@@ -10876,15 +10876,20 @@ contract Vault is IVault {
       expect(enumMembers).toEqual(expect.arrayContaining(['Active', 'Frozen', 'Closed']));
     });
 
-    it('should extract state variables, struct members, events, errors as fields', () => {
+    it('should extract state variables, struct members, errors as fields and events as event', () => {
       const result = extractFromSource('Vault.sol', code);
       const fieldNames = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
       // state variables
       expect(fieldNames).toEqual(expect.arrayContaining(['token', 'users', 'owner']));
       // struct members
       expect(fieldNames).toEqual(expect.arrayContaining(['balance', 'lastDeposit']));
-      // event + error
-      expect(fieldNames).toEqual(expect.arrayContaining(['Deposited', 'Withdrawn', 'NotOwner']));
+      // custom error remains field
+      expect(fieldNames).toContain('NotOwner');
+      // events use the dedicated `event` node kind (#3440)
+      const eventNames = result.nodes.filter((n) => n.kind === 'event').map((n) => n.name);
+      expect(eventNames).toEqual(expect.arrayContaining(['Deposited', 'Withdrawn']));
+      expect(fieldNames).not.toContain('Deposited');
+      expect(fieldNames).not.toContain('Withdrawn');
     });
 
     it('should treat `constant_variable_declaration` as a constant, not a variable', () => {
@@ -12368,8 +12373,10 @@ End Namespace
     expect(props).toEqual(expect.arrayContaining(['Id', 'State']));
     const fields = result.nodes.filter((n) => n.kind === 'field' || n.kind === 'constant').map((n) => n.name);
     expect(fields).toEqual(expect.arrayContaining(['_lines', 'MaxLines']));
-    // Event declarations index as findable members
-    expect(fields).toContain('Paid');
+    // Event declarations index with the dedicated `event` node kind (#3440)
+    const events = result.nodes.filter((n) => n.kind === 'event').map((n) => n.name);
+    expect(events).toContain('Paid');
+    expect(fields).not.toContain('Paid');
   });
 
   it('should qualify types with their namespace', () => {

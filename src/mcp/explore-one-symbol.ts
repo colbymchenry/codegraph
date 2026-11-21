@@ -79,7 +79,7 @@ export function oneSymbolQueryName(query: string): string | null {
 
 /** Node kinds that are a definition a one-symbol answer can be about. */
 const DEFINITION_KINDS: ReadonlySet<NodeKind> = new Set<NodeKind>([
-  'function', 'method', 'component', 'class', 'struct', 'interface', 'trait', 'protocol',
+  'function', 'method', 'component', 'event', 'class', 'struct', 'interface', 'trait', 'protocol',
   'enum', 'union', 'type_alias', 'variable', 'constant', 'property', 'field', 'enum_member',
 ]);
 
