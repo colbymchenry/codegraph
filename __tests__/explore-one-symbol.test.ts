@@ -369,3 +369,250 @@ describe('the answer for one Rust function with unit tests', () => {
     expect(text).toMatch(/\*\*In tests\*\* \(1 site, 1 file\)\n- `src\/store\.rs`: `checks_create_note` \(7\)/);
   });
 });
+
+describe('attribute accesses and shadowed names are not counted as function uses (#3431)', () => {
+  let pyAttr: Project | undefined;
+  let pyExt: Project | undefined;
+  let tsAttr: Project | undefined;
+  let rsArrow: Project | undefined;
+
+  beforeAll(async () => {
+    pyAttr = await project('codegraph-one-symbol-py-attr-', {
+      'pkg/__init__.py': '',
+      'pkg/termui.py': [
+        'def prompt(text):',
+        '    return input(text)',
+        '',
+      ].join('\n'),
+      'pkg/core.py': [
+        'from .termui import prompt',
+        '',
+        '',
+        'class Option:',
+        '    def __init__(self, text):',
+        '        self.prompt = text',
+        '',
+        '    def prompt_for_value(self):',
+        '        assert self.prompt is not None',
+        '        label = self.prompt.strip()',
+        '        return prompt(label)',
+        '',
+      ].join('\n'),
+    });
+
+    pyExt = await project('codegraph-one-symbol-py-ext-', {
+      'pkg/__init__.py': '',
+      'pkg/termui.py': [
+        'DEFAULT_PROMPT = "> "',
+        '',
+        'def prompt(text):',
+        '    return input(text)',
+        '',
+      ].join('\n'),
+      'pkg/core.py': [
+        'from .termui import prompt',
+        'from . import termui',
+        '',
+        'class Option:',
+        '    prompt = None',
+        '    def __init__(self, text):',
+        '        self.prompt = text',
+        '',
+        '    @classmethod',
+        '    def from_cls(cls, obj):',
+        '        a = cls.prompt',
+        '        b = obj.prompt',
+        '        assert obj.prompt is not None',
+        '        obj.prompt = a',
+        '        kw = dict(prompt=a)',
+        '        cb = prompt',
+        '        return prompt(a or b or cb or kw)',
+        '',
+        '    def via_module(self):',
+        '        x = self.prompt',
+        '        fn = termui.prompt',
+        '        return termui.prompt(x)',
+        '',
+        '    def shadowed(self, prompt=None):',
+        '        if prompt is True:',
+        '            self.prompt = "default"',
+        '        return termui.prompt(prompt)',
+        '',
+      ].join('\n'),
+      'pkg/consts.py': [
+        'from .termui import DEFAULT_PROMPT',
+        '',
+        'class Holder:',
+        '    def __init__(self, val):',
+        '        self.DEFAULT_PROMPT = val',
+        '',
+        '    def show(self):',
+        '        return DEFAULT_PROMPT',
+        '',
+      ].join('\n'),
+      'pkg/types.py': [
+        'class PromptConfig:',
+        '    pass',
+        '',
+      ].join('\n'),
+      'pkg/typed_consumer.py': [
+        'from .types import PromptConfig',
+        '',
+        'def build(cfg: PromptConfig = None):',
+        '    local_cfg: PromptConfig = cfg',
+        '    return local_cfg',
+        '',
+      ].join('\n'),
+    });
+
+    tsAttr = await project('codegraph-one-symbol-ts-attr-', {
+      'src/termui.ts': [
+        'export interface PromptConfig { prefix: string; }',
+        'export const DEFAULT_OPTS = { prefix: "> " };',
+        'export function formatPrompt(text: string): string {',
+        '  return text;',
+        '}',
+        '',
+      ].join('\n'),
+      'src/core.ts': [
+        "import { formatPrompt, DEFAULT_OPTS, type PromptConfig } from './termui';",
+        "import * as termui from './termui';",
+        '',
+        'export class Option {',
+        '  formatPrompt: string | null = null;',
+        '  ask(other?: { formatPrompt?: string }): string {',
+        '    if (!this.formatPrompt) {',
+        '      this.formatPrompt = other?.formatPrompt ?? "default";',
+        '    }',
+        '    const cfg: PromptConfig = { ...DEFAULT_OPTS };',
+        '    const alt: string | PromptConfig = cfg;',
+        '    const meta = { formatPrompt: "x" };',
+        '    const cb = formatPrompt;',
+        '    const label = this.formatPrompt.trim();',
+        '    return formatPrompt(label || cb(typeof alt === "string" ? alt : alt.prefix) || meta.formatPrompt);',
+        '  }',
+        '  askViaNs(other: { formatPrompt: string }): string {',
+        '    const x = other.formatPrompt;',
+        '    return termui.formatPrompt(x);',
+        '  }',
+        '  shadowed(formatPrompt?: string): string {',
+        '    if (!formatPrompt) {',
+        '      formatPrompt = "default";',
+        '    }',
+        '    return termui.formatPrompt(formatPrompt);',
+        '  }',
+        '}',
+        '',
+        'export const unparenArrow = x => {',
+        '  const ok = Boolean(formatPrompt) && typeof formatPrompt === "function";',
+        '  if (x && ok) { return formatPrompt(x); }',
+        '  return "";',
+        '};',
+        'export const typedArrow: (formatPrompt: string) => string = (text) => {',
+        '  const ok = typeof formatPrompt === "function";',
+        '  return ok ? termui.formatPrompt(text) : text;',
+        '};',
+        'export const shadowArrow = formatPrompt => {',
+        '  if (!formatPrompt) { return ""; }',
+        '  return termui.formatPrompt(formatPrompt);',
+        '};',
+        '',
+      ].join('\n'),
+    });
+
+    rsArrow = await project('codegraph-one-symbol-rs-arrow-', {
+      'Cargo.toml': '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n',
+      'src/lib.rs': 'pub mod limits;\npub mod check;\n',
+      'src/limits.rs': 'pub const MAX_ATTEMPTS: u32 = 3;\n',
+      'src/check.rs': [
+        'use crate::limits::MAX_ATTEMPTS;',
+        'pub fn is_limit(n: u32) -> bool {',
+        '    match n {',
+        '        MAX_ATTEMPTS => true,',
+        '        _ => false,',
+        '    }',
+        '}',
+        '',
+      ].join('\n'),
+    });
+  }, 120_000);
+
+  afterAll(() => {
+    destroy(pyAttr);
+    destroy(pyExt);
+    destroy(tsAttr);
+    destroy(rsArrow);
+  });
+
+  it('Python: skips self.name attributes inside a caller of a function', async () => {
+    const text = await explore(pyAttr!, 'prompt');
+    expect(text).toContain('**`prompt`** (function) — defined at `pkg/termui.py:1`; 1 site in 1 file depends on it.');
+    expect(text).toContain('**Called by** (1 site, 1 file)');
+    expect(text).toContain('- `Option.prompt_for_value` — `pkg/core.py:11`: `return prompt(label)`');
+    expect(text).not.toContain('**Used by**');
+    expect(text).not.toContain('pkg/core.py:9');
+    expect(text).not.toContain('pkg/core.py:10');
+  });
+
+  it('Python: skips self/cls/obj attributes, kwargs, and shadowed params while keeping calls and value uses', async () => {
+    const text = await explore(pyExt!, 'prompt');
+    expect(text).toContain('5 sites in 1 file depend on it.');
+    expect(text).toContain('**Called by** (3 sites, 1 file)');
+    expect(text).toContain('- `Option.from_cls` — `pkg/core.py:17`: `return prompt(a or b or cb or kw)`');
+    expect(text).toContain('- `Option.via_module` — `pkg/core.py:22`: `return termui.prompt(x)`');
+    expect(text).toContain('- `Option.shadowed` — `pkg/core.py:27`: `return termui.prompt(prompt)`');
+    expect(text).toContain('**Used by** (2 sites, 1 file)');
+    expect(text).toContain('- `Option.from_cls` — `pkg/core.py:16`: `cb = prompt`');
+    expect(text).toContain('- `Option.via_module` — `pkg/core.py:21`: `fn = termui.prompt`');
+    const dependents = text.split('**Other')[0]!;
+    for (const skipped of [11, 12, 13, 14, 15, 20, 24, 25, 26]) {
+      expect(dependents).not.toContain(`pkg/core.py:${skipped}\`:`);
+    }
+  });
+
+  it('Python: skips self.CONST attributes when scanning an importing file for constant uses', async () => {
+    const text = await explore(pyExt!, 'DEFAULT_PROMPT');
+    expect(text).toContain('1 site in 1 file depends on it.');
+    expect(text).toContain('- `Holder.show` — `pkg/consts.py:8`: `return DEFAULT_PROMPT`');
+    expect(text).not.toContain('pkg/consts.py:5');
+  });
+
+  it('Python: keeps type annotations followed by `=` in parameter defaults and local annotations', async () => {
+    const text = await explore(pyExt!, 'PromptConfig');
+    expect(text).toContain('- `build` — `pkg/typed_consumer.py:3`: `def build(cfg: PromptConfig = None):`');
+    expect(text).toContain('- `build` — `pkg/typed_consumer.py:4`: `local_cfg: PromptConfig = cfg`');
+  });
+
+  it('TypeScript: skips this/obj/optional-chain properties, object keys, and shadowed params while keeping calls, values, spreads, type annotations, and unparenthesized/typed arrows', async () => {
+    const fnText = await explore(tsAttr!, 'formatPrompt');
+    expect(fnText).toContain('**`formatPrompt`** (function) — defined at `src/termui.ts:3`;');
+    expect(fnText).toContain('- `Option.ask` — `src/core.ts:15`: `return formatPrompt(label || cb(typeof alt === "string" ? alt : alt.prefix) || meta.formatPrompt);`');
+    expect(fnText).toContain('- `Option.askViaNs` — `src/core.ts:19`: `return termui.formatPrompt(x);`');
+    expect(fnText).toContain('- `Option.shadowed` — `src/core.ts:25`: `return termui.formatPrompt(formatPrompt);`');
+    expect(fnText).toContain('- `Option.ask` — `src/core.ts:13`: `const cb = formatPrompt;`');
+    // Unparenthesized single-param arrow and typed function variable must NOT be falsely treated as shadowing `formatPrompt`.
+    expect(fnText).toContain('- `unparenArrow` — `src/core.ts:30`: `const ok = Boolean(formatPrompt) && typeof formatPrompt === "function";`');
+    expect(fnText).toContain('- `unparenArrow` — `src/core.ts:31`: `if (x && ok) { return formatPrompt(x); }`');
+    expect(fnText).toContain('- `typedArrow` — `src/core.ts:35`: `const ok = typeof formatPrompt === "function";`');
+    expect(fnText).toContain('- `typedArrow` — `src/core.ts:36`: `return ok ? termui.formatPrompt(text) : text;`');
+    // Unparenthesized arrow whose single param IS `formatPrompt` keeps the qualified call and skips the shadowed check.
+    expect(fnText).toContain('- `shadowArrow` — `src/core.ts:40`: `return termui.formatPrompt(formatPrompt);`');
+    for (const skipped of [6, 7, 8, 12, 14, 17, 18, 21, 22, 23, 34, 38, 39]) {
+      expect(fnText).not.toContain(`src/core.ts:${skipped}\`:`);
+    }
+
+    // Spread (`...DEFAULT_OPTS`) is not a member access and stays counted as a use.
+    const constText = await explore(tsAttr!, 'DEFAULT_OPTS');
+    expect(constText).toContain('- `Option.ask` — `src/core.ts:10`: `const cfg: PromptConfig = { ...DEFAULT_OPTS };`');
+
+    // Type annotations followed by `=` (`const cfg: PromptConfig = ...`, union `string | PromptConfig = ...`) stay counted.
+    const typeText = await explore(tsAttr!, 'PromptConfig');
+    expect(typeText).toContain('- `Option.ask` — `src/core.ts:10`: `const cfg: PromptConfig = { ...DEFAULT_OPTS };`');
+    expect(typeText).toContain('- `Option.ask` — `src/core.ts:11`: `const alt: string | PromptConfig = cfg;`');
+  });
+
+  it('Rust: keeps constant uses on the left-hand side of `=>` in match arms', async () => {
+    const text = await explore(rsArrow!, 'MAX_ATTEMPTS');
+    expect(text).toContain('- `is_limit` — `src/check.rs:4`: `MAX_ATTEMPTS => true,`');
+  });
+});
