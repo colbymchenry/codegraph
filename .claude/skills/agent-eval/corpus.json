@@ -607,5 +607,28 @@
       "files": "~3390",
       "question": "How does programs.git.enable produce the final git config file in the user's home directory? Trace the flow from the git program module to the home-files machinery that links generated files into place."
     }
+  ],
+  "GDScript": [
+    {
+      "name": "lorien",
+      "repo": "https://github.com/mbrlabs/Lorien",
+      "size": "Small",
+      "files": "50 scripts",
+      "question": "How does saving a project reach the serializer and write its strokes to disk?"
+    },
+    {
+      "name": "pixelorama",
+      "repo": "https://github.com/Orama-Interactive/Pixelorama",
+      "size": "Medium",
+      "files": "249 scripts",
+      "question": "How does a project serialize and deserialize its frames and layers?"
+    },
+    {
+      "name": "godot-demo-projects",
+      "repo": "https://github.com/godotengine/godot-demo-projects",
+      "size": "Medium",
+      "files": "461 scripts across independent Godot projects",
+      "question": "How does the multiplayer bomber demo start a game and synchronize player spawning?"
+    }
   ]
 }
