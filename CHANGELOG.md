@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- `codegraph_explore` on a single function or constant no longer lists same-named attributes (`self.name`, `this.name`, `obj?.name`, `ptr->name`), keyword arguments, object property keys, or shadowed parameters under **Used by** or counts them as dependent sites. (#3431)
+
 
 ## [1.6.4] - 2026-11-20
 

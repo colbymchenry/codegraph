@@ -161,17 +161,125 @@ const SYNTAX: Partial<Record<string, Syntax>> = {
   astro: { line: ['//'], block: [['/*', '*/'], ['<!--', '-->']], quotes: [] },
 };
 
+/** Languages where `.` is string concatenation, not member access. */
+const NO_DOT_MEMBER_LANGUAGES = new Set(['php', 'perl', 'erlang']);
+
+/** Languages where `->` is always member access (never a return-type arrow). */
+const ARROW_MEMBER_LANGUAGES = new Set(['c', 'objc', 'php', 'perl']);
+
+/** Languages where `->` without trailing space is member access (`ptr->x`, not `auto f() -> T`). */
+const TIGHT_ARROW_MEMBER_LANGUAGES = new Set(['cpp', 'csharp']);
+
+/** Languages where `=` is a value comparison, not assignment or a keyword argument. */
+const EQUALS_COMPARISON_LANGUAGES = new Set(['pascal', 'erlang', 'vbnet']);
+
+/** JS-family languages where `{ key: value }` and `(param: Type)` put a non-value label before `:`. */
+const JS_FAMILY_LANGUAGES = new Set(['typescript', 'javascript', 'tsx', 'jsx', 'arkts']);
+
+/** Languages whose callable parameter lists put the parameter name before `:` / `=` (not `Type name`). */
+const NAME_FIRST_PARAM_LANGUAGES = new Set([
+  'python', 'typescript', 'javascript', 'tsx', 'jsx', 'arkts', 'rust', 'ruby',
+]);
+
+/** Callable node kinds whose parameter list can shadow an outer top-level symbol. */
+const CALLABLE_OWNER_KINDS: ReadonlySet<NodeKind> = new Set(['function', 'method', 'component']);
+
+/**
+ * Whether the whole-word occurrence `code[start..end]` can refer to a
+ * non-member definition of `defKind`, rather than a same-named attribute
+ * (`self.name`, `obj?.name`, `ptr->name`), a declaration (`def name`), a
+ * keyword argument / assignment target (`foo(name=x)`, `<A name={x} />`), or
+ * a JS/TS property/parameter key (`{ name: x }`, `name?: T`).
+ */
+function isBareUse(
+  code: string,
+  start: number,
+  end: number,
+  language: string | undefined,
+  defKind: NodeKind,
+): boolean {
+  const before = code.slice(0, start);
+  const after = code.slice(end);
+
+  // Member / attribute access (`self.name`, `cls.name`, `obj?.name`, `ptr->name`, PHP `self::name`).
+  // A single dot not preceded by another dot catches `.` / `?.` / `!.` / `&.`
+  // while keeping spread (`...name`) and range/concat (`0..name`, `a..name`).
+  if ((!language || !NO_DOT_MEMBER_LANGUAGES.has(language)) && /(?:^|[^.])\.\s*$/.test(before)) {
+    return false;
+  }
+  if (language && ARROW_MEMBER_LANGUAGES.has(language) && /->\s*$/.test(before)) {
+    return false;
+  }
+  if (language && TIGHT_ARROW_MEMBER_LANGUAGES.has(language) && /->$/.test(before)) {
+    return false;
+  }
+  if (language === 'php' && /::\s*$/.test(before)) {
+    return false;
+  }
+
+  // Own declaration (`def name`, `function name`, `class name`, `fn name`, `func name`).
+  if (/\b(?:def|class|function|fn|func)\s+$/.test(before)) {
+    return false;
+  }
+
+  // Keyword argument, parameter default, JSX prop, JS/TS arrow param, or local assignment
+  // (`foo(name=x)`, `<A name={x} />`, `name => ...`, `name := x`, `name = x`).
+  // Kept for `variable` definitions (which code reassigns: `CHOSEN = cls`),
+  // for type annotations followed by an initializer/default (`x: MyType = val`,
+  // `x: Foo | MyType = val`), and for `=>` outside JS-family (Rust `match`,
+  // PHP/Ruby arrays & hashes where the LHS of `=>` is a value).
+  const isJsFamily = !!language && JS_FAMILY_LANGUAGES.has(language);
+  const assignRe = isJsFamily ? /^\s*(?::=|=(?!=))/ : /^\s*(?::=|=(?![=>]))/;
+  if (defKind !== 'variable' && (!language || !EQUALS_COMPARISON_LANGUAGES.has(language))
+      && assignRe.test(after) && !/(?:[:|&]|\breadonly)\s*$/.test(before)) {
+    return false;
+  }
+
+  // JS/TS optional property/parameter (`name?: T`) or property/parameter key (`{ name: x }`, `(name: T)`).
+  // Keeps `case name:`, `cond ? name : other`, shorthand `{ name }`, computed `{ [name]: x }`.
+  if (isJsFamily) {
+    if (/^\s*\?:/.test(after)) return false;
+    if (/^:(?!:)/.test(after)
+        && /(?:^\s*|[{,(;]\s*|(?:readonly|public|private|protected|static|declare|abstract|override)\s+)$/.test(before)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/** Whether `code` has a mention of the definition's name (optionally requiring a bare, non-member use). */
+function lineHasMention(
+  code: string,
+  pattern: RegExp,
+  globalPattern: RegExp,
+  language: string | undefined,
+  bareFor: NodeKind | undefined,
+): boolean {
+  if (!bareFor) return pattern.test(code);
+  globalPattern.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = globalPattern.exec(code)) !== null) {
+    if (isBareUse(code, m.index, m.index + m[0].length, language, bareFor)) return true;
+  }
+  return false;
+}
+
 /**
  * The lines in `from..to` whose CODE names the definition — not a comment, a
  * docstring or a string literal about it. `state` carries an open block
  * comment or docstring from one line to the next; a scan starts outside one.
+ * When `bareFor` is given, member/attribute accesses (`.name`, `?.name`,
+ * `->name`) and non-value positions are skipped.
  */
 function codeMentionLines(
   lines: readonly string[],
   from: number,
   to: number,
   pattern: RegExp,
+  globalPattern: RegExp,
   language: string | undefined,
+  bareFor?: NodeKind,
 ): number[] {
   const syntax = language ? SYNTAX[language] : undefined;
   const found: number[] = [];
@@ -179,15 +287,204 @@ function codeMentionLines(
   for (let ln = Math.max(1, from); ln <= Math.min(to, lines.length); ln++) {
     const text = lines[ln - 1]!;
     if (!syntax) {
-      if (pattern.test(text)) found.push(ln);
+      if (lineHasMention(text, pattern, globalPattern, language, bareFor)) found.push(ln);
       continue;
     }
     // Cheap reject first: most lines don't name it at all, but a block that
     // opens on one must still be tracked.
     if (!pattern.test(text) && state.close === null && !syntax.block.some(([open]) => text.includes(open))) continue;
-    if (pattern.test(codeOf(text, syntax, state))) found.push(ln);
+    if (lineHasMention(codeOf(text, syntax, state), pattern, globalPattern, language, bareFor)) found.push(ln);
   }
   return found;
+}
+
+/** Split `text` on commas outside `()`, `[]`, `{}` and `<>`. */
+function splitTopLevel(text: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '=' && text[i + 1] === '>') { i++; continue; }
+    if (ch === '(' || ch === '[' || ch === '{' || ch === '<') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}' || ch === '>') depth = Math.max(0, depth - 1);
+    else if (ch === ',' && depth === 0) {
+      parts.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(text.slice(start));
+  return parts;
+}
+
+/** Slice `text` before the first top-level occurrence of any character in `stops`. */
+function beforeTopLevel(text: string, stops: string): string {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '=' && text[i + 1] === '>') { i++; continue; }
+    if (ch === '(' || ch === '[' || ch === '{' || ch === '<') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}' || ch === '>') depth = Math.max(0, depth - 1);
+    else if (depth === 0 && stops.includes(ch)) return text.slice(0, i);
+  }
+  return text;
+}
+
+/** Bound identifier names introduced by one parameter pattern (including JS/TS destructuring). */
+function boundParamNames(rawParam: string, jsFamily: boolean): string[] {
+  let head = beforeTopLevel(rawParam, ':=').trim();
+  if (!head || head === '/' || head === '*') return [];
+  if (jsFamily) {
+    head = head.replace(/^(?:(?:public|private|protected|readonly|override)\s+)+/, '').replace(/^\.\.\.\s*/, '').trim();
+    if (head.startsWith('{') && head.endsWith('}')) {
+      const names: string[] = [];
+      for (const entry of splitTopLevel(head.slice(1, -1))) {
+        const noDefault = beforeTopLevel(entry, '=').trim().replace(/^\.\.\.\s*/, '');
+        const colonHead = beforeTopLevel(noDefault, ':');
+        const rhs = colonHead.length < noDefault.length ? noDefault.slice(colonHead.length + 1).trim() : noDefault;
+        names.push(...boundParamNames(rhs, true));
+      }
+      return names;
+    }
+    if (head.startsWith('[') && head.endsWith(']')) {
+      const names: string[] = [];
+      for (const entry of splitTopLevel(head.slice(1, -1))) {
+        names.push(...boundParamNames(entry, true));
+      }
+      return names;
+    }
+    head = head.replace(/\?$/, '').trim();
+  } else {
+    head = head.replace(/^(?:\*\*?|\&|mut\s+)/, '').trim();
+  }
+  return /^[\p{L}_$][\p{L}\p{N}_$]*$/u.test(head) ? [head] : [];
+}
+
+/**
+ * Whether `source` declares a parameter named `name`, shadowing any bare
+ * reference to a top-level symbol of that name inside `source`'s body.
+ */
+function shadowsAsParameter(source: Node, lines: readonly string[], name: string): boolean {
+  if (!CALLABLE_OWNER_KINDS.has(source.kind)) return false;
+  const lang = source.language;
+  if (!lang || !NAME_FIRST_PARAM_LANGUAGES.has(lang)) return false;
+  const syntax = SYNTAX[lang];
+  const state: { close: string | null } = { close: null };
+  const from = Math.max(1, source.startLine);
+  const to = Math.min(source.endLine ?? source.startLine, lines.length, from + 25);
+  let header = '';
+  for (let ln = from; ln <= to; ln++) {
+    const raw = lines[ln - 1]!;
+    const code = syntax ? codeOf(raw, syntax, state) : raw;
+    header += (header ? ' ' : '') + code;
+  }
+
+  let openIdx = -1;
+  const jsFamily = JS_FAMILY_LANGUAGES.has(lang);
+  if (lang === 'python') {
+    const m = /\bdef\s+[\p{L}_][\p{L}\p{N}_]*\s*\(/u.exec(header);
+    if (!m) return false;
+    openIdx = m.index + m[0].length - 1;
+  } else if (lang === 'rust') {
+    const m = /\bfn\s+[\p{L}_][\p{L}\p{N}_]*(?:\s*<[^>]*>)?\s*\(/u.exec(header);
+    if (!m) return false;
+    openIdx = m.index + m[0].length - 1;
+  } else if (lang === 'ruby') {
+    const m = /\bdef\s+(?:self\.)?[\p{L}_][\p{L}\p{N}_!?=]*\s*\(/u.exec(header);
+    if (!m) return false;
+    openIdx = m.index + m[0].length - 1;
+  } else {
+    let stripped = header;
+    while (/^\s*@/.test(stripped)) {
+      const m = /^\s*@[\p{L}_$][\p{L}\p{N}_$.]*/u.exec(stripped);
+      if (!m) break;
+      let idx = m[0].length;
+      if (stripped[idx] === '(') {
+        let d = 1;
+        idx++;
+        while (idx < stripped.length && d > 0) {
+          if (stripped[idx] === '(') d++;
+          else if (stripped[idx] === ')') d--;
+          idx++;
+        }
+      }
+      stripped = stripped.slice(idx);
+    }
+    header = stripped;
+
+    // For variable/field function initializers (`const f = x => ...`,
+    // `const f: (prompt: string) => void = (text) => ...`), jump past the
+    // top-level `=` so a function-type annotation is never read as the params.
+    let assignIdx = -1;
+    let d = 0;
+    for (let i = 0; i < header.length; i++) {
+      const ch = header[i]!;
+      if (ch === '=' && header[i + 1] === '>') { i++; continue; }
+      if (ch === '(' || ch === '[' || ch === '{' || ch === '<') {
+        if (ch === '{' && d === 0) break;
+        d++;
+      } else if (ch === ')' || ch === ']' || ch === '}' || ch === '>') {
+        d = Math.max(0, d - 1);
+      } else if (ch === '=' && d === 0 && header[i + 1] !== '=' && header[i - 1] !== '!' && header[i - 1] !== '=' && header[i - 1] !== '<' && header[i - 1] !== '>') {
+        assignIdx = i;
+        break;
+      }
+    }
+    if (assignIdx >= 0) {
+      header = header.slice(assignIdx + 1);
+    }
+
+    // Scan for the parameter list `(` while stopping at top-level `{` or `=>`
+    // so we never drift into calls inside a single-param arrow's body.
+    let angle = 0;
+    let arrowIdx = -1;
+    for (let i = 0; i < header.length; i++) {
+      const ch = header[i]!;
+      if (ch === '=' && header[i + 1] === '>') {
+        if (angle === 0) { arrowIdx = i; break; }
+        i++;
+        continue;
+      }
+      if (ch === '<') angle++;
+      else if (ch === '>') angle = Math.max(0, angle - 1);
+      else if (ch === '{' && angle === 0) return false;
+      else if (ch === '(' && angle === 0) { openIdx = i; break; }
+    }
+    if (arrowIdx >= 0) {
+      // Unparenthesized single-parameter arrow (`x => ...` or `async x => ...`).
+      const single = header.slice(0, arrowIdx).trim().replace(/^async\s+/, '').trim();
+      return /^[\p{L}_$][\p{L}\p{N}_$]*$/u.test(single) && single === name;
+    }
+    if (openIdx < 0) return false;
+    if (assignIdx >= 0) {
+      // After `=`, only `function ...(` or an arrow `(params)` / `<T>(params)`
+      // is a callable header — never a call like `const h = wrap(prompt, () => {})`.
+      const prefix = header.slice(0, openIdx).trim().replace(/^async\s+/, '').trim();
+      const beforeGeneric = prefix.split('<')[0]!.trim();
+      if (beforeGeneric !== '' && !/^function(?:\s*\*)?(?:\s+[\p{L}_$][\p{L}\p{N}_$]*)?$/u.test(beforeGeneric)) {
+        return false;
+      }
+    }
+  }
+
+  let depth = 1;
+  let closeIdx = -1;
+  for (let i = openIdx + 1; i < header.length; i++) {
+    const ch = header[i]!;
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      depth--;
+      if (depth === 0) { closeIdx = i; break; }
+    }
+  }
+  if (closeIdx < 0) return false;
+  if (jsFamily && !/(?:=>|\{)/.test(header.slice(closeIdx + 1))) return false;
+
+  const params = header.slice(openIdx + 1, closeIdx);
+  for (const rawParam of splitTopLevel(params)) {
+    if (boundParamNames(rawParam, jsFamily).includes(name)) return true;
+  }
+  return false;
 }
 
 /** `line` with its comments and strings blanked, given the block `state` it starts in. */
@@ -285,6 +582,8 @@ export function collectReferenceSites(cg: CodeGraph, def: Node, opts: ReferenceR
   const incoming = cg.getIncomingEdges(def.id);
   const container = memberContainer(cg, def, incoming);
   const pattern = wholeNamePattern(def.name);
+  const globalPattern = new RegExp(pattern.source, 'gu');
+  const bareFor = container ? undefined : def.kind;
   const linked = incoming.filter((e) => e.kind !== 'contains' && RELATION_OF[e.kind] !== undefined);
   const sources = cg.getNodesByIds([...new Set(linked.map((e) => e.source))]);
   // A definition's own members naming it (a Go receiver, a `self: Foo`
@@ -347,14 +646,32 @@ export function collectReferenceSites(cg: CodeGraph, def: Node, opts: ReferenceR
       continue;
     }
     // No line on the edge: find the name in the referring symbol's code (not
-    // a comment or a string about it).
+    // a comment or a string about it). For a non-member definition, prefer
+    // bare uses so `self.name` does not steal the line, falling back to any
+    // whole-word mention when the edge was written qualified (`mod.name`).
     const lines = opts.readLines(filePath);
-    const hits = lines
-      ? codeMentionLines(lines, source.startLine, source.endLine ?? source.startLine, pattern, source.language)
+    let hits = lines
+      ? codeMentionLines(lines, source.startLine, source.endLine ?? source.startLine, pattern, globalPattern, source.language, bareFor)
       : [];
+    if (lines && bareFor && hits.length === 0) {
+      hits = codeMentionLines(lines, source.startLine, source.endLine ?? source.startLine, pattern, globalPattern, source.language);
+    }
     for (const ln of hits) add({ relation, filePath, line: ln, owner: ownerAt(source, ln), edge });
     if (hits.length === 0) add({ relation, filePath, line: 0, owner: source, edge });
   }
+
+  const shadowedCache = new Map<string, boolean>();
+  const isShadowedOwner = (owner: Node | null, lines: readonly string[]): boolean => {
+    if (!owner) return false;
+    // Python pytest tests receive fixtures as parameters of the fixture's name.
+    if (owner.language === 'python' && owner.name.startsWith('test_')) return false;
+    let shadowed = shadowedCache.get(owner.id);
+    if (shadowed === undefined) {
+      shadowed = shadowsAsParameter(owner, lines, def.name);
+      shadowedCache.set(owner.id, shadowed);
+    }
+    return shadowed;
+  };
 
   // The rest of a linked function's lines that name the definition — a type
   // annotation beside the call the edge records, a second read of a constant.
@@ -363,7 +680,8 @@ export function collectReferenceSites(cg: CodeGraph, def: Node, opts: ReferenceR
     for (const source of bodiesToScan.values()) {
       const lines = opts.readLines(source.filePath);
       if (!lines) continue;
-      for (const ln of codeMentionLines(lines, source.startLine, source.endLine ?? source.startLine, pattern, source.language)) {
+      if (isShadowedOwner(source, lines)) continue;
+      for (const ln of codeMentionLines(lines, source.startLine, source.endLine ?? source.startLine, pattern, globalPattern, source.language, bareFor)) {
         if (byLine.has(keyOf(source.filePath, ln))) continue;
         add({ relation: 'uses', filePath: source.filePath, line: ln, owner: ownerAt(source, ln) });
       }
@@ -382,9 +700,11 @@ export function collectReferenceSites(cg: CodeGraph, def: Node, opts: ReferenceR
       const lines = opts.readLines(filePath);
       if (!lines) continue;
       const nodes = nodesIn(filePath);
-      for (const ln of codeMentionLines(lines, 1, lines.length, pattern, nodes[0]?.language)) {
+      for (const ln of codeMentionLines(lines, 1, lines.length, pattern, globalPattern, nodes[0]?.language, bareFor)) {
         if (byLine.has(keyOf(filePath, ln))) continue;
-        add({ relation: 'uses', filePath, line: ln, owner: innermostOwner(nodes, ln) });
+        const owner = innermostOwner(nodes, ln);
+        if (isShadowedOwner(owner, lines)) continue;
+        add({ relation: 'uses', filePath, line: ln, owner });
       }
     }
   }
