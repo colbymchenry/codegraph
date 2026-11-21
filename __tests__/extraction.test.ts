@@ -3893,7 +3893,8 @@ kernel void computeBlur(texture2d<float, access::read> inTexture [[texture(0)]],
 
     it('extracts vertex/fragment/kernel functions, structs, and calls from a .metal file', () => {
       const result = extractFromSource('Shaders.metal', METAL);
-      expect(result.errors).toHaveLength(0);
+      // The C++ grammar recovers the Metal-only parameter/kernel syntax.
+      expect(result.errors).toEqual([expect.objectContaining({ code: 'partial_parse', severity: 'warning' })]);
 
       const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
       expect(functions).toEqual(

@@ -231,19 +231,21 @@ export class RazorExtractor {
   }
 
   /** `@code { … }` / `@functions { … }` (Blazor) and `@{ … }` (Razor) C# blocks. */
-  private extractCodeBlocks(): Array<{ content: string; lineOffset: number }> {
-    const blocks: Array<{ content: string; lineOffset: number }> = [];
+  private extractCodeBlocks(): Array<{ content: string; lineOffset: number; blockLine: number; statements: boolean }> {
+    const blocks: Array<{ content: string; lineOffset: number; blockLine: number; statements: boolean }> = [];
+    const source = blankRazorComments(this.source);
     const re = /@(?:code|functions)\b\s*\{|@\{/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(this.source)) !== null) {
-      const openIdx = this.source.indexOf('{', m.index);
+    while ((m = re.exec(source)) !== null) {
+      const openIdx = source.indexOf('{', m.index);
       if (openIdx < 0) continue;
-      const close = this.matchBrace(this.source, openIdx);
+      const close = this.matchBrace(source, openIdx);
       if (close < 0) continue;
-      const content = this.source.slice(openIdx + 1, close);
+      const content = source.slice(openIdx + 1, close);
       // newlines before the content's first char → 0-indexed line of content start
-      const lineOffset = (this.source.slice(0, openIdx + 1).match(/\n/g) || []).length;
-      blocks.push({ content, lineOffset });
+      const lineOffset = (source.slice(0, openIdx + 1).match(/\n/g) || []).length;
+      const blockLine = (source.slice(0, m.index).match(/\n/g) || []).length + 1;
+      blocks.push({ content, lineOffset, blockLine, statements: m[0] === '@{' });
       re.lastIndex = close;
     }
     return blocks;
@@ -253,8 +255,8 @@ export class RazorExtractor {
    * Delegate each `@code`/`@functions`/`@{` block's C# to the tree-sitter C#
    * extractor and attribute the block's external references (service/DTO calls,
    * `new X()`, type uses) to the component. The block is wrapped in a synthetic
-   * class so tree-sitter parses the component's fields/methods in a class context
-   * (a Blazor `@code` body compiles into the component's partial class). We keep
+   * class so tree-sitter parses the component's fields/methods in a class context;
+   * `@{ }` statements also get a method body. We keep
    * only the dependency references — coverage just needs the edges to external
    * types, not per-member nodes. Degrades gracefully if the C# grammar isn't loaded.
    */
@@ -264,14 +266,14 @@ export class RazorExtractor {
       if (!block.content.trim()) continue;
       let result: ExtractionResult;
       try {
-        result = new TreeSitterExtractor(
-          this.filePath,
-          `class __RazorCode__ {\n${block.content}\n}`,
-          'csharp'
-        ).extract();
+        const wrapped = block.statements
+          ? `class __RazorCode__ { void __RazorBlock__() {\n${block.content}\n}}`
+          : `class __RazorCode__ {\n${block.content}\n}`;
+        result = new TreeSitterExtractor(this.filePath, wrapped, 'csharp').extract();
       } catch {
         continue; // grammar not loaded / parse failure — skip this block
       }
+      this.addBlockErrors(result.errors, 'C# block', block.blockLine, block.lineOffset - 1);
       // The synthetic wrapper adds one line before the block content; map ref
       // lines back to the .razor file (display only — coverage is line-agnostic).
       for (const ref of result.unresolvedReferences) {
@@ -297,7 +299,7 @@ export class RazorExtractor {
    */
   private processScriptBlocks(componentId: string): void {
     const source = blankRazorComments(this.source);
-    const blocks: Array<{ result: ExtractionResult; language: Language; lineOffset: number }> = [];
+    const blocks: Array<{ result: ExtractionResult; language: Language; lineOffset: number; blockLine: number }> = [];
     const elements = new RegExp(SFC_SCRIPT_ELEMENT);
     let match: RegExpExecArray | null;
     while ((match = elements.exec(source)) !== null) {
@@ -307,9 +309,10 @@ export class RazorExtractor {
       const language = sfcScriptLanguage(attrs, 'razor');
       if (!isLanguageSupported(language)) continue;
       const lineOffset = (source.slice(0, match.index + match[0].indexOf('>') + 1).match(/\n/g) || []).length;
+      const blockLine = (source.slice(0, match.index).match(/\n/g) || []).length + 1;
       try {
         const result = new TreeSitterExtractor(this.filePath, blankRazorInScript(content), language).extract();
-        blocks.push({ result, language, lineOffset });
+        blocks.push({ result, language, lineOffset, blockLine });
       } catch {
         // grammar not loaded / parse failure — skip this block
       }
@@ -318,7 +321,8 @@ export class RazorExtractor {
     for (const { result } of blocks) {
       for (const node of result.nodes) if (node.kind !== 'file' && node.kind !== 'import') own.add(node.name);
     }
-    for (const { result, language, lineOffset } of blocks) {
+    for (const { result, language, lineOffset, blockLine } of blocks) {
+      this.addBlockErrors(result.errors, '<script>', blockLine, lineOffset);
       for (const ref of result.unresolvedReferences) {
         if (own.has(ref.referenceName.split('.')[0]!)) continue;
         this.unresolvedReferences.push({
@@ -329,6 +333,24 @@ export class RazorExtractor {
           language,
         });
       }
+    }
+  }
+
+  /** A block's missing symbols do not mean the view's component is missing. */
+  private addBlockErrors(errors: ExtractionError[], label: string, blockLine: number, lineOffset: number): void {
+    for (const error of errors) {
+      if (error.severity === 'warning' && (error.code === 'parse_error' || error.code === 'partial_parse')) {
+        this.errors.push({
+          message: `${this.filePath}: ${label} at line ${blockLine} could not be fully parsed — the rest of the file is indexed, but calls inside that block may be missing from the graph`,
+          filePath: this.filePath,
+          line: blockLine,
+          severity: 'warning',
+          code: 'partial_parse',
+        });
+        continue;
+      }
+      if (error.line) error.line += lineOffset;
+      this.errors.push(error);
     }
   }
 }

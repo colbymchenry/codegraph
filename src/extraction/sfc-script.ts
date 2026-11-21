@@ -180,6 +180,17 @@ export function foldScriptResult(result: ExtractionResult, fold: ScriptFold, sin
   }
 
   for (const error of result.errors) {
+    if (error.severity === 'warning' && (error.code === 'parse_error' || error.code === 'partial_parse')) {
+      const line = error.line ? error.line + fold.lineOffset : fold.lineOffset + 1;
+      sink.errors.push({
+        ...error,
+        message: `${fold.filePath}: embedded code near line ${line} could not be fully parsed — symbols or references inside that block may be missing from the graph`,
+        filePath: fold.filePath,
+        line,
+        code: 'partial_parse',
+      });
+      continue;
+    }
     if (error.line) error.line += fold.lineOffset;
     sink.errors.push(error);
   }
