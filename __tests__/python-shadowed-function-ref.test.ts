@@ -1,10 +1,11 @@
 /**
  * A bare Python function-as-value reference (`function_ref`) of a name bound
  * locally in the enclosing function(s) — a parameter, assignment, loop/with/except
- * target, comprehension variable, lambda parameter, or nested def — reads that
- * local binding rather than a same-named function or class imported by the file
- * (#3430). A `global` declaration, an unshadowed function, a function-local
- * import, and a pytest fixture in reach keep linking as before.
+ * target, walrus target, comprehension variable, lambda parameter, function-local
+ * `import ... as name`, or nested `def`/`class` — reads that local binding rather
+ * than a same-named function or class imported by the file (#3430). A `global`
+ * declaration, an unshadowed function, a function-local `from ... import`, an
+ * unshadowed nested `def`, and a pytest fixture in reach keep linking as before.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -79,7 +80,7 @@ describe('a Python local binding shadows an imported function read as a value (#
     expect(edgesFrom('Option::prompt_for_value')).toEqual(['calls:prompt@pkg/termui.py']);
   });
 
-  it('blocks local assignments, enclosing parameters, comprehensions and lambdas, but keeps unshadowed, global, and nested defs', async () => {
+  it('blocks local assignments, enclosing parameters, comprehensions, lambdas, and local module imports while keeping positive controls', async () => {
     await index({
       'pkg/__init__.py': '',
       'pkg/termui.py': [
@@ -87,8 +88,17 @@ describe('a Python local binding shadows an imported function read as a value (#
         '    return input(text)',
         '',
       ].join('\n'),
+      'pkg/other.py': [
+        'def helper():',
+        '    return "other"',
+        '',
+      ].join('\n'),
       'pkg/use.py': [
         'from .termui import prompt',
+        '',
+        '',
+        'def wrap(fn):',
+        '    return fn',
         '',
         '',
         'def local_assign(flag):',
@@ -105,15 +115,44 @@ describe('a Python local binding shadows an imported function read as a value (#
         '',
         '',
         'def comp_shadow(items):',
-        '    return [prompt for prompt in items]',
+        '    return [wrap(prompt) for prompt in items]',
+        '',
+        '',
+        'def comp_control(items):',
+        '    return [wrap(prompt) for item in items]',
         '',
         '',
         'def lambda_shadow():',
-        '    return lambda prompt: prompt',
+        '    return lambda prompt: wrap(prompt)',
+        '',
+        '',
+        'def lambda_control():',
+        '    return lambda item: wrap(prompt)',
         '',
         '',
         'def with_global():',
         '    global prompt',
+        '    saved = prompt',
+        '    return saved',
+        '',
+        '',
+        'def with_global_and_assign(replacement):',
+        '    global prompt',
+        '    saved = prompt',
+        '    prompt = replacement',
+        '    return saved',
+        '',
+        '',
+        'def outer_with_nested_assign():',
+        '    def helper():',
+        '        prompt = "local"',
+        '        return prompt',
+        '    saved = prompt',
+        '    return saved',
+        '',
+        '',
+        'def local_module_alias():',
+        '    import pkg.other as prompt',
         '    saved = prompt',
         '    return saved',
         '',
@@ -129,16 +168,32 @@ describe('a Python local binding shadows an imported function read as a value (#
         '    saved = prompt',
         '    return saved',
         '',
+        '',
+        'def nested_def_closure():',
+        '    def prompt(text):',
+        '        return text',
+        '',
+        '    def inner():',
+        '        saved = prompt',
+        '        return saved',
+        '    return inner',
+        '',
       ].join('\n'),
     });
 
     expect(edgesFrom('local_assign')).toEqual([]);
     expect(edgesFrom('outer_param::inner')).toEqual([]);
-    expect(edgesFrom('comp_shadow')).toEqual([]);
-    expect(edgesFrom('lambda_shadow')).toEqual([]);
+    expect(edgesFrom('comp_shadow')).toEqual(['calls:wrap@pkg/use.py']);
+    expect(edgesFrom('comp_control')).toEqual(['calls:wrap@pkg/use.py', 'references:prompt@pkg/termui.py']);
+    expect(edgesFrom('lambda_shadow')).toEqual(['calls:wrap@pkg/use.py']);
+    expect(edgesFrom('lambda_control')).toEqual(['calls:wrap@pkg/use.py', 'references:prompt@pkg/termui.py']);
     expect(edgesFrom('with_global')).toEqual(['references:prompt@pkg/termui.py']);
+    expect(edgesFrom('with_global_and_assign')).toEqual(['references:prompt@pkg/termui.py']);
+    expect(edgesFrom('outer_with_nested_assign')).toEqual(['references:prompt@pkg/termui.py']);
+    expect(edgesFrom('local_module_alias')).toEqual([]);
     expect(edgesFrom('control')).toEqual(['references:prompt@pkg/termui.py']);
     expect(edgesFrom('nested_def')).toEqual(['references:nested_def::prompt@pkg/use.py']);
+    expect(edgesFrom('nested_def_closure::inner')).toEqual(['references:nested_def_closure::prompt@pkg/use.py']);
   });
 
   it('keeps an imported pytest fixture when a test takes it as a parameter', async () => {
@@ -164,7 +219,7 @@ describe('a Python local binding shadows an imported function read as a value (#
     expect(edgesFrom('test_reads_fixture')).toEqual(['references:sample_fixture@tests/conftest.py']);
   });
 
-  it('handles imported classes, function-local imports, and an inner parameter shadowing an outer nested def', async () => {
+  it('resolves exact innermost binding scope so shadowed nested defs and nested classes never leak false edges', async () => {
     await index({
       'pkg/__init__.py': '',
       'pkg/models.py': [
@@ -187,9 +242,40 @@ describe('a Python local binding shadows an imported function read as a value (#
         'from .termui import prompt',
         '',
         '',
+        'class Outer:',
+        '    class Widget:',
+        '        pass',
+        '',
+        '',
+        'def wrap(fn):',
+        '    return fn',
+        '',
+        '',
         'def takes_widget(Widget):',
         '    saved = Widget',
         '    return saved',
+        '',
+        '',
+        'def enclosing_param_widget(Widget):',
+        '    def inner():',
+        '        saved = Widget',
+        '        return saved',
+        '    return inner',
+        '',
+        '',
+        'def comp_widget(items):',
+        '    return [wrap(Widget) for Widget in items]',
+        '',
+        '',
+        'def lambda_widget():',
+        '    return lambda Widget: wrap(Widget)',
+        '',
+        '',
+        'def walrus_widget(get_val):',
+        '    if (Widget := get_val()):',
+        '        saved = Widget',
+        '        return saved',
+        '    return None',
         '',
         '',
         'def uses_widget():',
@@ -203,7 +289,7 @@ describe('a Python local binding shadows an imported function read as a value (#
         '    return saved',
         '',
         '',
-        'def outer_nested():',
+        'def outer_nested_param():',
         '    def prompt(text):',
         '        return text',
         '',
@@ -212,12 +298,56 @@ describe('a Python local binding shadows an imported function read as a value (#
         '        return saved',
         '    return inner',
         '',
+        '',
+        'def outer_nested_enclosing_param():',
+        '    def prompt(text):',
+        '        return text',
+        '',
+        '    def middle(prompt):',
+        '        def inner():',
+        '            saved = prompt',
+        '            return saved',
+        '        return inner',
+        '    return middle',
+        '',
+        '',
+        'def outer_nested_comp(items):',
+        '    def prompt(text):',
+        '        return text',
+        '    return [wrap(prompt) for prompt in items]',
+        '',
+        '',
+        'def outer_nested_lambda():',
+        '    def prompt(text):',
+        '        return text',
+        '    return lambda prompt: wrap(prompt)',
+        '',
+        '',
+        'def outer_nested_walrus(get_val):',
+        '    def prompt(text):',
+        '        return text',
+        '',
+        '    def inner():',
+        '        if (prompt := get_val()):',
+        '            saved = prompt',
+        '            return saved',
+        '        return None',
+        '    return inner',
+        '',
       ].join('\n'),
     });
 
     expect(edgesFrom('takes_widget')).toEqual([]);
+    expect(edgesFrom('enclosing_param_widget::inner')).toEqual([]);
+    expect(edgesFrom('comp_widget')).toEqual(['calls:wrap@pkg/cases.py']);
+    expect(edgesFrom('lambda_widget')).toEqual(['calls:wrap@pkg/cases.py']);
+    expect(edgesFrom('walrus_widget')).toEqual([]);
     expect(edgesFrom('uses_widget')).toEqual(['references:Widget@pkg/models.py']);
     expect(edgesFrom('local_import')).toEqual(['references:prompt@pkg/other.py']);
-    expect(edgesFrom('outer_nested::inner')).toEqual([]);
+    expect(edgesFrom('outer_nested_param::inner')).toEqual([]);
+    expect(edgesFrom('outer_nested_enclosing_param::middle::inner')).toEqual([]);
+    expect(edgesFrom('outer_nested_comp')).toEqual(['calls:wrap@pkg/cases.py']);
+    expect(edgesFrom('outer_nested_lambda')).toEqual(['calls:wrap@pkg/cases.py']);
+    expect(edgesFrom('outer_nested_walrus::inner')).toEqual([]);
   });
 });
