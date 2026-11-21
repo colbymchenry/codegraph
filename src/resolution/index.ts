@@ -69,6 +69,7 @@ import { aliasConfigFields, loadProjectAliases, type AliasMap } from './path-ali
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackagesAndManifests, workspaceFingerprint, workspacePackageDirOf, type ManifestDiscovery, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
+import { instanceTypeOwnerTail } from '../db/reference-tail';
 import { stripCommentsForRegex } from './strip-comments';
 import { lexicalPathWithinRoot } from '../utils';
 import type { CrossFileNodes, ReExport } from './types';
@@ -2430,7 +2431,8 @@ export class ReferenceResolver {
    */
   private parkable(ref: UnresolvedRef): UnresolvedRef {
     const read = this.lastResolved?.ref === ref ? this.lastResolved.context : this.context;
-    const tail = importBindingTail(ref, this.context, read);
+    const tail = ref.instanceTypeMerged && ref.instanceTypeOwner
+      ? instanceTypeOwnerTail(ref.instanceTypeOwner) : importBindingTail(ref, this.context, read);
     if (tail) ref.nameTail = tail;
     return ref;
   }

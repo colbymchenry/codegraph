@@ -3775,6 +3775,27 @@ export class ExtractionOrchestrator {
     return [...files];
   }
 
+  /** Revisit calls whose instance-result owner's declaration set changed. */
+  resurrectInstanceTypeEdges(names: readonly string[], changedFilePaths: readonly string[]): string[] {
+    if (names.length === 0) return [];
+    const owners = new Set(names);
+    const fresh = new Set(changedFilePaths);
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    const files = new Set<string>();
+    for (const edge of this.queries.getEdgesWithInstanceTypeOwner()) {
+      if (fresh.has(edge.sourceFilePath) || typeof edge.metadata?.instanceTypeOwner !== 'string' ||
+          !owners.has(edge.metadata.instanceTypeOwner)) continue;
+      const ref = resurrectRefFromDroppedEdge(edge);
+      if (!ref) continue;
+      edgeIds.push(edge.edgeId);
+      refs.push(ref);
+      files.add(edge.sourceFilePath);
+    }
+    if (refs.length > 0) this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return [...files];
+  }
+
   /**
    * Re-open every resolution a language made, for the sync's sweep to redo
    * against the current graph — the answer when an input to that language's
