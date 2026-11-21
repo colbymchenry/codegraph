@@ -259,7 +259,7 @@ export interface FileRecord {
   /** Number of nodes extracted */
   nodeCount: number;
 
-  /** Any extraction errors */
+  /** Extraction diagnostics, including warnings about partially parsed files. */
   errors?: ExtractionError[];
 
   /**
@@ -322,7 +322,7 @@ export interface ExtractionResult {
   /** References that couldn't be resolved yet */
   unresolvedReferences: UnresolvedReference[];
 
-  /** Any errors during extraction */
+  /** Extraction diagnostics, including warnings about partially parsed files. */
   errors: ExtractionError[];
 
   /** Extraction duration in milliseconds */
