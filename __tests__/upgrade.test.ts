@@ -16,8 +16,10 @@ import {
   reindexAdvisory,
   runUpgrade,
   verifyResolvedVersion,
+  defaultRun,
   defaultWirePromptHook,
   buildWindowsUpgradeScript,
+  windowsPowerShellEnv,
   WINDOWS_SWAP_FUNCTION,
   WINDOWS_UPGRADE_DAMAGED,
   NPM_PACKAGE,
@@ -430,6 +432,134 @@ describe('windows bundle swap script (#2185)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Windows PowerShell 5.1 child environment isolation (#3436)
+// ---------------------------------------------------------------------------
+
+describe('windowsPowerShellEnv (#3436)', () => {
+  it('removes PSModulePath case-insensitively and preserves other variables without mutating input', () => {
+    const base: NodeJS.ProcessEnv = {
+      PATH: 'C:\\Windows\\System32',
+      TEMP: 'C:\\Temp',
+      PSModulePath: 'C:\\Program Files\\PowerShell\\7\\Modules',
+      psmodulepath: 'C:\\Custom\\Modules',
+      PSMODULEPATH: 'C:\\Another\\Modules',
+    };
+    const cleaned = windowsPowerShellEnv(base);
+    expect(cleaned).toEqual({
+      PATH: 'C:\\Windows\\System32',
+      TEMP: 'C:\\Temp',
+    });
+    expect(base.PSModulePath).toBe('C:\\Program Files\\PowerShell\\7\\Modules');
+    expect(base.psmodulepath).toBe('C:\\Custom\\Modules');
+    expect(base.PSMODULEPATH).toBe('C:\\Another\\Modules');
+  });
+
+  it.runIf(process.platform === 'win32')(
+    'isolates powershell.exe Expand-Archive from an inherited PowerShell 7 PSModulePath and supports -Force overwrite',
+    () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-upgrade-ps51-'));
+      try {
+        // Mimic PowerShell 7's Microsoft.PowerShell.Archive 1.2.7 module, which
+        // invokes the 3-argument ExtractToDirectory overload absent in .NET Framework 4.x.
+        const ps7Modules = path.join(tmp, 'ps7-modules');
+        const archiveMod = path.join(ps7Modules, 'Microsoft.PowerShell.Archive', '1.2.7');
+        fs.mkdirSync(archiveMod, { recursive: true });
+        fs.writeFileSync(
+          path.join(archiveMod, 'Microsoft.PowerShell.Archive.psd1'),
+          [
+            '@{',
+            "  RootModule = 'Microsoft.PowerShell.Archive.psm1'",
+            "  ModuleVersion = '1.2.7'",
+            "  FunctionsToExport = @('Expand-Archive')",
+            '}',
+          ].join('\n'),
+        );
+        fs.writeFileSync(
+          path.join(archiveMod, 'Microsoft.PowerShell.Archive.psm1'),
+          [
+            'function Expand-Archive {',
+            '  param([string]$Path, [string]$DestinationPath, [switch]$Force)',
+            '  Add-Type -AssemblyName System.IO.Compression.FileSystem',
+            '  $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)',
+            '  try {',
+            '    [System.IO.Compression.ZipFileExtensions]::ExtractToDirectory($zip, $DestinationPath, [bool]$Force)',
+            '  } finally { $zip.Dispose() }',
+            '}',
+          ].join('\n'),
+        );
+
+        // Create a real ZIP archive with built-in Windows PowerShell 5.1.
+        const srcDir = path.join(tmp, 'src');
+        fs.mkdirSync(srcDir);
+        fs.writeFileSync(path.join(srcDir, 'payload.txt'), 'fresh-version');
+        const zipPath = path.join(tmp, 'bundle.zip');
+        const createZip = spawnSync(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            `Compress-Archive -Path '${srcDir.replace(/'/g, "''")}\\*' -DestinationPath '${zipPath.replace(/'/g, "''")}'`,
+          ],
+          { env: windowsPowerShellEnv(process.env), encoding: 'utf-8', windowsHide: true },
+        );
+        expect(createZip.status).toBe(0);
+
+        const encode = (ps: string) => Buffer.from(ps, 'utf16le').toString('base64');
+        const extractCmd = (dest: string) =>
+          encode(`$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; Expand-Archive -Path '${zipPath.replace(/'/g, "''")}' -DestinationPath '${dest.replace(/'/g, "''")}' -Force`);
+
+        // Polluted parent environment mimicking pwsh 7 -> node -> powershell.exe.
+        // Build from windowsPowerShellEnv so any differently-cased PSModulePath key
+        // in process.env cannot shadow the PSModulePath we inject here.
+        const pollutedEnv: NodeJS.ProcessEnv = {
+          ...windowsPowerShellEnv(process.env),
+          PSModulePath: `${ps7Modules};${process.env.PSModulePath ?? ''}`,
+        };
+
+        // Without stripping PSModulePath, powershell.exe loads the incompatible module and fails.
+        const failDest = path.join(tmp, 'out-polluted');
+        const polluted = spawnSync(
+          'powershell.exe',
+          ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', extractCmd(failDest)],
+          { env: pollutedEnv, encoding: 'utf-8', windowsHide: true },
+        );
+        expect(polluted.status, `stdout=${polluted.stdout}\nstderr=${polluted.stderr}`).not.toBe(0);
+        expect(`${polluted.stdout}\n${polluted.stderr}`).toMatch(/ExtractToDirectory|MethodCountCouldNotFindBest/);
+
+        // With windowsPowerShellEnv, powershell.exe uses its own Archive module and overwrites with -Force.
+        const okDest = path.join(tmp, 'out-clean');
+        fs.mkdirSync(okDest, { recursive: true });
+        fs.writeFileSync(path.join(okDest, 'payload.txt'), 'stale-version');
+
+        const cleanedEnv = windowsPowerShellEnv(pollutedEnv);
+        const exitCode = defaultRun(
+          'powershell.exe',
+          ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', extractCmd(okDest)],
+          cleanedEnv,
+        );
+        expect(exitCode).toBe(0);
+        expect(fs.readFileSync(path.join(okDest, 'payload.txt'), 'utf-8')).toBe('fresh-version');
+        // Polluted parent env was not mutated.
+        expect(pollutedEnv.PSModulePath).toContain(ps7Modules);
+
+        // Child failures still propagate with non-zero exit code.
+        const failCode = defaultRun(
+          'powershell.exe',
+          ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encode('exit 7')],
+          cleanedEnv,
+        );
+        expect(failCode).toBe(7);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+});
+
+// ---------------------------------------------------------------------------
 // runUpgrade orchestration — mocked side-effects
 // ---------------------------------------------------------------------------
 
@@ -590,6 +720,35 @@ describe('runUpgrade', () => {
     );
     expect(await runUpgrade({}, deps)).toBe(1);
     expect(calls.errors.join('\n')).toMatch(/exited with code -1/i);
+  });
+
+  it('windows bundle: strips PSModulePath from the child env without mutating process.env (#3436)', async () => {
+    const prevKey = Object.keys(process.env).find((k) => k.toLowerCase() === 'psmodulepath');
+    const prevVal = prevKey ? process.env[prevKey] : undefined;
+    const ps7Modules = 'C:\\Program Files\\PowerShell\\7\\Modules';
+    process.env.PSModulePath = ps7Modules;
+    try {
+      const { deps, calls } = makeDeps({
+        method: { kind: 'bundle', os: 'windows', bundleRoot: 'C:/x/codegraph/current', installDir: 'C:/x/codegraph' },
+        currentVersion: '1.6.4',
+        platform: 'win32',
+      });
+      // Pinned reinstall exercises the download/extraction path even when on the same version.
+      const code = await runUpgrade({ version: '1.6.4' }, deps);
+      expect(code).toBe(0);
+      expect(calls.runs).toHaveLength(1);
+      const childEnv = calls.runs[0].env;
+      expect(childEnv).toBeDefined();
+      expect(Object.keys(childEnv!).some((k) => k.toLowerCase() === 'psmodulepath')).toBe(false);
+      // Parent environment stays untouched.
+      expect(process.env.PSModulePath).toBe(ps7Modules);
+    } finally {
+      if (prevKey !== undefined && prevVal !== undefined) {
+        process.env[prevKey] = prevVal;
+      } else {
+        delete process.env.PSModulePath;
+      }
+    }
   });
 
   it('npm global: shells out to npm install -g @pkg@latest', async () => {

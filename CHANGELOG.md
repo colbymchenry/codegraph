@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- On Windows, `codegraph upgrade` launched from PowerShell 7 no longer fails while unpacking the release archive with an `ExtractToDirectory` overload error: the Windows PowerShell child process now starts without PowerShell 7's `PSModulePath` so it loads its own compatible archive module. Thanks @lifei6671 for the report. (#3436)
+
 
 ## [1.6.4] - 2026-11-20
 

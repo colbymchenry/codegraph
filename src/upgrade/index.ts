@@ -813,6 +813,27 @@ export function buildWindowsUpgradeScript(bundleRoot: string, version: string, a
   ].join('\n');
 }
 
+/**
+ * Build the child environment for Windows PowerShell 5.1 (`powershell.exe`).
+ *
+ * When `codegraph upgrade` is launched from PowerShell 7 (`pwsh.exe`), Node
+ * inherits PowerShell 7's `PSModulePath` (including `PowerShell\7\Modules`).
+ * Windows PowerShell 5.1 then loads PowerShell 7's `Microsoft.PowerShell.Archive`
+ * module, whose `Expand-Archive` calls a 3-argument `ExtractToDirectory` overload
+ * unavailable on .NET Framework (#3436). Dropping `PSModulePath`
+ * case-insensitively lets `powershell.exe` construct its own default module path
+ * without mutating the parent environment.
+ */
+export function windowsPowerShellEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (key.toLowerCase() !== 'psmodulepath') {
+      env[key] = value;
+    }
+  }
+  return env;
+}
+
 function upgradeWindowsBundle(
   method: Extract<InstallMethod, { kind: 'bundle' }>,
   latest: string,
@@ -825,7 +846,11 @@ function upgradeWindowsBundle(
   // parses it. Encoding sidesteps all shell quoting — the canonical approach.
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
   deps.log(c.dim(`Downloading and installing ${latest}…`));
-  const code = deps.run('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded]);
+  const code = deps.run(
+    'powershell.exe',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+    windowsPowerShellEnv()
+  );
   if (code !== 0) {
     // The script has already printed what went wrong and what to do.
     if (code === WINDOWS_UPGRADE_DAMAGED) {
