@@ -1,9 +1,9 @@
 ---
 title: Configuration
-description: CodeGraph is zero-config by default, with one optional codegraph.json for custom extensions, excluding tracked directories, indexing gitignored source, and indexing nested git repositories.
+description: CodeGraph is zero-config by default, with one optional codegraph.json for custom extensions, excluding tracked directories, indexing gitignored source, indexing nested git repositories, and naming a PHP site's web root.
 ---
 
-Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file, `codegraph.json`, covers [custom file extensions](#custom-file-extensions), [excluding tracked directories](#excluding-a-tracked-directory), [indexing gitignored source](#indexing-gitignored-source-a-second-vcs), and [indexing nested git repositories](#indexing-nested-git-repositories).
+Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file, `codegraph.json`, covers [custom file extensions](#custom-file-extensions), [excluding tracked directories](#excluding-a-tracked-directory), [indexing gitignored source](#indexing-gitignored-source-a-second-vcs), [indexing nested git repositories](#indexing-nested-git-repositories), and [naming a PHP site's web root](#php-includes-from-the-web-root) when CodeGraph can't work it out.
 
 ## What it skips out of the box
 
@@ -69,6 +69,27 @@ If your project uses a non-standard extension for a [supported language](/codegr
 Each value is a supported language id. The mappings merge on top of the built-in defaults and win on conflict, so you can also re-point a built-in (e.g. `".h": "cpp"`). Commit the file to share the mapping with your team.
 
 A typo'd language or a malformed file is warned about and skipped — it never breaks indexing — and a project with no `codegraph.json` behaves exactly as before. Re-index (`codegraph index`) after adding or changing mappings.
+
+## PHP includes from the web root
+
+PHP code often loads files from the folder the web server serves, as in `require $_SERVER['DOCUMENT_ROOT'] . '/inc/header.php'`. That folder is set in the server's configuration (Apache's `DocumentRoot`, nginx's `root`), not in your code, so CodeGraph works it out from your includes: it's the folder under which their paths name files your project has. With `public/` as the web root, that include links to `public/inc/header.php`.
+
+There's nothing to set when your includes settle it. CodeGraph picks a folder only when they clearly point to it: at least three different paths name files under it, and at least twice as many as under any other folder above the including file. When they don't settle it, or you'd rather say, name the folder as `webRoot` in `codegraph.json`:
+
+```json
+{
+  "webRoot": "public"
+}
+```
+
+The folder is relative to the project root, like `"public"`, `"web"` or `"htdocs"`, or `"."` when the project root is the web root, and a `webRoot` you set always wins. With neither, these includes link to nothing rather than to a guess: assuming the project root would link `public/index.php` to a root-level `config.php` instead of the `public/config.php` PHP loads.
+
+A few things to know:
+
+- Includes built from the including file's own folder, like `__DIR__ . '/inc/a.php'` or `dirname(__FILE__) . '/inc/a.php'`, link to their file with no setting, the way a plain `require_once 'lib.php'` does.
+- When CodeGraph works the web root out, a project holding two sites gets one for each, and a file outside the folder the server serves (an `includes/` folder beside `public_html/`) gets none. A `webRoot` you set applies to every file.
+- An absolute path (the server's own, like `/var/www/html`) or a folder outside the project is warned about and ignored, as if `webRoot` weren't set.
+- The next `sync`, or the file watcher, applies a change to `webRoot` or to what your includes show; there's no need to re-index.
 
 ## Indexing nested git repositories
 

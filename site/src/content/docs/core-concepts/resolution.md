@@ -9,7 +9,7 @@ Extraction produces nodes and raw edges; **resolution** turns names into real co
 
 After parsing, CodeGraph resolves:
 
-- **Imports** → the source files they point at (including tsconfig path aliases and cargo workspace members).
+- **Imports** → the source files they point at (including tsconfig path aliases, cargo workspace members, and PHP includes built from the including file's folder, like `__DIR__ . '/inc/a.php'`, or from the [web server's root](/codegraph/getting-started/configuration/#php-includes-from-the-web-root)).
 - **Calls** → their definitions, by import resolution and name matching.
 - **Inheritance** → `extends` / `implements` between types.
 

@@ -96,6 +96,12 @@ import {
   servedRangesForFile,
   symbolsInSpans,
 } from './explore-dedup';
+import {
+  oneSymbolDefinitions,
+  oneSymbolQueryName,
+  renderOneSymbolAnswer,
+  type OneSymbolAnswer,
+} from './explore-one-symbol';
 
 /**
  * An expected, recoverable "codegraph can't serve this" condition — most
@@ -4521,6 +4527,16 @@ export class ToolHandler {
         if (!pinnedFiles.includes(file.filePath)) pinnedFiles = [...pinnedFiles, file.filePath];
       }
     }
+
+    // A query that names ONE symbol — "what is X", "who calls X", "what breaks
+    // if X changes" — gets its definition and every line that depends on it,
+    // sized to the symbol rather than to the budget (#3407). A query that pins
+    // a file, a line or a copybook keeps the general path, which owns those.
+    if (pinnedFiles.length === 0 && unresolvedPathSpans.length === 0 && lineAnchors.length === 0) {
+      const oneSymbol = this.exploreOneSymbol(cg, matchQuery, query, projectRoot, budget, maxFiles, indexedFileCount);
+      if (oneSymbol) return oneSymbol;
+    }
+
     // A same-named file the span did not pin is named in the summary line, so
     // an agent that did mean it sees where it went instead of a silent drop.
     const setAsideNote = setAsideMatches.map((s) => {
@@ -8099,6 +8115,97 @@ export class ToolHandler {
       files: emittedFiles,
       sourceBytes,
       responseBytes: finalText.length,
+    };
+    return result;
+  }
+
+  /**
+   * codegraph_explore for a query that names one symbol (#3407; see
+   * `explore-one-symbol.ts`). Null hands the query to the general path: no
+   * single name, a name with no definition or more than three, or a definition
+   * whose file changed on disk since it was indexed (the general path owns
+   * drifted files). `CODEGRAPH_EXPLORE_ONE_SYMBOL=0` turns it off, for A/B runs.
+   */
+  private exploreOneSymbol(
+    cg: CodeGraph,
+    matchQuery: string,
+    query: string,
+    projectRoot: string,
+    budget: ExploreOutputBudget,
+    maxFiles: number,
+    indexedFileCount: number,
+  ): ToolResult | null {
+    if (process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL === '0') return null;
+    const name = oneSymbolQueryName(matchQuery);
+    if (!name) return null;
+    let defs: Node[] | null;
+    try {
+      defs = oneSymbolDefinitions(cg, name);
+    } catch {
+      return null;
+    }
+    if (!defs) return null;
+
+    // Each file read once, and only trusted when it still matches the index:
+    // a changed file's indexed line numbers can point at other code (#1474).
+    const read = new Map<string, { content: string; lines: string[] } | null>();
+    const readFile = (filePath: string) => {
+      const held = read.get(filePath);
+      if (held !== undefined) return held;
+      let entry: { content: string; lines: string[] } | null = null;
+      try {
+        const abs = validatePathWithinRoot(projectRoot, filePath);
+        if (abs && existsSync(abs)) {
+          const content = readFileSync(abs, 'utf-8');
+          if (!this.isFileStaleOnDisk(cg, filePath, content)) entry = { content, lines: content.split(/\r?\n/) };
+        }
+      } catch {
+        entry = null;
+      }
+      read.set(filePath, entry);
+      return entry;
+    };
+
+    const isTest = this.testCodeReading(cg);
+    const rel = (p: string) => p.replace(/\\/g, '/');
+    let answer: OneSymbolAnswer | null;
+    try {
+      answer = renderOneSymbolAnswer({
+        cg,
+        maxChars: budget.maxOutputChars,
+        // A definition is the answer, so it may take half the tier's ceiling,
+        // never less than the per-file cap the general path gives a file.
+        bodyChars: Math.max(budget.maxCharsPerFile, Math.floor(budget.maxOutputChars / 2)),
+        readLines: (filePath) => readFile(filePath)?.lines ?? null,
+        isTest,
+        synthNote: (edge) => this.synthEdgeNote(edge),
+        elidedNote: elidedBodyNote,
+        testsThroughCallers: (dependents) => this.indirectTestNote(cg, dependents, rel, isTest).replace(/^;\s*/, ''),
+        nodeServed: this.isToolServed('node'),
+      }, name, defs);
+    } catch {
+      return null; // never fail an explore call: the general path answers instead
+    }
+    if (!answer) return null;
+    ExploreDiagnostics.start(query, projectRoot, budget, maxFiles, indexedFileCount)
+      ?.finishDirect('one-symbol answer (#3407)', answer.text, budget.maxOutputChars);
+
+    const result = this.answerResult(cg, answer.text, answer.files);
+    const files: ExploreFileEmission[] = answer.shown.map((s) => {
+      const content = readFile(s.filePath)?.content;
+      return {
+        path: s.filePath,
+        ranges: [{ start: s.start, end: s.end }],
+        bytes: s.chars,
+        fingerprint: content === undefined ? undefined : fileFingerprint(content),
+      };
+    });
+    result[EXPLORE_EMISSION_KEY] = {
+      projectRoot,
+      query,
+      files,
+      sourceBytes: files.reduce((sum, f) => sum + f.bytes, 0),
+      responseBytes: answer.text.length,
     };
     return result;
   }
