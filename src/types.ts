@@ -43,6 +43,7 @@ export const NODE_KINDS = [
   'route',
   'component',
   'union',
+  'event',
 ] as const;
 
 export type NodeKind = (typeof NODE_KINDS)[number];

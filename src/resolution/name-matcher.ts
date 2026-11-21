@@ -9243,7 +9243,7 @@ function objcSupertypesOf(name: string, context: ResolutionContext): string[] {
   return supers;
 }
 
-const VB_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member', 'constant', 'variable']);
+const VB_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'event', 'enum_member', 'constant', 'variable']);
 
 /**
  * What a VB.NET member access is written on, read at the call site: the
@@ -14972,7 +14972,7 @@ function rustTypedReceiverCall(receiver: string, method: string, ref: Unresolved
 }
 
 /** What only exists inside a type, reachable through a receiver alone. */
-const TYPE_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member']);
+const TYPE_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'event', 'enum_member']);
 
 /** Per-context memo: `file\0name` → "the file binds this name locally". */
 /** Whether `n` lies outside the function that binds the reference's name itself (see jsFunctionLocalScope). */
