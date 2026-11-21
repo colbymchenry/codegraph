@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- TypeScript variance annotations like `interface Stream<out A, in E>` or `<in out T>` now parse. Before, each one was a parse error, and a generic arrow function later in the same file, such as `export const wrap = <A>(value: A): Box<A> => …`, could be indexed as a constant with its type references missing (#3226). Re-index TypeScript projects after upgrading.
 
 ## [1.6.4] - 2026-11-20
 
