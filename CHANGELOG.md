@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In Go, a variable given a chain that starts with `new(T)`, `make(T)` or a struct literal, like `sub := new(Route).Host("x").Subrouter()`, now has the type the chain returns, so a method called on it links to that type's method, not to a same-named method of the type the chain starts from. Thanks @inth3shadows for the report and the analysis. (#3447)
+
 
 ## [1.6.4] - 2026-11-20
 

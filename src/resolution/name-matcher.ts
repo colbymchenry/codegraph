@@ -3723,8 +3723,15 @@ function readGoScopes(code: string): GoScopeIndex {
     // declare; `x := pkg.New(…)` the package its value comes from, `x :=
     // newStore(…)` the function of its own package.
     const rhs = code.slice(i + 2, i + 160);
-    const literal = /^[ \t]*&?[ \t]*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)[ \t]*\{/.exec(rhs)?.[1] ??
-      /^[ \t]*new\([ \t]*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)[ \t]*\)/.exec(rhs)?.[1];
+    const written = /^[ \t]*&?[ \t]*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)[ \t]*\{/.exec(rhs) ??
+      /^[ \t]*new\([ \t]*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)[ \t]*\)/.exec(rhs);
+    // A selector after the literal or the `new(T)` makes it the start of a
+    // chain, `new(Route).Host("x").Subrouter()`: the local has the type the
+    // chain gives, read with its value like any call's result (#3447).
+    let after = i + 1 + (written?.[0].length ?? 0);
+    if (written && code[after] === '{') after = close.get(after) ?? code.length;
+    do after++; while (code[after] === ' ' || code[after] === '\t');
+    const literal = code[after] === '.' ? undefined : written?.[1];
     const type = names.length === 1 && literal && !GO_TYPE_KEYWORDS.has(literal) ? literal : undefined;
     const from = /^[ \t]*&?[ \t]*([A-Za-z_]\w*)\.[A-Za-z_]\w*[ \t]*[({]/.exec(rhs)?.[1];
     const call = from ? undefined : /^[ \t]*([A-Za-z_]\w*)[ \t]*(?:\[(?:[^[\]\n]|\[[^[\]\n]*\])*\][ \t]*)?\(/.exec(rhs)?.[1];
@@ -30658,7 +30665,10 @@ function goValueIsCall(local: GoDecl, index: GoScopeIndex): boolean {
   // A type switch's guard (`switch v := x.(type)`) has each case's type, and
   // an assertion (`v := x.(T)`) is goAssertedLocalType's to read.
   if (/\.\s*\([^()]*(?:\([^()]*\)[^()]*)*\)\s*$/.test(value)) return false;
-  return /^\s*[A-Za-z_(][\s\S]*\)\s*$/.test(value) && !/^\s*(?:new|make|append)\s*\(/.test(value);
+  // A builtin's call that is the whole value; a chain from one is a call (#3447).
+  const builtin = /^\s*(?:new|make|append)\s*\(/.exec(value);
+  if (builtin && goClosingBracket(value, builtin[0].length - 1) === value.trimEnd().length - 1) return false;
+  return /^\s*[A-Za-z_(][\s\S]*\)\s*$/.test(value);
 }
 
 /**
@@ -31049,11 +31059,11 @@ function goExprType(
     if (!t) return t;
     return t.text.startsWith('*') ? { ...t, text: t.text.slice(1) } : undefined;
   }
-  // `make(T, …)`, `new(T)`, `append(xs, …)`.
+  // `make(T, …)`, `new(T)`, `append(xs, …)`; a chain from one (`new(T).M()`)
+  // is read with the chains below.
   const builtin = /^(make|new|append)\s*\(/.exec(s);
-  if (builtin) {
+  if (builtin && goClosingBracket(s, builtin[0].length - 1) === s.length - 1) {
     const open = builtin[0].length - 1;
-    if (goClosingBracket(s, open) !== s.length - 1) return undefined;
     const first = goSplitTopLevel(s.slice(open + 1, -1), ',')[0]?.trim();
     if (!first) return undefined;
     if (builtin[1] === 'make') return goTypeTextAt(first, filePath, at, index, context);
