@@ -2110,7 +2110,7 @@ export function extractImportMappings(
 }
 
 const ZIG_IMPORT_BINDING_RE =
-  /(?:^|[;{}])\s*(?:pub\s+)?const\s+([A-Za-z_]\w*)\s*=\s*@import\(\s*"([^"]+)"\s*\)(?:\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*))?\s*;/g;
+  /(?:^|[;{}])\s*(?:pub\s+)?const\s+([A-Za-z_]\w*)\s*=\s*@import\(\s*"([^"]+)"\s*\)(?:\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*))?\s*(?=;)/gm;
 
 function extractZigImports(content: string): ImportMapping[] {
   const mappings: ImportMapping[] = [];
@@ -2146,7 +2146,7 @@ function extractZigReExports(content: string): ReExport[] {
   const out: ReExport[] = [];
   const cleaned = stripCommentsForRegex(content, 'zig');
   const re =
-    /(?:^|[;{}])\s*pub\s+const\s+([A-Za-z_]\w*)\s*=\s*@import\(\s*"([^"]+)"\s*\)(?:\.([A-Za-z_]\w*))?\s*;/g;
+    /(?:^|[;{}])\s*pub\s+const\s+([A-Za-z_]\w*)\s*=\s*@import\(\s*"([^"]+)"\s*\)(?:\.([A-Za-z_]\w*))?\s*(?=;)/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(cleaned)) !== null) {
     const exportedName = m[1]!;

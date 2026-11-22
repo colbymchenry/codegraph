@@ -607,5 +607,28 @@
       "files": "~3390",
       "question": "How does programs.git.enable produce the final git config file in the user's home directory? Trace the flow from the git program module to the home-files machinery that links generated files into place."
     }
+  ],
+  "Zig": [
+    {
+      "name": "libxev",
+      "repo": "https://github.com/mitchellh/libxev",
+      "size": "Small",
+      "files": "~42",
+      "question": "How does libxev's Timer watcher schedule a timer and dispatch its completion callback when the event loop runs? Trace from Timer.run through the loop/backend submission and tick to callback invocation."
+    },
+    {
+      "name": "tigerbeetle",
+      "repo": "https://github.com/tigerbeetle/tigerbeetle",
+      "size": "Medium",
+      "files": "~282",
+      "question": "How does a TigerBeetle replica handle an incoming client request from on_request through preparing, committing, and executing it in the state machine? Trace the cross-file flow across replica.zig, journal.zig, and state_machine.zig."
+    },
+    {
+      "name": "TensorFold",
+      "repo": "https://github.com/ashhart/TensorFold",
+      "size": "Large",
+      "files": "~6445",
+      "question": "How does TensorFold handle an incoming Anthropic /v1/messages HTTP request from route dispatch through request translation, prompt rendering, and response streaming? Trace from routes.zig through anthropic.zig, anthropic_translate.zig, and prompt.zig."
+    }
   ]
 }

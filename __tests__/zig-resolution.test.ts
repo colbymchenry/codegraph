@@ -142,4 +142,40 @@ pub fn main() void {
     const imports = cg.getOutgoingEdges(mainFile.id).filter((e) => e.kind === 'imports');
     expect(imports).toHaveLength(0);
   });
+
+  it('resolves every consecutive @import binding and re-export without skipping alternating lines', async () => {
+    writeFiles({
+      'src/a.zig': `pub fn post() void {}\n`,
+      'src/b.zig': `pub fn post() void {}\n`,
+      'src/c.zig': `pub fn post() void {}\n`,
+      'src/d.zig': `pub fn post() void {}\npub fn onlyViaReexport() void {}\n`,
+      'src/reexport.zig': `pub const b_mod = @import("b.zig");\npub const d_mod = @import("d.zig");\n`,
+      'src/routes.zig': `const a = @import("a.zig");
+const b = @import("b.zig");
+const c = @import("c.zig");
+const d = @import("d.zig");
+const rx = @import("reexport.zig");
+
+pub fn dispatch() void {
+    a.post();
+    b.post();
+    c.post();
+    d.post();
+    rx.d_mod.onlyViaReexport();
+}
+`,
+    });
+
+    cg = CodeGraph.initSync(dir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const dispatchFn = cg.getNodesInFile('src/routes.zig').find((n) => n.kind === 'function' && n.name === 'dispatch')!;
+    const callees = cg.getCallees(dispatchFn.id).map((c) => `${c.node.filePath}::${c.node.name}`);
+    expect(callees).toContain('src/a.zig::post');
+    expect(callees).toContain('src/b.zig::post');
+    expect(callees).toContain('src/c.zig::post');
+    expect(callees).toContain('src/d.zig::post');
+    expect(callees).toContain('src/d.zig::onlyViaReexport');
+  });
 });
