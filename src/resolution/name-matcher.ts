@@ -196,7 +196,7 @@ const CODE_FAMILY: Record<string, string> = {
   ...LANGUAGE_FAMILY,
   python: 'python', go: 'go', rust: 'rust', php: 'php', ruby: 'ruby', dart: 'dart',
   lua: 'lua', luau: 'lua', r: 'r', erlang: 'erlang', pascal: 'pascal', solidity: 'solidity',
-  nix: 'nix', cobol: 'cobol',
+  nix: 'nix', cobol: 'cobol', zig: 'zig',
 };
 
 export function crossesCodeBoundary(a: string, b: string): boolean {
@@ -2940,7 +2940,7 @@ function luaModuleFile(name: string, decl: Node, context: ResolutionContext): st
  * same holds for Java, C#, Swift, Scala and PHP members. (A Dart `_name` is
  * its library's, which can span several files: see isVisibleAcrossFiles.)
  */
-const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'php']);
+const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'php', 'zig']);
 
 /**
  * Whether a resolution lands on a Java record's implicit accessor from outside
@@ -24309,6 +24309,12 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // val lg = Logger(...)
         new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // val lg: Logger  / param
+      ];
+    case 'zig':
+      return [
+        new RegExp(`\\b${r}\\b\\s*:\\s*(?:\\?\\s*)?(?:\\*(?:\\s*const\\s+)?|\\[\\s*\\]\\s*(?:const\\s+)?)?(?:[a-z_]\\w*\\.)*([A-Z]\\w*)`),
+        new RegExp(`\\b${r}\\b\\s*=\\s*(?:[a-z_]\\w*\\.)*([A-Z]\\w*)\\s*\\{`),
+        new RegExp(`\\b${r}\\b\\s*=\\s*(?:try\\s+)?(?:[a-z_]\\w*\\.)*([A-Z]\\w*)\\.[A-Za-z_]\\w*\\s*\\(`),
       ];
     case 'csharp':
       return [

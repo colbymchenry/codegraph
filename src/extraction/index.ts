@@ -296,6 +296,8 @@ const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
   'lua_modules', '.luarocks',
   // Delphi / RAD Studio IDE backups (duplicate .pas source — would double-count)
   '__history', '__recovery',
+  // Zig build and cache output
+  '.zig-cache', 'zig-out',
   // Generic cache
   '.cache',
 ]);
@@ -358,7 +360,7 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
  * C++, PHP and Java are left out: setuptools and frozen apps copy `.py` into
  * `build/`, CMake generates C and C++ there, WordPress builds `build/*.php`.
  */
-const HAND_WRITTEN_SOURCE = /\.(?:[mc]?ts|tsx|ets|jsx|vue|svelte|astro|go|cs|rs)$/i;
+const HAND_WRITTEN_SOURCE = /\.(?:[mc]?ts|tsx|ets|jsx|vue|svelte|astro|go|cs|rs|zig)$/i;
 /** TypeScript declarations, which `tsc` writes beside its JavaScript. */
 const DECLARATION_FILE = /\.d\.(?:[mc]?ts|ets)$/i;
 /** Matches the JVM packages named `build`, whose whole subtree stays indexed. */

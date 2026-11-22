@@ -222,6 +222,12 @@ describe('Language Detection', () => {
     expect(isSourceFile('default.nix')).toBe(true);
   });
 
+  it('should detect Zig files', () => {
+    expect(detectLanguage('build.zig')).toBe('zig');
+    expect(detectLanguage('src/server/decision_path.zig')).toBe('zig');
+    expect(isSourceFile('src/main.zig')).toBe(true);
+  });
+
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
     // Lean Unreal-Engine style header: the class is annotated with an export
     // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
@@ -324,6 +330,173 @@ describe('Language Support', () => {
     expect(languages).toContain('dart');
     expect(languages).toContain('solidity');
     expect(languages).toContain('nix');
+    expect(languages).toContain('zig');
+  });
+});
+
+describe('Zig Extraction', () => {
+  it('should extract functions, visibility, signatures, and return types', () => {
+    const code = `
+/// Adds two numbers.
+pub fn add(a: i32, b: i32) i32 {
+    return helper(a + b);
+}
+
+fn helper(v: i32) i32 {
+    return v;
+}
+
+extern "c" fn c_entry(x: c_int) c_int;
+export fn exported_entry() void {
+    _ = add(1, 2);
+}
+`;
+    const result = extractFromSource('math.zig', code);
+
+    const add = result.nodes.find((n) => n.kind === 'function' && n.name === 'add');
+    const helper = result.nodes.find((n) => n.kind === 'function' && n.name === 'helper');
+    const cEntry = result.nodes.find((n) => n.kind === 'function' && n.name === 'c_entry');
+    const expEntry = result.nodes.find((n) => n.kind === 'function' && n.name === 'exported_entry');
+
+    expect(add).toBeDefined();
+    expect(add?.visibility).toBe('public');
+    expect(add?.isExported).toBe(true);
+    expect(add?.docstring).toBe('Adds two numbers.');
+    expect(add?.signature).toBe('(a: i32, b: i32) i32');
+
+    expect(helper).toBeDefined();
+    expect(helper?.visibility).toBe('private');
+    expect(helper?.isExported).toBe(false);
+
+    expect(cEntry).toBeDefined();
+    expect(expEntry?.isExported).toBe(true);
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('helper');
+    expect(calls).toContain('add');
+  });
+
+  it('should extract structs, enums, unions, opaque types, error sets, fields, and methods', () => {
+    const code = `
+pub const MyErr = error{ OutOfMemory, InvalidInput };
+
+pub const Color = enum(u8) {
+    red = 1,
+    green = 2,
+
+    pub fn isRed(self: Color) bool {
+        return self == .red;
+    }
+};
+
+pub const Payload = union(enum) {
+    int: i32,
+    str: []const u8,
+};
+
+pub const Handle = opaque {
+    pub fn close(self: *Handle) void {
+        _ = self;
+    }
+};
+
+pub const Point = struct {
+    x: f32,
+    y: f32 = 0,
+    pub const origin = Point{ .x = 0, .y = 0 };
+
+    pub fn init(x: f32, y: f32) Point {
+        return .{ .x = x, .y = y };
+    }
+
+    pub fn distance(self: *const Point, other: Point) f32 {
+        return self.norm() + other.x;
+    }
+
+    fn norm(self: *const Point) f32 {
+        return self.x + self.y;
+    }
+};
+`;
+    const result = extractFromSource('types.zig', code);
+
+    expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'MyErr')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'enum_member' && n.name === 'OutOfMemory')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'enum_member' && n.name === 'InvalidInput')).toBeDefined();
+
+    const color = result.nodes.find((n) => n.kind === 'enum' && n.name === 'Color');
+    expect(color?.isExported).toBe(true);
+    expect(result.nodes.find((n) => n.kind === 'enum_member' && n.name === 'red')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'method' && n.qualifiedName === 'Color::isRed')).toBeDefined();
+
+    expect(result.nodes.find((n) => n.kind === 'union' && n.name === 'Payload')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'field' && n.qualifiedName === 'Payload::int')).toBeDefined();
+
+    expect(result.nodes.find((n) => n.kind === 'struct' && n.name === 'Handle')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'method' && n.qualifiedName === 'Handle::close')).toBeDefined();
+
+    const point = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Point');
+    expect(point).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'field' && n.qualifiedName === 'Point::x')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.qualifiedName === 'Point::origin')).toBeDefined();
+
+    const init = result.nodes.find((n) => n.kind === 'method' && n.qualifiedName === 'Point::init');
+    const dist = result.nodes.find((n) => n.kind === 'method' && n.qualifiedName === 'Point::distance');
+    expect(init?.isStatic).toBe(true);
+    expect(init?.returnType).toBe('Point');
+    expect(dist?.isStatic).toBe(false);
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('Point.norm');
+
+    const insts = result.unresolvedReferences.filter((r) => r.referenceKind === 'instantiates').map((r) => r.referenceName);
+    expect(insts).toContain('Point');
+  });
+
+  it('should extract @import statements, constants, vars, type aliases, and test blocks', () => {
+    const code = `
+const std = @import("std");
+const utils = @import("./utils.zig");
+const Server = @import("../server.zig").Server;
+pub const MAX: usize = 64;
+var counter: u32 = 0;
+pub const Alias = std.mem.Allocator;
+
+fn compute() void {
+    _ = (@import("inline_mod.zig").run());
+}
+
+test "basic compute test" {
+    compute();
+}
+
+test Alias {
+    _ = MAX;
+}
+`;
+    const result = extractFromSource('src/app.zig', code);
+
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toEqual(['std', './utils.zig', '../server.zig', 'inline_mod.zig']);
+
+    const importRefs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    expect(importRefs).toEqual(['std', './utils.zig', '../server.zig', 'inline_mod.zig']);
+
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'MAX')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'counter')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Alias')).toBeDefined();
+
+    const namedTest = result.nodes.find((n) => n.kind === 'function' && n.name === 'test "basic compute test"');
+    const declTest = result.nodes.find((n) => n.kind === 'function' && n.name === 'test Alias');
+    expect(namedTest).toBeDefined();
+    expect(declTest).toBeDefined();
+
+    const callsFromTest = result.unresolvedReferences
+      .filter((r) => r.fromNodeId === namedTest?.id && r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(callsFromTest).toContain('compute');
   });
 });
 

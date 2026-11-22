@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **Zig** (`.zig`) — functions, structs, enums, unions, opaque types, error sets, constants, `test` blocks, relative `@import` file and symbol resolution, and call/reference edges.
+
 
 ## [1.6.4] - 2026-11-20
 
