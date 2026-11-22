@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph_callers` and `codegraph_callees` take an `offset`, so an agent can page through a list longer than `limit`, and a cut list names the offset of the next page.
+
 
 ## [1.6.4] - 2026-11-20
 
