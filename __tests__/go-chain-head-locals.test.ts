@@ -5,7 +5,8 @@
  * by the start of its value alone, `new(Route)`, so `sub.Path("/a")` reached
  * `Route`'s `Path`: gorilla/mux's subrouter tests are written this way. Only
  * a value that is the `new(T)` or the literal and nothing more types the
- * local by what it writes; a chain is read like any other call's result.
+ * local by what it writes; a chain is read like any other call's result. A
+ * chain broken after the `.` is left as it was, typed by its first line.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -61,6 +62,43 @@ func fromNewBroken() {
 	sub := new(Route).
 		Host("x").
 		Subrouter()
+	sub.Path("/a")
+}
+
+func builderBroken() {
+	b := new(Route).
+		Host("x")
+	b.Path("/a")
+}
+
+func builderBrokenCommented() {
+	b := new(Route). // then
+		Host("x")
+	b.Path("/a")
+}
+
+func fromLiteralBroken() {
+	sub := Plain{}.
+		Router()
+	sub.Path("/a")
+}
+
+func fromFilledLiteralBroken() {
+	sub := Plain{
+		Name: "x",
+	}.
+		Router()
+	sub.Path("/a")
+}
+
+func fromHeader() {
+	if sub := new(Route).Subrouter(); sub != nil {
+		sub.Path("/a")
+	}
+}
+
+func fromVar() {
+	var sub = new(Route).Subrouter()
 	sub.Path("/a")
 }
 
@@ -180,9 +218,23 @@ describe.each(['default', 'wasm'])('a Go local given a chain is typed by what th
     expect(pathCalls('fromNewSpaced')).toEqual(ROUTER);
   });
 
-  it("gives a chain broken after a `.` no type of its start's: it is read as a function's broken chain is", () => {
-    expect(pathCalls('fromNewBroken')).not.toContain('b_route.go::Route::Path');
-    expect(pathCalls('fromNewBroken')).toEqual(pathCalls('fromFuncBroken'));
+  it('reads a chain in an `if` header and in a `var` declaration', () => {
+    expect(pathCalls('fromHeader')).toEqual(ROUTER);
+    expect(pathCalls('fromVar')).toEqual(ROUTER);
+  });
+
+  it('types a chain broken after the `.` by its start, as before: right when the chain returns that type', () => {
+    expect(pathCalls('builderBroken')).toEqual(['b_route.go::Route::Path']);
+    expect(pathCalls('builderBrokenCommented')).toEqual(['b_route.go::Route::Path']);
+  });
+
+  // Not fixed here: a `:=` value is read to its line's end, so these keep the
+  // type their first line writes, and a function's broken chain has none.
+  it('leaves a broken chain that returns another type as it was', () => {
+    expect(pathCalls('fromNewBroken')).toEqual(['b_route.go::Route::Path']);
+    expect(pathCalls('fromLiteralBroken')).toEqual(['b_route.go::Plain::Path']);
+    expect(pathCalls('fromFilledLiteralBroken')).toEqual(['b_route.go::Plain::Path']);
+    expect(pathCalls('fromFuncBroken')).toEqual([]);
   });
 
   it('reads a chain that starts with `make(T)` the same way', () => {

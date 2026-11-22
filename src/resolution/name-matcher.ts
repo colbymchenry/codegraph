@@ -3727,11 +3727,15 @@ function readGoScopes(code: string): GoScopeIndex {
       /^[ \t]*new\([ \t]*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)[ \t]*\)/.exec(rhs);
     // A selector after the literal or the `new(T)` makes it the start of a
     // chain, `new(Route).Host("x").Subrouter()`: the local has the type the
-    // chain gives, read with its value like any call's result (#3447).
+    // chain gives, read with its value like any call's result (#3447). Not
+    // when the line ends at the `.`: a value is read to its line's end, so a
+    // chain broken there keeps the type its first line writes.
     let after = i + 1 + (written?.[0].length ?? 0);
     if (written && code[after] === '{') after = close.get(after) ?? code.length;
     do after++; while (code[after] === ' ' || code[after] === '\t');
-    const literal = code[after] === '.' ? undefined : written?.[1];
+    const onward = /\.[ \t]*\S/y;
+    onward.lastIndex = after;
+    const literal = onward.test(code) ? undefined : written?.[1];
     const type = names.length === 1 && literal && !GO_TYPE_KEYWORDS.has(literal) ? literal : undefined;
     const from = /^[ \t]*&?[ \t]*([A-Za-z_]\w*)\.[A-Za-z_]\w*[ \t]*[({]/.exec(rhs)?.[1];
     const call = from ? undefined : /^[ \t]*([A-Za-z_]\w*)[ \t]*(?:\[(?:[^[\]\n]|\[[^[\]\n]*\])*\][ \t]*)?\(/.exec(rhs)?.[1];
@@ -30651,8 +30655,9 @@ function goMethodOnElement(t: GoTypeText, ref: UnresolvedRef, context: Resolutio
 /**
  * Whether the value a Go declaration gives its name is a call or a
  * conversion: `f(…)`, `pkg.F(…)`, `x.M(…)`, `T(x)`, `a.b().C(…)`, alone or
- * as this name's place among several values (`a, b := f(), g()`). Not a
- * `range` clause, a builtin's `make`/`new`/`append`, an assertion
+ * as this name's place among several values (`a, b := f(), g()`), a chain
+ * from a builtin's call too (`new(T).M()`). Not a `range` clause, a
+ * builtin's `make`/`new`/`append` that is the whole value, an assertion
  * (goAssertedLocalType reads those) or a type switch's guard.
  */
 function goValueIsCall(local: GoDecl, index: GoScopeIndex): boolean {
