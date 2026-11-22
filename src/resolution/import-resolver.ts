@@ -21,6 +21,7 @@ import { moduleReferenceKeys, moduleTail } from '../db/reference-tail';
 import { PHP_DOCUMENT_ROOT } from '../extraction/languages/php';
 import { loadWebRoot } from '../project-config';
 import { underWebRoot } from './php-web-root';
+import { resolveZigBuildModule } from './zig-build-modules';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -467,6 +468,18 @@ function resolveImportPathUncached(
     return resolveCobolCopybook(importPath, fromFile, context);
   }
 
+  // Zig `@import(...)`: relative `.zig` paths resolve against the importing file's
+  // directory, while bare named modules (`@import("engine_api")`, `@import("stdx")`)
+  // resolve against the nearest ancestor `build.zig` module table. Built-ins (`std`,
+  // `builtin`, `root`) and unknown/external modules stay null.
+  if (language === 'zig') {
+    if (importPath.startsWith('.') || importPath.endsWith('.zig')) {
+      const fromDir = path.dirname(path.join(context.getProjectRoot(), fromFile));
+      return resolveRelativeImport(importPath, fromDir, 'zig', context);
+    }
+    return resolveZigBuildModule(importPath, fromFile, context);
+  }
+
   // Skip external/npm packages — but pass the context so the
   // bare-specifier heuristic can consult the project's tsconfig
   // alias map first (custom prefixes like `@components/*` would
@@ -487,12 +500,6 @@ function resolveImportPathUncached(
 
   // Handle relative imports
   if (importPath.startsWith('.')) {
-    return resolveRelativeImport(importPath, fromDir, language, context);
-  }
-
-  // Zig `@import("file.zig")` and `@import("sub/file.zig")` are relative to the
-  // importing file's directory even without a leading `./`.
-  if (language === 'zig' && importPath.endsWith('.zig')) {
     return resolveRelativeImport(importPath, fromDir, language, context);
   }
 
@@ -1389,6 +1396,9 @@ export function isExternalImport(
 
   if (language === 'zig') {
     if (!importPath.endsWith('.zig') && !importPath.startsWith('.')) {
+      if (context && options?.fromFile) {
+        return resolveZigBuildModule(importPath, options.fromFile, context) === null;
+      }
       return true;
     }
   }

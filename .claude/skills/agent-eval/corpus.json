@@ -628,7 +628,7 @@
       "repo": "https://github.com/ashhart/TensorFold",
       "size": "Large",
       "files": "~6445",
-      "question": "How does TensorFold handle an incoming Anthropic /v1/messages HTTP request from route dispatch through request translation, prompt rendering, and response streaming? Trace from routes.zig through anthropic.zig, anthropic_translate.zig, and prompt.zig."
+      "question": "How does TensorFold handle an incoming Anthropic /v1/messages HTTP request from route dispatch through request translation, prompt rendering, engine execution, and SSE response streaming?"
     }
   ]
 }

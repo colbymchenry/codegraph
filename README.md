@@ -879,7 +879,7 @@ agents learn the `codegraph explore` command:
 | Python | `.py` | Full support |
 | Go | `.go` | Full support |
 | Rust | `.rs` | Full support |
-| Zig | `.zig` | Full support (functions, structs/enums/unions/opaque/error sets, methods, constants, `test` blocks, `@import` file and symbol resolution, call and instantiation edges) |
+| Zig | `.zig` | Full support (functions, structs/enums/unions/opaque/error sets, methods, constants, `test` blocks, relative `@import` and `build.zig` named-module resolution, call and instantiation edges) |
 | Java | `.java` | Full support |
 | C# | `.cs` | Full support (MediatR `Send` / `Publish` link to their handlers, including ones written against your own interfaces like `ICommandHandler<T>` or a package's) |
 | ASP.NET Razor / Blazor | `.cshtml`, `.razor` | Markup links: `@model`, `@inherits`, `@inject`, `@typeof` and Blazor component tags link to the C# types they name, and what an inline `<script>` block calls links to the JavaScript that defines it |

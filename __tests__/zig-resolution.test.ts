@@ -178,4 +178,143 @@ pub fn dispatch() void {
     expect(callees).toContain('src/d.zig::post');
     expect(callees).toContain('src/d.zig::onlyViaReexport');
   });
+
+  it('resolves build.zig named modules from addModule, createModule+addImport, .imports, and helper build files', async () => {
+    writeFiles({
+      'pkg/build.zig': `const std = @import("std");
+const server_build = @import("zig/build/server.zig");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    _ = b.addModule("xev", .{
+        .root_source_file = b.path("zig/src/xev.zig"),
+    });
+    const lanes = b.createModule(.{
+        .root_source_file = b.path("zig/src/core/lanes.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const api = b.createModule(.{
+        .root_source_file = b.path("zig/src/core/engine_api.zig"),
+        .target = target,
+        .imports = &.{.{ .name = "lanes", .module = lanes }},
+    });
+    const srv = server_build.serverMod(b, target, api);
+    srv.addImport("family", @import("zig/build/family.zig").module(b, target));
+    const backend_a = b.createModule(.{ .root_source_file = b.path("zig/src/native/cuda.zig"), .target = target });
+    const backend_b = b.createModule(.{ .root_source_file = b.path("zig/src/native/xpu.zig"), .target = target });
+    srv.addImport("native_engines", backend_a);
+    api.addImport("native_engines", backend_b);
+}
+`,
+      'pkg/zig/build/server.zig': `const std = @import("std");
+
+pub fn json(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("zig/src/server/json.zig"), .target = target });
+}
+
+pub fn serverMod(b: *std.Build, target: std.Build.ResolvedTarget, api: *std.Build.Module) *std.Build.Module {
+    const m = b.createModule(.{
+        .root_source_file = b.path("zig/src/server/routes.zig"),
+        .target = target,
+        .imports = &.{.{ .name = "engine_api", .module = api }},
+    });
+    const j = json(b, target);
+    m.addImport("json", j);
+    return m;
+}
+`,
+      'pkg/zig/build/family.zig': `const std = @import("std");
+
+pub fn module(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Module {
+    return moduleAt(b, "zig/src/families/lfm3.zig", target);
+}
+
+fn moduleAt(b: *std.Build, root: []const u8, target: std.Build.ResolvedTarget) *std.Build.Module {
+    const helper = b.createModule(.{ .root_source_file = b.path("zig/src/families/rope.zig"), .target = target });
+    return b.createModule(.{
+        .root_source_file = b.path(root),
+        .target = target,
+        .imports = &.{.{ .name = "rope_freq", .module = helper }},
+    });
+}
+`,
+      'pkg/zig/src/xev.zig': `pub fn tick() void {}\n`,
+      'pkg/zig/src/core/lanes.zig': `pub fn schedule() void {}\n`,
+      'pkg/zig/src/core/engine_api.zig': `const lanes = @import("lanes");
+pub const Engine = struct {
+    pub fn open() void {
+        lanes.schedule();
+    }
+};
+pub fn learn() void {}
+`,
+      'pkg/zig/src/server/json.zig': `pub fn stringify() void {}\n`,
+      'pkg/zig/src/families/rope.zig': `pub fn freq() void {}\n`,
+      'pkg/zig/src/families/lfm3.zig': `const rope = @import("rope_freq");
+pub fn forward() void {
+    rope.freq();
+}
+`,
+      'pkg/zig/src/native/cuda.zig': `pub fn boot() void {}\n`,
+      'pkg/zig/src/native/xpu.zig': `pub fn boot() void {}\n`,
+      'pkg/zig/src/unrelated_std.zig': `pub fn std() void {}\npub fn builtin() void {}\npub fn third_party() void {}\n`,
+      'pkg/zig/src/server/routes.zig': `const std = @import("std");
+const builtin = @import("builtin");
+const third_party = @import("third_party");
+const native_engines = @import("native_engines");
+const xev = @import("xev");
+const api = @import("engine_api");
+const json = @import("json");
+const family = @import("family");
+
+pub fn handle() void {
+    _ = std;
+    _ = builtin;
+    _ = third_party;
+    _ = native_engines;
+    xev.tick();
+    api.Engine.open();
+    json.stringify();
+    family.forward();
+    @import("engine_api").learn();
+}
+`,
+    });
+
+    cg = CodeGraph.initSync(dir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const routesFile = cg.getNodesInFile('pkg/zig/src/server/routes.zig').find((n) => n.kind === 'file')!;
+    const routeImportFiles = cg
+      .getOutgoingEdges(routesFile.id)
+      .filter((e) => e.kind === 'imports')
+      .map((e) => cg!.getNode(e.target)?.filePath);
+    expect(routeImportFiles).toContain('pkg/zig/src/xev.zig');
+    expect(routeImportFiles).toContain('pkg/zig/src/core/engine_api.zig');
+    expect(routeImportFiles).toContain('pkg/zig/src/server/json.zig');
+    expect(routeImportFiles).toContain('pkg/zig/src/families/lfm3.zig');
+    // Built-ins, unknown third-party, and genuinely ambiguous multi-backend modules stay silent
+    expect(routeImportFiles).not.toContain('pkg/zig/src/unrelated_std.zig');
+    expect(routeImportFiles).not.toContain('pkg/zig/src/native/cuda.zig');
+    expect(routeImportFiles).not.toContain('pkg/zig/src/native/xpu.zig');
+
+    const handleFn = cg.getNodesInFile('pkg/zig/src/server/routes.zig').find((n) => n.kind === 'function' && n.name === 'handle')!;
+    const handleCallees = cg.getCallees(handleFn.id).map((c) => `${c.node.filePath}::${c.node.qualifiedName}`);
+    expect(handleCallees).toContain('pkg/zig/src/xev.zig::tick');
+    expect(handleCallees).toContain('pkg/zig/src/core/engine_api.zig::Engine::open');
+    expect(handleCallees).toContain('pkg/zig/src/core/engine_api.zig::learn');
+    expect(handleCallees).toContain('pkg/zig/src/server/json.zig::stringify');
+    expect(handleCallees).toContain('pkg/zig/src/families/lfm3.zig::forward');
+
+    const openFn = cg.getNodesInFile('pkg/zig/src/core/engine_api.zig').find((n) => n.name === 'open')!;
+    const openCallees = cg.getCallees(openFn.id).map((c) => `${c.node.filePath}::${c.node.name}`);
+    expect(openCallees).toContain('pkg/zig/src/core/lanes.zig::schedule');
+
+    const forwardFn = cg.getNodesInFile('pkg/zig/src/families/lfm3.zig').find((n) => n.name === 'forward')!;
+    const forwardCallees = cg.getCallees(forwardFn.id).map((c) => `${c.node.filePath}::${c.node.name}`);
+    expect(forwardCallees).toContain('pkg/zig/src/families/rope.zig::freq');
+  });
 });
