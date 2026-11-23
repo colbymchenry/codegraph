@@ -37,7 +37,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Pascal, a call to a routine its scope declares, like `Check(…)` in a test case or `Render(…)` in a controller, now links to that routine instead of a same-named method of an unrelated class. (#3476)
 - In Pascal, a call to a routine with overloads in several units, like mORMot's `FormatUtf8`, now links to the overload its arguments fit, and a call from another unit no longer links to a routine that a unit declares only in its implementation section. (#3476)
 - In Pascal, an `inherited` call, like `inherited Create(AOwner)` or a bare `inherited;`, now links to the method of the nearest ancestor class that declares it, so a flow through an overriding method goes on into the method it overrides; re-index Pascal projects after upgrading. (#3477)
-- In Pascal, a routine whose `{$IFDEF}` branches each open a block for one shared `end`, like a `case` on one platform and a `begin` on another, or a Pascal body beside assembler versions, now ends at its own `end`, so the routines after it keep their own nodes and calls instead of being read as part of it; re-index Pascal projects after upgrading.
+- In Pascal, a routine whose `{$IFDEF}` branches each open a block for one shared `end`, like a `case` on one platform and a `begin` on another, or a Pascal body beside assembler versions, now ends at its own `end`, so the routines after it keep their own nodes and calls instead of being read as part of it; re-index Pascal projects after upgrading. (#3478)
 
 ## [1.6.4] - 2026-11-20
 
