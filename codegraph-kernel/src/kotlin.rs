@@ -9,8 +9,9 @@
 //! is source-order dependent) and extractModifiers (expect/actual platform
 //! modifiers → the node DECORATORS wire field, on every created node — the
 //! KMP synthesizer's input). Preserved on purpose: the FIELD_COUNT-0 dead
-//! cluster (no signatures, ZERO type-annotation refs), the bodiless-class
-//! header re-walk asymmetry, enum-entry bodies being invisible, KDoc
+//! cluster (no signatures, ZERO type-annotation refs), a bodiless class
+//! walking its whole header (a bodied one walks only the header's code —
+//! class_header_code), enum-entry arguments being invisible, KDoc
 //! (`multiline_comment`) never being a docstring AND chain-breaking,
 //! comment-gluing into import/package extents,
 //! `@Anno(args)` emitting nothing while `@Anno` emits decorates, zero
@@ -154,6 +155,68 @@ fn accessor_owner<'t>(node: Node<'t>) -> Option<Node<'t>> {
         return if n.kind() == "property_declaration" { Some(n) } else { None };
     }
     None
+}
+
+/// The named child right after the first `token` child of `node`, if any.
+fn named_child_after<'t>(node: Node<'t>, token: &str) -> Option<Node<'t>> {
+    let mut seen = false;
+    for i in 0..node.child_count() {
+        let Some(c) = node.child(i) else { continue };
+        if !c.is_named() {
+            if c.kind() == token {
+                seen = true;
+            }
+            continue;
+        }
+        if seen {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// The code a class, object or enum header holds, in source order (TS
+/// `kotlinClassHeaderCode`): each constructor parameter's default value
+/// (`c: Clock = SystemClock()`), the arguments of the superclass constructor
+/// it calls (`: Base(load())`), and the expression after `by` it delegates an
+/// interface to (`I by Impl()`). A class with a body walks it as its own code
+/// before the body; the types and annotations around it are left alone.
+fn class_header_code<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    let mut out: Vec<Node<'t>> = Vec::new();
+    for i in 0..node.named_child_count() {
+        let Some(child) = node.named_child(i) else { continue };
+        match child.kind() {
+            "primary_constructor" => {
+                for j in 0..child.named_child_count() {
+                    let Some(param) = child.named_child(j) else { continue };
+                    if param.kind() != "class_parameter" {
+                        continue;
+                    }
+                    if let Some(value) = named_child_after(param, "=") {
+                        out.push(value);
+                    }
+                }
+            }
+            "delegation_specifier" => match child.named_child(0) {
+                Some(spec) if spec.kind() == "constructor_invocation" => {
+                    if let Some(args) = (0..spec.named_child_count())
+                        .filter_map(|j| spec.named_child(j))
+                        .find(|c| c.kind() == "value_arguments")
+                    {
+                        out.push(args);
+                    }
+                }
+                Some(spec) if spec.kind() == "explicit_delegation" => {
+                    if let Some(delegate) = named_child_after(spec, "by") {
+                        out.push(delegate);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The sibling accessors that follow a property declaration, in source order.
@@ -1083,10 +1146,16 @@ impl<'t> Walker<'t> {
         // primaryCtor refs: csharp-gated no-op.
         self.extract_decorators_for(node, row);
         self.stack.push(Scope { row, kind: "class", name });
-        // Bodied: ONLY class_body children (primary-ctor properties/defaults
-        // invisible). Bodiless: the class node itself → header children
-        // visited → ctor default-value + super-arg calls attribute to the
-        // CLASS (the asymmetry, pinned).
+        // Bodied: the header's code (ctor defaults, super-ctor args, a `by`
+        // delegate — class_header_code) is walked first, then the class_body
+        // children (primary-ctor properties still mint nothing). Bodiless: the
+        // class node itself → every header child visited → the same calls
+        // attribute to the CLASS.
+        if resolved_body.is_some() {
+            for code in class_header_code(node) {
+                self.visit_node(code);
+            }
+        }
         let body = resolved_body.unwrap_or(node);
         for i in 0..body.named_child_count() {
             if let Some(c) = body.named_child(i) {
@@ -1127,6 +1196,10 @@ impl<'t> Walker<'t> {
         let Some(row) = self.create_node("enum", &name, node, extra) else { return };
         self.extract_inheritance(node, row);
         self.stack.push(Scope { row, kind: "enum", name });
+        // The header's code (a ctor default) is the enum's, as a class's is.
+        for code in class_header_code(node) {
+            self.visit_node(code);
+        }
         for i in 0..body.named_child_count() {
             let Some(child) = body.named_child(i) else { continue };
             if child.kind() == "enum_entry" {

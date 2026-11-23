@@ -499,7 +499,7 @@ undefined; `: (Int) -> Unit` (function_type) → undefined; **`: T` (generic
 param) → `T`** (leaks as a returnType — preserve); extension receiver types
 never mistaken (they sit BEFORE the params). Methods and functions both.
 
-### extractClass (1679) — and the bodiless-header asymmetry
+### extractClass (1679) — and the class header's code
 
 resolvedBody = resolveBody (class_body by type; null for bodiless). NO
 skipBodilessClass → bodiless classes mint nodes. Extras: docstring,
@@ -510,20 +510,31 @@ extractCsharpPrimaryCtorParamRefs (no-op — needs language csharp… actually
 gated at :5939 by language, cheap early-out) and extractDecoratorsFor
 (§Decorators — the `@MyMarker class` ref). Push, walk, pop.
 
-- **Bodied class: body = class_body → ONLY class_body children are visited.**
-  The `primary_constructor` is a DIRECT child of class_declaration, NOT of
-  class_body → **constructor properties (`class Foo(val a: Int)`) mint NO
-  field nodes, ctor default-value calls emit NOTHING, and `data class`
-  components are invisible** (pinned: DataK has zero members).
-- **Bodiless class: body = the class node itself (1714) → the HEADER children
-  are visited**: the primary_constructor recursion reaches default-value
+- **Bodied class: the header's CODE is walked first, then the class_body
+  children.** `classHeaderCode` (kotlin.ts; kernel `class_header_code`)
+  lists it in source order: each `class_parameter`'s default (the named
+  child after `=`), each delegation_specifier's `constructor_invocation`
+  `value_arguments`, and each `explicit_delegation`'s delegate (the named
+  child after `by`). Each goes through visitNode with the class on top →
+  **`calls` refs from the CLASS node**, fn-ref capture in super-ctor
+  arguments, an object expression delegate → an anonymous class. Before
+  this walk a bodied class's header emitted ONLY its extends refs; under
+  tree-sitter-kotlin 0.3.8 a class written `I by X() {` looked bodiless (the
+  body parsed as X's trailing lambda), the only way such header calls ever
+  linked, and #3410's grammar update undid that. The `primary_constructor`
+  is still otherwise unwalked → **constructor properties (`class Foo(val a:
+  Int)`) mint NO field nodes and `data class` components are invisible**
+  (pinned: DataK has zero members).
+- **Bodiless class: body = the class node itself (1714) → EVERY header child
+  is visited**: the primary_constructor recursion reaches default-value
   `call_expression`s → **`calls` refs from the CLASS node**, and
   delegation_specifier recursion reaches super-ctor argument calls too.
   Ground truth (`extract-bodiless.txt`): `class Bodiless(val b: Int =
   initB()) : Base(readCfg2())` → extends `Base` + calls `initB` + calls
-  `readCfg2`, all from class:Bodiless; the IDENTICAL bodied class emits
-  ONLY extends `Base`. Reproduce the asymmetry exactly; also note the
-  header's value_arguments feed fn-ref capture in the bodiless case only.
+  `readCfg2`, all from class:Bodiless — now the same for the bodied class.
+  What only the bodiless walk reaches is the class's own annotations'
+  arguments (`@Deprecated("…", ReplaceWith("x"))` → calls `ReplaceWith`)
+  and those of its constructor parameters.
 - Class-body members: hook properties (fields/constants), function_
   declarations → extractMethod, nested class/object/enum → their branches,
   `getter`/`setter` siblings + `anonymous_initializer` + `secondary_
@@ -538,6 +549,8 @@ gated at :5939 by language, cheap early-out) and extractDecoratorsFor
 - extractEnum (1914): body REQUIRED (resolveBody finds `enum_class_body`) —
   a bodiless enum would mint nothing (doesn't occur). docstring, visibility,
   isExported undefined. extractInheritance (enum delegation_specifiers).
+  The header's code (`classHeaderCode`: `enum class E(val v: Int = f())`)
+  is walked with the enum pushed, before the body.
   Body loop (1941-1950): `enum_entry` ∈ enumMemberTypes →
   extractEnumMembers(entry); everything else (function_declaration after the
   `;`, companion_object, secondary constructors) → visitNode with the enum

@@ -2917,6 +2917,9 @@ export class TreeSitterExtractor {
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
     this.extractDartNamedPrimaryCtor(node, classNode.name);
+    // The code in a bodied class's header (a Kotlin `I by Impl()`) is the
+    // class's own; a bodiless class walks its whole header just below.
+    if (resolvedBody) this.visitClassHeaderCode(node);
     const body = resolvedBody ?? node;
 
     // Visit all children for methods and properties
@@ -2935,6 +2938,15 @@ export class TreeSitterExtractor {
     }
 
     this.nodeStack.pop();
+  }
+
+  /**
+   * Walk the code a class's header holds (`classHeaderCode`) with the class
+   * on the stack, as the walk of a bodiless class's header does. Mirrored in
+   * the kernel (kotlin.rs `class_header_code`).
+   */
+  private visitClassHeaderCode(node: SyntaxNode): void {
+    for (const code of this.extractor?.classHeaderCode?.(node) ?? []) this.visitNode(code);
   }
 
   /**
@@ -3212,6 +3224,7 @@ export class TreeSitterExtractor {
     // Push to stack and visit body children (enum members, nested types, methods)
     this.nodeStack.push(enumNode.id);
     this.extractDartNamedPrimaryCtor(node, enumNode.name);
+    this.visitClassHeaderCode(node);
 
     const memberTypes = this.extractor.enumMemberTypes;
     for (let i = 0; i < body.namedChildCount; i++) {

@@ -26,6 +26,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Pascal methods and functions now show their implementation bodies in `node` and `explore` instead of their interface or forward declarations, while keeping their declaration metadata and call relationships; re-index Pascal projects after upgrading. Thanks @Vizit0r for the report and @yang0228 for the fix. (#3453)
 - In Pascal, a call to an overloaded method or function now links to the overload whose parameters fit its arguments. (#3453)
 - In Pascal, a class declared right after a subrange or set type, like `TPercent = 0 .. 100;`, now gets its own name instead of that type's. (#3453)
+- In Kotlin, calls written in a class's header, such as a constructor parameter's default value, a superclass constructor's arguments, or a delegate like `SecureActivityDelegate by SecureActivityDelegateImpl()`, now link from the class when the class also has a body. (#3410)
 
 ## [1.6.4] - 2026-11-20
 
