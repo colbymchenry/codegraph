@@ -47,7 +47,8 @@
  * - it sits in a **vendored** directory (`vendor/`, `third_party/`,
  *   `node_modules/` — code the repository carries but does not own);
  * - it is in a **test scope** the path does not reveal — a Rust
- *   `#[cfg(test)] mod tests`, a nested `Tests` namespace;
+ *   `#[cfg(test)] mod tests`, a nested `Tests` namespace, or an Erlang
+ *   `*_test` function EUnit finds by its name;
  * - it is in a **component file** whose markup the index reads for calls but
  *   not for references, so a handler passed as `{onkeydown}` is invisible;
  * - it is in a file **nothing in the index reaches**. Then "nothing references
@@ -529,7 +530,7 @@ export function buildDeadCodeReport(cg: CodeGraph, query: DeadCodeQuery = {}): D
       excluded.vendored += 1;
       continue;
     }
-    if (!includeTests && isTestScope(node.qualifiedName)) {
+    if (!includeTests && (isTestScope(node.qualifiedName) || isNamedTest(node))) {
       excluded.testScope += 1;
       continue;
     }
@@ -779,6 +780,17 @@ export function isTestScope(qualifiedName: string): boolean {
     if (TEST_SCOPE_SEGMENTS.has(segment.toLowerCase())) return true;
   }
   return false;
+}
+
+/**
+ * A test a framework finds by its NAME inside an ordinary source file, so
+ * nothing in the index calls it. EUnit runs every `*_test/0` and `*_test_/0`
+ * function in a module, and Erlang keeps them beside the code they test (under
+ * `-ifdef(TEST)`), where neither the path nor the scope says "test" — cowboy's
+ * whole dead-code list was its own unit tests.
+ */
+export function isNamedTest(node: Pick<Node, 'name' | 'language'>): boolean {
+  return node.language === 'erlang' && /_test_?$/.test(node.name);
 }
 
 /** Code the repository carries rather than owns — see {@link VENDOR_SEGMENTS}. */

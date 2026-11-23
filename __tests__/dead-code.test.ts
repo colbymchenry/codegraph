@@ -30,6 +30,7 @@ import {
   buildDeadCodeReport,
   isHeaderFile,
   isImplicitEntryName,
+  isNamedTest,
   isTestScope,
   isVendoredPath,
   mentionCount,
@@ -405,6 +406,15 @@ describe('the rules that are pure', () => {
     expect(isTestScope('tests::row_sizes_match')).toBe(true);
     expect(isTestScope('Fixtures.Tests.Helper')).toBe(true);
     expect(isTestScope('Latest.value')).toBe(false);
+  });
+
+  it('recognises an EUnit test by its name, in Erlang only', () => {
+    // EUnit runs every `*_test/0` and `*_test_/0` in a module; Erlang keeps
+    // them in the source file, so the path never says "test".
+    expect(isNamedTest({ name: 'split_path_test', language: 'erlang' })).toBe(true);
+    expect(isNamedTest({ name: 'compile_test_', language: 'erlang' })).toBe(true);
+    expect(isNamedTest({ name: 'split_path', language: 'erlang' })).toBe(false);
+    expect(isNamedTest({ name: 'latest_test', language: 'python' })).toBe(false);
   });
 
   it('recognises names the language calls by itself', () => {
