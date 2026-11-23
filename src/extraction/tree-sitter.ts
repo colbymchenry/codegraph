@@ -842,6 +842,25 @@ const PASCAL_TEXT_HEADER = /^(\s*)(?:class\s+)?(?:procedure|function|constructor
  */
 const PASCAL_DATA_NAME = /^(?:F[A-Z][a-z]|[TE][A-Z][a-z]|[A-Z][A-Z0-9_]*$)/;
 
+const PASCAL_ROUTINE_KEYWORDS = new Set(['kProcedure', 'kFunction', 'kConstructor', 'kDestructor', 'kOperator']);
+
+/** Type names an implementation header may write for the type its declaration names otherwise. */
+const PASCAL_TYPE_SYNONYMS = new Map([['longint', 'integer'], ['longword', 'cardinal'], ['dword', 'cardinal']]);
+
+/** A Pascal routine's declaration, as an implementation header is matched to it (#3453). */
+interface PascalRoutineCandidate {
+  node: Node;
+  /** One `modifier:type` per parameter: what tells overloads apart, with the result type. */
+  params: string[];
+  signature: string;
+  /** The result type a function or an operator declares; '' for a procedure. */
+  result: string;
+  implemented: boolean;
+  overloaded: boolean;
+  /** The implementation the node was located at. */
+  body?: SyntaxNode;
+}
+
 export class TreeSitterExtractor {
   /**
    * The node's prose, from either place it can live: a preceding comment
@@ -920,7 +939,7 @@ export class TreeSitterExtractor {
   // each assigned target is a genuine possible callee. Same-body locality is
   // the precision guard (the #932 table-dispatch philosophy scoped to locals).
   private cppLocalFnPtrs = new Map<string, Map<string, Set<string>>>();
-  private pascalRoutineIndex = new Map<string, Array<{ node: Node; signature: string; implemented: boolean; overloaded: boolean }>>();
+  private pascalRoutineIndex = new Map<string, PascalRoutineCandidate[]>();
   // Paren-less Pascal names (#2514): the names each routine or anonymous
   // method being walked declares itself (innermost last), the class the
   // routine belongs to, how many `with` bodies the walk is inside (a bare name
@@ -9343,18 +9362,33 @@ export class TreeSitterExtractor {
   }
 
   /** Parameter types and modifiers identify overloads; names, grouping and defaults do not. */
-  private pascalRoutineSignature(header: SyntaxNode): string {
-    const tokens = (node: SyntaxNode | null): string => {
-      if (!node || node.type === 'comment') return '';
-      return node.childCount ? node.children.map(tokens).join('') : getNodeText(node, this.source).toLowerCase();
-    };
+  private pascalRoutineParams(header: SyntaxNode): string[] {
     return (getChildByField(header, 'args')?.namedChildren ?? [])
       .filter((arg) => arg.type === 'declArg')
       .flatMap((arg) => {
         const modifier = arg.namedChildren.find((c) => c.type === 'kConst' || c.type === 'kVar' || c.type === 'kOut')?.type ?? '';
-        const type = tokens(getChildByField(arg, 'type'));
+        const type = this.pascalTypeTokens(getChildByField(arg, 'type'));
         return arg.namedChildren.filter((c) => c.type === 'identifier').map(() => `${modifier}:${type}`);
-      }).join(';');
+      });
+  }
+
+  /**
+   * The result type a function or an operator declares: `class operator
+   * Implicit(const A: TDocValue): RawUtf8` and its `: Boolean` overload
+   * differ by it alone. '' for a procedure.
+   */
+  private pascalRoutineResult(header: SyntaxNode): string {
+    // A header the parse broke can hold its result as a bare `typeref`.
+    return this.pascalTypeTokens(header.namedChildren.find((c) => c.type === 'type' || c.type === 'typeref') ?? null);
+  }
+
+  private pascalDeclaresOverload(header: SyntaxNode): boolean {
+    return header.namedChildren.some((c) => c.type === 'procAttribute' && c.namedChildren.some((a) => a.type === 'kOverload'));
+  }
+
+  private pascalTypeTokens(node: SyntaxNode | null): string {
+    if (!node || node.type === 'comment' || node.type === 'pp') return '';
+    return node.childCount ? node.children.map((c) => this.pascalTypeTokens(c)).join('') : getNodeText(node, this.source).toLowerCase();
   }
 
   /** Generic parameters can carry constraints only in the declaration. */
@@ -9377,11 +9411,16 @@ export class TreeSitterExtractor {
     for (let parent = header.parent; parent; parent = parent.parent) {
       if (parent.type === 'declType') parts.unshift(this.pascalRoutineName(getChildByField(parent, 'name')));
     }
-    const candidate = {
+    const params = this.pascalRoutineParams(header);
+    const implementation = header.parent?.type === 'defProc' ? header.parent : undefined;
+    const candidate: PascalRoutineCandidate = {
       node,
-      signature: this.pascalRoutineSignature(header),
-      implemented: header.parent?.type === 'defProc',
-      overloaded: header.namedChildren.some((c) => c.type === 'procAttribute' && c.namedChildren.some((a) => a.type === 'kOverload')),
+      params,
+      signature: params.join(';'),
+      result: this.pascalRoutineResult(header),
+      implemented: implementation !== undefined,
+      overloaded: this.pascalDeclaresOverload(header),
+      body: implementation,
     };
     // Bare names belong to free routines, never to a namesake class method.
     for (let i = 0; i < (node.kind === 'method' ? parts.length - 1 : 1); i++) {
@@ -9392,26 +9431,124 @@ export class TreeSitterExtractor {
     }
   }
 
-  /** Keep the declaration's identity and metadata, but return its implementation as source. */
-  private locatePascalRoutine(routine: Node, node: SyntaxNode): void {
-    let end = node.endPosition;
-    if (node.hasError) {
-      let body: SyntaxNode | null = null;
-      for (const child of node.namedChildren) {
-        if (child.type === 'defProc' && (body || child.startPosition.column <= node.startPosition.column)) {
-          if (!body) return;
-          break;
-        }
-        if (!body && (child.type === 'block' || child.type === 'asm')) body = child;
+  /**
+   * Where an implementation's source runs, header to body end. Null when the
+   * parse joined no body to the header. A parse error the routine above ran
+   * into (DelphiMVCFramework's `const [ref] Src` parameter) starts it at
+   * its own header, not the routine above's.
+   */
+  private pascalImplementationRange(node: SyntaxNode, header: SyntaxNode): { start: { row: number; column: number }; end: { row: number; column: number } } | null {
+    if (!node.hasError) return { start: node.startPosition, end: node.endPosition };
+    let body: SyntaxNode | null = null;
+    for (const child of node.namedChildren) {
+      if (child.type === 'defProc' && (body || child.startPosition.column <= node.startPosition.column)) {
+        if (!body) return null;
+        break;
       }
-      if (!body) return;
-      const terminator = body.nextSibling;
-      end = (terminator?.type === ';' ? terminator : body).endPosition;
+      if (!body && (child.type === 'block' || child.type === 'asm')) body = child;
     }
-    routine.startLine = node.startPosition.row + 1;
-    routine.startColumn = node.startPosition.column;
-    routine.endLine = end.row + 1;
-    routine.endColumn = end.column;
+    if (!body) return null;
+    const terminator = body.nextSibling;
+    // The header's own keyword, before its name: what comes before it there
+    // is the routine above, which the error ran into.
+    const parts = header.children;
+    const name = getChildByField(header, 'name');
+    let at = name ? parts.findIndex((p) => p.startIndex === name.startIndex) - 1 : -1;
+    if (at >= 0 && PASCAL_ROUTINE_KEYWORDS.has(parts[at]!.type)) {
+      if (at > 0 && parts[at - 1]!.type === 'kClass') at--;
+    } else {
+      at = 0;
+    }
+    return { start: parts[at]?.startPosition ?? header.startPosition, end: (terminator?.type === ';' ? terminator : body).endPosition };
+  }
+
+  /**
+   * Keep the declaration's identity and metadata, but return its
+   * implementation as source. A second implementation of the routine, under
+   * `{$IFDEF}`, joins the first one's range when only directives and
+   * comments stand between them (mORMot's `{$ifdef CPUX64}` assembler beside
+   * its Pascal version); else the first stays the routine's source.
+   */
+  private locatePascalRoutine(routine: Node, candidate: PascalRoutineCandidate | undefined, node: SyntaxNode, header: SyntaxNode): void {
+    const range = this.pascalImplementationRange(node, header);
+    if (!range) return;
+    const first = candidate?.body;
+    if (first && first.startIndex !== node.startIndex) {
+      if (!this.pascalTwinImplementations(first, node)) return;
+    } else {
+      routine.startLine = range.start.row + 1;
+      routine.startColumn = range.start.column;
+    }
+    routine.endLine = range.end.row + 1;
+    routine.endColumn = range.end.column;
+    if (candidate) candidate.body = node;
+  }
+
+  /** Whether only directives and comments stand between two implementations. */
+  private pascalTwinImplementations(first: SyntaxNode, second: SyntaxNode): boolean {
+    for (let sibling = second.previousSibling; sibling; sibling = sibling.previousSibling) {
+      if (sibling.startIndex === first.startIndex) return true;
+      if (sibling.type !== 'pp' && sibling.type !== 'comment') return false;
+    }
+    return false;
+  }
+
+  /**
+   * The declaration an implementation header implements, of the routines of
+   * its name:
+   *  - the one with its parameter and result types. When `{$IFDEF}` branches
+   *    declare it twice alike (SynEdit's `AddKey`), the first not yet
+   *    implemented; an implemented one for a second body.
+   *  - for a header that leaves out its parameters, the routine that is not
+   *    overloaded.
+   *  - else the one not yet implemented that its parameters fit best, with at
+   *    least half their types alike: gnugettext implements an overload
+   *    declared with `Number: Longint` as `Number: Integer`.
+   */
+  private pascalDeclarationOf(candidates: PascalRoutineCandidate[], header: SyntaxNode): PascalRoutineCandidate | undefined {
+    if (candidates.length === 0) return undefined;
+    const params = this.pascalRoutineParams(header);
+    const signature = params.join(';');
+    const result = this.pascalRoutineResult(header);
+    const exact = candidates.filter((c) => c.signature === signature && c.result === result);
+    if (exact.length > 0) return exact.find((c) => !c.implemented) ?? exact[0];
+    if (!getChildByField(header, 'args')) {
+      // `procedure Run; overload;` is an overload of its own, with no parameters.
+      if (this.pascalDeclaresOverload(header)) return undefined;
+      const plain = candidates.length === 1 ? candidates : candidates.filter((c) => !c.overloaded);
+      return plain.find((c) => !c.implemented) ?? (plain.length === 1 && !plain[0]!.overloaded ? plain[0] : undefined);
+    }
+    const open = candidates.filter((c) => !c.implemented);
+    // An unmatched, non-overloaded declaration is unique even when the body
+    // qualifies a type differently.
+    if (candidates.length === 1 && open.length === 1 && !open[0]!.overloaded) return open[0];
+    const typeOf = (param: string): string => {
+      const type = param.slice(param.indexOf(':') + 1);
+      return PASCAL_TYPE_SYNONYMS.get(type) ?? type;
+    };
+    const modifierOf = (param: string): string => param.slice(0, param.indexOf(':'));
+    let best: PascalRoutineCandidate | undefined;
+    let bestScore = -1;
+    let tied = false;
+    for (const c of open) {
+      if (c.params.length !== params.length) continue;
+      let types = 0;
+      let modifiers = 0;
+      for (let i = 0; i < params.length; i++) {
+        if (typeOf(params[i]!) === typeOf(c.params[i]!)) types++;
+        if (modifierOf(params[i]!) === modifierOf(c.params[i]!)) modifiers++;
+      }
+      if (types * 2 < params.length) continue;
+      const score = types * 4 + modifiers * 2 + (c.result === result ? 1 : 0);
+      if (score > bestScore) {
+        best = c;
+        bestScore = score;
+        tied = false;
+      } else if (score === bestScore) {
+        tied = true;
+      }
+    }
+    return tied ? undefined : best;
   }
 
   /** Match a Pascal implementation to its declaration without merging overloads. */
@@ -9427,36 +9564,28 @@ export class TreeSitterExtractor {
     const fullNameKey = this.pascalRoutineName(nameNode);
     const shortNameKey = fullNameKey.split('.').pop()!.replace(/<\d+>$/, '');
     const candidates = this.pascalRoutineIndex.get(fullNameKey) ?? [];
-    const signature = this.pascalRoutineSignature(declProc);
-    const matches = candidates.filter((candidate) => candidate.signature === signature);
-    const args = getChildByField(declProc, 'args');
-    let candidate = matches.length === 1 ? matches[0] : undefined;
-    // An unmatched, non-overloaded declaration is unique even when the body
-    // qualifies a type differently; repeated headers can also omit parameters.
-    if (
-      !candidate && matches.length === 0 && candidates.length === 1 && !candidates[0]!.implemented &&
-      (!args || !candidates[0]!.overloaded)
-    ) {
-      candidate = candidates[0];
-    }
+    let candidate = this.pascalDeclarationOf(candidates, declProc);
     let routine = candidate?.node;
-    if (candidate) candidate.implemented = true;
 
     // No existing node? This is an implementation-only **free** procedure/function
     // (`procedure Helper; begin … end;` with no interface declaration and not a
     // class method). An ambiguous declaration stays unmatched.
     if (
-      !routine && !fullNameKey.includes('.') && matches.length === 0 &&
-      (candidates.length === 0 || args || candidates.every((c) => c.implemented))
+      !routine && !fullNameKey.includes('.') &&
+      (candidates.length === 0 || getChildByField(declProc, 'args') || candidates.every((c) => c.implemented))
     ) {
       const fnNode = this.createNode('function', fullName, declProc, {
         signature: this.extractor?.getSignature?.(declProc, this.signatureSource),
         visibility: this.extractor?.getVisibility?.(declProc),
       });
-      if (fnNode) routine = fnNode;
+      if (fnNode) {
+        routine = fnNode;
+        candidate = this.pascalRoutineIndex.get(fullNameKey)?.find((c) => c.node === fnNode);
+      }
     }
 
-    if (routine) this.locatePascalRoutine(routine, node);
+    if (routine) this.locatePascalRoutine(routine, candidate, node, declProc);
+    if (candidate) candidate.implemented = true;
     const parentId = routine?.id ?? this.nodeStack[this.nodeStack.length - 1];
     if (!parentId) return;
 
