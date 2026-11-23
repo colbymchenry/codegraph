@@ -27,6 +27,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Pascal, a call to an overloaded method or function now links to the overload whose parameters fit its arguments. (#3453)
 - In Pascal, a class declared right after a subrange or set type, like `TPercent = 0 .. 100;`, now gets its own name instead of that type's. (#3453)
 - In Kotlin, calls written in a class's header, such as a constructor parameter's default value, a superclass constructor's arguments, or a delegate like `SecureActivityDelegate by SecureActivityDelegateImpl()`, now link from the class when the class also has a body. (#3410)
+- In Pascal, a call to a routine that nothing in its scope declares, like `Max(A, B)` from `System.Math` or DUnit's `Check(…)`, no longer links to a project routine that only shares its name.
+- In Pascal, a call inside a `with` block, like `Add(S)` in `with Writer do`, now links to the method of the `with` object's class, before a same-named method of the calling class or of an unrelated class.
 
 ## [1.6.4] - 2026-11-20
 
