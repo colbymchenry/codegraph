@@ -854,7 +854,7 @@ export class CodeGraph {
           await this.resolver.resolveParameterFlows();
         }
 
-        if (result.success && !options.signal?.aborted) this.resolver.refreshAppleExternalTypes();
+        if (result.success && !options.signal?.aborted) await this.resolver.refreshAppleExternalTypes();
 
         // Over an existing graph the vocabulary was kept (see the top of the
         // run). Every write of this run has landed, so drop the rows of names
@@ -1922,7 +1922,7 @@ export class CodeGraph {
           await this.resolver.resolveParameterFlows(flowChange);
         }
 
-        this.resolver.refreshAppleExternalTypes();
+        await this.resolver.refreshAppleExternalTypes();
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         // Off-thread — see indexAll's call site.

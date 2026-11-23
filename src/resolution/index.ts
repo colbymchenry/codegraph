@@ -622,9 +622,9 @@ export class ReferenceResolver {
     this.frameworksByLanguage.clear();
   }
 
-  /** Reconcile the explicitly enabled external inheritance catalog after project resolution. */
-  refreshAppleExternalTypes(): void {
-    if (refreshAppleExternalTypes(this.queries, this.context, this.projectRoot)) this.clearCaches();
+  /** Reconcile explicitly configured SDK symbol graphs after project resolution. */
+  async refreshAppleExternalTypes(): Promise<void> {
+    if (await refreshAppleExternalTypes(this.queries, this.context, this.projectRoot)) this.clearCaches();
   }
 
   /** The detected frameworks whose `resolve()` reads a reference written in `language`. */
@@ -1737,7 +1737,7 @@ export class ReferenceResolver {
       scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),
       ref,
     ), ref, this.context), ref, this.context);
-    // 目录节点只由受限的外部继承步骤连接，不能成为普通调用或名称匹配的候选目标。
+    // 外部节点只由受限的外部继承步骤连接，不能成为普通调用或名称匹配的候选目标。
     if (resolved?.targetNodeId.startsWith(APPLE_EXTERNAL_TYPE_PREFIX)) return null;
     // A Dart class whose field holds its own type (`class Node { Node? next; }`)
     // names itself: a self-edge that says nothing (#2327).

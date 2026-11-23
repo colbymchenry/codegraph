@@ -14,7 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
-- Swift and Objective-C projects can opt into a small Apple superclass catalog to follow known Foundation and UIKit ancestry without indexing an SDK.
+- Swift and Objective-C projects can opt into compiler-generated SDK symbol graphs to follow external superclass relationships without maintaining a type list.
 
 
 ## [1.6.4] - 2026-11-20

@@ -4,109 +4,100 @@ import type { ResolutionContext } from './types';
 import { loadAppleExternalTypes } from '../project-config';
 import { isSwiftExtension } from './swift-type-visibility';
 
-interface AppleType {
-  module: 'Foundation' | 'UIKit';
-  objc: string;
-  swift: string;
-  parent?: string;
-}
+import { loadAppleSymbolGraphs, type ExternalClass } from './apple-symbol-graphs';
 
-// 只记录稳定的公开类型关系，不复制 SDK 源码，也不扫描本机 SDK。
-// 每个条目的官方说明由 documentation() 给出；增补关系时同时补回归测试。
-const TYPES: readonly AppleType[] = [
-  { module: 'Foundation', objc: 'NSObject', swift: 'NSObject' },
-  { module: 'Foundation', objc: 'NSURLProtocol', swift: 'URLProtocol', parent: 'NSObject' },
-  { module: 'Foundation', objc: 'NSOperation', swift: 'Operation', parent: 'NSObject' },
-  { module: 'UIKit', objc: 'UIResponder', swift: 'UIResponder', parent: 'NSObject' },
-  { module: 'UIKit', objc: 'UIView', swift: 'UIView', parent: 'UIResponder' },
-  { module: 'UIKit', objc: 'UIViewController', swift: 'UIViewController', parent: 'UIResponder' },
-  { module: 'UIKit', objc: 'UINavigationController', swift: 'UINavigationController', parent: 'UIViewController' },
-  { module: 'UIKit', objc: 'UIControl', swift: 'UIControl', parent: 'UIView' },
-  { module: 'UIKit', objc: 'UIButton', swift: 'UIButton', parent: 'UIControl' },
-  { module: 'UIKit', objc: 'UIImageView', swift: 'UIImageView', parent: 'UIView' },
-];
-export const APPLE_EXTERNAL_TYPE_PREFIX = 'external:apple:v1:';
-const PREFIX = APPLE_EXTERNAL_TYPE_PREFIX;
-const MODULES = ['Foundation', 'UIKit'] as const;
+export const APPLE_EXTERNAL_TYPE_PREFIX = 'external:apple:';
+const PREFIX = APPLE_EXTERNAL_TYPE_PREFIX + 'symbolgraph:';
+const EXTERNAL_FILE = '@external/apple/symbolgraphs';
 const typeKinds: readonly Node['kind'][] = ['class', 'struct', 'enum', 'interface', 'protocol', 'type_alias'];
-const filePath = (module: string): string => `@external/apple/${module}`;
-const idOf = (type: AppleType): string => PREFIX + type.module + ':' + type.objc;
-const documentation = (type: AppleType): string =>
-  `https://developer.apple.com/documentation/${type.module.toLowerCase()}/${type.swift.toLowerCase()}`;
+const idOf = (type: ExternalClass): string => PREFIX + type.usr;
 
-/**
- * 可选的外部继承目录，只补充仍未解析的类继承，不解析调用或猜测任意 SDK 类型。
- * 原始引用保留在数据库中，便于配置关闭、声明消失或本地同名类型出现后重新计算。
- * 外部节点使用限定名称，避免污染普通解析器的项目内同名候选集。
- */
-export function refreshAppleExternalTypes(queries: QueryBuilder, context: ResolutionContext, root: string): boolean {
-  const previous = MODULES.flatMap(module => queries.getNodesByFile(filePath(module)))
-    .filter(node => node.id.startsWith(PREFIX));
-  if (!loadAppleExternalTypes(root)) {
+/** 只补未解析的基类；USR 与继承关系来自工具链，不维护类型或别名表。 */
+export async function refreshAppleExternalTypes(queries: QueryBuilder, context: ResolutionContext, root: string): Promise<boolean> {
+  // 兼容试用版外部节点的清理，不把旧目录作为数据源。
+  const previous = [EXTERNAL_FILE, '@external/apple/Foundation', '@external/apple/UIKit']
+    .flatMap(file => queries.getNodesByFile(file)).filter(node => node.id.startsWith(APPLE_EXTERNAL_TYPE_PREFIX));
+  const config = loadAppleExternalTypes(root);
+  if (!config) {
     if (previous.length) queries.runInTransaction(() => previous.forEach(node => queries.deleteNode(node.id)));
     return previous.length > 0;
   }
-
   const declarations = typeKinds.flatMap(kind => queries.getNodesByKind(kind))
-    .filter(node => !node.id.startsWith(PREFIX));
+    .filter(node => !node.id.startsWith(APPLE_EXTERNAL_TYPE_PREFIX));
   const names = new Set(declarations.filter(node => !isSwiftExtension(node, context)).map(node => node.name));
   const sources = declarations.filter(node => (node.language === 'swift' || node.language === 'objc') &&
     node.kind === 'class' && !isSwiftExtension(node, context));
   const refs = queries.getUnresolvedReferenceNamesFrom(sources.map(node => node.id), ['extends']);
+  const imports = new Map<string, Set<string>>();
+  for (const source of sources) {
+    if (!refs.get(source.id)?.length || imports.has(source.filePath)) continue;
+    if (queries.getOutgoingEdges(source.id, ['extends']).some(edge => !edge.target.startsWith(APPLE_EXTERNAL_TYPE_PREFIX))) continue;
+    imports.set(source.filePath, new Set(queries.getNodesByFile(source.filePath)
+      .filter(node => node.kind === 'import' && (source.language === 'swift' || /^#import\s*</.test(node.signature ?? '')))
+      .map(node => node.name.split('/')[0]!)));
+  }
+  const graphs = await loadAppleSymbolGraphs(config, root, [...new Set([...imports.values()].flatMap(set => [...set]))].sort());
+  const types = new Map(graphs.flatMap(graph => graph.classes.map(type => [type.usr, type] as const)));
   const nodes = new Map<string, Node>();
   const edges: Edge[] = [];
-  const imports = new Map<string, Set<string>>();
-  const add = (type: AppleType): string => {
+  const metadata = { synthesizedBy: 'apple-symbolgraph', external: true, format: 'swift-symbolgraph' };
+  const add = (type: ExternalClass): string => {
     const id = idOf(type);
     if (nodes.has(id)) return id;
     nodes.set(id, {
-      id, kind: 'class', name: `${type.module}.${type.objc}`,
-      qualifiedName: id, filePath: filePath(type.module), language: 'objc',
+      id, kind: 'class', name: `${type.module}.${type.name}`, qualifiedName: id,
+      filePath: EXTERNAL_FILE, language: 'swift',
       startLine: 0, endLine: 0, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
-      signature: `External Apple type: ${type.module}.${type.swift} (Objective-C: ${type.objc})`,
-      docstring: `External type catalog v1, not indexed SDK source. No SDK methods or runtime behavior are modeled. ${documentation(type)}`,
+      signature: `External SDK type: ${type.module}.${type.name}${type.objc ? ` (Objective-C: ${type.objc})` : ''}`,
+      docstring: `Imported from Swift Symbol Graph; not indexed SDK source. USR: ${type.usr}. Only known class inheritance is modeled.`,
     });
-    if (type.parent) {
-      const parent = TYPES.find(entry => entry.objc === type.parent)!;
-      edges.push({ source: id, target: add(parent), kind: 'extends', provenance: 'heuristic',
-        metadata: { synthesizedBy: 'apple-external-types', catalog: 'apple-v1', external: true, documentation: documentation(type) } });
+    if (type.parent && type.parent !== type.usr) {
+      let parent = types.get(type.parent);
+      // 图中的跨模块父类可以只有编译器给出的标识和限定名称；不臆造其祖先。
+      if (!parent && type.parentFallback?.includes('.')) {
+        const separator = type.parentFallback.indexOf('.');
+        parent = { usr: type.parent, module: type.parentFallback.slice(0, separator),
+          name: type.parentFallback.slice(separator + 1), objc: /^c:objc\(cs\)([^(@]+)$/.exec(type.parent)?.[1] };
+      }
+      if (parent) edges.push({ source: id, target: add(parent), kind: 'extends', provenance: 'heuristic',
+        metadata: { ...metadata, evidence: 'inheritsFrom', sourceUSR: type.usr, targetUSR: parent.usr } });
     }
     return id;
   };
-
   for (const source of sources) {
     const references = refs.get(source.id);
-    if (!references?.length) continue;
-    let modules = imports.get(source.filePath);
-    if (!modules) {
-      modules = new Set(queries.getNodesByFile(source.filePath).filter(node => node.kind === 'import' &&
-        (source.language === 'swift' || /^#import\s*</.test(node.signature ?? '')))
-        .map(node => node.name.split('/')[0]!));
-      imports.set(source.filePath, modules);
-    }
+    const modules = imports.get(source.filePath);
+    if (!references?.length || !modules) continue;
+    const candidates = new Map<string, ExternalClass>();
     for (const name of new Set(references)) {
-      // 有任何本地同名声明就不补目录关系；歧义也不能靠目录替代真实声明。
-      const type = TYPES.find(entry => name === entry.swift || name === entry.objc);
-      if (!type || names.has(type.swift) || names.has(type.objc)) continue;
-      const visible = modules.has(type.module) || (type.module === 'Foundation' && modules.has('UIKit'));
-      if (!visible) continue;
-      // 已存在的继承边保留项目解析结果，不追加第二个猜测基类。
-      const existing = queries.getOutgoingEdges(source.id, ['extends']).some(edge => !edge.target.startsWith(PREFIX));
-      if (existing) continue;
-      edges.push({ source: source.id, target: add(type), kind: 'extends', line: source.startLine,
-        provenance: 'heuristic', metadata: { synthesizedBy: 'apple-external-types', catalog: 'apple-v1', external: true,
-          writtenName: name, documentation: documentation(type) } });
+      for (const graph of graphs) {
+        if (!modules.has(graph.module)) continue;
+        for (const type of graph.classes) {
+          if (name !== type.name && name !== type.objc) continue;
+          if (names.has(type.name) || (type.objc && names.has(type.objc))) continue;
+          candidates.set(type.usr, type);
+        }
+      }
     }
+    // 一条基类引用只能落到唯一身份；不以导入顺序消解歧义。
+    if (candidates.size !== 1) continue;
+    if (queries.getOutgoingEdges(source.id, ['extends']).some(edge => !edge.target.startsWith(APPLE_EXTERNAL_TYPE_PREFIX))) continue;
+    const type = candidates.values().next().value!;
+    edges.push({ source: source.id, target: add(type), kind: 'extends', line: source.startLine, provenance: 'heuristic',
+      metadata: { ...metadata, evidence: 'unresolved-superclass-name', targetUSR: type.usr } });
   }
 
   const edgeKey = (edge: Edge): string => JSON.stringify([
     edge.source, edge.target, edge.kind, edge.line ?? null, edge.provenance, edge.metadata,
   ]);
   const existingEdges = queries.getIncomingEdgesTo(previous.map(node => node.id));
-  if (previous.length === nodes.size && previous.every(node => nodes.has(node.id)) &&
+  if (previous.length === nodes.size && previous.every(node => {
+        const next = nodes.get(node.id);
+        return next && node.name === next.name && node.signature === next.signature && node.docstring === next.docstring;
+      }) &&
       JSON.stringify(existingEdges.map(edgeKey).sort()) === JSON.stringify(edges.map(edgeKey).sort())) return false;
 
-  // 目录节点不属于扫描文件；原子替换自身节点会级联清除旧关系，不改写项目节点或引用。
+  // 外部节点不属于扫描文件；原子替换自身节点会级联清除旧关系，不改写项目节点或引用。
   queries.runInTransaction(() => {
     previous.forEach(node => queries.deleteNode(node.id));
     for (const node of nodes.values()) queries.insertNode(node);
