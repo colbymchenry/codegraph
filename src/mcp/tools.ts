@@ -2411,7 +2411,10 @@ export class ToolHandler {
         'codegraph_search',
         'codegraph_node',
       ]);
-      if (stats.fileCount < TINY_REPO_FILE_THRESHOLD) {
+      // The gate trims only the default surface. An explicit
+      // CODEGRAPH_MCP_TOOLS allowlist is the operator's choice and wins on
+      // any repo size, so every tool it names stays listed (#3462).
+      if (!allow && stats.fileCount < TINY_REPO_FILE_THRESHOLD) {
         visible = visible.filter(t => TINY_REPO_CORE_TOOLS.has(t.name));
       }
 
