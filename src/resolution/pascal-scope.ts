@@ -250,38 +250,59 @@ function pascalCallArgumentCount(ref: UnresolvedRef, context: ResolutionContext)
   let found = word.exec(line);
   while (found && /^\s*(?:\^\s*)?\./.test(line.slice(found.index + found[0].length))) found = word.exec(line);
   if (!found) return null;
+  // The text after the name, a line more at a time while the call runs on (40 at most).
   let text = line.slice(found.index + found[0].length);
-  for (let i = ref.line; i < Math.min(lines.length, ref.line + 40); i++) text += '\n' + lines[i]!;
+  let next = ref.line;
+  const more = (): boolean => {
+    if (next >= lines.length || next >= ref.line + 40) return false;
+    text += '\n' + lines[next++]!;
+    return true;
+  };
+  const find = (token: string, from: number): number => {
+    for (;;) {
+      const at = text.indexOf(token, from);
+      if (at >= 0 || !more()) return at;
+    }
+  };
   let i = 0;
-  while (i < text.length && /\s/.test(text[i]!)) i++;
+  const skipBlanks = (): void => {
+    do {
+      while (i < text.length && /\s/.test(text[i]!)) i++;
+    } while (i >= text.length && more());
+  };
+  skipBlanks();
   // Explicit generic arguments: `Make<TFoo>(…)`.
   if (text[i] === '<') {
-    const close = text.indexOf('>', i);
+    const close = find('>', i);
     if (close < 0) return null;
-    for (i = close + 1; i < text.length && /\s/.test(text[i]!); i++);
+    i = close + 1;
+    skipBlanks();
   }
   if (text[i] === '[') return null;
   if (text[i] !== '(') return 0;
-  let depth = 0;
+  // Inside the call's own parentheses.
+  i++;
+  let depth = 1;
   let commas = 0;
   let any = false;
-  for (; i < text.length; i++) {
+  for (;;) {
+    if (i >= text.length && !more()) return null;
     const c = text[i]!;
     if (c === "'") {
-      // A string; '' is a quote inside it.
+      // A string, on its line; '' is a quote inside it.
       for (i++; i < text.length && !(text[i] === "'" && text[i + 1] !== "'"); i += text[i] === "'" ? 2 : 1);
       any = true;
+      i++;
       continue;
     }
     if (c === '{' || (c === '(' && text[i + 1] === '*') || (c === '/' && text[i + 1] === '/')) {
-      const end = c === '{' ? text.indexOf('}', i) : c === '(' ? text.indexOf('*)', i) + 1 : text.indexOf('\n', i);
-      if (end <= 0) return null;
-      i = end;
+      const end = c === '{' ? find('}', i) : c === '(' ? find('*)', i + 2) : find('\n', i);
+      if (end < 0) return null;
+      i = end + (c === '(' ? 2 : 1);
       continue;
     }
     if (c === '(' || c === '[') {
       depth++;
-      if (depth === 1) continue;
     } else if (c === ')' || c === ']') {
       depth--;
       if (depth === 0) return any ? commas + 1 : 0;
@@ -289,8 +310,8 @@ function pascalCallArgumentCount(ref: UnresolvedRef, context: ResolutionContext)
       commas++;
     }
     if (!/\s/.test(c)) any = true;
+    i++;
   }
-  return null;
 }
 
 /**
