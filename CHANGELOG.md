@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- On Windows, the `codegraph` command in Git Bash now works in a terminal that turns off path conversion with `MSYS_NO_PATHCONV=1` or `MSYS2_ARG_CONV_EXCL=*`, as some agent harnesses do, instead of failing with "Cannot find module". Thanks @BlueberryDuck for the report. (#3464)
 
 ## [1.6.4] - 2026-11-20
 
