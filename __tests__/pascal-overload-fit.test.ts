@@ -25,6 +25,7 @@ type
     procedure Show(const Caption: string; Flags: Integer = 0); overload;
     procedure Show(Left, Top, Width: Integer); overload;
     procedure Paint;
+    procedure Trace;
   end;
 implementation
 procedure TWin.SetRedraw(const Value: Boolean);
@@ -57,6 +58,13 @@ begin
   Show('title', 1);
   Show(1, 2, 3);
 end;
+procedure TWin.Trace;
+var
+  log: TWin;
+begin
+  log := Self;
+  log.Log('a', 'b');
+end;
 end.
 `,
 };
@@ -76,12 +84,12 @@ describe('a Pascal call reaches the overload its arguments fit', () => {
     if (root) fs.rmSync(root, { recursive: true, force: true });
   });
 
-  /** For each call `Paint` makes to `name`, by line: the signature of the overload it reaches. */
-  function reached(name: string): string[] {
-    const paint = cg!.getNodesInFile('Win.pas').find((n) => n.name === 'Paint' && n.kind === 'method');
-    expect(paint).toBeDefined();
+  /** For each call the method `from` makes to `name`, by line: the signature of the overload it reaches. */
+  function reached(name: string, from = 'Paint'): string[] {
+    const caller = cg!.getNodesInFile('Win.pas').find((n) => n.name === from && n.kind === 'method');
+    expect(caller).toBeDefined();
     return cg!
-      .getOutgoingEdges(paint!.id)
+      .getOutgoingEdges(caller!.id)
       .filter((e) => e.kind === 'calls')
       .map((e) => ({ line: e.line ?? 0, target: cg!.getNode(e.target)! }))
       .filter((c) => c.target.name === name)
@@ -95,6 +103,10 @@ describe('a Pascal call reaches the overload its arguments fit', () => {
 
   it('counts arguments past commas in strings, brackets, nested calls, comments and line breaks', () => {
     expect(reached('Log')).toEqual(['(const Text: string)', '(const Text, Detail: string)']);
+  });
+
+  it('counts the arguments of the call, not of a receiver named like it', () => {
+    expect(reached('Log', 'Trace')).toEqual(['(const Text, Detail: string)']);
   });
 
   it('counts a parameter with a default as one an argument may leave out', () => {

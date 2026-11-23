@@ -243,10 +243,14 @@ function pascalCallArgumentCount(ref: UnresolvedRef, context: ResolutionContext)
   if (line === undefined) return null;
   const name = ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1);
   if (!/^[A-Za-z_]\w*$/.test(name)) return null;
-  const from = Math.max(0, ref.column ?? 0);
-  const found = new RegExp(`\\b${escapeRegExp(name)}\\b`, 'i').exec(line.slice(from));
+  // The name's first mention from the reference on that a `.` does not
+  // follow: mORMot's `log.Log(sllWarning, …)` calls `Log` on a local `log`.
+  const word = new RegExp(`\\b${escapeRegExp(name)}\\b`, 'gi');
+  word.lastIndex = Math.max(0, ref.column ?? 0);
+  let found = word.exec(line);
+  while (found && /^\s*(?:\^\s*)?\./.test(line.slice(found.index + found[0].length))) found = word.exec(line);
   if (!found) return null;
-  let text = line.slice(from + found.index + found[0].length);
+  let text = line.slice(found.index + found[0].length);
   for (let i = ref.line; i < Math.min(lines.length, ref.line + 40); i++) text += '\n' + lines[i]!;
   let i = 0;
   while (i < text.length && /\s/.test(text[i]!)) i++;

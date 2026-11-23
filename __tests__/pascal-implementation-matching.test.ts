@@ -199,6 +199,35 @@ end.`;
     expect(callerOf(source, 'SlowMove')).toBe('Move');
   });
 
+  it.each([
+    ['a subrange', 'TPercent = 0 .. 100;'],
+    ['a set of a subrange', 'TBits = set of 0..255;'],
+  ])('names a class declared after %s, which the grammar cannot read, and finds its methods', (_label, before) => {
+    const source = `unit Demo;
+interface
+type
+  ${before}
+
+  /// The area a constraint applies to.
+  TArea = class(TObject)
+  protected
+    function AsJson: string;
+  end;
+implementation
+function TArea.AsJson: string;
+begin
+  Result := Dump();
+end;
+end.`;
+    const result = extract(source);
+    expect(result.nodes.filter((n) => n.kind === 'class').map((n) => n.name)).toEqual(['TArea']);
+    expect(result.nodes.find((n) => n.kind === 'type_alias')?.name).toBe(before.split(' ')[0]);
+    const method = result.nodes.find((n) => n.name === 'AsJson')!;
+    expect(method.qualifiedName).toBe('TArea::AsJson');
+    expect(body(source, method)).toContain('Result := Dump();');
+    expect(callerOf(source, 'Dump')).toBe('TArea::AsJson');
+  });
+
   it('starts a routine a parse error ran into at its own header', () => {
     // The parse of the `Assign` operator's implementation, with its
     // `const [ref]` parameter, breaks and runs into the header of `Keys`

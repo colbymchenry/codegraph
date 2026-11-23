@@ -9228,9 +9228,14 @@ export class TreeSitterExtractor {
    * Extract a Pascal declType node (class, interface, enum, or type alias)
    */
   private extractPascalDeclType(node: SyntaxNode): void {
-    const nameNode = getChildByField(node, 'name');
+    const declared = getChildByField(node, 'name');
+    const nameNode = this.pascalSwallowedTypeName(node) ?? declared;
     if (!nameNode) return;
     const name = getNodeText(nameNode, this.source);
+    if (declared && nameNode !== declared) {
+      // The type the grammar could not read keeps its name, as an alias.
+      this.createNode('type_alias', getNodeText(declared, this.source), declared);
+    }
 
     // Find the inner type declaration
     const declClass = node.namedChildren.find(
@@ -9406,10 +9411,36 @@ export class TreeSitterExtractor {
     return getNodeText(node, this.source).trim().toLowerCase();
   }
 
+  /**
+   * The class a `declType` declares when a type before it that the grammar
+   * cannot read ran into it: `TPercent = 0 .. 100;` (HeidiSQL's
+   * VirtualTrees) or `TBits = set of 0..255;` (mORMot) parses as one type
+   * declaration holding the next class, whose own `TArea =` is left as an
+   * error right before the class body. Null for any other declaration.
+   */
+  private pascalSwallowedTypeName(declType: SyntaxNode): SyntaxNode | null {
+    const parts = declType.namedChildren;
+    const at = parts.findIndex((c) => c.type === 'declClass' || c.type === 'declIntf');
+    const error = at > 0 ? parts[at - 1]! : null;
+    if (error?.type !== 'ERROR') return null;
+    const eq = error.namedChildren[error.namedChildCount - 1];
+    if (eq?.type !== 'kEq') return null;
+    // The last name before the `=`, wherever the broken type put it.
+    let name: SyntaxNode | null = null;
+    const walk = (n: SyntaxNode): void => {
+      if (n.startIndex >= eq.startIndex) return;
+      if (n.type === 'identifier') name = n;
+      else for (const c of n.namedChildren) walk(c);
+    };
+    walk(error);
+    const found = name as SyntaxNode | null;
+    return found && this.source.substring(found.endIndex, eq.startIndex).trim() === '' ? found : null;
+  }
+
   private indexPascalRoutine(node: Node, header: SyntaxNode): void {
     const parts = [this.pascalRoutineName(getChildByField(header, 'name'))];
     for (let parent = header.parent; parent; parent = parent.parent) {
-      if (parent.type === 'declType') parts.unshift(this.pascalRoutineName(getChildByField(parent, 'name')));
+      if (parent.type === 'declType') parts.unshift(this.pascalRoutineName(this.pascalSwallowedTypeName(parent) ?? getChildByField(parent, 'name')));
     }
     const params = this.pascalRoutineParams(header);
     const implementation = header.parent?.type === 'defProc' ? header.parent : undefined;
