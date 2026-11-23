@@ -3723,8 +3723,19 @@ function readGoScopes(code: string): GoScopeIndex {
     // declare; `x := pkg.New(…)` the package its value comes from, `x :=
     // newStore(…)` the function of its own package.
     const rhs = code.slice(i + 2, i + 160);
-    const literal = /^[ \t]*&?[ \t]*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)[ \t]*\{/.exec(rhs)?.[1] ??
-      /^[ \t]*new\([ \t]*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)[ \t]*\)/.exec(rhs)?.[1];
+    const written = /^[ \t]*&?[ \t]*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)[ \t]*\{/.exec(rhs) ??
+      /^[ \t]*new\([ \t]*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)[ \t]*\)/.exec(rhs);
+    // A selector after the literal or the `new(T)` makes it the start of a
+    // chain, `new(Route).Host("x").Subrouter()`: the local has the type the
+    // chain gives, read with its value like any call's result (#3447). So
+    // does one at a line's end, the way gofmt breaks a long chain: the value
+    // is read on past a line that ends at a `.` (#3455).
+    let after = i + 1 + (written?.[0].length ?? 0);
+    if (written && code[after] === '{') after = close.get(after) ?? code.length;
+    do after++; while (code[after] === ' ' || code[after] === '\t');
+    const onward = /\.\s*\S/y;
+    onward.lastIndex = after;
+    const literal = onward.test(code) ? undefined : written?.[1];
     const type = names.length === 1 && literal && !GO_TYPE_KEYWORDS.has(literal) ? literal : undefined;
     const from = /^[ \t]*&?[ \t]*([A-Za-z_]\w*)\.[A-Za-z_]\w*[ \t]*[({]/.exec(rhs)?.[1];
     const call = from ? undefined : /^[ \t]*([A-Za-z_]\w*)[ \t]*(?:\[(?:[^[\]\n]|\[[^[\]\n]*\])*\][ \t]*)?\(/.exec(rhs)?.[1];
@@ -3894,14 +3905,21 @@ function goBlockAt(index: GoScopeIndex, offset: number): [number, number] | null
   return open < 0 ? null : [open, index.close.get(open) ?? index.code.length];
 }
 
-/** Where the statement declaring at `at` ends: its line's end, or a `;`, outside brackets. */
+/** A trailing selector dot does not trigger Go's implicit semicolon. */
+function goContinuesAfterDot(code: string, start: number, newline: number): boolean {
+  let i = newline - 1;
+  while (i >= start && /[ \t\r\n]/.test(code[i]!)) i--;
+  return i >= start && code[i] === '.';
+}
+
+/** Where the declaration ends: a newline or semicolon outside brackets, accounting for line continuations. */
 function goStatementEnd(code: string, at: number): number {
   let depth = 0;
   for (let i = at; i < code.length; i++) {
     const c = code[i];
     if (c === '(' || c === '[' || c === '{') depth++;
     else if (c === ')' || c === ']' || c === '}') { if (--depth < 0) return i; }
-    else if ((c === '\n' || c === ';') && depth === 0) return i;
+    else if (depth === 0 && (c === ';' || (c === '\n' && !goContinuesAfterDot(code, at, i)))) return i;
   }
   return code.length;
 }
@@ -30646,8 +30664,9 @@ function goMethodOnElement(t: GoTypeText, ref: UnresolvedRef, context: Resolutio
 /**
  * Whether the value a Go declaration gives its name is a call or a
  * conversion: `f(…)`, `pkg.F(…)`, `x.M(…)`, `T(x)`, `a.b().C(…)`, alone or
- * as this name's place among several values (`a, b := f(), g()`). Not a
- * `range` clause, a builtin's `make`/`new`/`append`, an assertion
+ * as this name's place among several values (`a, b := f(), g()`), a chain
+ * from a builtin's call too (`new(T).M()`). Not a `range` clause, a
+ * builtin's `make`/`new`/`append` that is the whole value, an assertion
  * (goAssertedLocalType reads those) or a type switch's guard.
  */
 function goValueIsCall(local: GoDecl, index: GoScopeIndex): boolean {
@@ -30660,7 +30679,10 @@ function goValueIsCall(local: GoDecl, index: GoScopeIndex): boolean {
   // A type switch's guard (`switch v := x.(type)`) has each case's type, and
   // an assertion (`v := x.(T)`) is goAssertedLocalType's to read.
   if (/\.\s*\([^()]*(?:\([^()]*\)[^()]*)*\)\s*$/.test(value)) return false;
-  return /^\s*[A-Za-z_(][\s\S]*\)\s*$/.test(value) && !/^\s*(?:new|make|append)\s*\(/.test(value);
+  // A builtin's call that is the whole value; a chain from one is a call (#3447).
+  const builtin = /^\s*(?:new|make|append)\s*\(/.exec(value);
+  if (builtin && goClosingBracket(value, builtin[0].length - 1) === value.trimEnd().length - 1) return false;
+  return /^\s*[A-Za-z_(][\s\S]*\)\s*$/.test(value);
 }
 
 /**
@@ -31051,11 +31073,11 @@ function goExprType(
     if (!t) return t;
     return t.text.startsWith('*') ? { ...t, text: t.text.slice(1) } : undefined;
   }
-  // `make(T, …)`, `new(T)`, `append(xs, …)`.
+  // `make(T, …)`, `new(T)`, `append(xs, …)`; a chain from one (`new(T).M()`)
+  // is read with the chains below.
   const builtin = /^(make|new|append)\s*\(/.exec(s);
-  if (builtin) {
+  if (builtin && goClosingBracket(s, builtin[0].length - 1) === s.length - 1) {
     const open = builtin[0].length - 1;
-    if (goClosingBracket(s, open) !== s.length - 1) return undefined;
     const first = goSplitTopLevel(s.slice(open + 1, -1), ',')[0]?.trim();
     if (!first) return undefined;
     if (builtin[1] === 'make') return goTypeTextAt(first, filePath, at, index, context);
@@ -31489,7 +31511,7 @@ function goHeaderValueEnd(code: string, at: number): number {
     const c = code[i];
     if (c === '(' || c === '[') depth++;
     else if (c === ')' || c === ']') { if (--depth < 0) return i; }
-    else if (depth === 0 && (c === ';' || c === '{' || c === '\n')) return i;
+    else if (depth === 0 && (c === ';' || c === '{' || (c === '\n' && !goContinuesAfterDot(code, at, i)))) return i;
   }
   return code.length;
 }

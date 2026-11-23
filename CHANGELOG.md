@@ -12,9 +12,18 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph_callers` and `codegraph_callees` take an `offset`, so an agent can page through a list longer than `limit`, and a cut list names the offset of the next page. Thanks @blairjordan. (#3449)
+
 ### Fixes
 
-- Pascal methods and functions now show their implementation bodies in `node` and `explore` instead of their interface or forward declarations, while keeping their declaration metadata and call relationships; re-index Pascal projects after upgrading. Thanks @Vizit0r for the report. (#3453)
+- On Windows, the `codegraph` command in Git Bash now works in a terminal that turns off path conversion with `MSYS_NO_PATHCONV=1` or `MSYS2_ARG_CONV_EXCL=*`, as some agent harnesses do, instead of failing with "Cannot find module". Thanks @BlueberryDuck for the report. (#3464)
+- On projects with fewer than 500 files, every tool named in `CODEGRAPH_MCP_TOOLS` is now listed to the agent, instead of only the small-repo defaults. Thanks @nchrisr for the report and the fix. (#3462)
+- `codegraph callers` and `codegraph_callers` list callers outside tests before tests, so a symbol called mostly from tests no longer shows only tests under the default limit while its real callers are cut. Thanks @blairjordan for the report and the fix. (#3456)
+- In Go, a variable given a chain that starts with `new(T)`, `make(T)` or a struct literal, like `sub := new(Route).Host("x").Subrouter()`, now has the type the chain returns, so a method called on it links to that type's method, not to a same-named method of the type the chain starts from. Thanks @inth3shadows for the report and the analysis, and @maxmilian. (#3447)
+- In Go, a variable given a method chain broken across lines after its `.`s, the way gofmt leaves a long chain, now has the type the chain returns, so a method called on it links again. Thanks @maxmilian for the report and @zhangkom for the fix. (#3455)
+- Pascal methods and functions now show their implementation bodies in `node` and `explore` instead of their interface or forward declarations, while keeping their declaration metadata and call relationships; re-index Pascal projects after upgrading. Thanks @Vizit0r for the report and @yang0228 for the fix. (#3453)
 
 ## [1.6.4] - 2026-11-20
 
