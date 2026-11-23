@@ -33,8 +33,8 @@ import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformance
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
 import {
-  clearPascalScopeMemos, gatePascalCall, isPascalParenlessRef, isPascalSystemCall, matchPascalHelperCall, matchPascalNestedCall,
-  matchPascalParenlessRef, matchPascalSystemCall,
+  clearPascalScopeMemos, gatePascalCall, isPascalInheritedCall, isPascalParenlessRef, isPascalSystemCall, matchPascalHelperCall,
+  matchPascalInheritedCall, matchPascalNestedCall, matchPascalParenlessRef, matchPascalSystemCall,
 } from './pascal-scope';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
@@ -1828,6 +1828,10 @@ export class ReferenceResolver {
     // or variable is no candidate, and neither is a guess by any other strategy.
     if (isObjcDeclaredTypeRef(ref)) return matchByExactName(ref, this.context);
 
+    // A Pascal `inherited` call (`inherited Run(N)`, a bare `inherited;`)
+    // runs the method of the nearest ancestor that declares the name, never
+    // the calling class's own, nor a guess by name.
+    if (isPascalInheritedCall(ref)) return matchPascalInheritedCall(ref, this.context);
     // A Pascal name written without parentheses (#2514) links only to a
     // routine its scope reaches, or through a receiver to a method of the
     // receiver's declared type; data of that name links nothing.

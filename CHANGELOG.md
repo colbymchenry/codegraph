@@ -36,6 +36,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Pascal, a call on a value whose type has a helper in scope, like `R.Count` or `with R do Count`, now links to the helper's method, which hides a same-named method of the type, as in Delphi. (#3475)
 - In Pascal, a call to a routine its scope declares, like `Check(…)` in a test case or `Render(…)` in a controller, now links to that routine instead of a same-named method of an unrelated class. (#3476)
 - In Pascal, a call to a routine with overloads in several units, like mORMot's `FormatUtf8`, now links to the overload its arguments fit, and a call from another unit no longer links to a routine that a unit declares only in its implementation section. (#3476)
+- In Pascal, an `inherited` call, like `inherited Create(AOwner)` or a bare `inherited;`, now links to the method of the nearest ancestor class that declares it, so a flow through an overriding method goes on into the method it overrides; re-index Pascal projects after upgrading. (#INHERITED_PR)
 
 ## [1.6.4] - 2026-11-20
 

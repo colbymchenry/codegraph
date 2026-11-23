@@ -9899,6 +9899,9 @@ export class TreeSitterExtractor {
       }
     } else if (firstChild.type === 'identifier') {
       calleeName = getNodeText(firstChild, this.source);
+    } else if (firstChild.type === 'inherited') {
+      // `inherited Run(N)`: the ancestor's `Run` (see pushPascalInheritedCall).
+      this.pushPascalInheritedCall(firstChild);
     }
 
     const vagueLink = receiverLink && firstChild.type === 'exprDot' && !calleeName.includes('.');
@@ -9920,7 +9923,7 @@ export class TreeSitterExtractor {
     // `MD5FileSized(…)` in `MD5FileSized(…).IsSame(AKey)` (#2547), or the call
     // whose result is called in `GetHandler()(X)`.
     if (firstChild.type === 'exprDot') this.extractPascalReceiverCalls(firstChild.namedChild(0));
-    else if (firstChild.type !== 'identifier') this.extractPascalReceiverCalls(firstChild);
+    else if (firstChild.type !== 'identifier' && firstChild.type !== 'inherited') this.extractPascalReceiverCalls(firstChild);
 
     // Also visit arguments for nested calls
     const args = node.namedChildren.find(
@@ -9959,6 +9962,10 @@ export class TreeSitterExtractor {
       case 'exprTpl':
         // `TList<Integer>.Create`: a generic type's name, not a value's.
         this.extractPascalReceiverCalls(node.namedChild(0), false);
+        return;
+      case 'inherited':
+        // `inherited GetList.Count`, `inherited Items[I]`: the ancestor's.
+        this.pushPascalInheritedCall(node);
         return;
       case 'exprSubscript': {
         this.extractPascalReceiverCalls(node.namedChild(0), names);
@@ -10106,6 +10113,67 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * A Pascal `inherited` call, which runs a method of an ancestor of the
+   * routine's class: `inherited Run(N)`, `inherited Run`, `Result :=
+   * inherited Value`, or a bare `inherited;`, which runs the routine's own
+   * name with the parameters it was given. Recorded as
+   * `{inherited@Class}.Name`, a bare one as `{inherited/N@Class}.Name` with
+   * the routine's parameter count (see resolution/pascal-scope), which links
+   * the method of the nearest ancestor that declares the name, never the
+   * class's own. Nothing is recorded outside a method, nor for a name the
+   * statement assigns to (`inherited Items[I] := X`, a property's).
+   */
+  private pushPascalInheritedCall(inherited: SyntaxNode): void {
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    const scope = this.pascalScopeAt(inherited.startPosition.row + 1);
+    if (!callerId || !scope?.classQn) return;
+    const target = inherited.parent?.type === 'exprSubscript' ? inherited.parent : inherited;
+    if (target.parent?.type === 'assignment' && target.parent.namedChild(0)?.id === target.id) return;
+    const id = inherited.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+    let name: string;
+    let arity = '';
+    if (id) {
+      name = getNodeText(id, this.source);
+    } else {
+      const own = this.pascalRoutineAround(inherited, scope.routine);
+      if (!own) return;
+      name = own.name;
+      if (own.arity !== null) arity = `/${own.arity}`;
+    }
+    this.unresolvedReferences.push({
+      fromNodeId: callerId,
+      referenceName: `{inherited${arity}@${scope.classQn}}.${name}`,
+      referenceKind: 'calls',
+      line: inherited.startPosition.row + 1,
+      column: inherited.startPosition.column,
+    });
+  }
+
+  /**
+   * The routine a node is written in, for a bare `inherited`: its name as its
+   * header writes it (`TFoo.Bar<T>` → `Bar`) and its parameter count. Where
+   * the tree's routine isn't the one the scope names (`routine`, lowercased;
+   * a broken tree's text decides), that name and no count. Null in an
+   * anonymous method, or outside a routine.
+   */
+  private pascalRoutineAround(node: SyntaxNode, routine: string | null): { name: string; arity: number | null } | null {
+    if (!routine) return null;
+    for (let p = node.parent; p; p = p.parent) {
+      if (p.type === 'lambda') return null;
+      if (p.type !== 'defProc') continue;
+      const header = p.namedChildren.find((c: SyntaxNode) => c.type === 'declProc');
+      let name: SyntaxNode | null = header ? getChildByField(header, 'name') : null;
+      while (name?.type === 'genericDot' || name?.type === 'genericTpl') {
+        name = getChildByField(name, name.type === 'genericDot' ? 'rhs' : 'entity');
+      }
+      const written = name?.type === 'identifier' ? getNodeText(name, this.source) : '';
+      if (written.toLowerCase() !== routine) break;
+      return { name: written, arity: this.pascalRoutineParams(header!).length };
+    }
+    return { name: routine, arity: null };
+  }
+
+  /**
    * Recursively visit a Pascal block/statement tree for call expressions.
    * With `declarations`, a declaration in it is visited as a declaration.
    */
@@ -10150,6 +10218,9 @@ export class TreeSitterExtractor {
         }
       } else if (child.type === 'identifier') {
         this.extractPascalParenlessName(child, node);
+      } else if (child.type === 'inherited') {
+        // `inherited;`, `inherited Run;`, `Result := inherited Value`.
+        this.pushPascalInheritedCall(child);
       } else if (child.type === 'with') {
         this.pascalWithDepth++;
         this.visitPascalBlock(child, declarations);

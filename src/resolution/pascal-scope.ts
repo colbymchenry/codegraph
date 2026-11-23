@@ -171,6 +171,111 @@ export function matchPascalSystemCall(ref: UnresolvedRef, context: ResolutionCon
 }
 
 /**
+ * A Pascal `inherited` call as the extractor records it: `{inherited@TChild}.Run`
+ * for `inherited Run(N)`, and `{inherited/1@TChild}.Run` for a bare
+ * `inherited;` in a method of one parameter, which passes its own.
+ */
+const INHERITED = /^\{inherited(?:\/(\d+))?@([^}]+)\}\.([A-Za-z_]\w*)$/;
+
+/** Whether `ref` is a Pascal `inherited` call (see INHERITED), which only this module resolves. */
+export function isPascalInheritedCall(ref: UnresolvedRef): boolean {
+  return ref.language === 'pascal' && ref.referenceKind === 'calls' && INHERITED.test(ref.referenceName);
+}
+
+/**
+ * The method a Pascal `inherited` call runs: of the name it is written with,
+ * or a bare `inherited`'s own routine's, the one the nearest ancestor of the
+ * calling method's class declares (see inheritedAncestry), never the class's
+ * own. Of that ancestor's overloads, one the call's arguments fit — a bare
+ * call passes its routine's parameters, so one of the same types first —
+ * and when none does, one an ancestor further up declares, as an `overload`
+ * set reaches them. Null when the nearest declaration of the name is data (a
+ * property, a field), when none of the project's ancestors declares it (the
+ * RTL's `TComponent.Create`), or when no overload takes the arguments.
+ */
+export function matchPascalInheritedCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const m = INHERITED.exec(ref.referenceName);
+  if (!m) return null;
+  const cls = classByQualifiedName(m[2]!, ref.filePath!, context);
+  if (!cls) return null;
+  const lower = m[3]!.toLowerCase();
+  const bare = m[1] !== undefined;
+  const count = bare ? Number(m[1]) : pascalCallArgumentCount(ref, context);
+  const caller = routineNode(ref.fromNodeId, context);
+  if (caller && classInitializer(caller, context)) return null;
+  // A bare call passes the routine's own parameters: an override's match the
+  // method it overrides, types and all.
+  const own = bare && caller && caller.name.toLowerCase() === lower ? pascalParameterTypes(caller.signature) : null;
+  for (const c of inheritedAncestry(cls, context)) {
+    const owner = c.qualifiedName.toLowerCase();
+    const members = pascalNamed(lower, context).filter((n) => MEMBER_KINDS.has(n.kind) && n.filePath === c.filePath && ownerOf(n) === owner);
+    if (members.length === 0) continue;
+    if (!members.some(isRoutine)) return null;
+    const routines = members.filter((n) => isRoutine(n) && !classInitializer(n, context));
+    const fitting = count === null ? routines : routines.filter((n) => {
+      const range = pascalParameterRange(n.signature);
+      return range === null || (count >= range[0] && count <= range[1]);
+    });
+    if (fitting.length === 0) continue;
+    const exact = (n: Node): boolean => pascalParameterRange(n.signature)?.[1] === count;
+    const sameTypes = (n: Node): boolean => own !== null && String(pascalParameterTypes(n.signature)) === String(own);
+    const chosen = fitting.find(sameTypes) ?? (count === null ? fitting.find((n) => !needsArguments(n)) : fitting.find(exact)) ?? fitting[0]!;
+    context.rememberNode?.(chosen);
+    return { original: ref, targetNodeId: chosen.id, confidence: 0.9, resolvedBy: 'instance-method' };
+  }
+  return null;
+}
+
+/**
+ * Whether a routine is a class constructor or destructor (`class constructor
+ * Create;`), which only the runtime runs: no `inherited Create` reaches one,
+ * and an `inherited` written in one links nothing.
+ */
+function classInitializer(routine: Node, context: ResolutionContext): boolean {
+  if (routine.isStatic !== true) return false;
+  const keyword = routineKeyword(routine, context);
+  return keyword === 'constructor' || keyword === 'destructor';
+}
+
+/**
+ * The classes an `inherited` call made in a method of `cls` looks in, nearest
+ * first: the class it descends from, then that one's, as far as the project
+ * declares them where each class can see them — never an interface it
+ * implements, whose methods have no body. A helper's method looks in the
+ * helpers it descends from, then in the type it helps, then in that type's
+ * ancestors.
+ */
+function inheritedAncestry(cls: Node, context: ResolutionContext): Node[] {
+  const memo = memos(context).inheritedChains;
+  const hit = memo.get(cls.id);
+  if (hit) return hit;
+  const order: Node[] = [];
+  const seen = new Set<string>([cls.id]);
+  const add = (next: Node | null): Node | null => {
+    if (!next || next.kind !== 'class' || seen.has(next.id) || order.length >= MAX_HIERARCHY_DEPTH) return null;
+    seen.add(next.id);
+    order.push(next);
+    return next;
+  };
+  let c: Node | null = cls;
+  const helper = helperHead(cls);
+  if (helper) {
+    for (let h: Node | null = cls; h;) {
+      const parent: string | null | undefined = helperHead(h)?.parent;
+      h = add(parent ? visibleClassNamed(parent, h.filePath, context) : null);
+    }
+    c = add(visibleClassNamed(helper.helped, cls.filePath, context));
+  }
+  while (c) {
+    // A class's first supertype is the class it descends from; the others are interfaces.
+    const base: string | undefined = declaredSupertypes(c, context)[0];
+    c = add(base ? visibleClassNamed(base, c.filePath, context) : null);
+  }
+  memo.set(cls.id, order);
+  return order;
+}
+
+/**
  * What a Pascal call another strategy resolved stands for, when it landed on
  * data or on a routine nested in another (see gatePascalNestedTarget).
  *
@@ -204,6 +309,8 @@ export function matchPascalSystemCall(ref: UnresolvedRef, context: ResolutionCon
  * (pascalOverloadFor).
  */
 export function gatePascalCall(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  // An `inherited` call is settled where it is matched, overload included.
+  if (isPascalInheritedCall(ref)) return result;
   const target = context.getNodeById?.(result.targetNodeId);
   if (!target) return result;
   const bare = isBareCall(ref, context);
@@ -496,9 +603,57 @@ function pascalCallArgumentCount(ref: UnresolvedRef, context: ResolutionContext)
  * default may be left out. [0, 0] for a routine with no parameter list.
  */
 function pascalParameterRange(signature: string | undefined): [number, number] | null {
+  const groups = pascalParameterGroups(signature);
+  if (!groups) return null;
+  let min = 0;
+  let max = 0;
+  for (const group of groups) {
+    const names = groupNames(group).length;
+    max += names;
+    const colon = group.indexOf(':');
+    if (colon < 0 || !group.slice(colon).includes('=')) min += names;
+  }
+  return [min, max];
+}
+
+/**
+ * The type of each of a Pascal routine's parameters, with how it is passed
+ * (`const integer`, `var tstrings`), from its signature
+ * (`(const A, B: Integer; var L: TStrings)`); [] for none, null when the
+ * signature can't be read.
+ */
+function pascalParameterTypes(signature: string | undefined): string[] | null {
+  const groups = pascalParameterGroups(signature);
+  if (!groups) return null;
+  const types: string[] = [];
+  for (const group of groups) {
+    const colon = group.indexOf(':');
+    const passed = /^\s*(?:\[[^\]]*\]\s*)*(const|constref|var|out)\b/i.exec(group)?.[1]?.toLowerCase() ?? '';
+    const type = colon < 0 ? '' : group.slice(colon + 1).replace(/=[\s\S]*$/, '').replace(/\s+/g, ' ').trim().toLowerCase();
+    for (let k = groupNames(group).length; k > 0; k--) types.push(`${passed} ${type}`);
+  }
+  return types;
+}
+
+/** The names a parameter group declares (`const A, B: Integer` → A, B). */
+function groupNames(group: string): string[] {
+  const colon = group.indexOf(':');
+  return (colon < 0 ? group : group.slice(0, colon))
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/\b(?:const|constref|var|out)\b/gi, ' ')
+    .split(',')
+    .filter((n) => n.trim());
+}
+
+/**
+ * A Pascal signature's parameter groups, the text between its parentheses
+ * split at the `;`s outside brackets and strings; [] when it has no
+ * parameter list, null when the list doesn't close.
+ */
+function pascalParameterGroups(signature: string | undefined): string[] | null {
   const text = signature ?? '';
   const open = text.indexOf('(');
-  if (open < 0) return [0, 0];
+  if (open < 0) return [];
   const groups: string[] = [];
   let depth = 0;
   let start = open + 1;
@@ -512,19 +667,7 @@ function pascalParameterRange(signature: string | undefined): [number, number] |
       depth--;
       if (depth === 0) {
         groups.push(text.slice(start, i));
-        let min = 0;
-        let max = 0;
-        for (const group of groups) {
-          const colon = group.indexOf(':');
-          const names = (colon < 0 ? group : group.slice(0, colon))
-            .replace(/\[[^\]]*\]/g, ' ')
-            .replace(/\b(?:const|constref|var|out)\b/gi, ' ')
-            .split(',')
-            .filter((n) => n.trim()).length;
-          max += names;
-          if (colon < 0 || !group.slice(colon).includes('=')) min += names;
-        }
-        return [min, max];
+        return groups;
       }
     } else if (c === ';' && depth === 1) {
       groups.push(text.slice(start, i));
@@ -1648,6 +1791,7 @@ interface Memos {
   classOfRoutine: Map<string, Node | null>;
   classByQn: Map<string, Node | null>;
   ancestors: Map<string, Node[]>;
+  inheritedChains: Map<string, Node[]>;
   usedFiles: Map<string, string[]>;
   classByName: Map<string, Node | null>;
   unitsByName?: Map<string, string[]>;
@@ -1686,7 +1830,7 @@ function memos(context: ResolutionContext): Memos {
   if (!m) {
     m = {
       named: new Map(), inScope: new Map(), classOfRoutine: new Map(), classByQn: new Map(),
-      ancestors: new Map(), usedFiles: new Map(), classByName: new Map(), unitFiles: new Map(), hierarchy: new Map(),
+      ancestors: new Map(), inheritedChains: new Map(), usedFiles: new Map(), classByName: new Map(), unitFiles: new Map(), hierarchy: new Map(),
       memberTypes: new Map(), keywords: new Map(), procedural: new Map(), headerClasses: new Map(), outlines: new Map(),
       conditionDepths: new Map(), unitFileSets: new Map(), includes: new Map(), includers: new Map(), ownFiles: new Map(),
       nestedInScope: new Map(), routineNodes: new Map(), routineQns: new Map(), withOutlines: new Map(),
