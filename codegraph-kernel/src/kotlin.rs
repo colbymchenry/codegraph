@@ -1443,10 +1443,11 @@ impl<'t> Walker<'t> {
     }
 
     /// extractInheritance — delegation_specifier: user_type ?? its
-    /// constructor_invocation's user_type → ONE `extends` ref named by the
-    /// user_type's type_identifiers joined with `.` (`Outer.Inner`, type
-    /// arguments left out), at the first one (interfaces ride extends too;
-    /// `by`-delegation emits NOTHING).
+    /// constructor_invocation's user_type ?? its explicit_delegation's
+    /// user_type (`I by impl`) → ONE `extends` ref named by the user_type's
+    /// type_identifiers joined with `.` (`Outer.Inner`, type arguments left
+    /// out), at the first one (interfaces ride extends too; a function-type
+    /// delegation names no class and emits nothing).
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
         let extends_kind = edge_kind_index("extends").unwrap();
         for i in 0..node.named_child_count() {
@@ -1460,7 +1461,15 @@ impl<'t> Walker<'t> {
             let ctor_inv = (0..child.named_child_count())
                 .filter_map(|j| child.named_child(j))
                 .find(|c| c.kind() == "constructor_invocation");
-            let target = user_type.or(ctor_inv);
+            let delegated = (0..child.named_child_count())
+                .filter_map(|j| child.named_child(j))
+                .find(|c| c.kind() == "explicit_delegation")
+                .and_then(|d| {
+                    (0..d.named_child_count())
+                        .filter_map(|j| d.named_child(j))
+                        .find(|c| c.kind() == "user_type")
+                });
+            let target = user_type.or(ctor_inv).or(delegated);
             let Some(target) = target else { continue };
             let type_node: Option<Node> = if target.kind() == "user_type" {
                 Some(target)

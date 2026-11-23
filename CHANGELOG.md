@@ -30,6 +30,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Kotlin, calls written in a class's header, such as a constructor parameter's default value, a superclass constructor's arguments, or a delegate like `SecureActivityDelegate by SecureActivityDelegateImpl()`, now link from the class when the class also has a body. (#3410)
 - In Pascal, a call to a routine that nothing in its scope declares, like `Max(A, B)` from `System.Math` or DUnit's `Check(…)`, no longer links to a project routine that only shares its name. (#3471)
 - In Pascal, a call inside a `with` block, like `Add(S)` in `with Writer do`, now links to the method of the `with` object's class, before a same-named method of the calling class or of an unrelated class. (#3471)
+- In Kotlin, a class that implements an interface by delegation, like `class CachedRepo(inner: Repo) : Repo by inner`, is now listed as an implementation of that interface, so a call through the interface also reaches the methods the class overrides. (#3474)
+- In Kotlin, a class's superclass or interface now links to the type its file can see through its own package or its imports, instead of a same-named type somewhere else in the project, such as Exposed's JDBC test entities linking to the R2DBC `IntEntity`. (#3474)
 
 ## [1.6.4] - 2026-11-20
 
