@@ -435,6 +435,64 @@ end.
     expect(preParsePascal(uneven)).toBe(uneven);
   });
 
+  it('leaves a conditional it did not settle right after a header to the grammar', () => {
+    // mORMot's BlowFishCtrInc: whole assembler bodies for two CPUs inside the conditional after the header, which
+    // loses its directives. Blanked too, the inner directives would leave `nostackframe; assembler; asm … end;
+    // nostackframe; assembler; asm … end;` as plain code; the grammar reads them as alternative bodies instead.
+    const code = `unit Ctr;
+
+interface
+
+procedure CtrInc(Iv: PQWord);
+function Pop(out Value: Integer): Boolean;
+
+implementation
+
+procedure CtrInc(Iv: PQWord);
+{$ifdef ASMINTEL}
+{$ifdef ASMX64}
+{$ifdef FPC}nostackframe; assembler; asm {$else} asm .noframe {$endif FPC}
+  mov rax, qword ptr [Iv]
+end;
+{$else}
+{$ifdef FPC}nostackframe; assembler;{$endif}
+asm
+  mov ecx, dword ptr [eax]
+end;
+{$endif ASMX64}
+{$else}
+begin
+  Iv^ := Swap64(Iv^);
+end;
+{$endif ASMINTEL}
+
+function Pop(out Value: Integer): Boolean;
+begin
+  {$ifdef HASFASTTRYFINALLY}
+  try
+  {$else}
+  begin
+  {$endif HASFASTTRYFINALLY}
+    Result := Take(Value);
+  {$ifdef HASFASTTRYFINALLY}
+  finally
+  {$endif HASFASTTRYFINALLY}
+    Unlock(1);
+  end;
+end;
+
+end.
+`;
+    const out = preParsePascal(code).split('\n');
+    expect(out[10]!.trim()).toBe(''); // the conditional after the header: its directives go
+    expect(out[11]).toBe('{$ifdef ASMX64}');
+    expect(out[12]).toBe('{$ifdef FPC}nostackframe; assembler; asm {$else} asm .noframe {$endif FPC}');
+    expect(out[15]).toBe('{$else}');
+    // The other routine's begin went, which is what has this pass look again after the header.
+    expect(out[32]!.trim()).toBe('');
+    expect(extract(code, 'Ctr.pas').calls.filter((c) => c.startsWith('Pop->'))).toEqual(['Pop->Take', 'Pop->Unlock']);
+  });
+
   it('links a call in the routine after the conditional to that routine', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-pascal-conditional-blocks-'));
     try {
