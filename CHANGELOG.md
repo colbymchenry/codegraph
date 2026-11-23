@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph_callers` and `codegraph_callees` take an `offset`, so an agent can page through a list longer than `limit`, and a cut list names the offset of the next page. Thanks @blairjordan. (#3449)
+
 ### Fixes
 
 - On Windows, the `codegraph` command in Git Bash now works in a terminal that turns off path conversion with `MSYS_NO_PATHCONV=1` or `MSYS2_ARG_CONV_EXCL=*`, as some agent harnesses do, instead of failing with "Cannot find module". Thanks @BlueberryDuck for the report. (#3464)
