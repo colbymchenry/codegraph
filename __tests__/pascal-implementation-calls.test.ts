@@ -1,9 +1,13 @@
 /**
- * A Pascal call reaches the overload its argument count fits (#3453). A
- * routine is located at its implementation, and the name strategies choose
- * among a routine's overloads by where they are, so a call went to the
- * overload implemented nearest it: HeidiSQL's `SetRedraw(False)` reached
- * `SetRedraw(AHandle: HWND; const Value: Boolean)`.
+ * What a Pascal call reaches once a routine is located at its
+ * implementation (#3453), where the name strategies, which weigh candidates
+ * by where they are, find it nearer:
+ *  - the overload its argument count fits: HeidiSQL's `SetRedraw(False)`
+ *    reached `SetRedraw(AHandle: HWND; const Value: Boolean)`, implemented
+ *    nearer the call;
+ *  - through a receiver, a method other than the calling routine: SynEdit's
+ *    `Attribute[i].Assign(…)` in `TSynCustomHighlighter.Assign` reached the
+ *    routine itself, an answer the resolver drops.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -115,5 +119,60 @@ describe('a Pascal call reaches the overload its arguments fit', () => {
       '(const Caption: string; Flags: Integer = 0)',
       '(Left, Top, Width: Integer)',
     ]);
+  });
+});
+
+describe('a Pascal call through a receiver is not the routine making it', () => {
+  let root = '';
+  let cg: CodeGraph | undefined;
+
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-pascal-receiver-call-'));
+    fs.writeFileSync(path.join(root, 'Highlighter.pas'), `unit Highlighter;
+interface
+type
+  TAttr = class
+    procedure Assign(Source: TAttr);
+  end;
+  THighlighter = class
+  private
+    function GetAttribute(Index: Integer): TAttr;
+  public
+    procedure Assign(Source: THighlighter);
+    property Attribute[Index: Integer]: TAttr read GetAttribute;
+  end;
+implementation
+procedure TAttr.Assign(Source: TAttr);
+begin
+end;
+function THighlighter.GetAttribute(Index: Integer): TAttr;
+begin
+  Result := nil;
+end;
+procedure THighlighter.Assign(Source: THighlighter);
+var
+  i: Integer;
+begin
+  for i := 0 to 3 do
+    Attribute[i].Assign(Source.Attribute[i]);
+end;
+end.
+`);
+    cg = await CodeGraph.init(root, { index: true });
+  }, 60_000);
+
+  afterAll(() => {
+    cg?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("reaches the receiver's method of the name, not the calling routine", () => {
+    const caller = cg!.getNodesInFile('Highlighter.pas').find((n) => n.qualifiedName === 'THighlighter::Assign');
+    expect(caller).toBeDefined();
+    const called = cg!
+      .getOutgoingEdges(caller!.id)
+      .filter((e) => e.kind === 'calls')
+      .map((e) => cg!.getNode(e.target)!.qualifiedName);
+    expect(called).toEqual(['TAttr::Assign']);
   });
 });
