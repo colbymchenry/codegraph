@@ -55,9 +55,9 @@ import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, C
 import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
-import { isTestCode, type SourceReader } from '../graph/test-code';
+import { testCodeReading } from '../graph/test-code';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
-import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
+import { callSiteLines, formatCallSiteLines, nonTestFirst } from '../graph/call-sites';
 import { DEFAULT_IMPACT_MAX_EDGES, DEFAULT_IMPACT_MAX_NODES, type CallSiteRow } from '../graph/traversal';
 import { isCopybookInclude, MAX_COPYBOOK_INCLUDES, type NamedCopybook } from '../graph/cobol-copybooks';
 import { groupFilesByPackage, packageGroupTitle, packageListingTitle } from '../graph/owning-package';
@@ -3445,7 +3445,9 @@ export class ToolHandler {
       : '';
 
     // Every site of each caller (#2909): one row per caller, at the lines its
-    // calls sit on, and the symbol itself when it calls itself.
+    // calls sit on, and the symbol itself when it calls itself. Callers outside
+    // tests come first, so a cap never shows tests in their place.
+    const isTest = this.testCodeReading(cg);
     const collect = (defNodes: Node[]) => {
       const callers: Node[] = [];
       const labels = new Map<string, string>();
@@ -3467,7 +3469,7 @@ export class ToolHandler {
         }
       }
       const locations = new Map(callers.map((n) => [n.id, this.callSiteLocation(n, sites.get(n.id) ?? [])]));
-      return { callers, labels, locations, recursive };
+      return { callers: nonTestFirst(callers, isTest), labels, locations, recursive };
     };
 
     // Single definition (or same-file overloads): the familiar flat list.
@@ -4181,31 +4183,9 @@ export class ToolHandler {
     return `candidates for key \`${site.key}\`: ${list.join(', ')}`;
   }
 
-  /**
-   * Whether a caller is test code, for one blast-radius section. A Rust unit
-   * test is told by its file's source (an inline `#[cfg(test)]` module, or the
-   * parent's `#[cfg(test)] mod tests;`), so each file is read once.
-   */
+  /** Whether a caller is test code, for one answer; each file is read once. */
   private testCodeReading(cg: CodeGraph): (node: Node) => boolean {
-    const root = cg.getProjectRoot();
-    const sources = new Map<string, string | undefined>();
-    const readSource: SourceReader = (filePath) => {
-      if (!sources.has(filePath)) {
-        let text: string | undefined;
-        try {
-          const abs = validatePathWithinRoot(root, filePath);
-          text = abs === null ? undefined : readFileSync(abs, 'utf-8');
-        } catch { /* unreadable → not known to be test code */ }
-        sources.set(filePath, text);
-      }
-      return sources.get(filePath);
-    };
-    const verdicts = new Map<string, boolean>();
-    return (node) => {
-      let v = verdicts.get(node.id);
-      if (v === undefined) verdicts.set(node.id, (v = isTestCode(node, readSource)));
-      return v;
-    };
+    return testCodeReading(cg.getProjectRoot());
   }
 
   /**
