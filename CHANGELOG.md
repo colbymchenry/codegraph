@@ -32,6 +32,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Pascal, a call inside a `with` block, like `Add(S)` in `with Writer do`, now links to the method of the `with` object's class, before a same-named method of the calling class or of an unrelated class. (#3471)
 - In Kotlin, a class that implements an interface by delegation, like `class CachedRepo(inner: Repo) : Repo by inner`, is now listed as an implementation of that interface, so a call through the interface also reaches the methods the class overrides. (#3474)
 - In Kotlin, a class's superclass or interface now links to the type its file can see through its own package or its imports, instead of a same-named type somewhere else in the project, such as Exposed's JDBC test entities linking to the R2DBC `IntEntity`. (#3474)
+- In Pascal, class and record helpers like `TFooHelper = class helper for TFoo` are now indexed as types with their methods, so `node` and `explore` show those methods and the calls they make; re-index Pascal projects after upgrading. (#3475)
+- In Pascal, a call on a value whose type has a helper in scope, like `R.Count` or `with R do Count`, now links to the helper's method, which hides a same-named method of the type, as in Delphi. (#3475)
 
 ## [1.6.4] - 2026-11-20
 

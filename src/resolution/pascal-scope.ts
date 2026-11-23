@@ -195,7 +195,9 @@ export function matchPascalSystemCall(ref: UnresolvedRef, context: ResolutionCon
  * its class, its unit, the units it uses — links nothing: the name is the
  * RTL's or another library's, which the project doesn't hold (HeidiSQL's
  * `Max(a, b)` from `System.Math` reached `SynEditMiscProcs.Max`, a unit it
- * doesn't use; DUnit's `Check(…)` a test script's `TBase.Check`).
+ * doesn't use; DUnit's `Check(…)` a test script's `TBase.Check`). One the
+ * scope declares as a method the helper in scope adds to the calling class
+ * is that method, whatever namesake the strategy chose.
  *
  * A call that landed on a routine reaches the overload its arguments fit
  * (pascalOverloadFor).
@@ -221,9 +223,69 @@ export function gatePascalCall(result: ResolvedRef, ref: UnresolvedRef, context:
     const nested = gatePascalNestedTarget(result, ref, context);
     return nested && pascalOverloadFor(nested, ref, context);
   }
-  if (bare && isRoutine(target) && scopeKnown(ref.filePath!, context) &&
-      !declarationInScope(ref.referenceName.toLowerCase(), classOfCall(ref, context), ref, context)) return null;
+  // A helper's method is callable only where the helper is in scope: never
+  // from a unit that neither declares nor uses it (SynEdit's VCL
+  // `Canvas.FillRect(R)` is no FireMonkey canvas helper's).
+  if (isRoutine(target) && helperOwned(target, context) && !helperVisible(classOfRoutine(target, context)!, ref.filePath!, context)) return null;
+  if (bare && isRoutine(target)) {
+    const decl = declarationInScope(ref.referenceName.toLowerCase(), classOfCall(ref, context), ref, context);
+    if (!decl && scopeKnown(ref.filePath!, context)) return null;
+    // A method the helper in scope adds to the calling class, which a guess by
+    // name can't tell from a namesake on another class (a descendant's).
+    if (decl && isRoutine(decl.node) && decl.node.id !== target.id && helperOwned(decl.node, context) &&
+        !(decl.node.qualifiedName === target.qualifiedName && decl.node.filePath === target.filePath)) {
+      context.rememberNode?.(decl.node);
+      return pascalOverloadFor({ ...result, targetNodeId: decl.node.id, confidence: decl.confidence, resolvedBy: decl.resolvedBy }, ref, context);
+    }
+  }
   return pascalOverloadFor(result, ref, context);
+}
+
+/** Whether a member is a helper's (`TFooHelper = class helper for TFoo`). */
+function helperOwned(member: Node, context: ResolutionContext): boolean {
+  const owner = classOfRoutine(member, context);
+  return !!owner && helperHead(owner) !== null;
+}
+
+/**
+ * Whether a helper is in scope in a file: its unit is the file's or one it
+ * uses, or a helper in scope there descends from it.
+ */
+function helperVisible(helper: Node, fromFile: string, context: ResolutionContext): boolean {
+  const own = ownUnitFiles(fromFile, context);
+  const used = usedUnitFiles(fromFile, context);
+  const sees = (file: string): boolean => own.includes(file) || used.includes(file);
+  if (sees(helper.filePath)) return true;
+  for (const list of helpersByType(context).values()) {
+    for (const h of list) {
+      if (!sees(h.filePath)) continue;
+      for (let p: Node | null = h, depth = 0; p && depth < MAX_HIERARCHY_DEPTH; depth++) {
+        if (p.id === helper.id) return true;
+        const parent: string | null | undefined = helperHead(p)?.parent;
+        p = parent ? visibleClassNamed(parent, p.filePath, context) : null;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Of the overloads of a routine a call reached through its receiver's type
+ * (see matchPascalHelperCall), one taking exactly the call's argument count,
+ * none of them left to a default, before the one reached: memberOfValue
+ * takes an overload callable without arguments first, which suits a
+ * paren-less name. HeidiSQL's `Result.Add(Node)` is `Add(Value: TXmlNode)`,
+ * not `Add(NodeType: TXmlNodeType = ntElement)`.
+ */
+function overloadByArity(member: Node, ref: UnresolvedRef, context: ResolutionContext): Node {
+  const count = pascalCallArgumentCount(ref, context);
+  if (count === null) return member;
+  const exact = context.getNodesByQualifiedName(member.qualifiedName).find((n) => {
+    if (n.kind !== member.kind || n.language !== 'pascal' || n.filePath !== member.filePath) return false;
+    const range = pascalParameterRange(n.signature);
+    return range !== null && range[0] === count && range[1] === count;
+  });
+  return exact ?? member;
 }
 
 /**
@@ -467,40 +529,15 @@ function conditionDepthAfter(text: string, depth: number): number {
  * above the call names in the source text (`procedure TFoo.Bar;`), which holds
  * where the tree had errors and gave the code to the file, or to a routine
  * that swallowed the ones after it; else the reference's method's class. A
- * helper's method (`procedure TFooHelper.Bar;`) reaches the members of the
- * type it helps by name, as its own (see helpedType).
+ * helper's method (`procedure TFooHelper.Bar;`) is its helper's, whose
+ * ancestors include the type it helps (see ancestorsOf).
  */
 function classOfCall(ref: UnresolvedRef, context: ResolutionContext): Node | null {
   const qn = headerClassAt(ref.filePath!, ref.line, context);
-  const cls = qn ? classByQualifiedName(qn, ref.filePath!, context) ?? helpedType(qn, ref.filePath!, context) : null;
+  const cls = qn ? classByQualifiedName(qn, ref.filePath!, context) : null;
   if (cls) return cls;
   const routine = context.getNodeById?.(ref.fromNodeId);
   return routine?.kind === 'method' ? classOfRoutine(routine, context) : null;
-}
-
-/**
- * The class a helper the unit declares helps (`TFooHelper = class helper for
- * TFoo`, `record helper for`), whose members the helper's methods reach by
- * name: a helper is no class of the graph, so its methods' code is the
- * file's. Null for any other name.
- */
-function helpedType(qualifiedName: string, filePath: string, context: ResolutionContext): Node | null {
-  const memo = memos(context).helped;
-  const key = `${filePath}|${qualifiedName}`;
-  if (memo.has(key)) return memo.get(key)!;
-  let helped: Node | null = null;
-  const own = ownUnitFiles(filePath, context);
-  for (const alias of pascalNamed(qualifiedName.split('::').pop()!.toLowerCase(), context)) {
-    if (alias.kind !== 'type_alias' || !own.includes(alias.filePath)) continue;
-    const line = (fileLines(alias.filePath, context)[alias.startLine - 1] ?? '').replace(/\/\/.*$|\{[^}]*\}/g, ' ');
-    const type = /=\s*(?:class|record)\s+helper\s*(?:\([^)]*\)\s*)?for\s+&?([A-Za-z_][\w.]*)/i.exec(line)?.[1];
-    if (type) {
-      helped = classNamed(type, alias.filePath, context);
-      break;
-    }
-  }
-  memo.set(key, helped);
-  return helped;
 }
 
 /**
@@ -732,7 +769,7 @@ function declarationInScope(lower: string, cls: Node | null, ref: UnresolvedRef,
   const key = `${cls?.id ?? ''}|${ref.filePath}|${lower}`;
   if (memo.has(key)) return memo.get(key)!;
   let found: Found | null = null;
-  const member = cls ? memberInHierarchy(cls, lower, context) : null;
+  const member = cls ? memberOfSelf(cls, lower, ref.filePath!, context) : null;
   if (member) {
     found = { node: member, resolvedBy: 'instance-method', confidence: 0.9 };
   } else {
@@ -797,7 +834,7 @@ function memberAtPath(path: string[], cls: Node | null, ref: UnresolvedRef, cont
   }
   for (let i = 0; i < rest.length && type; i++) {
     const lower = rest[i]!.toLowerCase();
-    const member = memberInHierarchy(type, lower, context);
+    const member = memberOfValue(type, lower, ref.filePath!, context);
     if (i === rest.length - 1) return member ? { node: member, unit: false } : null;
     if (classRef && (member ? routineKeyword(member, context) === 'constructor' : lower === 'create')) {
       classRef = false;
@@ -819,7 +856,7 @@ function headOf(name: string, cls: Node | null, ref: UnresolvedRef, context: Res
   const lower = name.toLowerCase();
   if (lower === 'self') return cls ? { type: cls } : null;
   if (cls) {
-    const member = memberInHierarchy(cls, lower, context);
+    const member = memberOfSelf(cls, lower, ref.filePath!, context);
     if (member) return { type: typeOfMember(member, context) };
   }
   const decl = ownUnitDeclaration(ref.filePath!, lower, context) ??
@@ -898,7 +935,7 @@ function withSubjectMember(lower: string, ref: UnresolvedRef, context: Resolutio
   for (let p = 0; p < subjects.length; p++) {
     const type = withSubjectType(subjects, p, cls, ref, context);
     if (!type) return null;
-    const member = memberInHierarchy(type, lower, context);
+    const member = memberOfValue(type, lower, ref.filePath!, context);
     if (member) return member;
     if (!hierarchyInProject(type, context)) return null;
   }
@@ -1207,7 +1244,7 @@ function withSubjectType(subjects: Subject[], p: number, cls: Node | null, ref: 
     const outer = (lower: string): Node | null => {
       for (let q = p + 1; q < subjects.length; q++) {
         const around = withSubjectType(subjects, q, cls, ref, context);
-        const member = around && memberInHierarchy(around, lower, context);
+        const member = around && memberOfValue(around, lower, ref.filePath!, context);
         if (member) return member;
       }
       return null;
@@ -1301,7 +1338,7 @@ function typeOfLinks(
       type = typeOfText(local, ref.filePath!, head.indexed, context);
     } else {
       const decl = nestedRoutineInScope(lower, ref, context)?.node ??
-        (cls ? memberInHierarchy(cls, lower, context) : null) ?? ownUnitDeclaration(ref.filePath!, lower, context) ??
+        (cls ? memberOfSelf(cls, lower, ref.filePath!, context) : null) ?? ownUnitDeclaration(ref.filePath!, lower, context) ??
         usedUnitFiles(ref.filePath!, context).reduceRight<Node | undefined>(
           (hit, file) => hit ?? unitDeclaration(file, lower, context, ref.filePath!), undefined);
       const unitFile = decl ? null : unitFileNamed(lower, ref.filePath!, context);
@@ -1323,7 +1360,7 @@ function typeOfLinks(
   for (const link of rest) {
     if (!type) return null;
     const name = link.name.toLowerCase();
-    const member = memberInHierarchy(type, name, context);
+    const member = memberOfValue(type, name, ref.filePath!, context);
     // A constructor called on a class gives an instance of it: one the class
     // declares, or `Create`, which every class inherits.
     if (classRef && (member ? routineKeyword(member, context) === 'constructor' : name === 'create')) {
@@ -1475,9 +1512,9 @@ const IMPLICIT_ROOTS: ReadonlySet<string> = new Set(['tobject', 'tinterfacedobje
 /**
  * Whether the project declares a class's whole hierarchy, so a name its
  * classes don't declare isn't its member (save TObject's): no ancestor is
- * outside the project, and it is no helper, whose members include its
- * helped type's, nor an old-style object or an interface with an ancestor
- * of its own, whose ancestors aren't read.
+ * outside the project — for a helper, nor the type it helps — and it is no
+ * old-style object or interface with an ancestor of its own, whose
+ * ancestors aren't read.
  */
 function hierarchyInProject(cls: Node, context: ResolutionContext): boolean {
   const memo = memos(context).wholeHierarchies;
@@ -1485,9 +1522,16 @@ function hierarchyInProject(cls: Node, context: ResolutionContext): boolean {
   if (hit !== undefined) return hit;
   let whole = true;
   for (const c of ancestorsOf(cls, context)) {
+    if (helperHead(c)) {
+      if (supertypesOf(c, context).some((name) => !visibleClassNamed(name, c.filePath, context))) {
+        whole = false;
+        break;
+      }
+      continue;
+    }
     const head = fileLines(c.filePath, context).slice(c.startLine - 1, c.startLine + 1).join(' ').replace(/\{[^}]*\}|\/\/.*$/gm, ' ');
     const parentInterface = /=\s*(?:disp)?interface\s*\(\s*&?([A-Za-z_][\w.]*)/i.exec(head)?.[1]?.split('.').pop()!.toLowerCase();
-    if (/=\s*(?:packed\s+)?(?:class|record)\s+helper\b|=\s*(?:packed\s+)?object\s*\(/i.test(head) ||
+    if (/=\s*(?:packed\s+)?object\s*\(/i.test(head) ||
         (parentInterface !== undefined && !IMPLICIT_ROOTS.has(parentInterface))) {
       whole = false;
       break;
@@ -1538,7 +1582,9 @@ interface Memos {
   subjectTypes: Map<string, Node | null>;
   nestedSpans: Map<string, Array<[number, number]>>;
   wholeHierarchies: Map<string, boolean>;
-  helped: Map<string, Node | null>;
+  helperMembers: Map<string, Node | null>;
+  helpers?: Map<string, Node[]>;
+  helperNames?: Set<string>;
   defaultProperties: Map<string, Node | null>;
   usesIncludes: Map<string, string[]>;
 }
@@ -1553,7 +1599,7 @@ function memos(context: ResolutionContext): Memos {
       memberTypes: new Map(), keywords: new Map(), procedural: new Map(), headerClasses: new Map(), outlines: new Map(),
       conditionDepths: new Map(), unitFileSets: new Map(), includes: new Map(), includers: new Map(), ownFiles: new Map(),
       nestedInScope: new Map(), routineNodes: new Map(), routineQns: new Map(), withOutlines: new Map(),
-      subjectTypes: new Map(), nestedSpans: new Map(), wholeHierarchies: new Map(), helped: new Map(),
+      subjectTypes: new Map(), nestedSpans: new Map(), wholeHierarchies: new Map(), helperMembers: new Map(),
       defaultProperties: new Map(), usesIncludes: new Map(),
     };
     MEMOS.set(context, m);
@@ -1631,7 +1677,11 @@ function classOfRoutine(routine: Node, context: ResolutionContext): Node | null 
   return cls;
 }
 
-/** A class and its ancestors the project declares, nearest first. */
+/**
+ * A class and its ancestors the project declares, nearest first. A helper's
+ * are the helper it descends from, then the type it helps and that type's,
+ * whose members its methods reach by name as their own.
+ */
 function ancestorsOf(cls: Node, context: ResolutionContext): Node[] {
   const memo = memos(context).ancestors;
   const hit = memo.get(cls.id);
@@ -1645,8 +1695,10 @@ function ancestorsOf(cls: Node, context: ResolutionContext): Node[] {
       if (seen.has(c.id)) continue;
       seen.add(c.id);
       order.push(c);
-      for (const name of declaredSupertypes(c, context)) {
-        const sup = classNamed(name, c.filePath, context);
+      // What a helper names is a class its unit sees (see visibleClassNamed).
+      const named = helperHead(c) ? visibleClassNamed : classNamed;
+      for (const name of supertypesOf(c, context)) {
+        const sup = named(name, c.filePath, context);
         if (sup) next.push(sup);
       }
     }
@@ -1654,6 +1706,216 @@ function ancestorsOf(cls: Node, context: ResolutionContext): Node[] {
   }
   memo.set(cls.id, order);
   return order;
+}
+
+/**
+ * The class a name means in a file, when the file's unit declares it or a
+ * unit it uses does: not the one class of that name anywhere in the project
+ * (classNamed's last resort), which an outside type sharing the name isn't.
+ */
+function visibleClassNamed(typeName: string, fromFile: string, context: ResolutionContext): Node | null {
+  const cls = classNamed(typeName, fromFile, context);
+  return cls && (ownUnitFiles(fromFile, context).includes(cls.filePath) || usedUnitFiles(fromFile, context).includes(cls.filePath))
+    ? cls : null;
+}
+
+/**
+ * What a helper's head says (`class helper(TBaseHelper) for TFoo`, kept as
+ * the helper's signature): the helper it descends from, and the type it
+ * helps. Null for any other class.
+ */
+function helperHead(cls: Node): { parent: string | null; helped: string } | null {
+  const m = /^(?:class|record)\s+helper\s*(?:\(\s*&?([A-Za-z_][\w.]*)\s*\))?\s*for\s+&?([A-Za-z_][\w.]*)/i.exec(cls.signature ?? '');
+  return m ? { parent: m[1] ?? null, helped: m[2]! } : null;
+}
+
+/** The names of the types a class's members come from after its own (see ancestorsOf). */
+function supertypesOf(cls: Node, context: ResolutionContext): string[] {
+  const helper = helperHead(cls);
+  if (!helper) return declaredSupertypes(cls, context);
+  return helper.parent ? [helper.parent, helper.helped] : [helper.helped];
+}
+
+/**
+ * The member a name reaches on a value of a type: one the helper in scope
+ * for the type adds (`TFooHelper = class helper for TFoo`, see
+ * nearestHelper), which hides one the type declares of that name — Delphi's
+ * documentation calls the helper's `MyFunc` for `X.MyFunc` where the class
+ * declares one too — else the type's own; then the same for each ancestor.
+ */
+function memberOfValue(type: Node, lower: string, fromFile: string, context: ResolutionContext): Node | null {
+  // A helper's own methods see its scope: its members, the helpers it
+  // descends from, then the type it helps (see ancestorsOf).
+  if (helperHead(type) || helpersByType(context).size === 0) return memberInHierarchy(type, lower, context);
+  const memo = memos(context).helperMembers;
+  const key = `value|${type.id}|${fromFile}|${lower}`;
+  if (memo.has(key)) return memo.get(key)!;
+  // Class by class from the type up, the helper in scope for each before the
+  // class itself: a class's own method comes before a helper for its ancestor
+  // (DWScript's `TdwsLLVMCodeGen(Self).TypeSymbolToLLVMType(…)`, inside the
+  // helper for `TdwsCodeGen` that declares it too, calls the class's).
+  let found: Node | null = null;
+  for (const c of ancestorsOf(type, context)) {
+    found = helperChainMember(nearestHelper(c, fromFile, context), lower, context) ?? ownMember(c, lower, context);
+    if (found) break;
+  }
+  memo.set(key, found);
+  return found;
+}
+
+/**
+ * The member a bare name reaches in a method of `cls` (an implicit `Self`):
+ * one the class or its ancestors declare, else one the helper in scope adds.
+ */
+function memberOfSelf(cls: Node, lower: string, fromFile: string, context: ResolutionContext): Node | null {
+  return memberInHierarchy(cls, lower, context) ??
+    (helperHead(cls) ? null : helperMember(cls, lower, fromFile, context));
+}
+
+/**
+ * A member the helper in scope adds to a type's values, the type's own
+ * aside: Delphi applies the nearest helper for a type that the code's unit
+ * declares or uses — its own unit's, else the unit it uses last — and a
+ * helper for an ancestor to its descendants.
+ */
+function helperMember(type: Node, lower: string, fromFile: string, context: ResolutionContext): Node | null {
+  if (helpersByType(context).size === 0) return null;
+  const memo = memos(context).helperMembers;
+  const key = `helper|${type.id}|${fromFile}|${lower}`;
+  if (memo.has(key)) return memo.get(key)!;
+  let found: Node | null = null;
+  for (const c of ancestorsOf(type, context)) {
+    found = helperChainMember(nearestHelper(c, fromFile, context), lower, context);
+    if (found) break;
+  }
+  memo.set(key, found);
+  return found;
+}
+
+/**
+ * The helper for a class that applies in a file: of those its unit declares
+ * or uses, its own unit's, else the one of the unit it uses last, the one
+ * declared last of them. Null when none does.
+ */
+function nearestHelper(cls: Node, fromFile: string, context: ResolutionContext): Node | null {
+  const helpers = helpersByType(context).get(cls.id);
+  if (!helpers) return null;
+  const own = ownUnitFiles(fromFile, context);
+  const used = usedUnitFiles(fromFile, context);
+  // How near a helper's unit is: its own unit's nearest, then the units used last.
+  const rank = (file: string): number => (own.includes(file) ? Infinity : used.indexOf(file));
+  return helpers.filter((h) => rank(h.filePath) >= 0)
+    .sort((a, b) => rank(b.filePath) - rank(a.filePath) || b.startLine - a.startLine)[0] ?? null;
+}
+
+/** A member a helper declares, or one of the helpers it descends from. */
+function helperChainMember(helper: Node | null, lower: string, context: ResolutionContext): Node | null {
+  for (let h = helper, depth = 0; h && depth < MAX_HIERARCHY_DEPTH; depth++) {
+    const member = ownMember(h, lower, context);
+    if (member) return member;
+    const parent: string | null | undefined = helperHead(h)?.parent;
+    h = parent ? visibleClassNamed(parent, h.filePath, context) : null;
+  }
+  return null;
+}
+
+/** A member a class declares itself; a parameterless overload before the others. */
+function ownMember(cls: Node, lower: string, context: ResolutionContext): Node | null {
+  const owner = cls.qualifiedName.toLowerCase();
+  const members = pascalNamed(lower, context).filter((n) => MEMBER_KINDS.has(n.kind) && n.filePath === cls.filePath && ownerOf(n) === owner);
+  return members.find((n) => !needsArguments(n)) ?? members[0] ?? null;
+}
+
+/**
+ * A Pascal call through a receiver (`R.Total(3)`, `DataGrid.TrySetFocus`) to
+ * a method of a name some helper declares (`TRecordHelper = class helper for
+ * TRecord`): a guess by name can't tell the helper's from its namesakes, a
+ * method of the type's own among them, so the receiver's type decides: the
+ * method the helper in scope for it adds, which hides one of the type's own
+ * of that name, else the type's own (see memberOfValue). HeidiSQL declares
+ * `TrySetFocus` in a helper for the VCL's `TWinControl` and in its virtual
+ * tree. Undefined for any other call, which the other strategies resolve as
+ * before: a name no helper declares, a receiver whose type isn't read, a
+ * method its type doesn't reach.
+ */
+export function matchPascalHelperCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | undefined {
+  if (ref.language !== 'pascal' || ref.referenceKind !== 'calls') return undefined;
+  const dot = ref.referenceName.lastIndexOf('.');
+  if (dot <= 0) return undefined;
+  const method = ref.referenceName.slice(dot + 1).toLowerCase();
+  // Most names no helper declares: settled before the receiver is read.
+  if (!helperMemberNames(context).has(method)) return undefined;
+  const links = subjectLinks(ref.referenceName.slice(0, dot));
+  if (!links) return undefined;
+  const cls = classOfCall(ref, context);
+  // The receiver's first name may be a member of a `with` subject around the call.
+  const statements = withStatementsAt(ref, context);
+  const subjects: Subject[] = [];
+  for (const statement of statements) {
+    for (let k = statement.subjects.length - 1; k >= 0; k--) subjects.push({ statement, k });
+  }
+  const outer = (lower: string): Node | null => {
+    for (let p = 0; p < subjects.length; p++) {
+      const type = withSubjectType(subjects, p, cls, ref, context);
+      const member = type && memberOfValue(type, lower, ref.filePath!, context);
+      if (member) return member;
+    }
+    return null;
+  };
+  const type = typeOfLinks(links, cls, ref, context, outer);
+  if (!type) return undefined;
+  // A type a lone name gives is one the file sees, not the project namesake
+  // of an outside type (swagdoc's `System.JSON` `TJSONObject`, which
+  // JsonDataObjects' `TJsonObject` is not; see visibleClassNamed).
+  if (links.length === 1 && !(ownUnitFiles(ref.filePath!, context).includes(type.filePath) ||
+      usedUnitFiles(ref.filePath!, context).includes(type.filePath))) return undefined;
+  const reached = memberOfValue(type, method, ref.filePath!, context);
+  if (!reached || !isRoutine(reached)) return undefined;
+  const member = overloadByArity(reached, ref, context);
+  context.rememberNode?.(member);
+  return pascalOverloadFor({ original: ref, targetNodeId: member.id, confidence: 0.9, resolvedBy: 'instance-method' }, ref, context);
+}
+
+/** The names of the routines the project's helpers declare, lowercased, whatever type each helps. */
+function helperMemberNames(context: ResolutionContext): Set<string> {
+  const m = memos(context);
+  if (!m.helperNames) {
+    const names = new Set<string>();
+    for (const helper of context.iterateNodesByKind?.('class') ?? context.getNodesByKind('class')) {
+      if (helper.language !== 'pascal' || !helperHead(helper)) continue;
+      const owner = helper.qualifiedName.toLowerCase();
+      for (const n of context.getNodesInFile(helper.filePath)) {
+        if (isRoutine(n) && ownerOf(n) === owner) names.add(n.name.toLowerCase());
+      }
+    }
+    m.helperNames = names;
+  }
+  return m.helperNames;
+}
+
+/**
+ * The project's helpers by the id of the class each helps: a class the
+ * helper's unit declares or uses. A helper for a type outside the project
+ * helps none of the project's classes, though one shares its name
+ * (swagdoc's `class helper for TJsonObject`, under `uses System.JSON`, is
+ * not for JsonDataObjects' `TJsonObject`).
+ */
+function helpersByType(context: ResolutionContext): Map<string, Node[]> {
+  const m = memos(context);
+  if (!m.helpers) {
+    const helpers = new Map<string, Node[]>();
+    for (const n of context.iterateNodesByKind?.('class') ?? context.getNodesByKind('class')) {
+      if (n.language !== 'pascal') continue;
+      const head = helperHead(n);
+      const helped = head ? visibleClassNamed(head.helped, n.filePath, context) : null;
+      if (!helped) continue;
+      const list = helpers.get(helped.id);
+      if (list) list.push(n);
+      else helpers.set(helped.id, [n]);
+    }
+    m.helpers = helpers;
+  }
+  return m.helpers;
 }
 
 /** The qualified name of what declares a node (`TFoo::Bar` → `tfoo`), lowercased. */
