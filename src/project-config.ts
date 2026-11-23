@@ -32,6 +32,8 @@ import { logWarn } from './errors';
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
 
 export interface ProjectConfig {
+  /** Opt-in, bounded Apple SDK inheritance catalog; no SDK source is scanned. */
+  appleExternalTypes?: boolean;
   /** Map of custom file extension (`.foo`) to a supported language id. */
   extensions?: Record<string, string>;
   /**
@@ -98,6 +100,7 @@ export interface ProjectConfig {
 
 /** Parsed, validated view of a project's `codegraph.json`. */
 interface ParsedConfig {
+  appleExternalTypes: boolean;
   extensions: Record<string, Language>;
   includeIgnored: string[];
   exclude: string[];
@@ -129,6 +132,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
   webRoot: null,
+  appleExternalTypes: false,
 });
 
 /**
@@ -183,17 +187,21 @@ function parseConfig(file: string): ParsedConfig {
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
   const webRoot = extractWebRoot(parsed, file);
+  const appleExternalTypes = (parsed as ProjectConfig).appleExternalTypes === true;
+  if ((parsed as ProjectConfig).appleExternalTypes !== undefined && typeof (parsed as ProjectConfig).appleExternalTypes !== 'boolean') {
+    logWarn(`Ignoring "appleExternalTypes" in ${PROJECT_CONFIG_FILENAME}: must be a boolean`, { file });
+  }
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
     deprioritize.length === 0 &&
-    webRoot === null
+    webRoot === null && !appleExternalTypes
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize, webRoot };
+  return { extensions, includeIgnored, exclude, include, deprioritize, webRoot, appleExternalTypes };
 }
 
 /**
@@ -504,4 +512,9 @@ export function addIncludeIgnoredPatterns(rootDir: string, patterns: string[]): 
   fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
   clearProjectConfigCache();
   return added;
+}
+
+/** Whether the project explicitly enabled the bounded Apple inheritance catalog. */
+export function loadAppleExternalTypes(rootDir: string): boolean {
+  return loadParsedConfig(rootDir).appleExternalTypes;
 }

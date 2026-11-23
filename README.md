@@ -909,6 +909,29 @@ agents learn the `codegraph explore` command:
 | Terraform / OpenTofu | `.tf`, `.tfvars`, `.tofu` | Full support (resources, data sources, modules, variables, outputs, providers incl. aliases, `locals`; `var.`/`local.`/`module.`/resource references with Terraform's per-directory scoping enforced; module calls bridged across the boundary — inputs to the child module's variables, `module.M.out` to the child's output, `source` to the module's files; cloudposse/atmos `remote-state` cross-component wiring when the component is statically named; `provider = aws.east` selections resolved up the module tree; `moved`/`import`/`removed`/`check` block references; `.tfvars` assignments linked to the variables they set) |
 | Nix | `.nix` | Full support (functions with simple/destructured/curried params, `let`/attrset bindings, `inherit`, `import ./path` file edges — `./dir` resolving through `default.nix` — plus NixOS module `imports = [ ./x.nix ]` lists and `callPackage ./pkg.nix` file edges; call edges; module-system option wiring — a config write like `launchd.user.agents.x = { ... }` links to the module declaring `options.launchd.user.agents`, so option flows trace across modules) |
 
+### Optional Apple superclass catalog
+
+To include known Foundation and UIKit superclass chains without indexing an SDK,
+set `"appleExternalTypes": true` in the project's `codegraph.json`, then run
+`codegraph sync` (or `codegraph init` for a new index). The default is off.
+
+The initial catalog covers NSObject, URLProtocol/NSURLProtocol,
+Operation/NSOperation, UIResponder, UIView, UIViewController,
+UINavigationController, UIControl, UIButton and UIImageView. A Swift `import Foundation`/`import UIKit`, or an Objective-C framework `#import <…>`, must be
+present in the referring file. Only unresolved superclass references are
+supplemented. Indexed declarations, including ambiguous names, take precedence;
+unknown types and calls are not guessed. Qualified or indirectly imported types
+outside this matching scope remain unresolved.
+
+Catalog nodes have `external:apple:v1:` IDs, module-qualified display names and
+`@external/apple/…` locations. Their signatures and documentation explicitly say
+that they are **external catalog entries, not indexed SDK source**. Edges carry
+`metadata.external: true`, `metadata.catalog: "apple-v1"`, and an Apple
+documentation URL. Only referenced types and their catalog ancestors are added;
+no SDK files, methods, availability information or runtime behavior are modeled.
+The index does not read Xcode's SDK or fetch documentation. Disabling the option
+and running `codegraph sync` removes these entries and their edges.
+
 ## Measured cross-file coverage
 
 Impact and blast-radius queries are only as good as the dependency graph behind them, so coverage is measured rather than asserted. **Fair coverage** = the share of symbol-bearing source files that have at least one *resolved cross-file dependent* — something that imports, calls, references, or (through a framework convention) routes to them — on a real-world benchmark repo per language. The residual is always a genuine static-analysis frontier (runtime dynamic dispatch, reflection / DI containers, framework-convention entry points, vendored third-party code), never hidden by gaming the denominator.
