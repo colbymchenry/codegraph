@@ -142,7 +142,9 @@ if [ "$OSFAM" = "win32" ]; then
   # Git Bash (including Claude Code hooks) does not resolve .cmd via PATHEXT.
   cat > "$STAGE/bin/codegraph" <<'LAUNCH'
 #!/bin/sh
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# `pwd -W` prints the Windows form (C:/...). Node then gets a path it can open
+# even where MSYS_NO_PATHCONV=1 turns off MSYS's argument conversion.
+DIR="$(cd "$(dirname "$0")/.." && { pwd -W 2>/dev/null || pwd; })"
 # Preserve an inherited CODEGRAPH_HOST_PPID; do not replace it with MSYS's
 # $PPID, which is not a native Windows PID usable by the orphan watchdog.
 exec "$DIR/node.exe" --liftoff-only --disable-warning=ExperimentalWarning --max-semi-space-size=16 "$DIR/lib/dist/bin/codegraph.js" "$@"

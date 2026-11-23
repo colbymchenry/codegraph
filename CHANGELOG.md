@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- On Windows, `codegraph` runs from Git Bash where the shell sets `MSYS_NO_PATHCONV=1`, as some agent terminals do, instead of failing with `Cannot find module` (#3464).
+
 
 ## [1.6.4] - 2026-11-20
 

@@ -66,7 +66,7 @@ function checkForwarding(bundle: string) {
   expect(output.args).toEqual(args);
   expect(output.flags).toEqual(['--liftoff-only', '--disable-warning=ExperimentalWarning', '--max-semi-space-size=16']);
   expect(output.host).toBe('12345');
-  expect(fs.realpathSync(output.exe)).toBe(fs.realpathSync(path.join(bundle, windows ? 'node.exe' : 'node')));
+  expect(fs.realpathSync.native(output.exe)).toBe(fs.realpathSync.native(path.join(bundle, windows ? 'node.exe' : 'node')));
 }
 
 afterEach(() => {
@@ -80,6 +80,14 @@ describe('bundled launchers (#1278)', () => {
 
   it.runIf(windows)('runs from Git Bash in a spaced path and forwards arguments, exit status, flags and host PID', () => {
     checkForwarding(stage().bundle);
+  });
+
+  it.runIf(windows)('runs from Git Bash with MSYS path conversion turned off', () => {
+    const { bundle } = stage();
+    probe(bundle);
+    const result = invoke(bundle, 'codegraph', [], { MSYS_NO_PATHCONV: '1', MSYS2_ARG_CONV_EXCL: '*' });
+    expect(result.status, result.stderr).toBe(23);
+    expect(fs.realpathSync.native(JSON.parse(result.stdout).exe)).toBe(fs.realpathSync.native(path.join(bundle, 'node.exe')));
   });
 
   it.runIf(windows)('runs the real CLI and prompt hook in Git Bash, and keeps cmd and PowerShell working', () => {
