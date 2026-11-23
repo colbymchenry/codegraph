@@ -16153,6 +16153,14 @@ export function matchByExactName(
     }
     pool = overloads;
   }
+  // A Pascal call written through a receiver is not the routine making it
+  // (matchReference drops that answer): SynEdit's `Attribute[i].Assign(…)`
+  // in `TSynCustomHighlighter.Assign`, whose node now spans the call (#3453),
+  // is one of the others.
+  if (ref.language === 'pascal' && pool.length > 1 && pool.some((c) => c.id === ref.fromNodeId) &&
+      isCollapsedNonRecursion(ref, context)) {
+    pool = pool.filter((c) => c.id !== ref.fromNodeId);
+  }
 
   // Ubiquitous-name ceiling (#999): above it, picking one target among K
   // same-named defs by directory proximity is unreliable AND O(K) per ref — the

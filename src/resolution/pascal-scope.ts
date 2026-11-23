@@ -186,13 +186,176 @@ export function matchPascalSystemCall(ref: UnresolvedRef, context: ResolutionCon
  * declare at all is a `with` object's member (`with OCI do HandleAlloc(...)`)
  * or a declaration the parse put in the wrong place: it stands for the one
  * routine-holding field or variable the project declares by that name.
+ *
+ * A call that landed on a routine reaches the overload its arguments fit
+ * (pascalOverloadFor).
  */
 export function gatePascalCall(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const target = context.getNodeById?.(result.targetNodeId);
   if (!target) return result;
   if (DATA_KINDS.has(target.kind)) return gatePascalDataCall(target, result, ref, context);
-  if (isNestedRoutine(target, context)) return gatePascalNestedTarget(result, ref, context);
-  return result;
+  if (isNestedRoutine(target, context)) {
+    const nested = gatePascalNestedTarget(result, ref, context);
+    return nested && pascalOverloadFor(nested, ref, context);
+  }
+  return pascalOverloadFor(result, ref, context);
+}
+
+/**
+ * Of the overloads of the routine a call reached — the routines of its
+ * qualified name and kind in its file — one the call's argument count fits,
+ * when the reached one does not fit it (#3453). The name strategies choose
+ * among overloads by where they are, and a routine is where its body is:
+ * HeidiSQL's `SetRedraw(False)` reached the two-parameter
+ * `SetRedraw(AHandle: HWND; const Value: Boolean)` implemented nearer the
+ * call than `SetRedraw(const Value: Boolean)`. Of several that fit, one
+ * taking exactly that many, else the first.
+ */
+function pascalOverloadFor(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef {
+  const target = context.getNodeById?.(result.targetNodeId);
+  if (!target || target.language !== 'pascal' || (target.kind !== 'method' && target.kind !== 'function')) return result;
+  const overloads = context.getNodesByQualifiedName(target.qualifiedName).filter((n) =>
+    n.id !== target.id && n.kind === target.kind && n.language === 'pascal' && n.filePath === target.filePath);
+  if (overloads.length === 0) return result;
+  const count = pascalCallArgumentCount(ref, context);
+  if (count === null) return result;
+  const range = (n: Node): [number, number] | null => pascalParameterRange(n.signature);
+  const fits = (n: Node): boolean => {
+    const r = range(n);
+    return r !== null && count >= r[0] && count <= r[1];
+  };
+  if (fits(target)) return result;
+  const fitting = overloads.filter(fits);
+  if (fitting.length === 0) return result;
+  const choice = fitting.find((n) => range(n)![1] === count) ?? fitting[0]!;
+  context.rememberNode?.(choice);
+  return { ...result, targetNodeId: choice.id };
+}
+
+/**
+ * How many arguments a Pascal call passes: the list in parentheses after the
+ * called name, from the reference's column on and across lines; 0 for a call
+ * written without one. Null when the name is not there, or is indexed.
+ */
+function pascalCallArgumentCount(ref: UnresolvedRef, context: ResolutionContext): number | null {
+  const lines = fileLines(ref.filePath!, context);
+  const line = lines[ref.line - 1];
+  if (line === undefined) return null;
+  const name = ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1);
+  if (!/^[A-Za-z_]\w*$/.test(name)) return null;
+  // The name's first mention from the reference on that a `.` does not
+  // follow: mORMot's `log.Log(sllWarning, …)` calls `Log` on a local `log`.
+  const word = new RegExp(`\\b${escapeRegExp(name)}\\b`, 'gi');
+  word.lastIndex = Math.max(0, ref.column ?? 0);
+  let found = word.exec(line);
+  while (found && /^\s*(?:\^\s*)?\./.test(line.slice(found.index + found[0].length))) found = word.exec(line);
+  if (!found) return null;
+  // The text after the name, a line more at a time while the call runs on (40 at most).
+  let text = line.slice(found.index + found[0].length);
+  let next = ref.line;
+  const more = (): boolean => {
+    if (next >= lines.length || next >= ref.line + 40) return false;
+    text += '\n' + lines[next++]!;
+    return true;
+  };
+  const find = (token: string, from: number): number => {
+    for (;;) {
+      const at = text.indexOf(token, from);
+      if (at >= 0 || !more()) return at;
+    }
+  };
+  let i = 0;
+  const skipBlanks = (): void => {
+    do {
+      while (i < text.length && /\s/.test(text[i]!)) i++;
+    } while (i >= text.length && more());
+  };
+  skipBlanks();
+  // Explicit generic arguments: `Make<TFoo>(…)`.
+  if (text[i] === '<') {
+    const close = find('>', i);
+    if (close < 0) return null;
+    i = close + 1;
+    skipBlanks();
+  }
+  if (text[i] === '[') return null;
+  if (text[i] !== '(') return 0;
+  // Inside the call's own parentheses.
+  i++;
+  let depth = 1;
+  let commas = 0;
+  let any = false;
+  for (;;) {
+    if (i >= text.length && !more()) return null;
+    const c = text[i]!;
+    if (c === "'") {
+      // A string, on its line; '' is a quote inside it.
+      for (i++; i < text.length && !(text[i] === "'" && text[i + 1] !== "'"); i += text[i] === "'" ? 2 : 1);
+      any = true;
+      i++;
+      continue;
+    }
+    if (c === '{' || (c === '(' && text[i + 1] === '*') || (c === '/' && text[i + 1] === '/')) {
+      const end = c === '{' ? find('}', i) : c === '(' ? find('*)', i + 2) : find('\n', i);
+      if (end < 0) return null;
+      i = end + (c === '(' ? 2 : 1);
+      continue;
+    }
+    if (c === '(' || c === '[') {
+      depth++;
+    } else if (c === ')' || c === ']') {
+      depth--;
+      if (depth === 0) return any ? commas + 1 : 0;
+    } else if (c === ',' && depth === 1) {
+      commas++;
+    }
+    if (!/\s/.test(c)) any = true;
+    i++;
+  }
+}
+
+/**
+ * The fewest and most arguments a Pascal routine takes, from its signature
+ * (`(const A, B: Integer; C: string = ''): Boolean`): a parameter with a
+ * default may be left out. [0, 0] for a routine with no parameter list.
+ */
+function pascalParameterRange(signature: string | undefined): [number, number] | null {
+  const text = signature ?? '';
+  const open = text.indexOf('(');
+  if (open < 0) return [0, 0];
+  const groups: string[] = [];
+  let depth = 0;
+  let start = open + 1;
+  for (let i = open; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === "'") {
+      for (i++; i < text.length && !(text[i] === "'" && text[i + 1] !== "'"); i += text[i] === "'" ? 2 : 1);
+    } else if (c === '(' || c === '[') {
+      depth++;
+    } else if (c === ')' || c === ']') {
+      depth--;
+      if (depth === 0) {
+        groups.push(text.slice(start, i));
+        let min = 0;
+        let max = 0;
+        for (const group of groups) {
+          const colon = group.indexOf(':');
+          const names = (colon < 0 ? group : group.slice(0, colon))
+            .replace(/\[[^\]]*\]/g, ' ')
+            .replace(/\b(?:const|constref|var|out)\b/gi, ' ')
+            .split(',')
+            .filter((n) => n.trim()).length;
+          max += names;
+          if (colon < 0 || !group.slice(colon).includes('=')) min += names;
+        }
+        return [min, max];
+      }
+    } else if (c === ';' && depth === 1) {
+      groups.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  return null;
 }
 
 /** See gatePascalCall: a call resolved to data. */
