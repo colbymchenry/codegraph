@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Go calls on a local variable link to the right method when its value is a method chain split across lines after a dot. (#3455)
 
 ## [1.6.4] - 2026-11-20
 
