@@ -3727,13 +3727,13 @@ function readGoScopes(code: string): GoScopeIndex {
       /^[ \t]*new\([ \t]*((?:[A-Za-z_]\w*\.)?[A-Za-z_]\w*)[ \t]*\)/.exec(rhs);
     // A selector after the literal or the `new(T)` makes it the start of a
     // chain, `new(Route).Host("x").Subrouter()`: the local has the type the
-    // chain gives, read with its value like any call's result (#3447). Not
-    // when the line ends at the `.`: a value is read to its line's end, so a
-    // chain broken there keeps the type its first line writes.
+    // chain gives, read with its value like any call's result (#3447). So
+    // does one at a line's end, the way gofmt breaks a long chain: the value
+    // is read on past a line that ends at a `.` (#3455).
     let after = i + 1 + (written?.[0].length ?? 0);
     if (written && code[after] === '{') after = close.get(after) ?? code.length;
     do after++; while (code[after] === ' ' || code[after] === '\t');
-    const onward = /\.[ \t]*\S/y;
+    const onward = /\.\s*\S/y;
     onward.lastIndex = after;
     const literal = onward.test(code) ? undefined : written?.[1];
     const type = names.length === 1 && literal && !GO_TYPE_KEYWORDS.has(literal) ? literal : undefined;

@@ -5,8 +5,8 @@
  * by the start of its value alone, `new(Route)`, so `sub.Path("/a")` reached
  * `Route`'s `Path`: gorilla/mux's subrouter tests are written this way. Only
  * a value that is the `new(T)` or the literal and nothing more types the
- * local by what it writes; a chain is read like any other call's result. A
- * chain broken after the `.` is left as it was, typed by its first line.
+ * local by what it writes; a chain is read like any other call's result,
+ * across its lines too when it is broken after a `.` (#3455).
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -223,18 +223,18 @@ describe.each(['default', 'wasm'])('a Go local given a chain is typed by what th
     expect(pathCalls('fromVar')).toEqual(ROUTER);
   });
 
-  it('types a chain broken after the `.` by its start, as before: right when the chain returns that type', () => {
+  it('types a chain broken after the `.` by what it returns, here the type it starts from', () => {
     expect(pathCalls('builderBroken')).toEqual(['b_route.go::Route::Path']);
     expect(pathCalls('builderBrokenCommented')).toEqual(['b_route.go::Route::Path']);
   });
 
-  // Not fixed here: a `:=` value is read to its line's end, so these keep the
-  // type their first line writes, and a function's broken chain has none.
-  it('leaves a broken chain that returns another type as it was', () => {
-    expect(pathCalls('fromNewBroken')).toEqual(['b_route.go::Route::Path']);
-    expect(pathCalls('fromLiteralBroken')).toEqual(['b_route.go::Plain::Path']);
-    expect(pathCalls('fromFilledLiteralBroken')).toEqual(['b_route.go::Plain::Path']);
-    expect(pathCalls('fromFuncBroken')).toEqual([]);
+  // The value is read on past a line that ends at a `.` (#3455), so a broken
+  // chain has the type it returns, whatever it starts from.
+  it('reads a chain broken after the `.` across its lines', () => {
+    expect(pathCalls('fromNewBroken')).toEqual(ROUTER);
+    expect(pathCalls('fromLiteralBroken')).toEqual(ROUTER);
+    expect(pathCalls('fromFilledLiteralBroken')).toEqual(ROUTER);
+    expect(pathCalls('fromFuncBroken')).toEqual(ROUTER);
   });
 
   it('reads a chain that starts with `make(T)` the same way', () => {

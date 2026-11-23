@@ -21,8 +21,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On Windows, the `codegraph` command in Git Bash now works in a terminal that turns off path conversion with `MSYS_NO_PATHCONV=1` or `MSYS2_ARG_CONV_EXCL=*`, as some agent harnesses do, instead of failing with "Cannot find module". Thanks @BlueberryDuck for the report. (#3464)
 - On projects with fewer than 500 files, every tool named in `CODEGRAPH_MCP_TOOLS` is now listed to the agent, instead of only the small-repo defaults. Thanks @nchrisr for the report and the fix. (#3462)
 - `codegraph callers` and `codegraph_callers` list callers outside tests before tests, so a symbol called mostly from tests no longer shows only tests under the default limit while its real callers are cut. Thanks @blairjordan for the report and the fix. (#3456)
-- In Go, a variable given a one-line chain that starts with `new(T)`, `make(T)` or a struct literal, like `sub := new(Route).Host("x").Subrouter()`, now has the type the chain returns, so a method called on it links to that type's method, not to a same-named method of the type the chain starts from. Thanks @inth3shadows for the report and the analysis. (#3447)
-- Go calls on a local variable link to the right method when its value is a method chain split across lines after a dot. Thanks @maxmilian for the report and @zhangkom for the fix. (#3455)
+- In Go, a variable given a chain that starts with `new(T)`, `make(T)` or a struct literal, like `sub := new(Route).Host("x").Subrouter()`, now has the type the chain returns, so a method called on it links to that type's method, not to a same-named method of the type the chain starts from. Thanks @inth3shadows for the report and the analysis, and @maxmilian. (#3447)
+- In Go, a variable given a method chain broken across lines after its `.`s, the way gofmt leaves a long chain, now has the type the chain returns, so a method called on it links again. Thanks @maxmilian for the report and @zhangkom for the fix. (#3455)
 
 ## [1.6.4] - 2026-11-20
 
