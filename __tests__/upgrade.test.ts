@@ -362,6 +362,14 @@ describe('windows bundle swap script (#2185)', () => {
     expect(installPs1()).toMatch(/Install-CodeGraphFiles \$\(.*\) \$dest$/m);
   });
 
+  it('selects the Windows PowerShell archive module before expanding a bundle (#3436)', () => {
+    const s = script();
+    const modulePath = '$PSHOME \'Modules\\Microsoft.PowerShell.Archive\\Microsoft.PowerShell.Archive.psd1\'';
+    const loadArchive = s.indexOf(`Import-Module (Join-Path ${modulePath})`);
+    expect(loadArchive).toBeGreaterThan(-1);
+    expect(loadArchive).toBeLessThan(s.indexOf('Expand-Archive'));
+  });
+
   it('renames every replaced file aside before moving the staged file in', () => {
     const code = swapCode();
     // Replaced files and files the new version drops are both renamed aside…
