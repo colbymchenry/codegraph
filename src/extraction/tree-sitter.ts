@@ -9229,13 +9229,18 @@ export class TreeSitterExtractor {
    */
   private extractPascalDeclType(node: SyntaxNode): void {
     const declared = getChildByField(node, 'name');
-    const nameNode = this.pascalSwallowedTypeName(node) ?? declared;
+    const swallowed = this.pascalSwallowedTypeName(node);
+    const nameNode = swallowed ?? declared;
     if (!nameNode) return;
     const name = getNodeText(nameNode, this.source);
-    if (declared && nameNode !== declared) {
-      // The type the grammar could not read keeps its name, as an alias.
-      this.createNode('type_alias', getNodeText(declared, this.source), declared);
-    }
+    // The type the grammar could not read keeps its name, as an alias, and
+    // the class it ran into starts at its own name.
+    if (swallowed && declared) this.createNode('type_alias', getNodeText(declared, this.source), declared);
+    const startAtName = (created: Node | null): void => {
+      if (!created || !swallowed) return;
+      created.startLine = swallowed.startPosition.row + 1;
+      created.startColumn = swallowed.startPosition.column;
+    };
 
     // Find the inner type declaration
     const declClass = node.namedChildren.find(
@@ -9250,6 +9255,7 @@ export class TreeSitterExtractor {
 
     if (declClass) {
       const classNode = this.createNode('class', name, node);
+      startAtName(classNode);
       if (classNode) {
         // Extract inheritance from typeref children of declClass
         this.extractPascalInheritance(declClass, classNode.id);
@@ -9263,6 +9269,7 @@ export class TreeSitterExtractor {
       }
     } else if (declIntf) {
       const ifaceNode = this.createNode('interface', name, node);
+      startAtName(ifaceNode);
       if (ifaceNode) {
         // Visit interface members
         this.nodeStack.push(ifaceNode.id);

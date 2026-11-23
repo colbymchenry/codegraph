@@ -220,7 +220,7 @@ begin
 end;
 end.`;
     const result = extract(source);
-    expect(result.nodes.filter((n) => n.kind === 'class').map((n) => n.name)).toEqual(['TArea']);
+    expect(result.nodes.filter((n) => n.kind === 'class').map((n) => [n.name, n.startLine])).toEqual([['TArea', 7]]);
     expect(result.nodes.find((n) => n.kind === 'type_alias')?.name).toBe(before.split(' ')[0]);
     const method = result.nodes.find((n) => n.name === 'AsJson')!;
     expect(method.qualifiedName).toBe('TArea::AsJson');
