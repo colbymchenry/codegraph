@@ -10098,6 +10098,38 @@ function isKotlinTopLevelVisible(n: Node, ref: UnresolvedRef, context: Resolutio
 }
 
 /**
+ * Whether a bare Kotlin supertype name (`: Listener`, `: Listener by impl`) can
+ * mean `candidate`, a Kotlin type, the way Kotlin looks a type name up. A
+ * top-level type is in reach from its own file and package, through an import
+ * of it or a star import of its package, and from Kotlin's default imports. A
+ * type nested in a class is in reach inside that class or a type that inherits
+ * it (kotlinHierarchyAt), or through an import of it or a star import of its
+ * owner. mihon's `FilterList : List<Filter<*>> by list` delegates Kotlin's
+ * `List`, not the `object List` a display mode declares in another module, and
+ * ktor's `DelegateHeaders : Headers` under `import io.ktor.http.*` is that
+ * package's `Headers`, not the JS client's.
+ */
+function isKotlinSupertypeVisible(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'kotlin' || candidate.language !== 'kotlin') return true;
+  if (!/^[A-Za-z_]\w*$/.test(ref.referenceName) || candidate.filePath === ref.filePath) return true;
+  const pkg = kotlinFileScope(candidate.filePath, context).pkg;
+  const here = kotlinFileScope(ref.filePath, context);
+  const segs = candidate.qualifiedName.split('::');
+  const path = pkg && segs[0] === pkg ? segs.slice(1) : segs;
+  const fqn = [pkg, ...path].filter((p) => p !== '').join('.');
+  const ownerQn = segs.slice(0, -1).join('::');
+  const owner = path.length > 1
+    ? context.getNodesInFile(candidate.filePath).find((n) => n.qualifiedName === ownerQn && MEMBER_CLASS_KINDS.has(n.kind))
+    : undefined;
+  if (path.length > 1 && !owner) return true;
+  if (owner) {
+    if (kotlinHierarchyAt(ref, context).has(owner.name)) return true;
+    return here.imports.has(fqn) || here.stars.has(fqn.slice(0, fqn.lastIndexOf('.')));
+  }
+  return pkg === here.pkg || here.imports.has(fqn) || here.stars.has(pkg) || KOTLIN_DEFAULT_IMPORTS.has(pkg);
+}
+
+/**
  * Whether a Kotlin method found by its type's name can be called from the
  * reference's file. A member of a class in its file's package (`p::Modes::x`)
  * can; an extension, `fun Modes.hidden()` indexed as `Modes::hidden`, is
@@ -16084,6 +16116,9 @@ export function matchByExactName(
     // Likewise a bare Java type name: retrofit's tests' `new Builder()` is not
     // a wire converter test's nested `CrashingPhone.Builder`.
     isJavaTypeVisible(n, ref, context) &&
+    // And a bare Kotlin supertype, a type the file can see the way Kotlin looks
+    // one up: a `List<T> by list` is Kotlin's `List`, not a sealed class's `object List`.
+    !(inheritanceRef && !isKotlinSupertypeVisible(n, ref, context)) &&
     // And a Go name that isn't exported, only its own package's: prometheus
     // tsdb's `[]*memSeries` is head.go's, not `tsdb/agent`'s, which scored the
     // same (a child package's directory shares as much of the path) and won.
@@ -36103,7 +36138,9 @@ export function matchFuzzy(
     !(finalCandidates[0]!.kind !== 'function' && isBarePhpCall(ref, context)) &&
     isLexicallyReachable(finalCandidates[0]!, ref, context) &&
     // Nor another Ruby test suite's: its declarations exist only in its runs.
-    !(ref.language === 'ruby' && finalCandidates[0]!.language === 'ruby' && !isRubyDeclarationVisible(finalCandidates[0]!, ref.filePath))
+    !(ref.language === 'ruby' && finalCandidates[0]!.language === 'ruby' && !isRubyDeclarationVisible(finalCandidates[0]!, ref.filePath)) &&
+    // Nor a Kotlin type the supertype written here can't see.
+    !(isInheritanceRef(ref) && !isKotlinSupertypeVisible(finalCandidates[0]!, ref, context))
   ) {
     const isCrossLanguage = !sameLanguageFamily(finalCandidates[0]!.language, ref.language);
     return {

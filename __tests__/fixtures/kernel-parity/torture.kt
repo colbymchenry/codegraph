@@ -395,3 +395,14 @@ class CompanionHeader {
 }
 
 class BodilessHeader(val b: Int = initB()) : OpenBase(readCfg2()), Drawable by makeDrawable(seed())
+
+// `I by x` names a supertype like `I` does: plain, qualified, generic; a
+// function type names no class.
+class ByQualified(x: api.IFoo) : api.IFoo by x {
+    fun own() {
+    }
+}
+
+class ByGeneric<E>(c: Channel<E>) : Channel<E> by c
+
+class ByFunction(f: (Int) -> Unit) : (Int) -> Unit by f

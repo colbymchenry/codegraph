@@ -754,7 +754,9 @@ namedChildren — kotlin's `delegation_specifier`s are direct children
 (probed; no wrapper node). Per specifier:
 
 - userType = find direct `user_type`; ctorInv = find direct
-  `constructor_invocation`; target = userType ?? ctorInv; none → skip.
+  `constructor_invocation`; delegated = the direct `explicit_delegation`'s
+  `user_type` (`I by impl`); target = userType ?? ctorInv ?? delegated; none
+  → skip (a function-type delegation, `(Int) -> Unit by f`, names no class).
 - typeId: user_type → its FIRST `type_identifier` (?? itself);
   constructor_invocation → its user_type's FIRST type_identifier (?? the
   user_type ?? the invocation).
@@ -765,9 +767,10 @@ namedChildren — kotlin's `delegation_specifier`s are direct children
   → ref named `com`** (first type_identifier of the multi-segment
   user_type — pinned); generic supertype `Comparable<SubK>` → `Comparable`
   (type_arguments' identifiers aren't direct children); **`by`-delegation
-  (`: Drawable by d`) emits NOTHING** — the specifier's only child is
-  `explicit_delegation` and the direct-child finds miss (pinned:
-  DelegatedImpl has zero extends).
+  (`: Drawable by d`) emits `extends Drawable`** from its
+  `explicit_delegation`'s user_type, which the resolver promotes to
+  `implements` against an interface (the direct-child finds used to miss it,
+  and DelegatedImpl had zero extends).
 - Runs for classes, objects (extraClassNodeTypes → extractClass), interfaces,
   enums. `object Add : SealedOp()` → extends SealedOp ✓. Anonymous
   `object_literal`s never reach it (no class node).

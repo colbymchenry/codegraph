@@ -27,6 +27,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Pascal, a call to an overloaded method or function now links to the overload whose parameters fit its arguments. (#3453)
 - In Pascal, a class declared right after a subrange or set type, like `TPercent = 0 .. 100;`, now gets its own name instead of that type's. (#3453)
 - In Kotlin, calls written in a class's header, such as a constructor parameter's default value, a superclass constructor's arguments, or a delegate like `SecureActivityDelegate by SecureActivityDelegateImpl()`, now link from the class when the class also has a body. (#3410)
+- In Kotlin, a class that implements an interface by delegation, like `class CachedRepo(inner: Repo) : Repo by inner`, is now listed as an implementation of that interface, so a call through the interface also reaches the methods the class overrides. (#PR)
+- In Kotlin, a class's superclass or interface now links to the type its file can see through its own package or its imports, instead of a same-named type somewhere else in the project, such as Exposed's JDBC test entities linking to the R2DBC `IntEntity`. (#PR)
 
 ## [1.6.4] - 2026-11-20
 

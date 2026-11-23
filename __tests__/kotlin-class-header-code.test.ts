@@ -93,7 +93,8 @@ function refsFrom(result: ExtractionResult, name: string): string[] {
 function checkHeaders(result: ExtractionResult): void {
   // Defaults (a call, a lambda's call, a qualified call), the superclass
   // constructor's arguments (a call, a function reference), the delegate (a
-  // call and the call in its arguments). `own`'s call stays its own.
+  // call and the call in its arguments). `own`'s call stays its own. The
+  // delegated interface is a supertype (kotlin-delegated-supertype.test.ts).
   expect(refsFrom(result, 'HeaderCode')).toEqual([
     'calls Repo.create 7:18',
     'calls WidgetK 4:21',
@@ -101,6 +102,7 @@ function checkHeaders(result: ExtractionResult): void {
     'calls helper 6:27',
     'calls makeDrawable 8:50',
     'calls seed 8:63',
+    'extends Drawable 8:38',
     'extends OpenBase 8:4',
     'function_ref topLevel 8:27',
   ]);
@@ -108,10 +110,10 @@ function checkHeaders(result: ExtractionResult): void {
 
   // An object: its superclass constructor's arguments. A property read as the
   // delegate links nothing, as it doesn't in a bodiless header.
-  expect(refsFrom(result, 'HeaderObject')).toEqual(['calls objArg 14:31', 'extends OpenBase 14:22']);
+  expect(refsFrom(result, 'HeaderObject')).toEqual(['calls objArg 14:31', 'extends Drawable 14:42', 'extends OpenBase 14:22']);
 
   // An object expression as the delegate is an anonymous class like any other.
-  expect(refsFrom(result, 'AnonDelegate')).toEqual(['instantiates Runnable 20:42']);
+  expect(refsFrom(result, 'AnonDelegate')).toEqual(['extends Runnable 20:21', 'instantiates Runnable 20:42']);
   const anon = result.nodes.find((n) => n.name === '<Runnable$anon@20>');
   expect(anon?.kind).toBe('class');
   const run = result.nodes.find((n) => n.name === 'run');

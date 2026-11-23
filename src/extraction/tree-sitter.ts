@@ -8551,10 +8551,15 @@ export class TreeSitterExtractor {
 
       // Kotlin: `class Foo : Bar, Baz` → delegation_specifier > user_type > type_identifier
       // Also handles `class Foo : Bar()` → delegation_specifier > constructor_invocation > user_type
+      // and `class Foo : Baz by impl` → delegation_specifier > explicit_delegation > user_type:
+      // the class implements the interface it delegates (a function type names no class).
       if (child.type === 'delegation_specifier') {
         const userType = child.namedChildren.find((c: SyntaxNode) => c.type === 'user_type');
         const constructorInvocation = child.namedChildren.find((c: SyntaxNode) => c.type === 'constructor_invocation');
-        const target = userType ?? constructorInvocation;
+        const delegated = child.namedChildren
+          .find((c: SyntaxNode) => c.type === 'explicit_delegation')
+          ?.namedChildren.find((c: SyntaxNode) => c.type === 'user_type');
+        const target = userType ?? constructorInvocation ?? delegated;
         if (target) {
           // `class K : Outer.Inner()` names the nested type by its whole
           // path (`Outer.Inner`), type arguments left out — not `Outer`.
