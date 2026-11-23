@@ -195,9 +195,10 @@ export function matchPascalSystemCall(ref: UnresolvedRef, context: ResolutionCon
  * its class, its unit, the units it uses — links nothing: the name is the
  * RTL's or another library's, which the project doesn't hold (HeidiSQL's
  * `Max(a, b)` from `System.Math` reached `SynEditMiscProcs.Max`, a unit it
- * doesn't use; DUnit's `Check(…)` a test script's `TBase.Check`). One the
- * scope declares as a method the helper in scope adds to the calling class
- * is that method, whatever namesake the strategy chose.
+ * doesn't use; DUnit's `Check(…)` a test script's `TBase.Check`). One its
+ * scope declares is what the scope declares first, whatever namesake the
+ * strategy chose: the routine, or the data holding one; nothing when that is
+ * a type (a typecast), other data, or a parameter or local of the caller.
  *
  * A call that landed on a routine reaches the overload its arguments fit
  * (pascalOverloadFor).
@@ -229,16 +230,104 @@ export function gatePascalCall(result: ResolvedRef, ref: UnresolvedRef, context:
   if (isRoutine(target) && helperOwned(target, context) && !helperVisible(classOfRoutine(target, context)!, ref.filePath!, context)) return null;
   if (bare && isRoutine(target)) {
     const decl = declarationInScope(ref.referenceName.toLowerCase(), classOfCall(ref, context), ref, context);
-    if (!decl && scopeKnown(ref.filePath!, context)) return null;
-    // A method the helper in scope adds to the calling class, which a guess by
-    // name can't tell from a namesake on another class (a descendant's).
-    if (decl && isRoutine(decl.node) && decl.node.id !== target.id && helperOwned(decl.node, context) &&
-        !(decl.node.qualifiedName === target.qualifiedName && decl.node.filePath === target.filePath)) {
-      context.rememberNode?.(decl.node);
-      return pascalOverloadFor({ ...result, targetNodeId: decl.node.id, confidence: decl.confidence, resolvedBy: decl.resolvedBy }, ref, context);
+    if (!decl) return scopeKnown(ref.filePath!, context) ? null : pascalOverloadFor(result, ref, context);
+    // What the scope declares first is what the name means, whatever
+    // namesake the strategy chose: a routine; data that runs the routine it
+    // holds; never a type (`TFoo(X)` is a typecast) nor other data; and a
+    // parameter or local of the calling routine before any of them
+    // (DelphiMVCFramework's `Log('…')` on a `Log: TProc<string>`).
+    const declared = isRoutine(decl.node) ? decl.node : routineAlternative(decl.node, context) ?? decl.node;
+    if (sameRoutine(declared, target, context)) return pascalOverloadFor(result, ref, context);
+    if (!isNestedRoutine(declared, context) && declaredAsLocal(ref.referenceName.toLowerCase(), ref, context)) return null;
+    if (!isRoutine(declared) && !(DATA_KINDS.has(declared.kind) && isProceduralData(declared, context))) return null;
+    // Routines of one name in several units the code sees are one set of
+    // overloads (mORMot's `ConsoleWrite(Text, Color)` in mormot.core.os and
+    // `ConsoleWrite(Fmt, Args)` in mormot.core.text): the strategy's choice
+    // among them stands while the call's arguments fit it, else the one
+    // taking them exactly, else one they fit.
+    let chosen = declared;
+    if (isRoutine(declared) && !declared.qualifiedName.includes('::')) {
+      const overloads = pascalNamed(ref.referenceName.toLowerCase(), context).filter((n) =>
+        n.kind === 'function' && !n.qualifiedName.includes('::') && unitRoutineInScope(n, ref.filePath!, context));
+      if (overloads.some((n) => n.id === target.id) && fitsArguments(target, ref, context)) return pascalOverloadFor(result, ref, context);
+      const fitting = overloads.filter((n) => fitsArguments(n, ref, context));
+      chosen = fitting.find((n) => takesExactly(n, ref, context)) ?? fitting.find((n) => n.id === declared.id) ?? fitting[0] ?? declared;
+      if (sameRoutine(chosen, target, context)) return pascalOverloadFor(result, ref, context);
     }
+    context.rememberNode?.(chosen);
+    return pascalOverloadFor({ ...result, targetNodeId: chosen.id, confidence: decl.confidence, resolvedBy: decl.resolvedBy }, ref, context);
   }
   return pascalOverloadFor(result, ref, context);
+}
+
+/**
+ * Whether the routine making a call declares the called name as a parameter
+ * or a local of its own, or one of the routines it is nested in does, above
+ * the call (`procedure Show(Log: TProc<string>)`): not a routine's header
+ * (`function Max: Integer`), nor what a routine nested beside it declares.
+ */
+function declaredAsLocal(lower: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const lines = fileLines(ref.filePath!, context);
+  const from = routineHeaderAt(ref.filePath!, ref.line, context);
+  const name = escapeRegExp(lower);
+  const mentions = new RegExp(`\\b${name}\\b`, 'i');
+  const declares = new RegExp(
+    `(?<![.\\w])(?<!\\b(?:procedure|function|constructor|destructor|operator)\\s+(?:[\\w<>]+\\s*\\.\\s*)*)${name}(?:\\s*,\\s*&?[A-Za-z_]\\w*)*\\s*:(?!=)`, 'i');
+  const elsewhere = nestedRoutineSpans(ref.filePath!, context).filter(([start, end]) => ref.line < start || ref.line > end);
+  for (let i = Math.max(1, from); i <= ref.line && i <= lines.length; i++) {
+    const raw = lines[i - 1]!;
+    if (!mentions.test(raw) || elsewhere.some(([start, end]) => i >= start && i <= end)) continue;
+    if (declares.test(raw.replace(/\/\/.*$|\{[^}]*\}|\(\*.*?\*\)|'(?:[^']|'')*'/g, ' '))) return true;
+  }
+  return false;
+}
+
+/** Whether a unit's routine is one a file sees: its own unit's, or one a unit it uses declares in its interface. */
+function unitRoutineInScope(routine: Node, fromFile: string, context: ResolutionContext): boolean {
+  const unit = unitFilesOf(routine.filePath, context)[0]!;
+  if (ownUnitFiles(fromFile, context).includes(unit) || ownUnitFiles(fromFile, context).includes(routine.filePath)) return true;
+  return usedUnitFiles(fromFile, context).includes(unit) && exportedRoutine(routine, context);
+}
+
+/** Whether a call's argument count fits a routine's parameters; true when either can't be read. */
+function fitsArguments(routine: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const count = pascalCallArgumentCount(ref, context);
+  const range = pascalParameterRange(routine.signature);
+  return count === null || range === null || (count >= range[0] && count <= range[1]);
+}
+
+/** Whether a routine takes exactly a call's argument count, none of them left to a default. */
+function takesExactly(routine: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const count = pascalCallArgumentCount(ref, context);
+  const range = pascalParameterRange(routine.signature);
+  return count !== null && range !== null && range[0] === count && range[1] === count;
+}
+
+/**
+ * Whether two routine nodes are the same routine, or overloads of it: the
+ * same node, or of one qualified name (whatever its case) in one unit — a
+ * routine declared in a unit's file and implemented in one of its include
+ * files is two nodes (mORMot's `mormot.core.base.pas` and
+ * `mormot.core.base.asmx64.inc`).
+ */
+function sameRoutine(a: Node, b: Node, context: ResolutionContext): boolean {
+  if (a.id === b.id) return true;
+  if (!isRoutine(a) || !isRoutine(b) || a.qualifiedName.toLowerCase() !== b.qualifiedName.toLowerCase()) return false;
+  return a.filePath === b.filePath || unitFilesOf(a.filePath, context)[0] === unitFilesOf(b.filePath, context)[0];
+}
+
+/**
+ * A routine of a unit's declaration's name that its unit declares too: two
+ * declarations of one name in one unit are `{$ifdef}` alternatives, and the
+ * routine is the one with a body to read — mORMot's `MoveFast`, a variable
+ * holding `Move` or the asm procedure `mormot.core.base.asmx64.inc`
+ * implements, and `ToByte`, a type or an inline function.
+ */
+function routineAlternative(decl: Node, context: ResolutionContext): Node | null {
+  if (decl.qualifiedName.includes('::')) return null;
+  const unit = unitFilesOf(decl.filePath, context)[0];
+  return pascalNamed(decl.name.toLowerCase(), context).find((n) => n.kind === 'function' &&
+    n.qualifiedName.toLowerCase() === decl.qualifiedName.toLowerCase() && unitFilesOf(n.filePath, context)[0] === unit) ?? null;
 }
 
 /** Whether a member is a helper's (`TFooHelper = class helper for TFoo`). */
@@ -1001,6 +1090,7 @@ function withOutlineOf(filePath: string, context: ResolutionContext): { statemen
 
 const CH_TAB = 9, CH_LF = 10, CH_CR = 13, CH_SPACE = 32, CH_QUOTE = 39, CH_LPAREN = 40, CH_RPAREN = 41, CH_STAR = 42;
 const CH_COMMA = 44, CH_DOT = 46, CH_SLASH = 47, CH_SEMI = 59, CH_AMP = 38, CH_LBRACKET = 91, CH_RBRACKET = 93, CH_LBRACE = 123;
+const CH_DOLLAR = 36;
 
 function isWordStart(c: number): boolean {
   return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
@@ -1585,6 +1675,7 @@ interface Memos {
   helperMembers: Map<string, Node | null>;
   helpers?: Map<string, Node[]>;
   helperNames?: Set<string>;
+  interfaceNames: Map<string, Set<string> | null>;
   defaultProperties: Map<string, Node | null>;
   usesIncludes: Map<string, string[]>;
 }
@@ -1600,7 +1691,7 @@ function memos(context: ResolutionContext): Memos {
       conditionDepths: new Map(), unitFileSets: new Map(), includes: new Map(), includers: new Map(), ownFiles: new Map(),
       nestedInScope: new Map(), routineNodes: new Map(), routineQns: new Map(), withOutlines: new Map(),
       subjectTypes: new Map(), nestedSpans: new Map(), wholeHierarchies: new Map(), helperMembers: new Map(),
-      defaultProperties: new Map(), usesIncludes: new Map(),
+      defaultProperties: new Map(), usesIncludes: new Map(), interfaceNames: new Map(),
     };
     MEMOS.set(context, m);
   }
@@ -1955,12 +2046,123 @@ function memberInHierarchy(cls: Node, lower: string, context: ResolutionContext)
  * member the code calls.
  */
 function unitDeclaration(filePath: string, lower: string, context: ResolutionContext, fromFile = filePath): Node | undefined {
+  // Another unit sees only the routines a unit's interface section declares.
+  const otherUnit = fromFile !== filePath && !ownUnitFiles(fromFile, context).includes(filePath);
   const decls = pascalNamed(lower, context).filter((n) =>
     n.filePath === filePath && UNIT_KINDS.has(n.kind) && (n.kind === 'enum_member' || !n.qualifiedName.includes('::')) &&
-    !(fromFile !== filePath && n.kind === 'function' && n.startColumn > unitRoutineColumn(filePath, context)));
+    !(fromFile !== filePath && n.kind === 'function' && n.startColumn > unitRoutineColumn(filePath, context)) &&
+    !(otherUnit && n.kind === 'function' && !exportedRoutine(n, context)));
   // A routine declared in the interface and defined in the implementation is
   // one name; of overloads, one called without arguments first.
   return decls.find((n) => !isRoutine(n)) ?? decls.find((n) => !needsArguments(n)) ?? decls[0];
+}
+
+/**
+ * Whether other units see a unit's routine: one its unit's interface section
+ * declares (`function Foo…` above `implementation`), whatever file implements
+ * it. One its implementation alone declares is the unit's own (mORMot's
+ * `IdemPChar` in `mormot.core.os.posix.inc`, which `mormot.core.os`'s
+ * implementation includes). A file without sections (a program, a script)
+ * hides nothing.
+ */
+function exportedRoutine(routine: Node, context: ResolutionContext): boolean {
+  const names = interfaceRoutineNames(unitFilesOf(routine.filePath, context)[0]!, context);
+  return names === null || names.has(routine.name.toLowerCase());
+}
+
+/**
+ * The names of the routines a unit file's interface section declares,
+ * lowercased, the include files it pulls in there too; null when it has no
+ * implementation section. Only code counts (a comment may start a line with
+ * "implementation"), and a `{$ifdef}` branch that starts the implementation
+ * starts it for that branch alone: mORMot's `mormot.lib.sspi.pas` is
+ * `{$ifdef OSPOSIX} implementation {$else} …its interface… implementation
+ * … {$endif}`. A name any branch declares there counts.
+ */
+function interfaceRoutineNames(unitFile: string, context: ResolutionContext): Set<string> | null {
+  const memo = memos(context).interfaceNames;
+  if (memo.has(unitFile)) return memo.get(unitFile)!;
+  const names = new Set<string>();
+  const sections = scanInterface(unitFile, true, names, context, 0);
+  const result = sections.implementation ? names : null;
+  memo.set(unitFile, result);
+  return result;
+}
+
+/**
+ * Adds the routine names a Pascal file declares while in an interface
+ * section to `names` (see interfaceRoutineNames), starting in one or not;
+ * whether it ends in one, and whether it starts an implementation.
+ */
+function scanInterface(filePath: string, inInterface: boolean, names: Set<string>, context: ResolutionContext, depth: number):
+    { inInterface: boolean; implementation: boolean } {
+  const text = fileLines(filePath, context).join('\n');
+  let implementation = false;
+  // Per open `{$if…}`: the section it opened in, whether a branch of it so
+  // far ended in the interface, and whether it has an `{$else}`.
+  const open: { from: boolean; anyInterface: boolean; hasElse: boolean }[] = [];
+  // After `procedure` or `function` in the interface, the next word is a
+  // routine's name, whatever comments and directives come between:
+  // mORMot's `{$ifdef OSLINUXANDROID} function {$endif} CpuThreads: cardinal;`.
+  let nameDue = false;
+  for (let i = 0; i < text.length;) {
+    const c = text.charCodeAt(i);
+    const end = triviaEnd(text, i);
+    if (end > i) {
+      if (c === CH_LBRACE && text.charCodeAt(i + 1) === CH_DOLLAR) {
+        const directive = text.slice(i, Math.min(end, i + 400));
+        const word = /^\{\$(\w+)/.exec(directive)?.[1]?.toLowerCase();
+        const top = open[open.length - 1];
+        if (word === 'if' || word === 'ifdef' || word === 'ifndef' || word === 'ifopt') {
+          open.push({ from: inInterface, anyInterface: false, hasElse: false });
+        } else if ((word === 'else' || word === 'elseif') && top) {
+          top.anyInterface ||= inInterface;
+          top.hasElse ||= word === 'else';
+          inInterface = top.from;
+        } else if ((word === 'endif' || word === 'ifend') && top) {
+          inInterface = top.anyInterface || inInterface || (!top.hasElse && top.from);
+          open.pop();
+        } else if (inInterface && depth < 3) {
+          const inc = /^\{\$(?:I|INCLUDE)\s+['"]?([^'"}\s*]+)/i.exec(directive);
+          if (inc) {
+            let name = inc[1]!.replace(/\\/g, '/');
+            name = name.slice(name.lastIndexOf('/') + 1).toLowerCase();
+            if (!name.includes('.')) name += '.inc';
+            const file = nearest(projectFiles(context).byName.get(name) ?? [], filePath);
+            if (file && file !== filePath) {
+              const after = scanInterface(file, inInterface, names, context, depth + 1);
+              inInterface = after.inInterface;
+              implementation ||= after.implementation;
+            }
+          }
+        }
+      }
+      i = end;
+      continue;
+    }
+    if (!isWordStart(c)) {
+      // Blanks and an identifier's `&` keep a name due; anything else ends it.
+      if (c !== CH_SPACE && c !== CH_TAB && c !== CH_LF && c !== CH_CR && c !== CH_AMP) nameDue = false;
+      i++;
+      continue;
+    }
+    let j = i + 1;
+    while (j < text.length && isWordPart(text.charCodeAt(j))) j++;
+    const word = text.slice(i, j).toLowerCase();
+    if (nameDue) {
+      names.add(word);
+      nameDue = false;
+    } else if (word === 'implementation') {
+      inInterface = false;
+      implementation = true;
+      // Outside any `{$if…}`, the rest is the implementation.
+      if (open.length === 0) break;
+    } else if (inInterface && (word === 'procedure' || word === 'function')) {
+      nameDue = true;
+    }
+    i = j;
+  }
+  return { inInterface, implementation };
 }
 
 /**
