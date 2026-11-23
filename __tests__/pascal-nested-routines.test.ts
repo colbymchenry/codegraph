@@ -290,7 +290,9 @@ end;`);
 
   it('takes a routine a broken parse nests, at the start of its line, for one of the unit', async () => {
     // The missing `;` after `procedure First` leaves `Second` inside it in the tree.
-    const script = `procedure First
+    const script = `uses Lib;
+
+procedure First
 begin
 end;
 

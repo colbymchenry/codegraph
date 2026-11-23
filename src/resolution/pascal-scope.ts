@@ -187,17 +187,42 @@ export function matchPascalSystemCall(ref: UnresolvedRef, context: ResolutionCon
  * or a declaration the parse put in the wrong place: it stands for the one
  * routine-holding field or variable the project declares by that name.
  *
+ * A bare call in a `with` body is first a member of the `with` statement's
+ * subject (see withSubjectMember), whatever the strategy chose: in
+ * `with TJsonWriter.CreateOwnedStream(tmp) do … SetText(result)`, the
+ * writer's `SetText`, not a list class's. A bare call that reached a routine
+ * no scope of the call declares — no `with` subject, the calling routine,
+ * its class, its unit, the units it uses — links nothing: the name is the
+ * RTL's or another library's, which the project doesn't hold (HeidiSQL's
+ * `Max(a, b)` from `System.Math` reached `SynEditMiscProcs.Max`, a unit it
+ * doesn't use; DUnit's `Check(…)` a test script's `TBase.Check`).
+ *
  * A call that landed on a routine reaches the overload its arguments fit
  * (pascalOverloadFor).
  */
 export function gatePascalCall(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const target = context.getNodeById?.(result.targetNodeId);
   if (!target) return result;
+  const bare = isBareCall(ref, context);
+  if (bare) {
+    const member = withSubjectMember(ref.referenceName.toLowerCase(), ref, context);
+    if (member) {
+      // A subject's data runs only when it holds a routine.
+      if (!isRoutine(member) && !(DATA_KINDS.has(member.kind) && isProceduralData(member, context))) return null;
+      // An overload of it the strategy chose stands: the arguments' count decides between them, not the order they are declared in.
+      if (member.id === target.id || (member.qualifiedName === target.qualifiedName && member.kind === target.kind &&
+          member.filePath === target.filePath)) return pascalOverloadFor(result, ref, context);
+      context.rememberNode?.(member);
+      return pascalOverloadFor({ ...result, targetNodeId: member.id, confidence: 0.9, resolvedBy: 'instance-method' }, ref, context);
+    }
+  }
   if (DATA_KINDS.has(target.kind)) return gatePascalDataCall(target, result, ref, context);
   if (isNestedRoutine(target, context)) {
     const nested = gatePascalNestedTarget(result, ref, context);
     return nested && pascalOverloadFor(nested, ref, context);
   }
+  if (bare && isRoutine(target) && scopeKnown(ref.filePath!, context) &&
+      !declarationInScope(ref.referenceName.toLowerCase(), classOfCall(ref, context), ref, context)) return null;
   return pascalOverloadFor(result, ref, context);
 }
 
@@ -441,14 +466,51 @@ function conditionDepthAfter(text: string, depth: number): number {
  * The class whose method makes a call: the one the nearest method header
  * above the call names in the source text (`procedure TFoo.Bar;`), which holds
  * where the tree had errors and gave the code to the file, or to a routine
- * that swallowed the ones after it; else the reference's method's class.
+ * that swallowed the ones after it; else the reference's method's class. A
+ * helper's method (`procedure TFooHelper.Bar;`) reaches the members of the
+ * type it helps by name, as its own (see helpedType).
  */
 function classOfCall(ref: UnresolvedRef, context: ResolutionContext): Node | null {
   const qn = headerClassAt(ref.filePath!, ref.line, context);
-  const cls = qn ? classByQualifiedName(qn, ref.filePath!, context) : null;
+  const cls = qn ? classByQualifiedName(qn, ref.filePath!, context) ?? helpedType(qn, ref.filePath!, context) : null;
   if (cls) return cls;
   const routine = context.getNodeById?.(ref.fromNodeId);
   return routine?.kind === 'method' ? classOfRoutine(routine, context) : null;
+}
+
+/**
+ * The class a helper the unit declares helps (`TFooHelper = class helper for
+ * TFoo`, `record helper for`), whose members the helper's methods reach by
+ * name: a helper is no class of the graph, so its methods' code is the
+ * file's. Null for any other name.
+ */
+function helpedType(qualifiedName: string, filePath: string, context: ResolutionContext): Node | null {
+  const memo = memos(context).helped;
+  const key = `${filePath}|${qualifiedName}`;
+  if (memo.has(key)) return memo.get(key)!;
+  let helped: Node | null = null;
+  const own = ownUnitFiles(filePath, context);
+  for (const alias of pascalNamed(qualifiedName.split('::').pop()!.toLowerCase(), context)) {
+    if (alias.kind !== 'type_alias' || !own.includes(alias.filePath)) continue;
+    const line = (fileLines(alias.filePath, context)[alias.startLine - 1] ?? '').replace(/\/\/.*$|\{[^}]*\}/g, ' ');
+    const type = /=\s*(?:class|record)\s+helper\s*(?:\([^)]*\)\s*)?for\s+&?([A-Za-z_][\w.]*)/i.exec(line)?.[1];
+    if (type) {
+      helped = classNamed(type, alias.filePath, context);
+      break;
+    }
+  }
+  memo.set(key, helped);
+  return helped;
+}
+
+/**
+ * Whether what a file's code sees is known: a unit's or a program's file,
+ * or an include file whose unit includes it. One no file of the project
+ * includes with `{$I}` (an Inno Setup script's, pulled in by `#include`) may
+ * see declarations its includer's other files make.
+ */
+function scopeKnown(filePath: string, context: ResolutionContext): boolean {
+  return !/\.inc$/i.test(filePath) || unitFilesOf(filePath, context)[0] !== filePath;
 }
 
 /**
@@ -470,23 +532,34 @@ function headerClassAt(filePath: string, line: number, context: ResolutionContex
       const first = text.charCodeAt(0) | 0x20;
       if (first !== 0x63 && first !== 0x64 && first !== 0x65 && first !== 0x66 && first !== 0x69 && first !== 0x6f && first !== 0x70) continue;
       if (/^(?:end;|(?:initialization|finalization)\b)/i.test(text)) {
-        headers.push({ line: i + 1, classQn: null, routine: false });
+        headers.push({ line: i + 1, classQn: null, routine: false, qn: null });
         continue;
       }
       const m = header.exec(text);
       if (!m) continue;
       const parts = m[1]!.replace(/<[^>]*>/g, '').replace(/\s+/g, '').split('.');
-      headers.push({ line: i + 1, classQn: parts.length > 1 ? parts.slice(0, -1).join('::') : null, routine: true });
+      headers.push({ line: i + 1, classQn: parts.length > 1 ? parts.slice(0, -1).join('::') : null, routine: true, qn: parts.join('::') });
     }
     memo.set(filePath, headers);
   }
+  return headerAt(headers, line)?.classQn ?? null;
+}
+
+/** The qualified name of the routine the nearest routine header at or above a line names (`TFoo::Bar`), or null as for headerClassAt. */
+function headerRoutineAt(filePath: string, line: number, context: ResolutionContext): string | null {
+  headerClassAt(filePath, line, context);
+  return headerAt(memos(context).headerClasses.get(filePath) ?? [], line)?.qn ?? null;
+}
+
+/** The last of a file's header lines (see headerClassAt) at or above a line. */
+function headerAt<T extends { line: number }>(headers: T[], line: number): T | undefined {
   let lo = 0;
   let hi = headers.length - 1;
-  let hit: string | null = null;
+  let hit: T | undefined;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     if (headers[mid]!.line <= line) {
-      hit = headers[mid]!.classQn;
+      hit = headers[mid];
       lo = mid + 1;
     } else {
       hi = mid - 1;
@@ -515,23 +588,27 @@ function nameInScope(name: string, cls: Node | null, ref: UnresolvedRef, context
  * and its `begin`, `TFoo::Bar::Inner`): the innermost one declared above the
  * call, the calling routine itself among them, or declared `forward` above
  * it (see declaredForward). It comes before anything of the class or the
- * unit. Null when none is.
+ * unit. Null when none is. Code the graph gives to the file — a helper's
+ * method, which is no node — is the routine's whose header is above it.
  */
 function nestedRoutineInScope(lower: string, ref: UnresolvedRef, context: ResolutionContext): Found | null {
   // Most names no nested routine has: settled before any other lookup.
   const named = pascalNamed(lower, context);
   if (!named.some((n) => n.kind === 'function' && n.qualifiedName.includes('::'))) return null;
+  const caller = routineNode(ref.fromNodeId, context);
+  const fromHeader = caller ? null : headerRoutineAt(ref.filePath!, ref.line, context);
   const memo = memos(context).nestedInScope;
-  const key = `${ref.fromNodeId}|${lower}`;
+  const key = `${ref.fromNodeId}|${fromHeader ?? ''}|${lower}`;
   if (memo.has(key)) return memo.get(key)!;
   let found: Found | null = null;
-  const caller = routineNode(ref.fromNodeId, context);
-  if (caller && caller.language === 'pascal') {
-    const chain = caller.qualifiedName.toLowerCase();
+  if ((caller && caller.language === 'pascal') || fromHeader) {
+    const chain = (caller?.qualifiedName ?? fromHeader!).toLowerCase();
     let best: Node | null = null;
     let depth = -1;
     for (const n of named) {
-      if (n.filePath !== caller.filePath || !isNestedRoutine(n, context)) continue;
+      // A routine whose header is above the code is no node: what is nested in it is one by its name alone.
+      const nested = caller ? isNestedRoutine(n, context) : n.kind === 'function' && n.language === 'pascal' && n.qualifiedName.includes('::');
+      if (n.filePath !== ref.filePath || !nested) continue;
       if (n.startLine > ref.line && !declaredForward(n, ref.line, context)) continue;
       const outer = ownerOf(n);
       // Nested in the caller, or in a routine the caller is nested in.
@@ -779,6 +856,654 @@ function returnsRoutineType(routine: Node, context: ResolutionContext): boolean 
 }
 
 // ---------------------------------------------------------------------------
+// `with` statements
+// ---------------------------------------------------------------------------
+
+/**
+ * A `with` statement of a file: its subjects as written (`with A, B do` has
+ * two) and the span of its body, as offsets into the file's lines joined by
+ * `\n`.
+ */
+interface WithStatement {
+  subjects: string[];
+  /** Just after its `do`. */
+  start: number;
+  /** Where its statement ends: its `;`, or the `end`, `until`, `except`, `finally` or `else` after it. */
+  end: number;
+  /** The `with` statement whose body holds this one, or -1. */
+  parent: number;
+}
+
+/**
+ * The routine member a bare call in a `with` body reaches as a member of a
+ * subject (Delphi looks a name up in the subjects first, the innermost one
+ * first, before the routine, its class or its units): in
+ * `with TJsonWriter.CreateOwnedStream(tmp) do SetText(result)`, the writer's
+ * `SetText` (see withSubjectType). The member may be data. Null when no
+ * subject's type declares the name, and when a subject nearer the call than
+ * one that does has a type the project doesn't declare whole — an RTL class
+ * (`with TRegistry.Create do OpenKeyReadOnly(…)`), a class with an ancestor
+ * outside the project, a type the subject's text doesn't say — whose members
+ * aren't known.
+ */
+function withSubjectMember(lower: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const statements = withStatementsAt(ref, context);
+  if (statements.length === 0) return null;
+  const cls = classOfCall(ref, context);
+  // The subjects in the order a name is looked up in them: `with A, B do` is `with A do with B do`.
+  const subjects: Subject[] = [];
+  for (const statement of statements) {
+    for (let k = statement.subjects.length - 1; k >= 0; k--) subjects.push({ statement, k });
+  }
+  for (let p = 0; p < subjects.length; p++) {
+    const type = withSubjectType(subjects, p, cls, ref, context);
+    if (!type) return null;
+    const member = memberInHierarchy(type, lower, context);
+    if (member) return member;
+    if (!hierarchyInProject(type, context)) return null;
+  }
+  return null;
+}
+
+/** One subject of a `with` statement: its `k`-th. */
+interface Subject {
+  statement: WithStatement;
+  k: number;
+}
+
+/** The `with` statements whose bodies hold a reference, the innermost first. */
+function withStatementsAt(ref: UnresolvedRef, context: ResolutionContext): WithStatement[] {
+  const { statements, lineStarts } = withOutlineOf(ref.filePath!, context);
+  if (statements.length === 0) return [];
+  const at = (lineStarts[ref.line - 1] ?? Infinity) + (ref.column ?? 0);
+  // The last statement whose body starts at or before the reference; the
+  // statements holding the reference are it or the ones around it.
+  let lo = 0;
+  let hi = statements.length - 1;
+  let k = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (statements[mid]!.start <= at) {
+      k = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  const holding: WithStatement[] = [];
+  for (; k >= 0; k = statements[k]!.parent) if (statements[k]!.end > at) holding.push(statements[k]!);
+  return holding;
+}
+
+/** A file's `with` statements (see scanWithStatements), and where each of its lines starts in its text. */
+function withOutlineOf(filePath: string, context: ResolutionContext): { statements: WithStatement[]; lineStarts: number[] } {
+  const memo = memos(context).withOutlines;
+  let outline = memo.get(filePath);
+  if (!outline) {
+    const lines = fileLines(filePath, context);
+    const lineStarts: number[] = [];
+    let offset = 0;
+    for (const line of lines) {
+      lineStarts.push(offset);
+      offset += line.length + 1;
+    }
+    const text = lines.join('\n');
+    let statements: WithStatement[] = [];
+    if (/\bwith\b/i.test(text)) {
+      // What a routine header at the start of a line follows is over, however
+      // the blocks before it balanced (see headerClassAt).
+      headerClassAt(filePath, 1, context);
+      const resets = (memos(context).headerClasses.get(filePath) ?? []).map((h) => lineStarts[h.line - 1] ?? text.length);
+      statements = scanWithStatements(text, resets);
+    }
+    outline = { statements, lineStarts };
+    memo.set(filePath, outline);
+  }
+  return outline;
+}
+
+const CH_TAB = 9, CH_LF = 10, CH_CR = 13, CH_SPACE = 32, CH_QUOTE = 39, CH_LPAREN = 40, CH_RPAREN = 41, CH_STAR = 42;
+const CH_COMMA = 44, CH_DOT = 46, CH_SLASH = 47, CH_SEMI = 59, CH_AMP = 38, CH_LBRACKET = 91, CH_RBRACKET = 93, CH_LBRACE = 123;
+
+function isWordStart(c: number): boolean {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
+}
+
+function isWordPart(c: number): boolean {
+  return isWordStart(c) || (c >= 48 && c <= 57);
+}
+
+/**
+ * The offset after the comment or string that starts at `i` — `{…}`
+ * (directives too), `(*…*)`, `//…`, `'…'` with `''` for a quote, ending at
+ * its line's end when unterminated — or `i` when none does.
+ */
+function triviaEnd(text: string, i: number): number {
+  const c = text.charCodeAt(i);
+  if (c === CH_LBRACE) {
+    const e = text.indexOf('}', i + 1);
+    return e < 0 ? text.length : e + 1;
+  }
+  if (c === CH_LPAREN && text.charCodeAt(i + 1) === CH_STAR) {
+    const e = text.indexOf('*)', i + 2);
+    return e < 0 ? text.length : e + 2;
+  }
+  if (c === CH_SLASH && text.charCodeAt(i + 1) === CH_SLASH) {
+    const e = text.indexOf('\n', i + 2);
+    return e < 0 ? text.length : e;
+  }
+  if (c === CH_QUOTE) {
+    let j = i + 1;
+    while (j < text.length) {
+      const d = text.charCodeAt(j);
+      if (d === CH_QUOTE) {
+        if (text.charCodeAt(j + 1) !== CH_QUOTE) return j + 1;
+        j += 2;
+      } else if (d === CH_LF) {
+        return j;
+      } else {
+        j++;
+      }
+    }
+    return j;
+  }
+  return i;
+}
+
+/**
+ * The `with` statements of a Pascal text, in the order they start. A
+ * statement's body runs from its `do` to the `;` that ends the statement, or
+ * to the `end`, `until`, `except` or `finally` of the block it is in, or to
+ * an `else` that isn't one of its own `if`s'. `begin`, `try`, `case`, `asm`
+ * and `repeat` open blocks; a block's `end` with none open (a record's, a
+ * class's) is passed over. At each offset in `resets` — the routine headers
+ * at the start of a line — every open statement and block ends.
+ */
+function scanWithStatements(text: string, resets: number[]): WithStatement[] {
+  const statements: WithStatement[] = [];
+  const blocks: string[] = [];
+  const open: Array<{ index: number; depth: number; parens: number; ifs: number }> = [];
+  let parens = 0;
+  const closeWhile = (at: number, ends: (o: { depth: number; parens: number }) => boolean): void => {
+    while (open.length > 0 && ends(open[open.length - 1]!)) statements[open.pop()!.index]!.end = at;
+  };
+  let reset = 0;
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    if (reset < resets.length && i >= resets[reset]!) {
+      closeWhile(resets[reset]!, () => true);
+      blocks.length = 0;
+      parens = 0;
+      while (reset < resets.length && resets[reset]! <= i) reset++;
+    }
+    const c = text.charCodeAt(i);
+    if (c === CH_SPACE || c === CH_TAB || c === CH_LF || c === CH_CR) {
+      i++;
+      continue;
+    }
+    const skip = triviaEnd(text, i);
+    if (skip > i) {
+      i = skip;
+      continue;
+    }
+    if (!isWordStart(c)) {
+      if (c === CH_LPAREN || c === CH_LBRACKET) {
+        parens++;
+      } else if (c === CH_RPAREN || c === CH_RBRACKET) {
+        if (parens > 0) parens--;
+        closeWhile(i, (o) => o.parens > parens);
+      } else if (c === CH_SEMI) {
+        closeWhile(i, (o) => o.depth >= blocks.length && o.parens >= parens);
+      }
+      i++;
+      continue;
+    }
+    let j = i + 1;
+    while (j < n && isWordPart(text.charCodeAt(j))) j++;
+    const top = blocks[blocks.length - 1];
+    const before = i > 0 ? text.charCodeAt(i - 1) : 0;
+    // A keyword written as a name (`&begin`, `Foo.End`) is a name, and an
+    // assembler block is over only at its `end`.
+    const word = before === CH_AMP || before === CH_DOT ? '' : text.slice(i, j).toLowerCase();
+    if (top === 'asm' && word !== 'end') {
+      i = j;
+      continue;
+    }
+    switch (word) {
+      case 'begin': case 'try': case 'case': case 'asm': case 'repeat':
+        blocks.push(word);
+        break;
+      case 'end':
+        closeWhile(i, (o) => o.depth >= blocks.length);
+        blocks.pop();
+        break;
+      case 'until':
+        if (top === 'repeat') {
+          closeWhile(i, (o) => o.depth >= blocks.length);
+          blocks.pop();
+        }
+        break;
+      case 'except': case 'finally':
+        closeWhile(i, (o) => o.depth >= blocks.length);
+        break;
+      case 'if': {
+        const o = open[open.length - 1];
+        if (o && o.depth === blocks.length && o.parens === parens) o.ifs++;
+        break;
+      }
+      case 'else':
+        // The `else` of an `if` in a statement's body, else the statement's end.
+        while (open.length > 0) {
+          const o = open[open.length - 1]!;
+          if (o.depth < blocks.length || o.parens !== parens) break;
+          if (o.ifs > 0) {
+            o.ifs--;
+            break;
+          }
+          statements[open.pop()!.index]!.end = i;
+        }
+        break;
+      case 'with': {
+        const parsed = withSubjectsAt(text, j);
+        if (!parsed) break;
+        statements.push({ subjects: parsed.subjects, start: parsed.end, end: n, parent: open.length > 0 ? open[open.length - 1]!.index : -1 });
+        open.push({ index: statements.length - 1, depth: blocks.length, parens, ifs: 0 });
+        j = parsed.end;
+        break;
+      }
+      default:
+        break;
+    }
+    i = j;
+  }
+  return statements;
+}
+
+/**
+ * A `with` statement's subjects, from just after its `with` to its `do`, and
+ * the offset after the `do`; null when no `do` closes them within a couple
+ * of thousand characters.
+ */
+function withSubjectsAt(text: string, from: number): { subjects: string[]; end: number } | null {
+  const subjects: string[] = [];
+  const clean = (s: string): string => s.replace(/\{[^}]*\}|\(\*[\s\S]*?\*\)|\/\/[^\n]*/g, ' ').replace(/\s+/g, ' ').trim();
+  let depth = 0;
+  let partStart = from;
+  const limit = Math.min(text.length, from + 2000);
+  let i = from;
+  while (i < limit) {
+    const c = text.charCodeAt(i);
+    const skip = triviaEnd(text, i);
+    if (skip > i) {
+      i = skip;
+      continue;
+    }
+    if (isWordStart(c)) {
+      let j = i + 1;
+      while (j < text.length && isWordPart(text.charCodeAt(j))) j++;
+      if (depth === 0 && j - i === 2 && text.slice(i, j).toLowerCase() === 'do' && text.charCodeAt(i - 1) !== CH_AMP) {
+        subjects.push(clean(text.slice(partStart, i)));
+        return { subjects, end: j };
+      }
+      i = j;
+      continue;
+    }
+    if (c === CH_LPAREN || c === CH_LBRACKET) {
+      depth++;
+    } else if (c === CH_RPAREN || c === CH_RBRACKET) {
+      if (--depth < 0) return null;
+    } else if (c === CH_COMMA && depth === 0) {
+      subjects.push(clean(text.slice(partStart, i)));
+      partStart = i + 1;
+    } else if (c === CH_SEMI && depth === 0) {
+      return null;
+    }
+    i++;
+  }
+  return null;
+}
+
+/** One link of a `with` subject: `Items[I]` is `Items`, indexed; `TFoo.Create(Self)` two, the second called. */
+interface SubjectLink {
+  name: string;
+  called: boolean;
+  indexed: boolean;
+}
+
+/**
+ * The class (or record or interface) the project declares that a `with`
+ * statement's subject is a value of, read as Delphi reads it: `Self`; a
+ * local or parameter of the calling routine, by its declared type; a member
+ * of the routine's class, its unit or the units it uses, by its declared
+ * type or its result's; then member by member through a chain
+ * (`Owner.Items[I]`, an indexed array or generic list giving its element). A
+ * class's constructor gives an instance of the class
+ * (`TJsonWriter.CreateOwnedStream(tmp)`), a typecast (`TFoo(Sender)`,
+ * `Sender as TFoo`) its type, a class's name the class. A subject's first
+ * name is first a member of a subject around it (`with Orm do with
+ * DynArrayFields[F] do`), as any name in a `with` body is. Null when the type
+ * is one the project doesn't declare, or the text doesn't say.
+ *
+ * `subjects` are the subjects around a reference, the innermost first; the
+ * one typed is the `p`-th, and the ones after it are around it.
+ */
+function withSubjectType(subjects: Subject[], p: number, cls: Node | null, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const { statement, k } = subjects[p]!;
+  const memo = memos(context).subjectTypes;
+  const key = `${ref.filePath}|${statement.start}|${k}`;
+  if (memo.has(key)) return memo.get(key)!;
+  // Guards a cycle while the subjects around it are typed.
+  memo.set(key, null);
+  let type: Node | null = null;
+  let text = statement.subjects[k]!;
+  while (text.startsWith('(') && closingBracket(text, 0) === text.length - 1) text = text.slice(1, -1).trim();
+  const cast = /^(?:.*\S)\s+as\s+&?([A-Za-z_][\w.]*)$/i.exec(text);
+  if (cast) {
+    type = classNamed(cast[1]!, ref.filePath!, context);
+  } else {
+    const links = subjectLinks(text);
+    // A member of a subject around this one, the innermost first.
+    const outer = (lower: string): Node | null => {
+      for (let q = p + 1; q < subjects.length; q++) {
+        const around = withSubjectType(subjects, q, cls, ref, context);
+        const member = around && memberInHierarchy(around, lower, context);
+        if (member) return member;
+      }
+      return null;
+    };
+    if (links) type = typeOfLinks(links, cls, ref, context, outer);
+  }
+  memo.set(key, type);
+  return type;
+}
+
+/** The offset of the bracket that closes the one at `open` (`(`/`[`), or -1. */
+function closingBracket(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const skip = triviaEnd(text, i);
+    if (skip > i) {
+      i = skip - 1;
+      continue;
+    }
+    const c = text.charCodeAt(i);
+    if (c === CH_LPAREN || c === CH_LBRACKET) depth++;
+    else if ((c === CH_RPAREN || c === CH_RBRACKET) && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/** The links of a `with` subject (see SubjectLink), or null for any other expression. */
+function subjectLinks(text: string): SubjectLink[] | null {
+  const links: SubjectLink[] = [];
+  let i = 0;
+  const blanks = (): void => {
+    while (i < text.length && /\s/.test(text[i]!)) i++;
+  };
+  for (;;) {
+    blanks();
+    const m = /^&?([A-Za-z_]\w*)/.exec(text.slice(i));
+    if (!m) return null;
+    const link: SubjectLink = { name: m[1]!, called: false, indexed: false };
+    i += m[0].length;
+    blanks();
+    // A generic type's arguments: `TList<TFoo>.Create`.
+    if (text[i] === '<') {
+      const close = text.indexOf('>', i);
+      if (close < 0) return null;
+      i = close + 1;
+    }
+    for (;;) {
+      blanks();
+      if (text[i] === '(' || text[i] === '[') {
+        const close = closingBracket(text, i);
+        if (close < 0) return null;
+        if (text[i] === '(') link.called = true;
+        else link.indexed = true;
+        i = close + 1;
+      } else if (text[i] === '^') {
+        // Delphi reaches a pointer's members through it: `P^.Name` is `P.Name`.
+        i++;
+      } else {
+        break;
+      }
+    }
+    links.push(link);
+    blanks();
+    if (i >= text.length) return links;
+    if (text[i] !== '.') return null;
+    i++;
+  }
+}
+
+/** What a `with` subject's links reach (see withSubjectType). */
+function typeOfLinks(
+  links: SubjectLink[], cls: Node | null, ref: UnresolvedRef, context: ResolutionContext, outer: (lower: string) => Node | null,
+): Node | null {
+  const head = links[0]!;
+  const lower = head.name.toLowerCase();
+  let rest = links.slice(1);
+  let type: Node | null = null;
+  // A class written as a value (`TFoo.Create`), whose members are its class's.
+  let classRef = false;
+  const around = lower === 'self' || lower === 'result' ? null : outer(lower);
+  if (lower === 'self') {
+    type = cls;
+  } else if (lower === 'result') {
+    // A function's result, of the type the function declares.
+    type = typeOfText(resultTypeText(ref, context) ?? '', ref.filePath!, head.indexed, context);
+  } else if (around) {
+    ({ type, classRef } = valueOfDeclaration(around, head, context));
+  } else {
+    const local = head.called ? undefined : localTypeText(lower, ref, context);
+    if (local !== undefined) {
+      type = typeOfText(local, ref.filePath!, head.indexed, context);
+    } else {
+      const decl = nestedRoutineInScope(lower, ref, context)?.node ??
+        (cls ? memberInHierarchy(cls, lower, context) : null) ?? ownUnitDeclaration(ref.filePath!, lower, context) ??
+        usedUnitFiles(ref.filePath!, context).reduceRight<Node | undefined>(
+          (hit, file) => hit ?? unitDeclaration(file, lower, context, ref.filePath!), undefined);
+      const unitFile = decl ? null : unitFileNamed(lower, ref.filePath!, context);
+      if (decl) {
+        ({ type, classRef } = valueOfDeclaration(decl, head, context));
+      } else if (unitFile && rest.length > 0) {
+        // `UnitName.Name`: what the unit declares.
+        const inUnit = unitDeclaration(unitFile, rest[0]!.name.toLowerCase(), context, ref.filePath!);
+        if (!inUnit) return null;
+        ({ type, classRef } = valueOfDeclaration(inUnit, rest[0]!, context));
+        rest = rest.slice(1);
+      } else {
+        // A class the unit's `uses` don't show, by its name alone.
+        type = /^T[A-Z]/.test(head.name) ? classNamed(head.name, ref.filePath!, context) : null;
+        classRef = !head.called;
+      }
+    }
+  }
+  for (const link of rest) {
+    if (!type) return null;
+    const name = link.name.toLowerCase();
+    const member = memberInHierarchy(type, name, context);
+    // A constructor called on a class gives an instance of it: one the class
+    // declares, or `Create`, which every class inherits.
+    if (classRef && (member ? routineKeyword(member, context) === 'constructor' : name === 'create')) {
+      classRef = false;
+      continue;
+    }
+    if (!member) return null;
+    type = valueTypeOf(member, link.indexed, context);
+    classRef = false;
+  }
+  return type;
+}
+
+/** What a subject's first link is when it names a declaration: a class (a value of it when called, a typecast), or a value of a type. */
+function valueOfDeclaration(decl: Node, link: SubjectLink, context: ResolutionContext): { type: Node | null; classRef: boolean } {
+  if (CLASS_KINDS.has(decl.kind)) return { type: decl, classRef: !link.called };
+  if (decl.kind === 'type_alias') return { type: classNamed(decl.name, decl.filePath, context), classRef: !link.called };
+  return { type: valueTypeOf(decl, link.indexed, context), classRef: false };
+}
+
+/**
+ * The class a member's value is of: a field's, a variable's or a property's
+ * declared type, a function's result; indexed, the element of an array or a
+ * generic list, or what an array property gives.
+ */
+function valueTypeOf(member: Node, indexed: boolean, context: ResolutionContext): Node | null {
+  if (isRoutine(member)) {
+    const result = member.returnType ?? /(?:^|\))\s*:\s*([^;]+?)\s*;?\s*$/.exec(member.signature ?? '')?.[1];
+    return result ? typeOfText(result, member.filePath, indexed, context) : null;
+  }
+  // An array property's declared type is its element's: `property Items[I: Integer]: TItem`.
+  const arrayProperty = indexed && member.kind === 'property' &&
+    new RegExp(`\\bproperty\\s+${escapeRegExp(member.name)}\\s*\\[`, 'i').test(fileLines(member.filePath, context)[member.startLine - 1] ?? '');
+  return typeOfText(declaredTypeText(member, context), member.filePath, indexed && !arrayProperty, context);
+}
+
+/**
+ * The class a written type names (through its aliases, see classNamed); for
+ * an indexed value, the element of an array (`array of TFoo`, an alias of
+ * one like `TFooDynArray = array of TFoo;`), of a generic collection
+ * (`TObjectList<TFoo>`, a dictionary's value) or what a class's default
+ * array property gives.
+ */
+function typeOfText(text: string, fromFile: string, indexed: boolean, context: ResolutionContext, depth = 0): Node | null {
+  // Delphi reaches a pointer's members through it (`F: ^TRec`).
+  const t = text.trim().replace(/^\^\s*/, '');
+  // The type's name, which a property's `read`/`write` may follow; a generic
+  // instance's (`TList<TFoo>`) is no class the project declares by that name.
+  const name = /^&?([A-Za-z_][\w.]*)(?![\w.]|\s*<)/.exec(t)?.[1];
+  if (!indexed) return name ? classNamed(name, fromFile, context) : null;
+  const element = /^(?:packed\s+)?array\s*(?:\[[^\]]*\]\s*)?of\s+&?([A-Za-z_][\w.]*)/i.exec(t)?.[1] ??
+    /^[A-Za-z_][\w.]*\s*<\s*(?:[^<>]*,\s*)?&?([A-Za-z_][\w.]*)\s*>/.exec(t)?.[1];
+  if (element) return classNamed(element, fromFile, context);
+  if (!name || depth > 3) return null;
+  for (const alias of typesNamed(name.split('.').pop()!.toLowerCase(), context)) {
+    if (alias.kind !== 'type_alias') continue;
+    const type = typeOfText(aliasedTypeText(alias, context), alias.filePath, true, context, depth + 1);
+    if (type) return type;
+  }
+  const cls = classNamed(name, fromFile, context);
+  return cls ? defaultPropertyType(cls, context) : null;
+}
+
+/** What a class's default array property gives (`property Items[I: Integer]: TFoo …; default;`), or null. */
+function defaultPropertyType(cls: Node, context: ResolutionContext): Node | null {
+  const memo = memos(context).defaultProperties;
+  if (memo.has(cls.id)) return memo.get(cls.id)!;
+  memo.set(cls.id, null);
+  let type: Node | null = null;
+  for (const c of ancestorsOf(cls, context)) {
+    const owner = c.qualifiedName.toLowerCase();
+    const property = context.getNodesInFile(c.filePath).find((n) => {
+      if (n.kind !== 'property' || ownerOf(n) !== owner) return false;
+      const lines = fileLines(n.filePath, context);
+      const text = `${lines[n.startLine - 1] ?? ''} ${lines[n.startLine] ?? ''}`.replace(/\/\/.*$|\{[^}]*\}/gm, ' ');
+      return /\bproperty\s+\w+\s*\[[^\]]*\][^;]*;\s*default\s*;/i.test(text);
+    });
+    if (property) {
+      type = valueTypeOf(property, false, context);
+      break;
+    }
+  }
+  memo.set(cls.id, type);
+  return type;
+}
+
+/**
+ * The result type, as written, of the function making a call: the routine
+ * the reference comes from, or, for code the graph gives to the file (a
+ * helper's method), the one whose header is above it.
+ */
+function resultTypeText(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  const routine = routineNode(ref.fromNodeId, context);
+  const signature = routine ? routine.signature ?? '' : (() => {
+    const lines = fileLines(ref.filePath!, context);
+    const from = routineHeaderAt(ref.filePath!, ref.line, context);
+    // A header's parameters may go on over a few lines.
+    let text = '';
+    for (let i = from; i <= ref.line && i < from + 6 && i <= lines.length; i++) {
+      text += ' ' + lines[i - 1]!.replace(/\/\/.*$|\{[^}]*\}/g, ' ');
+      if (/;\s*$/.test(text) && text.split('(').length <= text.split(')').length) break;
+    }
+    return text.replace(/^\s*(?:class\s+)?function\s+[\w.<>, ]*?(?=[(:])/i, '');
+  })();
+  return routine?.returnType ?? /(?:^|\))\s*:\s*([^;]+?)\s*;?\s*$/.exec(signature.trim())?.[1];
+}
+
+/**
+ * The declared type, as written, of a parameter or a local the calling
+ * routine declares above a reference, the nearest one (`Writer: TWriter;`,
+ * `A, Writer: TWriter`, `var Writer := TWriter.Create;`); not one a routine
+ * nested in it declares for itself. Undefined when it declares none.
+ */
+function localTypeText(lower: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  const lines = fileLines(ref.filePath!, context);
+  const from = routineHeaderAt(ref.filePath!, ref.line, context);
+  const name = escapeRegExp(lower);
+  const mentions = new RegExp(`\\b${name}\\b`, 'i');
+  const declares = new RegExp(`(?:^|[^.\\w])${name}(?:\\s*,\\s*&?[A-Za-z_]\\w*)*\\s*:(?!=)\\s*([^;=)]*)`, 'i');
+  const created = new RegExp(`\\bvar\\s+${name}\\s*:=\\s*&?([A-Za-z_][\\w.]*)\\s*\\.\\s*create\\b`, 'i');
+  const elsewhere = nestedRoutineSpans(ref.filePath!, context).filter(([start, end]) => ref.line < start || ref.line > end);
+  let found: string | undefined;
+  for (let i = Math.max(1, from); i <= ref.line && i <= lines.length; i++) {
+    const raw = lines[i - 1]!;
+    if (!mentions.test(raw) || elsewhere.some(([start, end]) => i >= start && i <= end)) continue;
+    const text = raw.replace(/\/\/.*$|\{[^}]*\}|\(\*.*?\*\)|'(?:[^']|'')*'/g, ' ');
+    const m = declares.exec(text) ?? created.exec(text);
+    if (m && m[1]!.trim()) found = m[1]!.trim();
+  }
+  return found;
+}
+
+/** The lines (first, last) of the routines a file nests in others. */
+function nestedRoutineSpans(filePath: string, context: ResolutionContext): Array<[number, number]> {
+  const memo = memos(context).nestedSpans;
+  let spans = memo.get(filePath);
+  if (!spans) {
+    spans = context.getNodesInFile(filePath)
+      .filter((n) => isNestedRoutine(n, context))
+      .map((n): [number, number] => [n.startLine, n.endLine ?? n.startLine]);
+    memo.set(filePath, spans);
+  }
+  return spans;
+}
+
+/** Roots every class or interface has, whose members a call by name doesn't reach in the project. */
+const IMPLICIT_ROOTS: ReadonlySet<string> = new Set(['tobject', 'tinterfacedobject', 'iinterface', 'iunknown', 'idispatch']);
+
+/**
+ * Whether the project declares a class's whole hierarchy, so a name its
+ * classes don't declare isn't its member (save TObject's): no ancestor is
+ * outside the project, and it is no helper, whose members include its
+ * helped type's, nor an old-style object or an interface with an ancestor
+ * of its own, whose ancestors aren't read.
+ */
+function hierarchyInProject(cls: Node, context: ResolutionContext): boolean {
+  const memo = memos(context).wholeHierarchies;
+  const hit = memo.get(cls.id);
+  if (hit !== undefined) return hit;
+  let whole = true;
+  for (const c of ancestorsOf(cls, context)) {
+    const head = fileLines(c.filePath, context).slice(c.startLine - 1, c.startLine + 1).join(' ').replace(/\{[^}]*\}|\/\/.*$/gm, ' ');
+    const parentInterface = /=\s*(?:disp)?interface\s*\(\s*&?([A-Za-z_][\w.]*)/i.exec(head)?.[1]?.split('.').pop()!.toLowerCase();
+    if (/=\s*(?:packed\s+)?(?:class|record)\s+helper\b|=\s*(?:packed\s+)?object\s*\(/i.test(head) ||
+        (parentInterface !== undefined && !IMPLICIT_ROOTS.has(parentInterface))) {
+      whole = false;
+      break;
+    }
+    // A class's first supertype is its ancestor; the others are interfaces it implements.
+    const base = declaredSupertypes(c, context)[0];
+    if (base && !/^I[A-Z]/.test(base) && !IMPLICIT_ROOTS.has(base.toLowerCase()) && !classNamed(base, c.filePath, context)) {
+      whole = false;
+      break;
+    }
+  }
+  memo.set(cls.id, whole);
+  return whole;
+}
+
+// ---------------------------------------------------------------------------
 // Classes, units and declarations
 // ---------------------------------------------------------------------------
 
@@ -803,12 +1528,19 @@ interface Memos {
   memberTypes: Map<string, Node | null>;
   keywords: Map<string, string | null>;
   procedural: Map<string, boolean>;
-  headerClasses: Map<string, Array<{ line: number; classQn: string | null; routine: boolean }>>;
+  headerClasses: Map<string, Array<{ line: number; classQn: string | null; routine: boolean; qn: string | null }>>;
   outlines: Map<string, { classes: Node[]; imports: Node[]; routineColumn: number }>;
   conditionDepths: Map<string, number[]>;
   nestedInScope: Map<string, Found | null>;
   routineNodes: Map<string, Node | null>;
   routineQns: Map<string, boolean>;
+  withOutlines: Map<string, { statements: WithStatement[]; lineStarts: number[] }>;
+  subjectTypes: Map<string, Node | null>;
+  nestedSpans: Map<string, Array<[number, number]>>;
+  wholeHierarchies: Map<string, boolean>;
+  helped: Map<string, Node | null>;
+  defaultProperties: Map<string, Node | null>;
+  usesIncludes: Map<string, string[]>;
 }
 const MEMOS = new WeakMap<ResolutionContext, Memos>();
 
@@ -820,7 +1552,9 @@ function memos(context: ResolutionContext): Memos {
       ancestors: new Map(), usedFiles: new Map(), classByName: new Map(), unitFiles: new Map(), hierarchy: new Map(),
       memberTypes: new Map(), keywords: new Map(), procedural: new Map(), headerClasses: new Map(), outlines: new Map(),
       conditionDepths: new Map(), unitFileSets: new Map(), includes: new Map(), includers: new Map(), ownFiles: new Map(),
-      nestedInScope: new Map(), routineNodes: new Map(), routineQns: new Map(),
+      nestedInScope: new Map(), routineNodes: new Map(), routineQns: new Map(), withOutlines: new Map(),
+      subjectTypes: new Map(), nestedSpans: new Map(), wholeHierarchies: new Map(), helped: new Map(),
+      defaultProperties: new Map(), usesIncludes: new Map(),
     };
     MEMOS.set(context, m);
   }
@@ -1009,14 +1743,45 @@ function usedUnitFiles(fromFile: string, context: ResolutionContext): string[] {
   // `.inc` files open the unit's implementation with one.
   const unit = unitFilesOf(fromFile, context);
   const files: string[] = [];
+  const add = (name: string, own: string): void => {
+    const file = unitFileNamed(name.toLowerCase(), own, context);
+    if (file && !unit.includes(file) && !files.includes(file)) files.push(file);
+  };
   for (const own of unit) {
-    for (const imp of outlineOf(own, context).imports) {
-      const file = unitFileNamed(imp.name.toLowerCase(), own, context);
-      if (file && !unit.includes(file) && !files.includes(file)) files.push(file);
-    }
+    // What an include file in a clause lists comes first: `uses {$I mormot.uses.inc} mormot.core.base, …`.
+    for (const name of unitsIncludedInUses(own, context)) add(name, own);
+    for (const imp of outlineOf(own, context).imports) add(imp.name, own);
   }
   memo.set(fromFile, files);
   return files;
+}
+
+/**
+ * The units an include file in one of a file's `uses` clauses lists
+ * (`uses {$I mormot.uses.inc} …`), which the parse doesn't see: every
+ * name its text lists, whatever conditions it is under.
+ */
+function unitsIncludedInUses(filePath: string, context: ResolutionContext): string[] {
+  const memo = memos(context).usesIncludes;
+  let names = memo.get(filePath);
+  if (names) return names;
+  names = [];
+  const text = fileLines(filePath, context).join('\n');
+  if (/\{\$I(?:NCLUDE)?\s/i.test(text)) {
+    for (const clause of text.matchAll(/\buses\b([^;]*);/gi)) {
+      for (const directive of clause[1]!.matchAll(/\{\$I(?:NCLUDE)?\s+['"]?([^'"}\s*]+)/gi)) {
+        let name = directive[1]!.replace(/\\/g, '/');
+        name = name.slice(name.lastIndexOf('/') + 1).toLowerCase();
+        if (!name.includes('.')) name += '.inc';
+        const inc = nearest(projectFiles(context).byName.get(name) ?? [], filePath);
+        if (!inc) continue;
+        const listed = fileLines(inc, context).join('\n').replace(/\{[^}]*\}|\(\*[\s\S]*?\*\)|\/\/[^\n]*/g, ' ');
+        for (const part of listed.split(',')) if (/^[A-Za-z_][\w.]*$/.test(part.trim())) names.push(part.trim());
+      }
+    }
+  }
+  memo.set(filePath, names);
+  return names;
 }
 
 /** The unit's own declaration of a name, seen from one of its files (see ownUnitFiles). */
