@@ -24,6 +24,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Go, a variable given a chain that starts with `new(T)`, `make(T)` or a struct literal, like `sub := new(Route).Host("x").Subrouter()`, now has the type the chain returns, so a method called on it links to that type's method, not to a same-named method of the type the chain starts from. Thanks @inth3shadows for the report and the analysis, and @maxmilian. (#3447)
 - In Go, a variable given a method chain broken across lines after its `.`s, the way gofmt leaves a long chain, now has the type the chain returns, so a method called on it links again. Thanks @maxmilian for the report and @zhangkom for the fix. (#3455)
 - Pascal methods and functions now show their implementation bodies in `node` and `explore` instead of their interface or forward declarations, while keeping their declaration metadata and call relationships; re-index Pascal projects after upgrading. Thanks @Vizit0r for the report and @yang0228 for the fix. (#3453)
+- In Pascal, a call to an overloaded method or function now links to the overload whose parameters fit its arguments. (#3453)
 
 ## [1.6.4] - 2026-11-20
 
