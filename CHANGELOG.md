@@ -34,6 +34,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Kotlin, a class's superclass or interface now links to the type its file can see through its own package or its imports, instead of a same-named type somewhere else in the project, such as Exposed's JDBC test entities linking to the R2DBC `IntEntity`. (#3474)
 - In Pascal, class and record helpers like `TFooHelper = class helper for TFoo` are now indexed as types with their methods, so `node` and `explore` show those methods and the calls they make; re-index Pascal projects after upgrading. (#3475)
 - In Pascal, a call on a value whose type has a helper in scope, like `R.Count` or `with R do Count`, now links to the helper's method, which hides a same-named method of the type, as in Delphi. (#3475)
+- In Pascal, a call to a routine its scope declares, like `Check(…)` in a test case or `Render(…)` in a controller, now links to that routine instead of a same-named method of an unrelated class. (#3476)
+- In Pascal, a call to a routine with overloads in several units, like mORMot's `FormatUtf8`, now links to the overload its arguments fit, and a call from another unit no longer links to a routine that a unit declares only in its implementation section. (#3476)
 
 ## [1.6.4] - 2026-11-20
 
