@@ -3905,14 +3905,21 @@ function goBlockAt(index: GoScopeIndex, offset: number): [number, number] | null
   return open < 0 ? null : [open, index.close.get(open) ?? index.code.length];
 }
 
-/** Where the statement declaring at `at` ends: its line's end, or a `;`, outside brackets. */
+/** A trailing selector dot does not trigger Go's implicit semicolon. */
+function goContinuesAfterDot(code: string, start: number, newline: number): boolean {
+  let i = newline - 1;
+  while (i >= start && /[ \t\r\n]/.test(code[i]!)) i--;
+  return i >= start && code[i] === '.';
+}
+
+/** Where the declaration ends: a newline or semicolon outside brackets, accounting for line continuations. */
 function goStatementEnd(code: string, at: number): number {
   let depth = 0;
   for (let i = at; i < code.length; i++) {
     const c = code[i];
     if (c === '(' || c === '[' || c === '{') depth++;
     else if (c === ')' || c === ']' || c === '}') { if (--depth < 0) return i; }
-    else if ((c === '\n' || c === ';') && depth === 0) return i;
+    else if (depth === 0 && (c === ';' || (c === '\n' && !goContinuesAfterDot(code, at, i)))) return i;
   }
   return code.length;
 }
@@ -31502,7 +31509,7 @@ function goHeaderValueEnd(code: string, at: number): number {
     const c = code[i];
     if (c === '(' || c === '[') depth++;
     else if (c === ')' || c === ']') { if (--depth < 0) return i; }
-    else if (depth === 0 && (c === ';' || c === '{' || c === '\n')) return i;
+    else if (depth === 0 && (c === ';' || c === '{' || (c === '\n' && !goContinuesAfterDot(code, at, i)))) return i;
   }
   return code.length;
 }
