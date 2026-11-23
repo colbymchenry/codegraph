@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- On projects with fewer than 500 files, every tool named in `CODEGRAPH_MCP_TOOLS` is now listed to the agent, instead of only the small-repo defaults (#3462).
 
 ## [1.6.4] - 2026-11-20
 
