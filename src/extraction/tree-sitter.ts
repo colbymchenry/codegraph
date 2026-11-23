@@ -9264,6 +9264,11 @@ export class TreeSitterExtractor {
     const declClass = node.namedChildren.find(
       (c: SyntaxNode) => c.type === 'declClass'
     );
+    // A class or record helper (`TFooHelper = class helper for TFoo`) is a
+    // type of its own, whose methods are written like a class's.
+    const declHelper = node.namedChildren.find(
+      (c: SyntaxNode) => c.type === 'declHelper'
+    );
     const declIntf = node.namedChildren.find(
       (c: SyntaxNode) => c.type === 'declIntf'
     );
@@ -9271,16 +9276,19 @@ export class TreeSitterExtractor {
       (c: SyntaxNode) => c.type === 'type'
     );
 
-    if (declClass) {
-      const classNode = this.createNode('class', name, node);
+    if (declClass || declHelper) {
+      const body = (declClass ?? declHelper)!;
+      const classNode = this.createNode('class', name, node,
+        declHelper ? { signature: this.pascalHelperSignature(declHelper) } : undefined);
       startAtName(classNode);
       if (classNode) {
         // Extract inheritance from typeref children of declClass
-        this.extractPascalInheritance(declClass, classNode.id);
+        if (declClass) this.extractPascalInheritance(declClass, classNode.id);
+        else this.extractPascalHelperTypes(declHelper!, classNode.id);
         // Visit class body
         this.nodeStack.push(classNode.id);
-        for (let i = 0; i < declClass.namedChildCount; i++) {
-          const child = declClass.namedChild(i);
+        for (let i = 0; i < body.namedChildCount; i++) {
+          const child = body.namedChild(i);
           if (child) this.visitNode(child);
         }
         this.nodeStack.pop();
@@ -9391,6 +9399,43 @@ export class TreeSitterExtractor {
     }
   }
 
+  /**
+   * The types a helper names: the helper it descends from
+   * (`class helper(TBaseHelper) for TFoo`), which it extends, and the type it
+   * helps, after `for`, which it references (a helper is no subclass of it).
+   */
+  private extractPascalHelperTypes(declHelper: SyntaxNode, classId: string): void {
+    let afterFor = false;
+    for (const child of declHelper.children) {
+      if (child.type === 'kFor') {
+        afterFor = true;
+      } else if (child.type === 'typeref') {
+        this.unresolvedReferences.push({
+          fromNodeId: classId,
+          referenceName: getNodeText(child, this.source),
+          referenceKind: afterFor ? 'references' : 'extends',
+          line: child.startPosition.row + 1,
+          column: child.startPosition.column,
+        });
+        if (afterFor) return;
+      }
+    }
+  }
+
+  /** A helper's head as written, spaces collapsed: `class helper for TFoo`, `record helper(TBase) for TFoo`. */
+  private pascalHelperSignature(declHelper: SyntaxNode): string {
+    let end = declHelper.startIndex;
+    let afterFor = false;
+    for (const child of declHelper.children) {
+      if (child.type === 'kFor') afterFor = true;
+      else if (afterFor && child.type === 'typeref') {
+        end = child.endIndex;
+        break;
+      }
+    }
+    return this.source.substring(declHelper.startIndex, end).replace(/\s+/g, ' ').trim();
+  }
+
   /** Parameter types and modifiers identify overloads; names, grouping and defaults do not. */
   private pascalRoutineParams(header: SyntaxNode): string[] {
     return (getChildByField(header, 'args')?.namedChildren ?? [])
@@ -9445,7 +9490,7 @@ export class TreeSitterExtractor {
    */
   private pascalSwallowedTypeName(declType: SyntaxNode): SyntaxNode | null {
     const parts = declType.namedChildren;
-    const at = parts.findIndex((c) => c.type === 'declClass' || c.type === 'declIntf');
+    const at = parts.findIndex((c) => c.type === 'declClass' || c.type === 'declHelper' || c.type === 'declIntf');
     const error = at > 0 ? parts[at - 1]! : null;
     if (error?.type !== 'ERROR') return null;
     const eq = error.namedChildren[error.namedChildCount - 1];

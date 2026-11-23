@@ -33,7 +33,7 @@ import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformance
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
 import {
-  clearPascalScopeMemos, gatePascalCall, isPascalParenlessRef, isPascalSystemCall, matchPascalNestedCall,
+  clearPascalScopeMemos, gatePascalCall, isPascalParenlessRef, isPascalSystemCall, matchPascalHelperCall, matchPascalNestedCall,
   matchPascalParenlessRef, matchPascalSystemCall,
 } from './pascal-scope';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
@@ -1841,6 +1841,10 @@ export class ReferenceResolver {
     // and one made in a nested routine is what its scope declares first.
     const nested = matchPascalNestedCall(ref, this.context);
     if (nested) return nested;
+    // A Pascal call through a receiver to a method a helper in scope adds to
+    // the receiver's type (`R.Total(3)` through `class helper for TRecord`).
+    const viaHelper = matchPascalHelperCall(ref, this.context);
+    if (viaHelper) return viaHelper;
     // A Dart member read (`x.area`) links the getter the receiver's type
     // reaches, as a call, or nothing — never a guess by name (#2338).
     if (isDartMemberRead(ref)) return matchDartMemberRead(ref, this.context);
