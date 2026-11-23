@@ -48,13 +48,16 @@ const MIN_PARALLEL_BATCH = 1000;
 const CHUNK_SIZE = 500;
 
 /**
- * Minimum TOTAL pending refs before the pool is created at all. Pool boot
- * (module load + readonly DB open + framework detect + cache warm, times N
- * workers) costs real CPU that CONTENDS with sequential resolution on the
- * same cores — measured on a medium repo (~40k refs, ~1.2s of resolution)
- * the pool made indexing slower. It pays off when resolution runs for tens
- * of seconds to minutes (large JVM/Spring-class repos). Override:
- * CODEGRAPH_PARALLEL_RESOLVE_MIN=<refs> (0 forces the pool on).
+ * Minimum TOTAL pending refs for the pool to start up front, before the first
+ * batch, with the batch loop waiting for it. Pool boot (module load + readonly
+ * DB open + framework detect + cache warm, times N workers) costs real CPU that
+ * CONTENDS with sequential resolution on the same cores — measured on a medium
+ * repo (~40k refs, ~1.2s of resolution) the pool made indexing slower. It pays
+ * off when resolution runs for tens of seconds to minutes (large
+ * JVM/Spring-class repos). Below it a full index near the gate starts the pool
+ * without waiting (nearGatePoolMin), and smaller runs leave it to the batch
+ * loop's adaptive check. Override: CODEGRAPH_PARALLEL_RESOLVE_MIN=<refs> (0
+ * forces the pool on).
  */
 export function minRefsForPool(): number {
   const raw = process.env.CODEGRAPH_PARALLEL_RESOLVE_MIN;
@@ -63,6 +66,32 @@ export function minRefsForPool(): number {
     if (Number.isFinite(parsed) && parsed >= 0) return parsed;
   }
   return 150_000;
+}
+
+/**
+ * Fewest refs for a full index to start the pool before its first batch
+ * without waiting for it: two thirds of the up-front gate, which an override of
+ * the gate moves too. A run this size clears the adaptive bar at the cheapest
+ * per-ref rate measured (Go's 4 µs: 100,000 refs project 400 ms), so the batch
+ * loop would start the pool after its first batch anyway, ready only for the
+ * third. Started now, it boots while the first batch resolves on this thread.
+ */
+export function nearGatePoolMin(): number {
+  return Math.round((minRefsForPool() * 2) / 3);
+}
+
+/**
+ * Whether the batch loop starts the pool before its first batch, from the refs
+ * it has to settle: 'up-front' at the gate, where it waits for the pool;
+ * 'near-gate' in a full index from nearGatePoolMin, where it goes on while the
+ * pool boots; null below, where the adaptive check decides mid-run. A sync never
+ * starts it near the gate: its workers detect the project's frameworks for
+ * themselves, which can read every source file.
+ */
+export function poolStartBeforeFirstBatch(total: number, fullIndex: boolean): 'up-front' | 'near-gate' | null {
+  if (total >= minRefsForPool()) return 'up-front';
+  if (fullIndex && total >= nearGatePoolMin()) return 'near-gate';
+  return null;
 }
 
 /**
@@ -193,9 +222,16 @@ export class ResolverPool {
    * source in tests → callers use the sequential path), the kill switch is
    * off, and the machine has the cores AND memory to carry it. Returns null
    * otherwise. `CODEGRAPH_RESOLVE_WORKERS` overrides the computed size
-   * (0 disables the pool; values are capped at 16).
+   * (0 disables the pool; values are capped at 16). `beforeStart` runs once the
+   * pool is going to start, before any worker opens the database.
    */
-  static tryCreate(dbPath: string, projectRoot: string, frameworks?: readonly string[], worth?: number): ResolverPool | null {
+  static tryCreate(
+    dbPath: string,
+    projectRoot: string,
+    frameworks?: readonly string[],
+    worth?: number,
+    beforeStart?: () => void
+  ): ResolverPool | null {
     if (process.env.CODEGRAPH_NO_PARALLEL_RESOLVE === '1') return null;
     const workerScript = path.join(__dirname, 'resolver-worker.js');
     if (!fs.existsSync(workerScript)) return null;
@@ -220,6 +256,7 @@ export class ResolverPool {
       );
     }
     if (size === null) return null;
+    beforeStart?.();
     try {
       return new ResolverPool(workerScript, dbPath, projectRoot, size, frameworks);
     } catch {

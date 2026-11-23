@@ -349,3 +349,60 @@ class ObjectExpressions {
 }
 
 class DottedSuper : Outer.Inner(), com.example.Api.Listener
+
+// A header's code is the class's own, body or no body: constructor-parameter
+// defaults (a call, a lambda, a qualified call), the superclass constructor's
+// arguments (a call, a function reference), a `by` delegate (a call, a
+// property read, an object expression); an enum's defaults; a companion's
+// header (walked for the class around it).
+class HeaderCode(
+    val a: WidgetK = WidgetK(1),
+    b: Int = 2,
+    val cb: () -> Unit = { helper() },
+    val d: Repo = Repo.create(),
+) : OpenBase(compute(3), ::topLevel), Drawable by makeDrawable(seed()) {
+    fun own() {
+        helper()
+    }
+}
+
+object HeaderObject : OpenBase(objArg()), Drawable by Defaults.INSTANCE {
+    fun own() {
+        helper()
+    }
+}
+
+class AnonDelegate : Runnable by object : Runnable {
+    override fun run() {
+        helper()
+    }
+} {
+    fun own() {
+    }
+}
+
+enum class EnumHeader(val v: Int = enumDefault()) {
+    A, B;
+    fun own() {
+    }
+}
+
+class CompanionHeader {
+    companion object : Factory by factoryOf(companionArg()) {
+        fun c() {
+        }
+    }
+}
+
+class BodilessHeader(val b: Int = initB()) : OpenBase(readCfg2()), Drawable by makeDrawable(seed())
+
+// `I by x` names a supertype like `I` does: plain, qualified, generic; a
+// function type names no class.
+class ByQualified(x: api.IFoo) : api.IFoo by x {
+    fun own() {
+    }
+}
+
+class ByGeneric<E>(c: Channel<E>) : Channel<E> by c
+
+class ByFunction(f: (Int) -> Unit) : (Int) -> Unit by f

@@ -60,7 +60,6 @@ import { loadDeprioritizePatterns } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
-import { minRefsForPool } from './resolution/resolver-pool';
 
 // Re-export types for consumers
 export * from './types';
@@ -781,11 +780,15 @@ export class CodeGraph {
 
           // Fast-init leaves the DB in memory-journal (rollback) mode, where
           // the parallel resolver pool's read connections would contend with
-          // the main writer's exclusive commits. When the pool will actually
-          // run (enough pending refs), restore WAL BEFORE resolution so
-          // readers never block the writer; otherwise stay in the fast mode
-          // until the finally — sequential resolution has no readers.
-          if (fastInit && unresolvedCount >= minRefsForPool()) {
+          // the main writer's exclusive commits. The resolver calls this right
+          // before it starts the pool, whether before its first batch or
+          // mid-run, so WAL is back before any worker reads and readers never
+          // block the writer; a run that never starts one stays in the fast
+          // mode until the finally — sequential resolution has no readers.
+          let walForPool = false;
+          const beforePool = fastInit ? (): void => {
+            if (walForPool) return;
+            walForPool = true;
             try {
               this.db.getDb().pragma('synchronous = NORMAL');
               this.db.getDb().pragma('journal_mode = WAL');
@@ -807,8 +810,8 @@ export class CodeGraph {
                 options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
               );
               walValve.start();
-            } catch { /* keep current mode; resolution still works sequentially */ }
-          }
+            } catch { /* keep current mode; the workers' reads just contend with the commits */ }
+          } : undefined;
 
           options.onProgress?.({
             phase: 'resolving',
@@ -832,9 +835,11 @@ export class CodeGraph {
                 total: totalPasses,
               });
             },
-            walValve ? () => walValve!.backpressure() : undefined,
+            // Looked up on each call: on a fresh index the valve only comes up with the pool.
+            walValve || beforePool ? () => walValve?.backpressure() ?? null : undefined,
             true,
-            true
+            true,
+            beforePool
           );
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolution: ${Date.now() - tResolve}ms`);
           this.lastSynthesisAt = Date.now();
@@ -2342,11 +2347,14 @@ export class CodeGraph {
     synthesize: boolean = true,
     // The caller has just re-detected the frameworks on this index, so the
     // resolver pool's workers needn't each read the project again to do it.
-    frameworksCurrent: boolean = false
+    frameworksCurrent: boolean = false,
+    // Run right before the resolver pool starts (see resolveAndPersistBatched).
+    beforePool?: () => void
   ): Promise<ResolutionResult> {
     return this.resolver.resolveAndPersistBatched(onProgress, undefined, onSynthesisProgress, {
       dbPath: this.db.getPath(),
       shareFrameworks: frameworksCurrent,
+      beforePool,
       // Bulk-edge-load hooks: on big runs the resolver drops the non-unique
       // edge indexes for the batch loop and recreates them before synthesis
       // (which reads kind-keyed). Concurrent readers (a daemon serving this

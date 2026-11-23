@@ -15,7 +15,24 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### New Features
 
 - CodeGraph now indexes **Zig** (`.zig`) — functions, structs, enums, unions, opaque types, error sets, constants, `test` blocks, relative `@import` and `build.zig` named-module resolution, and call/reference edges.
+- `codegraph_callers` and `codegraph_callees` take an `offset`, so an agent can page through a list longer than `limit`, and a cut list names the offset of the next page. Thanks @blairjordan. (#3449)
+- `codegraph init` is faster on large projects: the background workers that link references start sooner, and they and the indexer's own writes no longer hold each other up. (#3472)
 
+### Fixes
+
+- On Windows, the `codegraph` command in Git Bash now works in a terminal that turns off path conversion with `MSYS_NO_PATHCONV=1` or `MSYS2_ARG_CONV_EXCL=*`, as some agent harnesses do, instead of failing with "Cannot find module". Thanks @BlueberryDuck for the report. (#3464)
+- On projects with fewer than 500 files, every tool named in `CODEGRAPH_MCP_TOOLS` is now listed to the agent, instead of only the small-repo defaults. Thanks @nchrisr for the report and the fix. (#3462)
+- `codegraph callers` and `codegraph_callers` list callers outside tests before tests, so a symbol called mostly from tests no longer shows only tests under the default limit while its real callers are cut. Thanks @blairjordan for the report and the fix. (#3456)
+- In Go, a variable given a chain that starts with `new(T)`, `make(T)` or a struct literal, like `sub := new(Route).Host("x").Subrouter()`, now has the type the chain returns, so a method called on it links to that type's method, not to a same-named method of the type the chain starts from. Thanks @inth3shadows for the report and the analysis, and @maxmilian. (#3447)
+- In Go, a variable given a method chain broken across lines after its `.`s, the way gofmt leaves a long chain, now has the type the chain returns, so a method called on it links again. Thanks @maxmilian for the report and @zhangkom for the fix. (#3455)
+- Pascal methods and functions now show their implementation bodies in `node` and `explore` instead of their interface or forward declarations, while keeping their declaration metadata and call relationships; re-index Pascal projects after upgrading. Thanks @Vizit0r for the report and @yang0228 for the fix. (#3453)
+- In Pascal, a call to an overloaded method or function now links to the overload whose parameters fit its arguments. (#3453)
+- In Pascal, a class declared right after a subrange or set type, like `TPercent = 0 .. 100;`, now gets its own name instead of that type's. (#3453)
+- In Kotlin, calls written in a class's header, such as a constructor parameter's default value, a superclass constructor's arguments, or a delegate like `SecureActivityDelegate by SecureActivityDelegateImpl()`, now link from the class when the class also has a body. (#3410)
+- In Pascal, a call to a routine that nothing in its scope declares, like `Max(A, B)` from `System.Math` or DUnit's `Check(…)`, no longer links to a project routine that only shares its name. (#3471)
+- In Pascal, a call inside a `with` block, like `Add(S)` in `with Writer do`, now links to the method of the `with` object's class, before a same-named method of the calling class or of an unrelated class. (#3471)
+- In Kotlin, a class that implements an interface by delegation, like `class CachedRepo(inner: Repo) : Repo by inner`, is now listed as an implementation of that interface, so a call through the interface also reaches the methods the class overrides. (#3474)
+- In Kotlin, a class's superclass or interface now links to the type its file can see through its own package or its imports, instead of a same-named type somewhere else in the project, such as Exposed's JDBC test entities linking to the R2DBC `IntEntity`. (#3474)
 
 ## [1.6.4] - 2026-11-20
 

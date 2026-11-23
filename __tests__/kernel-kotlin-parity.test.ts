@@ -10,7 +10,9 @@
  * extension-function receiver QNs
  * (`WidgetK::extend`, the qualified `com::qext` bug) + the owner-contains
  * fallback, expect/actual → node DECORATORS (the KMP synthesizer feed),
- * the bodiless-vs-bodied class header asymmetry, comment-glued
+ * a class header's code (constructor defaults, superclass constructor
+ * arguments, a `by` delegate) walked as the class's with or without a body
+ * (kotlin-class-header-code.test.ts), comment-glued
  * import/package extents, KDoc dropped-and-chain-breaking docstrings,
  * `@Marker` decorates vs `@Anno(args)` nothing, zero type-annotation refs,
  * zero instantiates, the #750 capitalized-chain re-encode, paren-then-
