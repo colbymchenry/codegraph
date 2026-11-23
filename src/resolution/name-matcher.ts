@@ -24966,6 +24966,8 @@ function enclosingScopeStartLine(ref: UnresolvedRef, context: ResolutionContext)
   for (const n of context.getNodesInFile(ref.filePath)) {
     if (n.kind !== 'function' && n.kind !== 'method') continue;
     if (n.language !== ref.language) continue;
+    // Pascal fields precede separately implemented methods; only nested routines bound this scan.
+    if (n.language === 'pascal' && (n.kind !== 'function' || !n.qualifiedName.includes('::'))) continue;
     const end = n.endLine ?? n.startLine;
     if (n.startLine <= ref.line && end >= ref.line && n.startLine >= start) {
       start = n.startLine;

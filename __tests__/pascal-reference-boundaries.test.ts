@@ -330,6 +330,21 @@ end.` });
     expect(dependencies('TConsumer::UseLocal')).toEqual([expected]);
   });
 
+  it.each(['Receiver.Run;', 'Receiver.Run();'])('keeps inherited field receiver calls after relocating method ranges: %s', async (call) => {
+    await index({ 'Main.pas': `unit Main;
+interface
+type
+ TField = class procedure Run; end;
+ TBase = class Receiver: TField; end;
+ TConsumer = class(TBase) procedure UseField; end;
+implementation
+procedure TField.Run; begin end;
+procedure TConsumer.UseField;
+begin ${call} end;
+end.` });
+    expect(dependencies('TConsumer::UseField')).toEqual(['calls:TField::Run']);
+  });
+
   it('does not infer field types from unrelated method parameters', async () => {
     await index({ 'Main.pas': `unit Main;
 interface

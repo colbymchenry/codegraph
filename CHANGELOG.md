@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Pascal methods and functions now show their implementation bodies in `node` and `explore` instead of their interface or forward declarations, while keeping their declaration metadata and call relationships; re-index Pascal projects after upgrading. Thanks @Vizit0r for the report. (#3453)
 
 ## [1.6.4] - 2026-11-20
 
