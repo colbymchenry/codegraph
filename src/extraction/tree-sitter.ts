@@ -920,7 +920,7 @@ export class TreeSitterExtractor {
   // each assigned target is a genuine possible callee. Same-body locality is
   // the precision guard (the #932 table-dispatch philosophy scoped to locals).
   private cppLocalFnPtrs = new Map<string, Map<string, Set<string>>>();
-  private methodIndex: Map<string, string> | null = null; // lookup key → node ID for Pascal defProc lookup
+  private pascalRoutineIndex = new Map<string, Array<{ node: Node; signature: string; implemented: boolean; overloaded: boolean }>>();
   // Paren-less Pascal names (#2514): the names each routine or anonymous
   // method being walked declares itself (innermost last), the class the
   // routine belongs to, how many `with` bodies the walk is inside (a bare name
@@ -2174,6 +2174,9 @@ export class TreeSitterExtractor {
     }
 
     this.nodes.push(newNode);
+    if (this.language === 'pascal' && node.type === 'declProc' && (kind === 'method' || kind === 'function')) {
+      this.indexPascalRoutine(newNode, node);
+    }
 
     // Add containment edge from parent
     if (this.nodeStack.length > 0) {
@@ -9131,7 +9134,7 @@ export class TreeSitterExtractor {
       return true;
     }
 
-    // defProc in implementation section → extract calls but don't create duplicate nodes
+    // defProc → attach the implementation to its declaration and extract calls.
     if (nodeType === 'defProc') {
       this.extractPascalDefProc(node);
       return true;
@@ -9339,12 +9342,80 @@ export class TreeSitterExtractor {
     }
   }
 
-  /**
-   * Extract calls and resolve method context from a Pascal defProc (implementation body).
-   * Does not create a new node — the declaration was already captured from the interface section.
-   */
+  /** Parameter types and modifiers identify overloads; names, grouping and defaults do not. */
+  private pascalRoutineSignature(header: SyntaxNode): string {
+    const tokens = (node: SyntaxNode | null): string => {
+      if (!node || node.type === 'comment') return '';
+      return node.childCount ? node.children.map(tokens).join('') : getNodeText(node, this.source).toLowerCase();
+    };
+    return (getChildByField(header, 'args')?.namedChildren ?? [])
+      .filter((arg) => arg.type === 'declArg')
+      .flatMap((arg) => {
+        const modifier = arg.namedChildren.find((c) => c.type === 'kConst' || c.type === 'kVar' || c.type === 'kOut')?.type ?? '';
+        const type = tokens(getChildByField(arg, 'type'));
+        return arg.namedChildren.filter((c) => c.type === 'identifier').map(() => `${modifier}:${type}`);
+      }).join(';');
+  }
+
+  /** Generic parameters can carry constraints only in the declaration. */
+  private pascalRoutineName(node: SyntaxNode | null): string {
+    if (!node) return '';
+    if (node.type === 'genericTpl') {
+      const arity = (getChildByField(node, 'args')?.namedChildren ?? [])
+        .filter((arg) => arg.type === 'genericArg')
+        .reduce((count, arg) => count + arg.namedChildren.filter((c) => c.type === 'identifier').length, 0);
+      return `${this.pascalRoutineName(getChildByField(node, 'entity'))}<${arity}>`;
+    }
+    if (node.type === 'genericDot') {
+      return `${this.pascalRoutineName(getChildByField(node, 'lhs'))}.${this.pascalRoutineName(getChildByField(node, 'rhs'))}`;
+    }
+    return getNodeText(node, this.source).trim().toLowerCase();
+  }
+
+  private indexPascalRoutine(node: Node, header: SyntaxNode): void {
+    const parts = [this.pascalRoutineName(getChildByField(header, 'name'))];
+    for (let parent = header.parent; parent; parent = parent.parent) {
+      if (parent.type === 'declType') parts.unshift(this.pascalRoutineName(getChildByField(parent, 'name')));
+    }
+    const candidate = {
+      node,
+      signature: this.pascalRoutineSignature(header),
+      implemented: header.parent?.type === 'defProc',
+      overloaded: header.namedChildren.some((c) => c.type === 'procAttribute' && c.namedChildren.some((a) => a.type === 'kOverload')),
+    };
+    // Bare names belong to free routines, never to a namesake class method.
+    for (let i = 0; i < (node.kind === 'method' ? parts.length - 1 : 1); i++) {
+      const key = parts.slice(i).join('.');
+      const candidates = this.pascalRoutineIndex.get(key);
+      if (candidates) candidates.push(candidate);
+      else this.pascalRoutineIndex.set(key, [candidate]);
+    }
+  }
+
+  /** Keep the declaration's identity and metadata, but return its implementation as source. */
+  private locatePascalRoutine(routine: Node, node: SyntaxNode): void {
+    let end = node.endPosition;
+    if (node.hasError) {
+      let body: SyntaxNode | null = null;
+      for (const child of node.namedChildren) {
+        if (child.type === 'defProc' && (body || child.startPosition.column <= node.startPosition.column)) {
+          if (!body) return;
+          break;
+        }
+        if (!body && (child.type === 'block' || child.type === 'asm')) body = child;
+      }
+      if (!body) return;
+      const terminator = body.nextSibling;
+      end = (terminator?.type === ';' ? terminator : body).endPosition;
+    }
+    routine.startLine = node.startPosition.row + 1;
+    routine.startColumn = node.startPosition.column;
+    routine.endLine = end.row + 1;
+    routine.endColumn = end.column;
+  }
+
+  /** Match a Pascal implementation to its declaration without merging overloads. */
   private extractPascalDefProc(node: SyntaxNode): void {
-    // Find the matching declaration node by name to use as call parent
     const declProc = node.namedChildren.find(
       (c: SyntaxNode) => c.type === 'declProc'
     );
@@ -9353,61 +9424,40 @@ export class TreeSitterExtractor {
     const nameNode = getChildByField(declProc, 'name');
     if (!nameNode) return;
     const fullName = getNodeText(nameNode, this.source).trim();
-    // fullName is like "TAuthService.Create"
-    const shortName = fullName.includes('.') ? fullName.split('.').pop()! : fullName;
-    const fullNameKey = fullName.toLowerCase();
-    const shortNameKey = shortName.toLowerCase();
-
-    // Build method index on first use (O(n) once, then O(1) per lookup)
-    if (!this.methodIndex) {
-      this.methodIndex = new Map();
-      for (const n of this.nodes) {
-        if (n.kind === 'method' || n.kind === 'function') {
-          const nameKey = n.name.toLowerCase();
-          // Keep first seen short-name mapping to avoid silently overwriting earlier entries.
-          if (!this.methodIndex.has(nameKey)) {
-            this.methodIndex.set(nameKey, n.id);
-          }
-
-          // For Pascal methods, also index qualified forms (e.g. TAuthService.Create).
-          if (n.kind === 'method') {
-            const qualifiedParts = n.qualifiedName.split('::');
-            if (qualifiedParts.length >= 2) {
-              // Create suffix keys so both "Module.Class.Method" and "Class.Method" can resolve.
-              for (let i = 0; i < qualifiedParts.length - 1; i++) {
-                const scopedName = qualifiedParts.slice(i).join('.').toLowerCase();
-                this.methodIndex.set(scopedName, n.id);
-              }
-            }
-          }
-        }
-      }
+    const fullNameKey = this.pascalRoutineName(nameNode);
+    const shortNameKey = fullNameKey.split('.').pop()!.replace(/<\d+>$/, '');
+    const candidates = this.pascalRoutineIndex.get(fullNameKey) ?? [];
+    const signature = this.pascalRoutineSignature(declProc);
+    const matches = candidates.filter((candidate) => candidate.signature === signature);
+    const args = getChildByField(declProc, 'args');
+    let candidate = matches.length === 1 ? matches[0] : undefined;
+    // An unmatched, non-overloaded declaration is unique even when the body
+    // qualifies a type differently; repeated headers can also omit parameters.
+    if (
+      !candidate && matches.length === 0 && candidates.length === 1 && !candidates[0]!.implemented &&
+      (!args || !candidates[0]!.overloaded)
+    ) {
+      candidate = candidates[0];
     }
-
-    let parentId =
-      this.methodIndex.get(fullNameKey) ||
-      this.methodIndex.get(shortNameKey);
+    let routine = candidate?.node;
+    if (candidate) candidate.implemented = true;
 
     // No existing node? This is an implementation-only **free** procedure/function
     // (`procedure Helper; begin … end;` with no interface declaration and not a
-    // class method). Create a function node so its body's calls attribute to it,
-    // not to the enclosing file/module. A method (`TClass.Method`, a dotted name)
-    // always has a node from its class declaration, so this only fires for free
-    // routines — and the methodIndex lookup above already covers interface-declared
-    // free routines, so there's no duplicate.
-    if (!parentId && !fullName.includes('.')) {
+    // class method). An ambiguous declaration stays unmatched.
+    if (
+      !routine && !fullNameKey.includes('.') && matches.length === 0 &&
+      (candidates.length === 0 || args || candidates.every((c) => c.implemented))
+    ) {
       const fnNode = this.createNode('function', fullName, declProc, {
         signature: this.extractor?.getSignature?.(declProc, this.signatureSource),
         visibility: this.extractor?.getVisibility?.(declProc),
       });
-      if (fnNode) {
-        parentId = fnNode.id;
-        this.methodIndex.set(fullNameKey, fnNode.id);
-        if (!this.methodIndex.has(shortNameKey)) this.methodIndex.set(shortNameKey, fnNode.id);
-      }
+      if (fnNode) routine = fnNode;
     }
 
-    if (!parentId) parentId = this.nodeStack[this.nodeStack.length - 1];
+    if (routine) this.locatePascalRoutine(routine, node);
+    const parentId = routine?.id ?? this.nodeStack[this.nodeStack.length - 1];
     if (!parentId) return;
 
     // `TList<T>.Add` belongs to `TList`, whose node may spell its parameters
@@ -9416,11 +9466,8 @@ export class TreeSitterExtractor {
     const routineId = parentId;
     // What a routine nested in this one is qualified under: the routine's
     // node, or its name as written when the implementation matched none.
-    const qualifiedName = (): string => {
-      const routine = this.nodes.find((n) => n.id === routineId);
-      return routine && routine.kind !== 'file' ? routine.qualifiedName : fullName.replace(/<[^>]*>/g, '').split('.').join('::');
-    };
-    this.walkPascalRoutine(node, routineId, owner, shortNameKey.replace(/<.*$/, ''), qualifiedName);
+    const qualifiedName = (): string => routine?.qualifiedName ?? fullName.replace(/<[^>]*>/g, '').split('.').join('::');
+    this.walkPascalRoutine(node, routineId, owner, shortNameKey, qualifiedName);
   }
 
   /**
