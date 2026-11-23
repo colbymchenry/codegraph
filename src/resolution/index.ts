@@ -52,7 +52,7 @@ import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { clearRubyConstantPathMemos, matchRubyConstantPathRef } from './ruby-constant-paths';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, CPP_COMPILE_DB_FILES, loadCppIncludeDirsFromCompileDB, loadCppIncludeDirsHeuristic, readCompileDbIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName, packageJsonMain } from './import-resolver';
-import { ResolverPool, minRefsForPool, poolStartSettled, resolveWorkersWorthStarting, shouldEngageAdaptively } from './resolver-pool';
+import { ResolverPool, poolStartBeforeFirstBatch, poolStartSettled, resolveWorkersWorthStarting, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { readCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } from './frameworks';
@@ -2861,6 +2861,13 @@ export class ReferenceResolver {
        *  each per-batch DELETE's B-tree work (DatabaseConnection.beginBulkRefLoad). */
       refIndexLoad?: { begin: () => void; end: () => void | Promise<void> };
       backpressure?: () => Promise<void> | null;
+      /**
+       * Called once the pool is going to start, before any worker opens the
+       * database, whether it starts before the first batch or mid-run: a fresh
+       * index moves its fast-init journal to WAL here, so the workers' reads
+       * never wait on this thread's commits, nor its commits on their reads.
+       */
+      beforePool?: () => void;
     },
     synthesize: boolean = true
   ): Promise<ResolutionResult> {
@@ -2905,12 +2912,17 @@ export class ReferenceResolver {
     // stretch on the thread the liveness watchdog watches (#1091), 20 s or more
     // on a project the size of LLVM. The wait is bounded and a failure ends it
     // (poolStartSettled), and any failure downgrades to sequential permanently.
-    // A pool engaged mid-loop keeps the loop running while it boots: a run under
-    // that bar is too small for the first batch to matter.
+    // A full index near that bar starts the pool before its first batch too, but
+    // goes on while it boots: there the first batch is the work the boot can
+    // hide behind, and the pool is ready for the second, where the adaptive
+    // check below would only start it after the first and have it for the third
+    // (two sequential batches of a Kotlin project of 142,000 refs). A pool
+    // engaged mid-loop keeps the loop running while it boots as well.
     let pool: ResolverPool | null = null;
     let poolReady = false;
     // True once pool creation has been attempted by EITHER engage site (the
-    // up-front ref-count gate or the adaptive projection below) — a pool that
+    // start before the first batch, at or near the ref-count gate, or the
+    // adaptive projection below) — a pool that
     // failed or was destroyed must stay down (downgrade is permanent), and
     // tryCreate's sizing probes shouldn't re-run every batch on hosts that
     // declined.
@@ -2918,7 +2930,13 @@ export class ReferenceResolver {
     const createPool = (t0: number, why: string, worth?: number): ResolverPool | null => {
       poolEngageTried = true;
       if (!parallel) return null;
-      const p = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot, parallel.shareFrameworks ? this.getDetectedFrameworks() : undefined, worth);
+      const p = ResolverPool.tryCreate(
+        parallel.dbPath,
+        this.projectRoot,
+        parallel.shareFrameworks ? this.getDetectedFrameworks() : undefined,
+        worth,
+        parallel.beforePool
+      );
       if (p && parallel.shareFrameworks) {
         const scans = this.projectScans();
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] project scans: ${scans.cpp ? 'shared' : 'none'}`);
@@ -2936,9 +2954,10 @@ export class ReferenceResolver {
       );
       return p;
     };
-    if (parallel && total >= minRefsForPool()) {
-      pool = createPool(Date.now(), 'ref-count');
-      if (pool) await poolStartSettled(pool.ready());
+    const startBeforeFirstBatch = parallel ? poolStartBeforeFirstBatch(total, parallel.shareFrameworks === true) : null;
+    if (startBeforeFirstBatch) {
+      pool = createPool(Date.now(), startBeforeFirstBatch === 'up-front' ? 'ref-count' : 'near-gate');
+      if (pool && startBeforeFirstBatch === 'up-front') await poolStartSettled(pool.ready());
     }
     // Adaptive engagement bar (see the batch-loop hook): projected remaining
     // sequential settle above this boots the pool mid-loop. Boot is async and
@@ -3028,10 +3047,10 @@ export class ReferenceResolver {
     // and the source-keyed supertype-walk reads both live on it). Recreated in
     // the inner finally BEFORE synthesis, whose passes read kind-keyed.
     // Measured on a 224k-edge resolution set: insert 2.8s → 1.1s + 0.3s
-    // recreate. Same ref-count gate as the pool so small syncs never pay the
-    // recreate cost.
+    // recreate. Same gate as the pool's start before the first batch, so small
+    // syncs never pay the recreate cost.
     let bulkEdgesActive = false;
-    if (parallel?.bulkEdgeLoad && total >= minRefsForPool()) {
+    if (parallel?.bulkEdgeLoad && startBeforeFirstBatch) {
       try {
         parallel.bulkEdgeLoad.begin();
         bulkEdgesActive = true;
@@ -3041,7 +3060,7 @@ export class ReferenceResolver {
     // the five sync-path unresolved_refs indexes, and the end-of-loop rebuild
     // is near-free (only failed refs survive the loop).
     let bulkRefsActive = false;
-    if (parallel?.refIndexLoad && total >= minRefsForPool()) {
+    if (parallel?.refIndexLoad && startBeforeFirstBatch) {
       try {
         parallel.refIndexLoad.begin();
         bulkRefsActive = true;

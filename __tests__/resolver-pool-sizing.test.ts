@@ -6,9 +6,16 @@
  * 2-CPU container) and memory-blind sizing (six ~1GB workers OOM-killing a
  * 7GB container at true 8-core concurrency).
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import * as os from 'os';
-import { ResolverPool, ADAPTIVE_ENGAGE_MIN_REFS, resolveWorkersWorthStarting, shouldEngageAdaptively } from '../src/resolution/resolver-pool';
+import {
+  ResolverPool,
+  ADAPTIVE_ENGAGE_MIN_REFS,
+  nearGatePoolMin,
+  poolStartBeforeFirstBatch,
+  resolveWorkersWorthStarting,
+  shouldEngageAdaptively,
+} from '../src/resolution/resolver-pool';
 import {
   cgroupMemoryAvailable,
   darwinMemoryAvailable,
@@ -133,5 +140,40 @@ describe('adaptive pool engagement needs a real amount of work left', () => {
     // tokio-class: ~55k Rust refs at ~36 µs each.
     expect(shouldEngageAdaptively(1_980, 55_000, 400)).toBe(true);
     expect(shouldEngageAdaptively(399, 55_000, 400)).toBe(false);
+  });
+});
+
+describe('the pool starts before the first batch', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('at the gate, whatever the run', () => {
+    expect(poolStartBeforeFirstBatch(150_000, true)).toBe('up-front');
+    expect(poolStartBeforeFirstBatch(150_000, false)).toBe('up-front');
+  });
+
+  it('near it in a full index: from two thirds of the gate, where any measured rate clears the adaptive bar', () => {
+    expect(nearGatePoolMin()).toBe(100_000);
+    // ktor once #3419's grammar stopped minting misparsed refs: 151,423 became 142,215.
+    expect(poolStartBeforeFirstBatch(142_215, true)).toBe('near-gate');
+    expect(poolStartBeforeFirstBatch(100_000, true)).toBe('near-gate');
+    expect(poolStartBeforeFirstBatch(99_999, true)).toBeNull();
+    // At 100,000 refs Go's 4 µs a ref projects the adaptive check's bar.
+    expect(shouldEngageAdaptively((100_000 * 4) / 1000, 100_000, 400)).toBe(true);
+  });
+
+  it('never near it in a sync, whose workers would each detect the frameworks again', () => {
+    expect(poolStartBeforeFirstBatch(142_215, false)).toBeNull();
+  });
+
+  it('moves with an override of the gate', () => {
+    vi.stubEnv('CODEGRAPH_PARALLEL_RESOLVE_MIN', '30');
+    expect(nearGatePoolMin()).toBe(20);
+    expect(poolStartBeforeFirstBatch(25, true)).toBe('near-gate');
+    expect(poolStartBeforeFirstBatch(25, false)).toBeNull();
+    expect(poolStartBeforeFirstBatch(30, false)).toBe('up-front');
+    vi.stubEnv('CODEGRAPH_PARALLEL_RESOLVE_MIN', '0');
+    expect(poolStartBeforeFirstBatch(0, false)).toBe('up-front');
   });
 });
