@@ -55,9 +55,9 @@ import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, C
 import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
-import { isTestCode, type SourceReader } from '../graph/test-code';
+import { testCodeReading } from '../graph/test-code';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
-import { callSiteLines, formatCallSiteLines } from '../graph/call-sites';
+import { callSiteLines, formatCallSiteLines, nonTestFirst } from '../graph/call-sites';
 import { DEFAULT_IMPACT_MAX_EDGES, DEFAULT_IMPACT_MAX_NODES, type CallSiteRow } from '../graph/traversal';
 import { isCopybookInclude, MAX_COPYBOOK_INCLUDES, type NamedCopybook } from '../graph/cobol-copybooks';
 import { groupFilesByPackage, packageGroupTitle, packageListingTitle } from '../graph/owning-package';
@@ -1764,6 +1764,11 @@ export const tools: ToolDefinition[] = [
           description: 'Maximum number of callers to return (default: 20)',
           default: 20,
         },
+        offset: {
+          type: 'number',
+          description: 'Number of callers to skip before listing, to page past `limit` (default: 0)',
+          default: 0,
+        },
         projectPath: projectPathProperty,
       },
       required: ['symbol'],
@@ -1788,6 +1793,11 @@ export const tools: ToolDefinition[] = [
           type: 'number',
           description: 'Maximum number of callees to return (default: 20)',
           default: 20,
+        },
+        offset: {
+          type: 'number',
+          description: 'Number of callees to skip before listing, to page past `limit` (default: 0)',
+          default: 0,
         },
         projectPath: projectPathProperty,
       },
@@ -2102,6 +2112,35 @@ export interface ProjectLifecycle {
   release(cg: CodeGraph): void | Promise<void>;
 }
 
+/** A non-negative whole `offset` argument; anything else is 0. */
+function listOffset(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+/**
+ * The note closing a flat callers/callees list: which slice of how many it
+ * shows and how to see the rest (#1639, #1674). Empty when the list is whole.
+ * A page with no marker reads as the complete set, and an agent under-counts
+ * from it.
+ */
+function pageNote(noun: 'callers' | 'callees', total: number, offset: number, limit: number): string {
+  if (offset === 0) {
+    return total > limit
+      ? `\n\n> Showing ${limit} of ${total} ${noun}; pass \`limit\` (up to 100) to widen, or \`offset: ${limit}\` for the next page.`
+      : '';
+  }
+  if (offset >= total) return `\n\n> No ${noun} at offset ${offset}; there are ${total}.`;
+  const end = Math.min(total, offset + limit);
+  const next = end < total ? `; pass \`offset: ${end}\` for the next page` : '';
+  return `\n\n> Showing ${noun} ${offset + 1}-${end} of ${total}${next}.`;
+}
+
+/** The first line of a paged per-definition section: which slice of how many. */
+function sectionRange(total: number, offset: number, limit: number): string {
+  if (offset >= total) return `- (none at offset ${offset}; there are ${total})`;
+  return `- (${offset + 1}-${Math.min(total, offset + limit)} of ${total})`;
+}
+
 /**
  * Tool handler that executes tools against a CodeGraph instance
  *
@@ -2411,7 +2450,10 @@ export class ToolHandler {
         'codegraph_search',
         'codegraph_node',
       ]);
-      if (stats.fileCount < TINY_REPO_FILE_THRESHOLD) {
+      // The gate trims only the default surface. An explicit
+      // CODEGRAPH_MCP_TOOLS allowlist is the operator's choice and wins on
+      // any repo size, so every tool it names stays listed (#3462).
+      if (!allow && stats.fileCount < TINY_REPO_FILE_THRESHOLD) {
         visible = visible.filter(t => TINY_REPO_CORE_TOOLS.has(t.name));
       }
 
@@ -3427,7 +3469,8 @@ export class ToolHandler {
     if (typeof symbol !== 'string') return symbol;
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
-    const limit = clamp((args.limit as number) || 20, 1, 100);
+    const limit = Math.floor(clamp((args.limit as number) || 20, 1, 100));
+    const offset = listOffset(args.offset);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
     const allMatches = this.findAllSymbols(cg, symbol);
@@ -3442,7 +3485,9 @@ export class ToolHandler {
       : '';
 
     // Every site of each caller (#2909): one row per caller, at the lines its
-    // calls sit on, and the symbol itself when it calls itself.
+    // calls sit on, and the symbol itself when it calls itself. Callers outside
+    // tests come first, so a cap never shows tests in their place.
+    const isTest = this.testCodeReading(cg);
     const collect = (defNodes: Node[]) => {
       const callers: Node[] = [];
       const labels = new Map<string, string>();
@@ -3464,7 +3509,7 @@ export class ToolHandler {
         }
       }
       const locations = new Map(callers.map((n) => [n.id, this.callSiteLocation(n, sites.get(n.id) ?? [])]));
-      return { callers, labels, locations, recursive };
+      return { callers: nonTestFirst(callers, isTest), labels, locations, recursive };
     };
 
     // Single definition (or same-file overloads): the familiar flat list.
@@ -3478,10 +3523,8 @@ export class ToolHandler {
       const note = fileFilter && !filteredOut ? '' : allMatches.note;
       // Say when the cap cut the list (#1639, #1674): a truncated answer with
       // no marker reads as the complete set, and an agent under-counts from it.
-      const cut = callers.length > limit
-        ? `\n\n> Showing ${limit} of ${callers.length} callers; pass \`limit\` (up to 100) to widen.`
-        : '';
-      const formatted = this.formatNodeList(callers.slice(0, limit), `Callers of ${symbol}`, labels, locations, recursive) + cut + note + filterNote;
+      const cut = pageNote('callers', callers.length, offset, limit);
+      const formatted = this.formatNodeList(callers.slice(offset, offset + limit), `Callers of ${symbol}`, labels, locations, recursive) + cut + note + filterNote;
       return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
@@ -3498,11 +3541,12 @@ export class ToolHandler {
         lines.push('- (no callers)');
         continue;
       }
-      for (const node of callers.slice(0, limit)) {
+      if (offset > 0) lines.push(sectionRange(callers.length, offset, limit));
+      for (const node of callers.slice(offset, offset + limit)) {
         lines.push(this.formatNodeListEntry(node, labels, locations, recursive));
       }
-      if (callers.length > limit) {
-        lines.push(`- … +${callers.length - limit} more (pass \`limit\` to widen)`);
+      if (callers.length > offset + limit) {
+        lines.push(`- … +${callers.length - offset - limit} more (pass \`limit\` to widen, or \`offset: ${offset + limit}\` for the next page)`);
       }
     }
     return this.answerResult(cg, this.truncateOutput(lines.join('\n') + filterNote), answerPaths);
@@ -3516,7 +3560,8 @@ export class ToolHandler {
     if (typeof symbol !== 'string') return symbol;
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
-    const limit = clamp((args.limit as number) || 20, 1, 100);
+    const limit = Math.floor(clamp((args.limit as number) || 20, 1, 100));
+    const offset = listOffset(args.offset);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
     const allMatches = this.findAllSymbols(cg, symbol);
@@ -3562,10 +3607,8 @@ export class ToolHandler {
       const note = fileFilter && !filteredOut ? '' : allMatches.note;
       // Say when the cap cut the list (#1639, #1674): a truncated answer with
       // no marker reads as the complete set, and an agent under-counts from it.
-      const cut = callees.length > limit
-        ? `\n\n> Showing ${limit} of ${callees.length} callees; pass \`limit\` (up to 100) to widen.`
-        : '';
-      const formatted = this.formatNodeList(callees.slice(0, limit), `Callees of ${symbol}`, labels, undefined, recursive) + cut + note + filterNote;
+      const cut = pageNote('callees', callees.length, offset, limit);
+      const formatted = this.formatNodeList(callees.slice(offset, offset + limit), `Callees of ${symbol}`, labels, undefined, recursive) + cut + note + filterNote;
       return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
@@ -3580,11 +3623,12 @@ export class ToolHandler {
         lines.push('- (no callees)');
         continue;
       }
-      for (const node of callees.slice(0, limit)) {
+      if (offset > 0) lines.push(sectionRange(callees.length, offset, limit));
+      for (const node of callees.slice(offset, offset + limit)) {
         lines.push(this.formatNodeListEntry(node, labels, undefined, recursive));
       }
-      if (callees.length > limit) {
-        lines.push(`- … +${callees.length - limit} more (pass \`limit\` to widen)`);
+      if (callees.length > offset + limit) {
+        lines.push(`- … +${callees.length - offset - limit} more (pass \`limit\` to widen, or \`offset: ${offset + limit}\` for the next page)`);
       }
     }
     return this.answerResult(cg, this.truncateOutput(lines.join('\n') + filterNote), answerPaths);
@@ -4178,31 +4222,9 @@ export class ToolHandler {
     return `candidates for key \`${site.key}\`: ${list.join(', ')}`;
   }
 
-  /**
-   * Whether a caller is test code, for one blast-radius section. A Rust unit
-   * test is told by its file's source (an inline `#[cfg(test)]` module, or the
-   * parent's `#[cfg(test)] mod tests;`), so each file is read once.
-   */
+  /** Whether a caller is test code, for one answer; each file is read once. */
   private testCodeReading(cg: CodeGraph): (node: Node) => boolean {
-    const root = cg.getProjectRoot();
-    const sources = new Map<string, string | undefined>();
-    const readSource: SourceReader = (filePath) => {
-      if (!sources.has(filePath)) {
-        let text: string | undefined;
-        try {
-          const abs = validatePathWithinRoot(root, filePath);
-          text = abs === null ? undefined : readFileSync(abs, 'utf-8');
-        } catch { /* unreadable → not known to be test code */ }
-        sources.set(filePath, text);
-      }
-      return sources.get(filePath);
-    };
-    const verdicts = new Map<string, boolean>();
-    return (node) => {
-      let v = verdicts.get(node.id);
-      if (v === undefined) verdicts.set(node.id, (v = isTestCode(node, readSource)));
-      return v;
-    };
+    return testCodeReading(cg.getProjectRoot());
   }
 
   /**

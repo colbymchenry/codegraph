@@ -143,9 +143,14 @@ if [ "$OSFAM" = "win32" ]; then
   cat > "$STAGE/bin/codegraph" <<'LAUNCH'
 #!/bin/sh
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# node.exe is a native program, so hand it a Windows path. Git Bash rewrites a
+# /c/... argument only while path conversion is on, and a terminal with
+# MSYS_NO_PATHCONV=1 or MSYS2_ARG_CONV_EXCL=* turns it off (#3464).
+JS="$DIR/lib/dist/bin/codegraph.js"
+if command -v cygpath >/dev/null 2>&1; then JS="$(cygpath -w "$JS")"; fi
 # Preserve an inherited CODEGRAPH_HOST_PPID; do not replace it with MSYS's
 # $PPID, which is not a native Windows PID usable by the orphan watchdog.
-exec "$DIR/node.exe" --liftoff-only --disable-warning=ExperimentalWarning --max-semi-space-size=16 "$DIR/lib/dist/bin/codegraph.js" "$@"
+exec "$DIR/node.exe" --liftoff-only --disable-warning=ExperimentalWarning --max-semi-space-size=16 "$JS" "$@"
 LAUNCH
   chmod +x "$STAGE/bin/codegraph"
 else
