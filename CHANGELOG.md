@@ -19,6 +19,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In Go, a method called on a value returned by a local closure now links to the method of the type in that result position. Thanks @inth3shadows for the report. (#3448)
 - On Windows, the `codegraph` command in Git Bash now works in a terminal that turns off path conversion with `MSYS_NO_PATHCONV=1` or `MSYS2_ARG_CONV_EXCL=*`, as some agent harnesses do, instead of failing with "Cannot find module". Thanks @BlueberryDuck for the report. (#3464)
 - On projects with fewer than 500 files, every tool named in `CODEGRAPH_MCP_TOOLS` is now listed to the agent, instead of only the small-repo defaults. Thanks @nchrisr for the report and the fix. (#3462)
 - `codegraph callers` and `codegraph_callers` list callers outside tests before tests, so a symbol called mostly from tests no longer shows only tests under the default limit while its real callers are cut. Thanks @blairjordan for the report and the fix. (#3456)
