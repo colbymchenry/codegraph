@@ -763,6 +763,7 @@ function buildPythonModuleIndex(context: ResolutionContext): PythonModuleIndex {
 /**
  * Package roots a build config declares, relative to the repo root. Only the
  * keys that mean "packages live here" are read, each in its own table:
+ * pytest's `pythonpath`, Pyright's and BasedPyright's `extraPaths`,
  * setuptools `[tool.setuptools.packages.find] where` and
  * `[tool.setuptools.package-dir] "" =` (or the inline `package-dir` of
  * `[tool.setuptools]`), poetry `packages = [{ from = … }]`, hatch
@@ -780,7 +781,20 @@ function declaredPythonRoots(context: ResolutionContext, service: string): strin
   const toml = context.readFile(joinRel(service, 'pyproject.toml'));
   if (toml) {
     for (const [table, body] of iniTables(toml)) {
-      if (table === 'tool.setuptools.packages.find') {
+      const isPytest = table === 'tool.pytest.ini_options' || table === 'tool.pytest';
+      if (isPytest || table === 'tool.pyright' || table === 'tool.basedpyright') {
+        const paths = isPytest
+          ? body.match(/^[ \t]*pythonpath[ \t]*=[ \t]*(?:\[([^\]]*)\]|["']([^"'\r\n]*)["'])/m)
+          : body.match(/^[ \t]*extraPaths[ \t]*=[ \t]*\[([^\]]*)\]/m);
+        if (paths?.[1] !== undefined) {
+          for (const item of paths[1].matchAll(/"([^"\r\n]*)"|'([^'\r\n]*)'|#[^\r\n]*/g)) {
+            const dir = item[1] ?? item[2];
+            if (dir !== undefined) add(dir);
+          }
+        } else if (paths?.[2] !== undefined) {
+          for (const dir of paths[2].trim().split(/\s+/)) add(dir);
+        }
+      } else if (table === 'tool.setuptools.packages.find') {
         const m = body.match(/^\s*where\s*=\s*\[([^\]]*)\]/m);
         if (m) for (const item of m[1]!.split(',')) add(item);
       } else if (table === 'tool.setuptools.package-dir') {
