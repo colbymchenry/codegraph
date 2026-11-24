@@ -62,6 +62,79 @@ describe('Express middleware imports', () => {
   });
 });
 
+describe('Express routes on custom receiver names (#3473)', () => {
+  it('finds the mounted routes and their handlers without inventing routes for other objects', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-express-receivers-'));
+    let cg: CodeGraph | undefined;
+    try {
+      const files = {
+        'package.json': JSON.stringify({ dependencies: { express: '^4.18.0' } }),
+        'app.ts': `
+import express from 'express';
+import orders from './orders';
+import items from './items';
+import notes from './notes';
+const service = express();
+function health(req, res) { res.send('ok'); }
+service.get('/health', health);
+service.use('/orders', orders);
+service.use('/items', items);
+service.use('/notes', notes);
+`,
+        'orders.ts': `
+import { Router } from 'express';
+const orderRoutes = Router();
+function listOrders(req, res) { res.json([]); }
+orderRoutes.get('/', listOrders);
+export default orderRoutes;
+`,
+        'items.ts': `
+import express from 'express';
+const itemRoutes = express.Router();
+function getItem(req, res) { res.json({}); }
+function saveItem(req, res) { res.sendStatus(204); }
+itemRoutes.route('/:id').get(getItem).put(saveItem);
+const cache = new Map();
+cache.get('/cached', getItem);
+export default itemRoutes;
+`,
+        'notes.js': `
+const noteRoutes = require('express').Router();
+function listNotes(req, res) { res.json([]); }
+noteRoutes.get('/', listNotes);
+module.exports = noteRoutes;
+`,
+      };
+      for (const [file, contents] of Object.entries(files)) {
+        fs.writeFileSync(path.join(tmpDir, file), contents);
+      }
+      const graph = await CodeGraph.init(tmpDir, { index: true });
+      cg = graph;
+
+      const routes = graph.getNodesByKind('route');
+      const handlers = {
+        'GET /health': 'health',
+        'GET /items/:id': 'getItem',
+        'GET /notes': 'listNotes',
+        'GET /orders': 'listOrders',
+        'PUT /items/:id': 'saveItem',
+      };
+      expect(routes.filter((route) => !route.name.startsWith('USE ')).map((route) => route.name).sort())
+        .toEqual(Object.keys(handlers));
+      for (const [name, handler] of Object.entries(handlers)) {
+        const route = routes.find((node) => node.name === name)!;
+        const targets = graph.getOutgoingEdgesFrom([route.id])
+          .filter((edge) => edge.kind === 'references')
+          .map((edge) => graph.getNode(edge.target)?.name);
+        expect(targets, name).toContain(handler);
+      }
+    } finally {
+      cg?.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('Django end-to-end framework extraction', () => {
   let tmpDir: string | undefined;
   afterEach(() => {

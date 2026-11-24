@@ -208,16 +208,20 @@ export const expressResolver: FrameworkResolver = {
     const lang = detectLanguage(filePath);
     const safe = stripCommentsForRegex(content, lang);
     if (ELYSIA_APP_FILE.test(safe)) return { nodes, references };
+    const receivers = new Set(['app', 'router']);
+    const factories = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:express(?:\s*\.\s*Router)?|Router|require\s*\(\s*['"]express['"]\s*\)\s*\.\s*Router)\s*\(/g;
+    for (const declaration of safe.matchAll(factories)) receivers.add(declaration[1]!);
     // Brackets and commas are counted on `structure`, where string and regex
     // contents are blanked: `/[^]]/`, `/}/` or `'a, b)'` must not end an
     // argument or a body early. Same offsets as `safe`, which the route path
     // and reply calls are still read from.
-    // Match the route head up to the first arg: (app|router).METHOD('/path',
+    // Match the route head up to the first arg: receiver.METHOD('/path',
     // (NOT the whole call — handlers are often inline arrows whose `)`/`{}` the
     // old single-regex couldn't span, so inline-handler routes connected to nothing.)
-    const head = /\b(app|router)\s*\.\s*(get|post|put|patch|delete|all|use)\s*\(\s*['"]([^'"]+)['"]\s*,/g;
+    const head = /(?<![\w$])([A-Za-z_$][\w$]*)\s*\.\s*(get|post|put|patch|delete|all|use)\s*\(\s*['"]([^'"]+)['"]\s*,/g;
     let match: RegExpExecArray | null;
     while ((match = head.exec(safe)) !== null) {
+      if (!receivers.has(match[1]!)) continue;
       const method = match[2]!;
       const routePath = match[3]!;
       if (method === 'use' && !routePath.startsWith('/')) continue;
@@ -246,9 +250,10 @@ export const expressResolver: FrameworkResolver = {
     // The chained form: `router.route('/:id').get(getProduct).put(protect, updateProduct)`
     // — one path, several methods, each with its own handler. One route node
     // per method, at the line of its `.method(`, bound like the plain form.
-    const chainHead = /\b(?:app|router)\s*\.\s*route\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+    const chainHead = /(?<![\w$])([A-Za-z_$][\w$]*)\s*\.\s*route\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
     while ((match = chainHead.exec(safe)) !== null) {
-      const routePath = match[1]!;
+      if (!receivers.has(match[1]!)) continue;
+      const routePath = match[2]!;
       let at = match.index + match[0].length;
       for (;;) {
         const link = /^\s*\.\s*(get|post|put|patch|delete|all)\s*\(/.exec(safe.slice(at, at + 64));
