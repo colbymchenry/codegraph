@@ -30889,9 +30889,10 @@ function goReceiverChainType(
   } else {
     const decl = index ? goLocalDeclAt(index, head.text, at) : undefined;
     if (decl && index) {
-      // A func value's call (`run(x).M()`) is not typed here.
-      if (links[1]?.kind === 'call') return undefined;
-      t = goDeclaredValueType(decl, filePath, index, context, depth + 1);
+      if (links[1]?.kind === 'call') {
+        t = goLocalFuncLiteralResultType(decl, filePath, index, context, resultOf(1));
+        i = 2;
+      } else t = goDeclaredValueType(decl, filePath, index, context, depth + 1);
     } else if (context.getImportMappings(filePath, 'go').some((m) => m.localName === head.text)) {
       // `pkg.Var`, `pkg.New(…)`, `pkg.T{…}`, `pkg.T(x)`: a package-level
       // variable, function or type of the package imported.
@@ -30949,6 +30950,24 @@ function goTypeArgsLink(links: GoChainLink[], k: number): string {
   const link = links[k];
   const next = links[k + 1]?.kind;
   return link?.kind === 'index' && (next === 'call' || next === 'composite') ? `[${link.text}]` : '';
+}
+
+/** The result of a call on a local bound directly to a Go function literal. */
+function goLocalFuncLiteralResultType(
+  decl: GoDecl, filePath: string, index: GoScopeIndex, context: ResolutionContext, result: number,
+): GoTypeText | undefined {
+  if (!decl.value) return undefined;
+  const { at, k, n } = decl.value;
+  const code = index.code;
+  const end = decl.kind === 'header' ? goHeaderValueEnd(code, at) : goStatementEnd(code, at);
+  const values = goSplitTopLevel(code.slice(at, end), ',');
+  const literal = values.length === n ? values[k]?.trim() : undefined;
+  if (!literal || !/^func[ \t]*\(/.test(literal)) return undefined;
+  const signature = goSignature(literal, 4);
+  // An immediately invoked literal gives its result to the local, not the function.
+  if (!signature || goClosingBracket(literal, signature.body) !== literal.length - 1) return undefined;
+  const text = goResultText(literal.slice(4, signature.body), result);
+  return text === undefined ? undefined : goTypeTextAt(text, filePath, decl.at, index, context);
 }
 
 /**

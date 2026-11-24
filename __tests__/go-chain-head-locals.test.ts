@@ -147,6 +147,43 @@ func fromLocal() {
 	sub.Path("/a")
 }
 
+func fromClosure() {
+	split := func(r *Route) (*Route, *Router) { return r, r.Subrouter() }
+	_, r := split(new(Route))
+	r.Path("/a")
+}
+
+func fromRenamedClosure() {
+	split := func(x *Route) (*Route, *Router) { return x, x.Subrouter() }
+	_, r := split(new(Route))
+	r.Path("/a")
+}
+
+func firstClosureResult() {
+	split := func(r *Router) (*Route, *Router) { return new(Route), r }
+	r, _ := split(new(Router))
+	r.Path("/a")
+}
+
+func splitRoute(r *Route) (*Route, *Router) { return r, r.Subrouter() }
+
+func fromPackageFunction() {
+	_, r := splitRoute(new(Route))
+	r.Path("/a")
+}
+
+func fromShadowingClosure() {
+	splitRoute := func(x *Route) (*Router, *Route) { return x.Subrouter(), x }
+	_, r := splitRoute(new(Route))
+	r.Path("/a")
+}
+
+func thirdClosureResult() {
+	split := func(r *Route) (int, *Route, *Router) { return 0, r, r.Subrouter() }
+	_, _, r := split(new(Route))
+	r.Path("/a")
+}
+
 func plainNew() {
 	x := new(Route)
 	x.Path("/a")
@@ -250,6 +287,15 @@ describe.each(['default', 'wasm'])('a Go local given a chain is typed by what th
     expect(pathCalls('fromLiteral')).toEqual(ROUTER);
     expect(pathCalls('fromFunc')).toEqual(ROUTER);
     expect(pathCalls('fromLocal')).toEqual(ROUTER);
+  });
+
+  it('types a Go local by the corresponding result of a function literal (#3448)', () => {
+    expect(pathCalls('fromClosure')).toEqual(ROUTER);
+    expect(pathCalls('fromRenamedClosure')).toEqual(ROUTER);
+    expect(pathCalls('firstClosureResult')).toEqual(['b_route.go::Route::Path']);
+    expect(pathCalls('fromPackageFunction')).toEqual(ROUTER);
+    expect(pathCalls('fromShadowingClosure')).toEqual(['b_route.go::Route::Path']);
+    expect(pathCalls('thirdClosureResult')).toEqual(ROUTER);
   });
 
   it('still types a local by the `new(T)` or the literal that is its whole value', () => {
