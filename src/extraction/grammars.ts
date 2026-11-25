@@ -52,7 +52,6 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
-  groovy: 'tree-sitter-groovy.wasm',
 };
 
 /**
@@ -124,11 +123,6 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.sc': 'scala',
   '.lua': 'lua',
   '.luau': 'luau',
-  '.groovy': 'groovy',
-  '.gradle': 'groovy',
-  '.gvy': 'groovy',
-  '.gy': 'groovy',
-  '.gsh': 'groovy',
   '.m': 'objc',
   '.mm': 'objc',
   '.sol': 'solidity',
@@ -961,7 +955,6 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
-    groovy: 'Groovy',
     unknown: 'Unknown',
   };
   return names[language] || language;
