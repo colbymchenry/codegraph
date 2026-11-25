@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- Supabase projects: the SQL in `supabase/migrations` is now part of the graph. Functions, tables, views, row-level-security policies and triggers become symbols, with what each one reads, writes and calls, and a `supabase.rpc('name')` or `.from('table')` call in TypeScript or JavaScript links to the function or table it names, so asking about a SQL function shows the code that calls it, and a change to a table shows every function, policy and caller that depends on it. In a repository with several Supabase projects, each one's code links only to its own SQL.
 - `codegraph_callers` and `codegraph_callees` take an `offset`, so an agent can page through a list longer than `limit`, and a cut list names the offset of the next page. Thanks @blairjordan. (#3449)
 - `codegraph init` is faster on large projects: the background workers that link references start sooner, and they and the indexer's own writes no longer hold each other up. (#3472)
 
