@@ -25,7 +25,7 @@ import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
-import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, loadMaxFileSize, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath, isMissingPathError, escapesRoot } from '../utils';
@@ -37,7 +37,7 @@ import { createYielder, type MaybeYield } from '../resolution/cooperative-yield'
 import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
 import { createImportReader, reopenReferencesThroughRemovedFiles } from '../resolution/module-importers';
 import { manifestEvidence, type ManifestEvidence } from '../resolution/workspace-packages';
-import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+import { oversizeStamp, readBoundedSource, readBoundedSourceSync, storedOverSizeLimit } from '../file-limits';
 export { oversizeStamp };
 
 /**
@@ -214,8 +214,8 @@ export function hashContent(content: string): string {
  * and runs only for a file that is new or changed — never once per `.ts` file
  * at discovery, which on a slow disk is a random read per file per scan.
  */
-function readSourceOrStamp(fullPath: string): string | null {
-  const { stats, bytes } = readBoundedSourceSync(fullPath);
+function readSourceOrStamp(fullPath: string, limit: number): string | null {
+  const { stats, bytes } = readBoundedSourceSync(fullPath, limit);
   if (bytes === null) return oversizeStamp(stats.size);
   return isMpegTsBytes(fullPath, bytes) ? null : bytes.toString('utf8');
 }
@@ -2298,6 +2298,7 @@ export class ExtractionOrchestrator {
    */
   private buildDetectionContext(files: string[], inputs?: NonNullable<ExtractionOrchestrator['detectionInputs']>): ResolutionContext {
     const rootDir = this.rootDir;
+    const maxFileSize = loadMaxFileSize(rootDir);
     const listed = inputs ? new Set(files) : null;
     const reads = inputs ? this.detectionReads : null;
     // What is at a path, once per path until a sync says it changed.
@@ -2336,7 +2337,7 @@ export class ExtractionOrchestrator {
           try {
             // Framework detectors scan source by name; a file over the size
             // limit was never indexed and must not be decoded here either (#1910).
-            known.content = readBoundedSourceSync(known.full).bytes?.toString('utf8') ?? null;
+            known.content = readBoundedSourceSync(known.full, maxFileSize).bytes?.toString('utf8') ?? null;
           } catch {
             known.content = null;
           }
@@ -2546,6 +2547,8 @@ export class ExtractionOrchestrator {
     // Threaded into language detection so custom-extension files load the right
     // grammar and store under the mapped language.
     const overrides = loadExtensionOverrides(this.rootDir);
+    // The size limit, read once so every file of this run is held to the same one.
+    const maxFileSize = loadMaxFileSize(this.rootDir);
 
     const log = verbose
       ? (msg: string) => { console.log(`[worker] ${msg}`); }
@@ -2909,7 +2912,7 @@ export class ExtractionOrchestrator {
             // Stat first: a file over the size limit is stored as skipped
             // without ever being read or decoded (#1910), so ten oversize
             // fixtures in one I/O batch no longer cost their size in RSS.
-            const { stats, bytes } = await readBoundedSource(fullPath);
+            const { stats, bytes } = await readBoundedSource(fullPath, maxFileSize);
             if (bytes === null) {
               return { filePath: fp, content: oversizeStamp(stats.size), stats, error: null as Error | null };
             }
@@ -2972,18 +2975,18 @@ export class ExtractionOrchestrator {
           continue;
         }
 
-        // Honour MAX_SOURCE_FILE_SIZE_BYTES. Without this check, vendored generated
+        // Honour the size limit. Without this check, vendored generated
         // headers, minified bundles, and other multi-MB files get indexed,
         // wasting WASM heap and the worker recycle budget on inputs with no
         // useful symbols. The single-file extractFile path already enforces
         // this; the bulk path used to silently skip the check.
-        if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+        if (stats.size > maxFileSize) {
           await storeResult(filePath, content, stats, {
             nodes: [],
             edges: [],
             unresolvedReferences: [],
             errors: [{
-              message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES})`,
+              message: `File exceeds max size (${stats.size} > ${maxFileSize})`,
               filePath,
               severity: 'warning',
               code: 'size_exceeded',
@@ -3087,7 +3090,7 @@ export class ExtractionOrchestrator {
           const fullPath = validatePathWithinRoot(this.rootDir, filePath);
           if (!fullPath) continue;
           // Bounded like the first read: the file may have grown since (#1910).
-          const bytes = (await readBoundedSource(fullPath)).bytes;
+          const bytes = (await readBoundedSource(fullPath, maxFileSize)).bytes;
           if (bytes === null) continue;
           content = bytes.toString('utf8');
         } catch {
@@ -3141,7 +3144,7 @@ export class ExtractionOrchestrator {
           try {
             const fullPath = validatePathWithinRoot(this.rootDir, filePath);
             if (!fullPath) continue;
-            const bytes = (await readBoundedSource(fullPath)).bytes;
+            const bytes = (await readBoundedSource(fullPath, maxFileSize)).bytes;
             if (bytes === null) continue;
             fullContent = bytes.toString('utf8');
           } catch {
@@ -3276,7 +3279,7 @@ export class ExtractionOrchestrator {
     let stats: fs.Stats;
     try {
       // An oversize file is stored as skipped; its bytes are never needed (#1910).
-      const read = await readBoundedSource(fullPath);
+      const read = await readBoundedSource(fullPath, loadMaxFileSize(this.rootDir));
       stats = read.stats;
       // An MPEG transport stream named `.ts` is not TypeScript (#1910).
       if (read.bytes !== null && isMpegTsBytes(relativePath, read.bytes)) {
@@ -3332,14 +3335,15 @@ export class ExtractionOrchestrator {
     const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir), this.rootDir);
 
     // Check file size
-    if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+    const maxFileSize = loadMaxFileSize(this.rootDir);
+    if (stats.size > maxFileSize) {
       const result: ExtractionResult = {
         nodes: [],
         edges: [],
         unresolvedReferences: [],
         errors: [
           {
-            message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES})`,
+            message: `File exceeds max size (${stats.size} > ${maxFileSize})`,
             filePath: relativePath,
             severity: 'warning',
             code: 'size_exceeded',
@@ -3915,6 +3919,9 @@ export class ExtractionOrchestrator {
     const pairsBefore = new Set<string>();
     // Importers' import statements, read once per sync for the files it removes.
     const importReader = createImportReader(this.rootDir);
+    // The size limit in force for this sync: a file can cross it without its
+    // bytes changing, when `maxFileSize` in codegraph.json changed.
+    const maxFileSize = loadMaxFileSize(this.rootDir);
 
     onProgress?.({
       phase: 'scanning',
@@ -4069,10 +4076,14 @@ export class ExtractionOrchestrator {
       // change that preserves both exactly is the blind spot every mtime-based
       // incremental tool accepts; `index --force` is the escape hatch. Git bumps
       // mtime on every file it writes during checkout/merge, so pulls are caught.)
+      // Unless the file is on the other side of the size limit than when it was
+      // stored: `maxFileSize` changed, and the hash below, taken under the new
+      // limit, re-indexes it or drops its symbols.
       if (tracked && !neverParsed) {
         try {
           const stat = fs.statSync(fullPath);
-          if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
+          if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt) &&
+              storedOverSizeLimit(tracked.errors) === stat.size > maxFileSize) {
             continue;
           }
         } catch (error) {
@@ -4086,7 +4097,7 @@ export class ExtractionOrchestrator {
       // (An oversize file hashes as its size stamp, unread — #1910.)
       let content: string | null;
       try {
-        content = readSourceOrStamp(fullPath);
+        content = readSourceOrStamp(fullPath, maxFileSize);
       } catch (error) {
         logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
         failedFilePaths.push(filePath);
@@ -4338,6 +4349,7 @@ export class ExtractionOrchestrator {
     const gitChanges = dirtyPaths !== null && canTrustGitFastPath(this.rootDir, sinceCommit)
       ? getGitChangedFiles(this.rootDir, sinceCommit)
       : null;
+    const maxFileSize = loadMaxFileSize(this.rootDir);
 
     if (gitChanges) {
       // === Git fast path ===
@@ -4348,7 +4360,8 @@ export class ExtractionOrchestrator {
       // Git supplies candidates, never the verdict. A committed deletion may
       // have been recreated locally; a previously indexed dirty path may have
       // vanished from git status after restore. Classify current disk vs DB once.
-      const candidates = new Set([...gitChanges.deleted, ...gitChanges.modified, ...gitChanges.added, ...dirtyPaths!, ...this.sparseCheckoutChanges(), ...this.includedFileChanges()]);
+      // Git sees no change in a file that only crossed a changed `maxFileSize`.
+      const candidates = new Set([...gitChanges.deleted, ...gitChanges.modified, ...gitChanges.added, ...dirtyPaths!, ...this.sparseCheckoutChanges(), ...this.includedFileChanges(), ...this.queries.getFilePathsAcrossSizeLimit(maxFileSize)]);
       const scope = this.scopedSyncMatcher();
       const overrides = loadExtensionOverrides(this.rootDir);
       for (const filePath of candidates) {
@@ -4359,7 +4372,7 @@ export class ExtractionOrchestrator {
           continue;
         }
         let content: string | null;
-        try { content = readSourceOrStamp(fullPath); }
+        try { content = readSourceOrStamp(fullPath, maxFileSize); }
         catch (error) {
           logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
           continue;
@@ -4403,7 +4416,7 @@ export class ExtractionOrchestrator {
       const fullPath = path.join(this.rootDir, filePath);
       let content: string | null;
       try {
-        content = readSourceOrStamp(fullPath);
+        content = readSourceOrStamp(fullPath, maxFileSize);
       } catch (error) {
         logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
         continue;

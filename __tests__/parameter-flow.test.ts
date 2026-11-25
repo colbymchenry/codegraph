@@ -450,6 +450,15 @@ describe('what the pass reads of a file', () => {
     expect(addToCalls(cg)).toEqual(GUESSED);
   });
 
+  it('reads a call site past a million lines in a file the project\'s maxFileSize lets in', async () => {
+    // More lines than a file within the default limit can have, so the call
+    // that passes the class sits past what a table sized for that limit holds.
+    const tables = `${'\n'.repeat(MAX_SOURCE_FILE_SIZE_BYTES + 100)}${TABLES}`;
+    const config = JSON.stringify({ maxFileSize: 2 * MAX_SOURCE_FILE_SIZE_BYTES });
+    const { cg } = await indexed({ ...BASE, 'codegraph.json': config, 'lib/tables.rb': tables });
+    expect(addToCalls(cg)).toEqual(FLOWED);
+  }, 60_000);
+
   it('takes every word of a line past the cap as bound, so the flow abstains', async () => {
     const { cg } = await indexed({ ...BASE, 'lib/reference.rb': inAddTo(`puts "${'x'.repeat(3_000)}", table`) });
     expect(addToCalls(cg)).toEqual(GUESSED);

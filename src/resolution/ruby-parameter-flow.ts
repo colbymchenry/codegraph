@@ -10,6 +10,7 @@ import * as path from 'path';
 import type { Node } from '../types';
 import type { Abstention, FlowMethod, FlowParameter, FlowSignature, FlowSite, FlowValue, FollowParameter, ParameterFlowAdapter, ParameterFlowLanguage } from './parameter-flow';
 import { MAX_SOURCE_FILE_SIZE_BYTES, readSourceText } from '../file-limits';
+import { loadMaxFileSize } from '../project-config';
 import { rubyAncestry, rubyClassMethodOf, rubyConstantQn, rubyMethodsOf } from './name-matcher';
 import { ivarClass } from './ruby-constant-paths';
 import { createYielder } from './cooperative-yield';
@@ -40,7 +41,11 @@ interface Bindings {
   other: Set<string>;
 }
 
-/** Line starts while a file is read. A file within the size limit has a line per byte at most. */
+/**
+ * Line starts while a file is read: a file has a line per character at most.
+ * Sized for the default size limit and grown only for a longer file, which a
+ * project's `maxFileSize` can let in.
+ */
 let scratch: Int32Array | null = null;
 
 /**
@@ -53,7 +58,9 @@ class SourceLines {
   readonly length: number;
 
   constructor(private readonly source: string) {
-    scratch ??= new Int32Array(MAX_SOURCE_FILE_SIZE_BYTES + 2);
+    if (scratch === null || scratch.length < source.length + 2) {
+      scratch = new Int32Array(Math.max(MAX_SOURCE_FILE_SIZE_BYTES, source.length) + 2);
+    }
     let count = 1;
     for (let at = source.indexOf('\n'); at >= 0; at = source.indexOf('\n', at + 1)) scratch[count++] = at + 1;
     scratch[count] = source.length + 1;
@@ -433,6 +440,7 @@ export const rubyParameterFlow: ParameterFlowLanguage = {
 
   adapter(context, methods): ParameterFlowAdapter<RubySignature> {
     const root = context.getProjectRoot();
+    const maxFileSize = loadMaxFileSize(root);
     const texts = new Map<string, string>();
     const sources = new Map<string, SourceLines>();
     const signatures = new Map<string, RubySignature | null>();
@@ -444,9 +452,9 @@ export const rubyParameterFlow: ParameterFlowLanguage = {
     /** A file's text; nothing for one extraction wouldn't take, or that can't be read. */
     const readText = (file: string): string => {
       try {
-        const text = readSourceText(path.join(root, file)) ?? '';
+        const text = readSourceText(path.join(root, file), maxFileSize) ?? '';
         // It can have grown since the check.
-        return text.length > MAX_SOURCE_FILE_SIZE_BYTES ? '' : text;
+        return text.length > maxFileSize ? '' : text;
       } catch {
         return '';
       }
