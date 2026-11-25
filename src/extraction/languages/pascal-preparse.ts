@@ -32,9 +32,14 @@
  *   opens too: `{$IFDEF FOLDING} Index: Integer; begin … {$ELSE} begin
  *   {$ENDIF}`. Read together, the branches open one block more than the code
  *   closes, so every routine after it was lost. The other branch's `begin`
- *   stays. An assembler version that opens the body beside a Pascal one,
- *   `{$IFDEF WIN32_ASM} asm … {$ELSE} begin … {$ENDIF} end;`, is blanked
- *   whole, so the Pascal version is the body.
+ *   stays, as does a `case` or a `try` that one branch leaves for the same
+ *   `end` where the others leave a `begin`: `{$IFDEF ABIX86} case R of …
+ *   else {$ELSE} if V = nil then begin {$ENDIF} … end;` (there the routine
+ *   around it never closed, and took in the routines after it). An assembler
+ *   version that opens the body beside a Pascal one, `{$IFDEF WIN32_ASM} asm
+ *   … {$ELSE} begin … {$ENDIF} end;`, is blanked whole, so the Pascal version
+ *   is the body. A branch may hold conditionals of its own, read as these
+ *   fixes leave them.
  * - A field, variable or typed constant of an anonymous record type:
  *   `AlgData: record case … end`, `Stack: array[1..32] of record First, Last:
  *   LongInt; end;`. The grammar knows a record only as a named type, so the
@@ -611,14 +616,55 @@ function blankConditionalsAfterHeader(s: string, i: number, groupAt: ReadonlyMap
   }
 }
 
+/** The end of the furthest-reaching `[from, to)` span in `ranges` that holds `i`, or -1 when none does. */
+function blankedEnd(ranges: readonly number[], i: number): number {
+  let end = -1;
+  for (let r = 0; r < ranges.length; r += 2) if (ranges[r]! <= i && ranges[r + 1]! > i && ranges[r + 1]! > end) end = ranges[r + 1]!;
+  return end;
+}
+
+/**
+ * Once the bodies are settled, from `i`, the index after a routine header's
+ * `;` whose conditional had its directives blanked: blank the directives of
+ * each conditional with branches that open the body for the code after it
+ * (one `resolved` by `blankDuplicateBegins`) that the blanking left right
+ * after the header, past what reads as spaces now. One nested at the start
+ * of a body comes there (`{$IFNDEF WIN32_ASM} {$IFNDEF CPUX64} … begin …
+ * {$ELSE} begin …`), as does one at the start of a Pascal body whose
+ * assembler branch before it was blanked whole (`{$IFDEF WIN32_ASM} asm …
+ * {$ELSE} {$IFDEF WIN64_ASM} asm … {$ELSE} begin …`). The grammar reads a
+ * conditional there as alternative bodies, which these branches aren't.
+ */
+function blankConditionalsLeftAfterHeader(
+  s: string,
+  i: number,
+  groupAt: ReadonlyMap<number, ConditionalGroup>,
+  resolved: ReadonlySet<ConditionalGroup>,
+  ranges: number[],
+): void {
+  for (;;) {
+    let at = i;
+    for (;;) {
+      at = skipTriviaToGroup(s, at, groupAt);
+      const end = blankedEnd(ranges, at);
+      if (end < 0) break;
+      at = end;
+    }
+    const group = groupAt.get(at);
+    if (!group || !resolved.has(group)) return;
+    ranges.push(...group.bounds);
+  }
+}
+
 const OPEN_BEGIN = 0, OPEN_ASM = 1, OPEN_OTHER = 2;
 
 /**
  * The blocks the code from `from` to `to` leaves open, in order, each as its
  * opener's offset and kind (OPEN_BEGIN, OPEN_ASM, or OPEN_OTHER for `try`,
- * `case` and `record`), or null when it closes a block it didn't open.
+ * `case` and `record`), or null when it closes a block it didn't open. A
+ * word starting in one of the `[from, to)` spans in `blanked` doesn't count.
  */
-function openBlocks(s: string, from: number, to: number): Array<[number, number]> | null {
+function openBlocks(s: string, from: number, to: number, blanked: readonly number[] = []): Array<[number, number]> | null {
   const open: Array<[number, number]> = [];
   let i = from;
   while (i < to) {
@@ -629,7 +675,7 @@ function openBlocks(s: string, from: number, to: number): Array<[number, number]
     }
     if (isIdentStart(s.charCodeAt(i))) {
       const e = wordEnd(s, i + 1);
-      if (e - i >= 3 && e - i <= 6) {
+      if (e - i >= 3 && e - i <= 6 && !(blanked.length > 0 && overlapsRange(blanked, i, i + 1))) {
         const word = s.slice(i, e).toLowerCase();
         if (word === 'end') {
           if (open.pop() === undefined) return null;
@@ -646,39 +692,63 @@ function openBlocks(s: string, from: number, to: number): Array<[number, number]
 }
 
 /**
- * In every conditional (holding no conditional of its own) whose branches
- * each leave blocks open for the code after it to close. When they all leave
- * the same number of `begin`s open, the `begin`s each branch after the first
- * leaves open are blanked: read together, they would open that many blocks
- * more than the code closes, and a branch's statements can sit in the first
- * branch's block, as the graph doesn't read nesting. When each opens one
- * body, some with `asm` and some with `begin` (an assembler and a Pascal
- * version of a routine sharing one `end`), each assembler branch is blanked
- * whole, so the Pascal one is the body; the graph reads nothing in assembler.
+ * In every conditional whose branches each leave blocks open for the code
+ * after it to close. When they all leave the same number of blocks open, all
+ * of them `begin`s but for at most one branch's (a `case` whose `else` the
+ * shared code ends, `{$IFDEF X86} case R of … else {$ELSE} if V = nil then
+ * begin {$ENDIF} … end;`, or a `try`, `{$IFDEF HASFASTTRYFINALLY} try
+ * {$ELSE} begin {$ENDIF}`), the `begin`s are blanked in every branch but
+ * that one, or but the first: read together, the branches would open that
+ * many blocks more than the code closes, and a branch's statements can sit
+ * in the kept branch's block, as the graph doesn't read nesting. When each
+ * opens one body, some with `asm` and some with `begin` (an assembler and a
+ * Pascal version of a routine sharing one `end`), each assembler branch is
+ * blanked whole, so the Pascal one is the body; the graph reads nothing in
+ * assembler. A conditional inside a branch reads as this left it (one
+ * `begin` of its two, say): `groups` come innermost first. Returns the
+ * conditionals it blanked something in.
  */
-function blankDuplicateBegins(s: string, groups: readonly ConditionalGroup[], ranges: number[]): void {
-  for (const { bounds, nested } of groups) {
-    if (nested.length < 2 || nested.includes(true)) continue;
+function blankDuplicateBegins(s: string, groups: readonly ConditionalGroup[], ranges: number[]): Set<ConditionalGroup> {
+  const resolved = new Set<ConditionalGroup>();
+  const blanked: number[] = []; // the spans blanked here, `[from, to)` each, in the order blanked
+  const blank = (from: number, to: number) => {
+    blanked.push(from, to);
+    ranges.push(from, to);
+  };
+  for (const group of groups) {
+    const { bounds, nested } = group;
+    if (nested.length < 2) continue;
+    const inside: number[] = [];
+    if (nested.includes(true)) {
+      for (let r = 0; r < blanked.length; r += 2) {
+        if (blanked[r]! >= bounds[0]! && blanked[r + 1]! <= bounds[bounds.length - 1]!) inside.push(blanked[r]!, blanked[r + 1]!);
+      }
+    }
     const open: Array<Array<[number, number]>> = [];
     for (let b = 0; b < nested.length; b++) {
-      const blocks = openBlocks(s, bounds[2 * b + 1]!, bounds[2 * b + 2]!);
+      const blocks = openBlocks(s, bounds[2 * b + 1]!, bounds[2 * b + 2]!, inside);
       if (!blocks || blocks.length === 0) break;
       open.push(blocks);
     }
     if (open.length < nested.length) continue;
     const kinds = (kind: number) => open.filter((o) => o.every(([, k]) => k === kind)).length;
-    if (kinds(OPEN_BEGIN) === open.length && open.every((o) => o.length === open[0]!.length)) {
-      for (let b = 1; b < open.length; b++) for (const [at] of open[b]!) ranges.push(at, at + 5);
-    } else if (open.every((o) => o.length === 1) && kinds(OPEN_ASM) > 0 && kinds(OPEN_BEGIN) > 0 && kinds(OPEN_BEGIN) + kinds(OPEN_ASM) === open.length) {
+    const begins = kinds(OPEN_BEGIN);
+    if (begins >= open.length - 1 && open.every((o) => o.length === open[0]!.length && o.every(([, k]) => k !== OPEN_ASM))) {
+      const kept = begins === open.length ? 0 : open.findIndex((o) => o.some(([, k]) => k !== OPEN_BEGIN));
+      for (let b = 0; b < open.length; b++) if (b !== kept) for (const [at] of open[b]!) blank(at, at + 5);
+      resolved.add(group);
+    } else if (open.every((o) => o.length === 1) && kinds(OPEN_ASM) > 0 && begins > 0 && begins + kinds(OPEN_ASM) === open.length) {
       let kept = false;
       for (let b = 0; b < open.length; b++) {
         const [at, kind] = open[b]![0]!;
-        if (kind === OPEN_ASM) ranges.push(bounds[2 * b + 1]!, bounds[2 * b + 2]!);
-        else if (kept) ranges.push(at, at + 5);
+        if (kind === OPEN_ASM) blank(bounds[2 * b + 1]!, bounds[2 * b + 2]!);
+        else if (kept) blank(at, at + 5);
         else kept = true;
       }
+      resolved.add(group);
     }
   }
+  return resolved;
 }
 
 const SHAPE_NONE = -1, SHAPE_STATEMENTS = 0, SHAPE_STATEMENTS_SEMI = 1, SHAPE_EMPTY = 2;
@@ -1000,6 +1070,8 @@ export function preParsePascal(source: string): string {
   for (const group of groups) groupAt.set(group.bounds[0]!, group);
   // Each conditional's opening directive that comes where one statement goes: whether a case label is before it.
   const label = new Map<number, boolean>();
+  // The end of each routine header whose conditional after it had its directives blanked.
+  const blankedAfterHeader: number[] = [];
   // The last token read, start and end, for that; -1 right after a declaration the scan read past.
   let lastAt = -1;
   let lastEnd = -1;
@@ -1030,7 +1102,11 @@ export function preParsePascal(source: string): string {
         const next = source.charCodeAt(open) === CH_LPAREN ? scanParameterList(source, open, ranges) : e;
         if (groupAt.size > 0) {
           const headerEnd = semicolonEnd(source, next, MAX_HEADER_PART_LENGTH);
-          if (headerEnd >= 0) blankConditionalsAfterHeader(source, headerEnd, groupAt, ranges);
+          if (headerEnd >= 0) {
+            const before = ranges.length;
+            blankConditionalsAfterHeader(source, headerEnd, groupAt, ranges);
+            if (ranges.length > before) blankedAfterHeader.push(headerEnd);
+          }
         }
         i = next;
         lastAt = -1;
@@ -1076,7 +1152,10 @@ export function preParsePascal(source: string): string {
     }
   }
   if (groups.length > 0) {
-    blankDuplicateBegins(source, groups, ranges);
+    const resolved = blankDuplicateBegins(source, groups, ranges);
+    if (resolved.size > 0) {
+      for (const headerEnd of blankedAfterHeader) blankConditionalsLeftAfterHeader(source, headerEnd, groupAt, resolved, ranges);
+    }
     if (label.size > 0) wrapAlternativeStatements(source, groups, label, ranges, words);
   }
   return applyEdits(source, ranges, words);

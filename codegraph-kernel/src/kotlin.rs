@@ -9,8 +9,9 @@
 //! is source-order dependent) and extractModifiers (expect/actual platform
 //! modifiers → the node DECORATORS wire field, on every created node — the
 //! KMP synthesizer's input). Preserved on purpose: the FIELD_COUNT-0 dead
-//! cluster (no signatures, ZERO type-annotation refs), the bodiless-class
-//! header re-walk asymmetry, enum-entry bodies being invisible, KDoc
+//! cluster (no signatures, ZERO type-annotation refs), a bodiless class
+//! walking its whole header (a bodied one walks only the header's code —
+//! class_header_code), enum-entry arguments being invisible, KDoc
 //! (`multiline_comment`) never being a docstring AND chain-breaking,
 //! comment-gluing into import/package extents,
 //! `@Anno(args)` emitting nothing while `@Anno` emits decorates, zero
@@ -110,7 +111,8 @@ fn kotlin_receiver_chain(text: &str) -> Option<String> {
 }
 
 /// A property's CODE children: the named child right after the `=` token, a
-/// `property_delegate` (`by lazy { … }`), and an accessor the grammar nested
+/// `property_delegate` (`by lazy { … }`), an explicit backing field (`field =
+/// MutableStateFlow(S())`, Kotlin 2.x), and an accessor the grammar nested
 /// under the declaration (`val x: Int get() = compute()` — written on ONE line;
 /// an accessor on its own line parses as a SIBLING of the property and is not
 /// reachable from here). What stays unwalked is the declaration itself —
@@ -132,7 +134,7 @@ fn property_initializers<'t>(node: Node<'t>) -> Vec<Node<'t>> {
         if after_eq {
             out.push(c);
             after_eq = false;
-        } else if matches!(c.kind(), "property_delegate" | "getter" | "setter") {
+        } else if matches!(c.kind(), "property_delegate" | "getter" | "setter" | "backing_field") {
             out.push(c);
         }
     }
@@ -153,6 +155,68 @@ fn accessor_owner<'t>(node: Node<'t>) -> Option<Node<'t>> {
         return if n.kind() == "property_declaration" { Some(n) } else { None };
     }
     None
+}
+
+/// The named child right after the first `token` child of `node`, if any.
+fn named_child_after<'t>(node: Node<'t>, token: &str) -> Option<Node<'t>> {
+    let mut seen = false;
+    for i in 0..node.child_count() {
+        let Some(c) = node.child(i) else { continue };
+        if !c.is_named() {
+            if c.kind() == token {
+                seen = true;
+            }
+            continue;
+        }
+        if seen {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// The code a class, object or enum header holds, in source order (TS
+/// `kotlinClassHeaderCode`): each constructor parameter's default value
+/// (`c: Clock = SystemClock()`), the arguments of the superclass constructor
+/// it calls (`: Base(load())`), and the expression after `by` it delegates an
+/// interface to (`I by Impl()`). A class with a body walks it as its own code
+/// before the body; the types and annotations around it are left alone.
+fn class_header_code<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    let mut out: Vec<Node<'t>> = Vec::new();
+    for i in 0..node.named_child_count() {
+        let Some(child) = node.named_child(i) else { continue };
+        match child.kind() {
+            "primary_constructor" => {
+                for j in 0..child.named_child_count() {
+                    let Some(param) = child.named_child(j) else { continue };
+                    if param.kind() != "class_parameter" {
+                        continue;
+                    }
+                    if let Some(value) = named_child_after(param, "=") {
+                        out.push(value);
+                    }
+                }
+            }
+            "delegation_specifier" => match child.named_child(0) {
+                Some(spec) if spec.kind() == "constructor_invocation" => {
+                    if let Some(args) = (0..spec.named_child_count())
+                        .filter_map(|j| spec.named_child(j))
+                        .find(|c| c.kind() == "value_arguments")
+                    {
+                        out.push(args);
+                    }
+                }
+                Some(spec) if spec.kind() == "explicit_delegation" => {
+                    if let Some(delegate) = named_child_after(spec, "by") {
+                        out.push(delegate);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The sibling accessors that follow a property declaration, in source order.
@@ -647,22 +711,22 @@ impl<'t> Walker<'t> {
         None
     }
 
-    /// getReceiverType — extension functions: the last user_type BEFORE a `.`
-    /// child; its FIRST type_identifier's text (qualified receivers take the
-    /// FIRST segment — the `com::qext` bug, preserve).
+    /// getReceiverType — extension functions: the `receiver_type` child's
+    /// user_type (a nullable or function-type receiver gives none); its FIRST
+    /// type_identifier's text (qualified receivers take the FIRST segment —
+    /// the `com::qext` bug, preserve).
     fn receiver_type_of(&self, node: Node<'t>) -> Option<String> {
-        let mut found_user_type: Option<Node> = None;
         for i in 0..node.child_count() {
             let Some(child) = node.child(i) else { continue };
             match child.kind() {
-                "user_type" => found_user_type = Some(child),
-                "." => {
-                    if let Some(ut) = found_user_type {
-                        let type_id = (0..ut.named_child_count())
-                            .filter_map(|j| ut.named_child(j))
-                            .find(|c| c.kind() == "type_identifier");
-                        return Some(self.text(type_id.unwrap_or(ut)).to_string());
-                    }
+                "receiver_type" => {
+                    let ut = (0..child.named_child_count())
+                        .filter_map(|j| child.named_child(j))
+                        .find(|c| c.kind() == "user_type")?;
+                    let type_id = (0..ut.named_child_count())
+                        .filter_map(|j| ut.named_child(j))
+                        .find(|c| c.kind() == "type_identifier");
+                    return Some(self.text(type_id.unwrap_or(ut)).to_string());
                 }
                 "simple_identifier" | "function_value_parameters" => break,
                 _ => {}
@@ -1082,10 +1146,16 @@ impl<'t> Walker<'t> {
         // primaryCtor refs: csharp-gated no-op.
         self.extract_decorators_for(node, row);
         self.stack.push(Scope { row, kind: "class", name });
-        // Bodied: ONLY class_body children (primary-ctor properties/defaults
-        // invisible). Bodiless: the class node itself → header children
-        // visited → ctor default-value + super-arg calls attribute to the
-        // CLASS (the asymmetry, pinned).
+        // Bodied: the header's code (ctor defaults, super-ctor args, a `by`
+        // delegate — class_header_code) is walked first, then the class_body
+        // children (primary-ctor properties still mint nothing). Bodiless: the
+        // class node itself → every header child visited → the same calls
+        // attribute to the CLASS.
+        if resolved_body.is_some() {
+            for code in class_header_code(node) {
+                self.visit_node(code);
+            }
+        }
         let body = resolved_body.unwrap_or(node);
         for i in 0..body.named_child_count() {
             if let Some(c) = body.named_child(i) {
@@ -1126,6 +1196,10 @@ impl<'t> Walker<'t> {
         let Some(row) = self.create_node("enum", &name, node, extra) else { return };
         self.extract_inheritance(node, row);
         self.stack.push(Scope { row, kind: "enum", name });
+        // The header's code (a ctor default) is the enum's, as a class's is.
+        for code in class_header_code(node) {
+            self.visit_node(code);
+        }
         for i in 0..body.named_child_count() {
             let Some(child) = body.named_child(i) else { continue };
             if child.kind() == "enum_entry" {
@@ -1369,10 +1443,11 @@ impl<'t> Walker<'t> {
     }
 
     /// extractInheritance — delegation_specifier: user_type ?? its
-    /// constructor_invocation's user_type → ONE `extends` ref named by the
-    /// user_type's type_identifiers joined with `.` (`Outer.Inner`, type
-    /// arguments left out), at the first one (interfaces ride extends too;
-    /// `by`-delegation emits NOTHING).
+    /// constructor_invocation's user_type ?? its explicit_delegation's
+    /// user_type (`I by impl`) → ONE `extends` ref named by the user_type's
+    /// type_identifiers joined with `.` (`Outer.Inner`, type arguments left
+    /// out), at the first one (interfaces ride extends too; a function-type
+    /// delegation names no class and emits nothing).
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
         let extends_kind = edge_kind_index("extends").unwrap();
         for i in 0..node.named_child_count() {
@@ -1386,7 +1461,15 @@ impl<'t> Walker<'t> {
             let ctor_inv = (0..child.named_child_count())
                 .filter_map(|j| child.named_child(j))
                 .find(|c| c.kind() == "constructor_invocation");
-            let target = user_type.or(ctor_inv);
+            let delegated = (0..child.named_child_count())
+                .filter_map(|j| child.named_child(j))
+                .find(|c| c.kind() == "explicit_delegation")
+                .and_then(|d| {
+                    (0..d.named_child_count())
+                        .filter_map(|j| d.named_child(j))
+                        .find(|c| c.kind() == "user_type")
+                });
+            let target = user_type.or(ctor_inv).or(delegated);
             let Some(target) = target else { continue };
             let type_node: Option<Node> = if target.kind() == "user_type" {
                 Some(target)

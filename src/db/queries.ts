@@ -503,6 +503,7 @@ export class QueryBuilder {
     getNodesByFileAndName?: NodeStatement;
     getNodeIdentitiesByFile?: SqliteStatement;
     getFileNodesByNamePrefix?: SqliteStatement;
+    getPhpDocumentRootIncludes?: SqliteStatement;
     getNodesByQualifiedNameExact?: NodeStatement;
     getNodesByLowerName?: NodeStatement;
     hasFilesOfLanguage?: SqliteStatement;
@@ -1767,6 +1768,20 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getNodesByNamePrefix.all(prefix, prefix + '￿', limit) as NodeRow[];
     return rows.map(rowToNode);
+  }
+
+  /**
+   * The PHP includes built from `$_SERVER['DOCUMENT_ROOT']` (#3298): the import
+   * nodes the extractors name `prefix` + the path appended to the web root,
+   * each with its file. By index range scan, ordered for a stable reading.
+   */
+  getPhpDocumentRootIncludes(prefix: string): Array<{ filePath: string; name: string }> {
+    if (!this.stmts.getPhpDocumentRootIncludes) {
+      this.stmts.getPhpDocumentRootIncludes = this.db.prepare(
+        "SELECT file_path AS filePath, name FROM nodes WHERE name >= ? AND name < ? AND kind = 'import' AND language = 'php' ORDER BY name, file_path"
+      );
+    }
+    return this.stmts.getPhpDocumentRootIncludes.all(prefix, prefix + '￿') as Array<{ filePath: string; name: string }>;
   }
 
   /** File nodes whose basename starts with `prefix`, without a result cap. */
@@ -3560,6 +3575,76 @@ export class QueryBuilder {
       line: row.line,
       column: row.col,
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+      rowId: row.id,
+    }));
+  }
+
+  /**
+   * The references named `tail` that the resolver gave up on — `h.ServeHTTP(…)`
+   * through an interface, `x.update()` on a receiver it could not type — at most
+   * `limit` of them in file and line order, and how many there are in all.
+   * Excludes `kinds` (a failed import of a same-named package export is someone
+   * else's symbol). One probe of `idx_unresolved_failed_tail` each.
+   */
+  getFailedReferencesByTail(
+    tail: string,
+    excludeKinds: readonly string[],
+    limit: number,
+  ): { refs: UnresolvedReference[]; total: number } {
+    if (!tail) return { refs: [], total: 0 };
+    const kindFilter = excludeKinds.length > 0
+      ? ` AND reference_kind NOT IN (${excludeKinds.map(() => '?').join(',')})`
+      : '';
+    const where = `WHERE status = 'failed' AND name_tail = ?${kindFilter}`;
+    const total = (this.db
+      .prepare(`SELECT COUNT(*) AS n FROM unresolved_refs ${where}`)
+      .get(tail, ...excludeKinds) as { n: number }).n;
+    if (total === 0 || limit <= 0) return { refs: [], total };
+    const rows = this.db
+      .prepare(`SELECT * FROM unresolved_refs ${where} ORDER BY file_path, line, col LIMIT ?`)
+      .all(tail, ...excludeKinds, limit) as UnresolvedRefRow[];
+    return {
+      total,
+      refs: rows.map((row) => ({
+        fromNodeId: row.from_node_id,
+        referenceName: row.reference_name,
+        referenceKind: row.reference_kind as EdgeKind,
+        line: row.line,
+        column: row.col,
+        filePath: row.file_path,
+        language: row.language as Language,
+        rowId: row.id,
+      })),
+    };
+  }
+
+  /**
+   * The references the resolver gave up on that are written exactly as one of
+   * `names` (`binding.Query`), at most `limit`, in file and line order. One
+   * probe of `idx_unresolved_name` per chunk.
+   */
+  getFailedReferencesByNames(names: readonly string[], limit: number): UnresolvedReference[] {
+    const unique = [...new Set(names)].filter((n) => n.length > 0);
+    if (unique.length === 0 || limit <= 0) return [];
+    const rows: UnresolvedRefRow[] = [];
+    for (let i = 0; i < unique.length && rows.length < limit; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      rows.push(...this.db
+        .prepare(
+          `SELECT * FROM unresolved_refs WHERE reference_name IN (${placeholders}) AND status = 'failed'
+            ORDER BY file_path, line, col LIMIT ?`
+        )
+        .all(...chunk, limit - rows.length) as UnresolvedRefRow[]);
+    }
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
       filePath: row.file_path,
       language: row.language as Language,
       rowId: row.id,

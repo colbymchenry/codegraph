@@ -28,7 +28,7 @@ extern "C" {
 extern "C" {
     fn tree_sitter_scala() -> *const ();
 }
-// Vendored dart grammar (build.rs-compiled C — UserNobody14 d4d8f3e; the
+// Vendored dart grammar (build.rs-compiled C — UserNobody14 0038280; the
 // crates.io crate is a different-lineage fork; see grammars/dart).
 extern "C" {
     fn tree_sitter_dart() -> *const ();
@@ -77,7 +77,8 @@ pub fn grammar_for(language: &str) -> Option<Language> {
         "swift" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_swift) }.into())
         }
-        // R7b: fwcd 0.3.8, vendored C compiled in build.rs (crate unusable).
+        // R7b: fwcd main@d6af96d (#3410), vendored C compiled in build.rs
+        // (no crate carries it).
         "kotlin" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_kotlin) }.into())
         }
@@ -97,8 +98,8 @@ pub fn grammar_for(language: &str) -> Option<Language> {
         "scala" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_scala) }.into())
         }
-        // R7b batch 4: UserNobody14 d4d8f3e vendored C compiled in build.rs
-        // (same commit as the byte-copied tree-sitter-wasms 0.1.13 artifact).
+        // UserNobody14 0038280 vendored C compiled in build.rs, the sources
+        // the vendored wasm is built from (#3270).
         "dart" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_dart) }.into())
         }

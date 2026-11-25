@@ -493,13 +493,20 @@ extractImport, hook-first (:3176). Four php shapes:
    phpShadowsDirname finds, ONCE per file over every node of the tree, a
    `use function` that imports a non-global `dirname` (text-normalized: JS
    whitespace runs → one space, the space beside `\ { } ,` dropped) or a
-   `function dirname` in a file with a namespace. Other dynamic forms
-   (`$_SERVER['DOCUMENT_ROOT'] . '/x'`, variables, interpolation) → hook null
-   → falls THROUGH the php grouped branch (include nodes never match it) →
-   `if (this.extractor.extractImport) return;` (:3350) → **nothing
+   `function dirname` in a file with a namespace. **A path built from the web
+   server's root (#3298)**: a head that is `$_SERVER['DOCUMENT_ROOT']` (a
+   `subscript_expression` of exactly two named children, the `variable_name`
+   `$_SERVER` and a pure literal `DOCUMENT_ROOT`, either quote) takes the same
+   appended path, written behind PHP_DOCUMENT_ROOT:
+   `$_SERVER['DOCUMENT_ROOT']/inc/c.php`, no shadow check. Other dynamic forms
+   (variables, interpolation, `$_ENV[…]`, `$GLOBALS['_SERVER'][…]`) → hook
+   null → falls THROUGH the php grouped branch (include nodes never match it)
+   → `if (this.extractor.extractImport) return;` (:3350) → **nothing
    emitted**. Consumed by resolveIncludePath (import-resolver.ts:682-758) —
    suffix/relative file matching, `.php` appended if missing, except for a
-   `./` or `../` path, which loads exactly as written.
+   `./` or `../` path, which loads exactly as written, and a
+   `$_SERVER['DOCUMENT_ROOT']/` one, which loads exactly as written under the
+   project's `codegraph.json` `webRoot` and links nothing without one.
 2. **Single `use`** (incl. `use function`/`use const`/aliased): hook finds
    `namespace_use_clause` → its `qualified_name` (full text, e.g.
    `App\Contracts\Logger` — alias NOT included) else its `name` (bare

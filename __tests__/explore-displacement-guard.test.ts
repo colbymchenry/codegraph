@@ -114,13 +114,21 @@ describe('CG-31 — the cluster path holds back what is still owed below it', ()
         bytes: attributeSourceBytes(response),
       };
     };
+    // PRECISE_QUERY names one symbol, which explore now answers with that symbol
+    // and its references (#3407, explore-one-symbol.test.ts). This guard is about
+    // the ranked allocation, which a one-name query still reaches when the name
+    // has several definitions, so the precise run turns that answer off.
+    const oneSymbol = process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL;
     try {
       const handler = new ToolHandler(cg);
       spread = await run(handler, QUERY);
+      process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL = '0';
       precise = await run(handler, PRECISE_QUERY);
     } finally {
       if (previous === undefined) delete process.env.CODEGRAPH_EXPLORE_DEBUG;
       else process.env.CODEGRAPH_EXPLORE_DEBUG = previous;
+      if (oneSymbol === undefined) delete process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL;
+      else process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL = oneSymbol;
     }
   }, 180_000);
 

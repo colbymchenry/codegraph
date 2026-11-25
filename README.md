@@ -604,7 +604,7 @@ When running as an MCP server, CodeGraph exposes a **single tool** — `codegrap
 
 | Tool | Purpose |
 |------|---------|
-| `codegraph_explore` | Answer almost any question in one call — "how does X work", a flow ("how does X reach Y"), or surveying an area — returning the relevant symbols' verbatim source grouped by file, plus the call paths between them and a blast-radius summary. Surfaces dynamic-dispatch hops (callbacks, React re-render, interface→impl) grep can't follow. Name a file or symbol in the query to read its current line-numbered source, the same shape the Read tool gives you. |
+| `codegraph_explore` | Answer almost any question in one call — "how does X work", a flow ("how does X reach Y"), or surveying an area — returning the relevant symbols' verbatim source grouped by file, plus the call paths between them and a blast-radius summary. Surfaces dynamic-dispatch hops (callbacks, React re-render, interface→impl) grep can't follow. Name a file or symbol in the query to read its current line-numbered source, the same shape the Read tool gives you. A query that names one symbol, like "who calls `toValidURL`?", gets that symbol's source and every line that uses it, each with the function it sits in and the line's text. |
 
 The other tools (`codegraph_node`, `codegraph_search`, `codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_files`, `codegraph_status`) stay fully functional but **unlisted by default** — everything they return already arrives inline on `codegraph_explore` (its blast-radius section, the relationship map, a symbol's body as its callee list). Re-enable any of them for the MCP surface with the `CODEGRAPH_MCP_TOOLS` environment variable (e.g. `CODEGRAPH_MCP_TOOLS=explore,node,search,callers`), or use their CLI equivalents (`codegraph node` / `query` / `callers` / `callees` / `impact` / `files` / `status`).
 
@@ -752,6 +752,28 @@ defaults and win on conflict, so you can also re-point a built-in (e.g.
 language or a malformed file is warned about and skipped — it never breaks
 indexing — and a project with no `codegraph.json` behaves exactly as before.
 Re-index (`codegraph index`) after adding or changing mappings.
+
+### PHP includes from the web root
+
+PHP code often loads files from the folder the web server serves, as in
+`require $_SERVER['DOCUMENT_ROOT'] . '/inc/header.php'`. That folder is set in
+the server's configuration, not in your code, so CodeGraph works it out from
+your includes: it's the folder under which their paths name files your project
+has. When they don't settle it (fewer than three different paths, or two
+folders that fit them about as well), name it in `codegraph.json`:
+
+```json
+{
+  "webRoot": "public"
+}
+```
+
+The folder is relative to the project root, like `"public"`, `"web"` or
+`"htdocs"`, or `"."` for the root itself, and a `webRoot` you set always wins.
+Without either, these includes link to nothing rather than to a guess, which
+could be a different file of the same name. The next sync applies a change.
+Includes built from the including file's own folder, like
+`__DIR__ . '/inc/a.php'`, need neither.
 
 ## Telemetry
 

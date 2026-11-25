@@ -1,9 +1,11 @@
 /**
- * Kotlin syntax newer than the vendored grammar — `when` guards (2.1), `..<`
- * ranges (1.9), multi-dollar strings (2.1), nullable function-type
- * receivers — is rewritten to an older equivalent of the same length before
- * the parse; otherwise error recovery dropped the class around it (Exposed's
- * dialect classes came out as loose functions).
+ * Kotlin syntax newer than tree-sitter-kotlin 0.3.8 — `when` guards (2.1),
+ * `..<` ranges (1.9), nullable function-type receivers — is rewritten to an
+ * older equivalent of the same length before the parse; otherwise error
+ * recovery dropped the class around it (Exposed's dialect classes came out as
+ * loose functions). The grammar vendored since #3410 reads these itself, and a
+ * multi-dollar string (2.1) is no longer rewritten: its literal `${…}` must not
+ * turn back into interpolation.
  */
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import * as fs from 'fs';
@@ -11,6 +13,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
 import { rewriteNewerKotlinSyntax } from '../src/extraction/languages/kotlin';
+import { extractFromSource } from '../src/extraction';
 
 const SOURCE = `package app
 
@@ -60,8 +63,19 @@ describe('newer Kotlin syntax', () => {
     expect(out).toContain('is String,   mode == 2 ->');
     expect(out).toContain('is Long -> if (mode == 1)');
     expect(out).toContain('0.. n');
-    expect(out).toContain('  "?(@.user.team == $team)"');
+    // The grammar reads a multi-dollar string itself, so it stays as written.
+    expect(out).toContain('$$"?(@.user.team == $team)"');
     expect(out).toContain('Op<Boolean>.( ) -> Op<Boolean>');
+  });
+
+  it('leaves a multi-dollar string whose ${…} is literal text parsing clean', () => {
+    // Without its `$$`, `${spring.exposed.show-sql:false}` is an interpolation
+    // that is no expression, and the file stopped parsing (#3410).
+    const src = 'package app\n\nclass Config {\n    @Value($$"${spring.exposed.show-sql:false}")\n    var showSql: Boolean = false\n\n    fun after(): Int = 1\n}\n';
+    expect(rewriteNewerKotlinSyntax(src)).toBe(src);
+    const result = extractFromSource('src/Config.kt', src, 'kotlin');
+    expect(result.errors.filter((e) => e.code === 'parse_error')).toEqual([]);
+    expect(result.nodes.find((n) => n.name === 'after')?.kind).toBe('method');
   });
 
   it('keeps the class around it and every method', () => {

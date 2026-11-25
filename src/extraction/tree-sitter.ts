@@ -27,7 +27,10 @@ import { appendCppMacroMethods } from './languages/cpp-macro-methods';
 import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { rustMacroArgRefs } from './languages/rust-macro-calls';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
-import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
+import {
+  dartMisparsedCtor, dartMisparsedCtorIn, dartMisparsedGenericCall, dartReceiverOf, dartTypeArgumentsType,
+  isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs,
+} from './languages/dart';
 import { cfmlConstructedComponent, cfmlCreatedComponent, isCfIncludeCall } from './languages/cfscript';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
@@ -839,6 +842,25 @@ const PASCAL_TEXT_HEADER = /^(\s*)(?:class\s+)?(?:procedure|function|constructor
  */
 const PASCAL_DATA_NAME = /^(?:F[A-Z][a-z]|[TE][A-Z][a-z]|[A-Z][A-Z0-9_]*$)/;
 
+const PASCAL_ROUTINE_KEYWORDS = new Set(['kProcedure', 'kFunction', 'kConstructor', 'kDestructor', 'kOperator']);
+
+/** Type names an implementation header may write for the type its declaration names otherwise. */
+const PASCAL_TYPE_SYNONYMS = new Map([['longint', 'integer'], ['longword', 'cardinal'], ['dword', 'cardinal']]);
+
+/** A Pascal routine's declaration, as an implementation header is matched to it (#3453). */
+interface PascalRoutineCandidate {
+  node: Node;
+  /** One `modifier:type` per parameter: what tells overloads apart, with the result type. */
+  params: string[];
+  signature: string;
+  /** The result type a function or an operator declares; '' for a procedure. */
+  result: string;
+  implemented: boolean;
+  overloaded: boolean;
+  /** The implementation the node was located at. */
+  body?: SyntaxNode;
+}
+
 export class TreeSitterExtractor {
   /**
    * The node's prose, from either place it can live: a preceding comment
@@ -918,7 +940,7 @@ export class TreeSitterExtractor {
   // each assigned target is a genuine possible callee. Same-body locality is
   // the precision guard (the #932 table-dispatch philosophy scoped to locals).
   private cppLocalFnPtrs = new Map<string, Map<string, Set<string>>>();
-  private methodIndex: Map<string, string> | null = null; // lookup key → node ID for Pascal defProc lookup
+  private pascalRoutineIndex = new Map<string, PascalRoutineCandidate[]>();
   // Paren-less Pascal names (#2514): the names each routine or anonymous
   // method being walked declares itself (innermost last), the class the
   // routine belongs to, how many `with` bodies the walk is inside (a bare name
@@ -2173,6 +2195,9 @@ export class TreeSitterExtractor {
     }
 
     this.nodes.push(newNode);
+    if (this.language === 'pascal' && node.type === 'declProc' && (kind === 'method' || kind === 'function')) {
+      this.indexPascalRoutine(newNode, node);
+    }
 
     // Add containment edge from parent
     if (this.nodeStack.length > 0) {
@@ -2887,12 +2912,17 @@ export class TreeSitterExtractor {
 
     // C# primary-constructor parameter dependencies (`class Svc(IRepo r, …)`).
     this.extractCsharpPrimaryCtorParamRefs(node, classNode.id);
+    this.extractDartPrimaryCtorRefs(node, classNode.id);
 
     // Extract decorators applied to the class (`@Foo class X {}`).
     this.extractDecoratorsFor(node, classNode.id);
 
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
+    this.extractDartNamedPrimaryCtor(node, classNode.name);
+    // The code in a bodied class's header (a Kotlin `I by Impl()`) is the
+    // class's own; a bodiless class walks its whole header just below.
+    if (resolvedBody) this.visitClassHeaderCode(node);
     const body = resolvedBody ?? node;
 
     // Visit all children for methods and properties
@@ -2911,6 +2941,15 @@ export class TreeSitterExtractor {
     }
 
     this.nodeStack.pop();
+  }
+
+  /**
+   * Walk the code a class's header holds (`classHeaderCode`) with the class
+   * on the stack, as the walk of a bodiless class's header does. Mirrored in
+   * the kernel (kotlin.rs `class_header_code`).
+   */
+  private visitClassHeaderCode(node: SyntaxNode): void {
+    for (const code of this.extractor?.classHeaderCode?.(node) ?? []) this.visitNode(code);
   }
 
   /**
@@ -3183,9 +3222,12 @@ export class TreeSitterExtractor {
 
     // Extract inheritance (e.g. Swift: enum AFError: Error)
     this.extractInheritance(node, enumNode.id);
+    this.extractDartPrimaryCtorRefs(node, enumNode.id);
 
     // Push to stack and visit body children (enum members, nested types, methods)
     this.nodeStack.push(enumNode.id);
+    this.extractDartNamedPrimaryCtor(node, enumNode.name);
+    this.visitClassHeaderCode(node);
 
     const memberTypes = this.extractor.enumMemberTypes;
     for (let i = 0; i < body.namedChildCount; i++) {
@@ -7017,6 +7059,9 @@ export class TreeSitterExtractor {
     if (this.language === 'dart') {
       if (node.type !== 'selector') return;
       if (node.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) return;
+      // So is `Map` in `List<Map<K, V>>.from(m)` when the grammar split the
+      // call into comparisons: the body walker references the call's types.
+      if (knownParent?.type === 'relational_expression' && dartMisparsedCtorIn(knownParent, node)) return;
       const prev = dartReceiverOf(node);
       if (prev?.type === 'identifier' && /^[A-Z][A-Za-z0-9_]*$/.test(prev.text)) {
         // `Map` in `x.read<Map<K, V>>(y)` parsed as comparisons is a type
@@ -7024,7 +7069,13 @@ export class TreeSitterExtractor {
         const before = knownParent?.type === 'relational_expression' ? prev.previousNamedSibling : null;
         if (before?.type === 'relational_operator' && dartMisparsedGenericCall(before)) return;
         this.pushStaticMemberRef(prev.text, ownerId, prev);
+        return;
       }
+      // The type a `<…>` follows is referenced as a type, `_Box` and `$Box`
+      // in `_Box<T>.named(…)` too, and `Box` after an import prefix in
+      // `p.Box<T>.named(…)`.
+      const type = dartTypeArgumentsType(node);
+      if (type && isDartTypeName(type)) this.pushStaticMemberRef(type.text, ownerId, type);
       return;
     }
 
@@ -7991,6 +8042,29 @@ export class TreeSitterExtractor {
             column: typeNode.startPosition.column,
           });
         }
+        // A generic constructor call the grammar read as comparisons and a dot
+        // shorthand, `(Future < void) > .delayed(d)`: the call, from where a
+        // parsed one starts, and the types it names (dartMisparsedCtor).
+        const ctor = nodeType === 'relational_expression' && ownerId ? dartMisparsedCtor(node) : undefined;
+        if (ctor && ownerId) {
+          this.unresolvedReferences.push({
+            fromNodeId: ownerId,
+            referenceName: `${ctor.type.text}.${ctor.name.text}`,
+            referenceKind: 'calls',
+            line: ctor.head.startPosition.row + 1,
+            column: ctor.head.startPosition.column,
+          });
+          for (const type of [ctor.type, ...ctor.typeArgs]) {
+            if (!isDartTypeName(type)) continue;
+            this.unresolvedReferences.push({
+              fromNodeId: ownerId,
+              referenceName: type.text,
+              referenceKind: 'references',
+              line: type.startPosition.row + 1,
+              column: type.startPosition.column,
+            });
+          }
+        }
       }
 
       // Local variable type annotations inside a body — `const items: Foo[] = []`,
@@ -8481,10 +8555,15 @@ export class TreeSitterExtractor {
 
       // Kotlin: `class Foo : Bar, Baz` → delegation_specifier > user_type > type_identifier
       // Also handles `class Foo : Bar()` → delegation_specifier > constructor_invocation > user_type
+      // and `class Foo : Baz by impl` → delegation_specifier > explicit_delegation > user_type:
+      // the class implements the interface it delegates (a function type names no class).
       if (child.type === 'delegation_specifier') {
         const userType = child.namedChildren.find((c: SyntaxNode) => c.type === 'user_type');
         const constructorInvocation = child.namedChildren.find((c: SyntaxNode) => c.type === 'constructor_invocation');
-        const target = userType ?? constructorInvocation;
+        const delegated = child.namedChildren
+          .find((c: SyntaxNode) => c.type === 'explicit_delegation')
+          ?.namedChildren.find((c: SyntaxNode) => c.type === 'user_type');
+        const target = userType ?? constructorInvocation ?? delegated;
         if (target) {
           // `class K : Outer.Inner()` names the nested type by its whole
           // path (`Outer.Inner`), type arguments left out — not `Outer`.
@@ -8795,6 +8874,43 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * A Dart 3.13 primary constructor in a class or enum header, `class
+   * Point(final Offset origin, {Size? size})`: the types its parameters name
+   * are the type's, as a field's declared type is, since a `final` or `var`
+   * parameter declares one (#3270). The native kernel's
+   * `primary_ctor_type_refs` mirrors it.
+   */
+  private extractDartPrimaryCtorRefs(node: SyntaxNode, ownerId: string): void {
+    if (this.language !== 'dart') return;
+    const ctor = getChildByField(node, 'primary_constructor');
+    const parameters = ctor ? getChildByField(ctor, 'parameters') : null;
+    if (parameters) pushDartTypeRefs(parameters, ownerId, (ref) => this.unresolvedReferences.push(ref));
+  }
+
+  /**
+   * A named Dart 3.13 primary constructor, `class Point.origin(final int x)`,
+   * is the type's named constructor as `Point.origin(…)` in its body would
+   * be: a method named `origin` that returns the type, which a call
+   * `Point.origin(…)` links. An unnamed one, like `Point()`, mints no node
+   * (#3270). The native kernel's `named_primary_ctor` mirrors it.
+   */
+  private extractDartNamedPrimaryCtor(node: SyntaxNode, typeName: string): void {
+    if (this.language !== 'dart') return;
+    const ctor = getChildByField(node, 'primary_constructor');
+    const name = ctor ? getChildByField(ctor, 'name') : null;
+    if (!ctor || name?.type !== 'identifier') return;
+    const parameters = getChildByField(ctor, 'parameters');
+    const signature = parameters ? getNodeText(parameters, this.source).trim() : '';
+    this.createNode('method', getNodeText(name, this.source), ctor, {
+      signature: signature || undefined,
+      visibility: 'public',
+      isAsync: false,
+      isStatic: false,
+      returnType: typeName,
+    });
+  }
+
+  /**
    * Record the dependencies declared by a C# PRIMARY CONSTRUCTOR
    * (`class Svc(IRepo repo, [FromKeyedServices("k")] ICache cache) { … }`,
    * C# 12+). The parameter list hangs off the class/struct/record declaration
@@ -9059,7 +9175,7 @@ export class TreeSitterExtractor {
       return true;
     }
 
-    // defProc in implementation section → extract calls but don't create duplicate nodes
+    // defProc → attach the implementation to its declaration and extract calls.
     if (nodeType === 'defProc') {
       this.extractPascalDefProc(node);
       return true;
@@ -9134,13 +9250,28 @@ export class TreeSitterExtractor {
    * Extract a Pascal declType node (class, interface, enum, or type alias)
    */
   private extractPascalDeclType(node: SyntaxNode): void {
-    const nameNode = getChildByField(node, 'name');
+    const declared = getChildByField(node, 'name');
+    const swallowed = this.pascalSwallowedTypeName(node);
+    const nameNode = swallowed ?? declared;
     if (!nameNode) return;
     const name = getNodeText(nameNode, this.source);
+    // The type the grammar could not read keeps its name, as an alias, and
+    // the class it ran into starts at its own name.
+    if (swallowed && declared) this.createNode('type_alias', getNodeText(declared, this.source), declared);
+    const startAtName = (created: Node | null): void => {
+      if (!created || !swallowed) return;
+      created.startLine = swallowed.startPosition.row + 1;
+      created.startColumn = swallowed.startPosition.column;
+    };
 
     // Find the inner type declaration
     const declClass = node.namedChildren.find(
       (c: SyntaxNode) => c.type === 'declClass'
+    );
+    // A class or record helper (`TFooHelper = class helper for TFoo`) is a
+    // type of its own, whose methods are written like a class's.
+    const declHelper = node.namedChildren.find(
+      (c: SyntaxNode) => c.type === 'declHelper'
     );
     const declIntf = node.namedChildren.find(
       (c: SyntaxNode) => c.type === 'declIntf'
@@ -9149,21 +9280,26 @@ export class TreeSitterExtractor {
       (c: SyntaxNode) => c.type === 'type'
     );
 
-    if (declClass) {
-      const classNode = this.createNode('class', name, node);
+    if (declClass || declHelper) {
+      const body = (declClass ?? declHelper)!;
+      const classNode = this.createNode('class', name, node,
+        declHelper ? { signature: this.pascalHelperSignature(declHelper) } : undefined);
+      startAtName(classNode);
       if (classNode) {
         // Extract inheritance from typeref children of declClass
-        this.extractPascalInheritance(declClass, classNode.id);
+        if (declClass) this.extractPascalInheritance(declClass, classNode.id);
+        else this.extractPascalHelperTypes(declHelper!, classNode.id);
         // Visit class body
         this.nodeStack.push(classNode.id);
-        for (let i = 0; i < declClass.namedChildCount; i++) {
-          const child = declClass.namedChild(i);
+        for (let i = 0; i < body.namedChildCount; i++) {
+          const child = body.namedChild(i);
           if (child) this.visitNode(child);
         }
         this.nodeStack.pop();
       }
     } else if (declIntf) {
       const ifaceNode = this.createNode('interface', name, node);
+      startAtName(ifaceNode);
       if (ifaceNode) {
         // Visit interface members
         this.nodeStack.push(ifaceNode.id);
@@ -9268,11 +9404,260 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Extract calls and resolve method context from a Pascal defProc (implementation body).
-   * Does not create a new node — the declaration was already captured from the interface section.
+   * The types a helper names: the helper it descends from
+   * (`class helper(TBaseHelper) for TFoo`), which it extends, and the type it
+   * helps, after `for`, which it references (a helper is no subclass of it).
    */
+  private extractPascalHelperTypes(declHelper: SyntaxNode, classId: string): void {
+    let afterFor = false;
+    for (const child of declHelper.children) {
+      if (child.type === 'kFor') {
+        afterFor = true;
+      } else if (child.type === 'typeref') {
+        this.unresolvedReferences.push({
+          fromNodeId: classId,
+          referenceName: getNodeText(child, this.source),
+          referenceKind: afterFor ? 'references' : 'extends',
+          line: child.startPosition.row + 1,
+          column: child.startPosition.column,
+        });
+        if (afterFor) return;
+      }
+    }
+  }
+
+  /** A helper's head as written, spaces collapsed: `class helper for TFoo`, `record helper(TBase) for TFoo`. */
+  private pascalHelperSignature(declHelper: SyntaxNode): string {
+    let end = declHelper.startIndex;
+    let afterFor = false;
+    for (const child of declHelper.children) {
+      if (child.type === 'kFor') afterFor = true;
+      else if (afterFor && child.type === 'typeref') {
+        end = child.endIndex;
+        break;
+      }
+    }
+    return this.source.substring(declHelper.startIndex, end).replace(/\s+/g, ' ').trim();
+  }
+
+  /** Parameter types and modifiers identify overloads; names, grouping and defaults do not. */
+  private pascalRoutineParams(header: SyntaxNode): string[] {
+    return (getChildByField(header, 'args')?.namedChildren ?? [])
+      .filter((arg) => arg.type === 'declArg')
+      .flatMap((arg) => {
+        const modifier = arg.namedChildren.find((c) => c.type === 'kConst' || c.type === 'kVar' || c.type === 'kOut')?.type ?? '';
+        const type = this.pascalTypeTokens(getChildByField(arg, 'type'));
+        return arg.namedChildren.filter((c) => c.type === 'identifier').map(() => `${modifier}:${type}`);
+      });
+  }
+
+  /**
+   * The result type a function or an operator declares: `class operator
+   * Implicit(const A: TDocValue): RawUtf8` and its `: Boolean` overload
+   * differ by it alone. '' for a procedure.
+   */
+  private pascalRoutineResult(header: SyntaxNode): string {
+    // A header the parse broke can hold its result as a bare `typeref`.
+    return this.pascalTypeTokens(header.namedChildren.find((c) => c.type === 'type' || c.type === 'typeref') ?? null);
+  }
+
+  private pascalDeclaresOverload(header: SyntaxNode): boolean {
+    return header.namedChildren.some((c) => c.type === 'procAttribute' && c.namedChildren.some((a) => a.type === 'kOverload'));
+  }
+
+  private pascalTypeTokens(node: SyntaxNode | null): string {
+    if (!node || node.type === 'comment' || node.type === 'pp') return '';
+    return node.childCount ? node.children.map((c) => this.pascalTypeTokens(c)).join('') : getNodeText(node, this.source).toLowerCase();
+  }
+
+  /** Generic parameters can carry constraints only in the declaration. */
+  private pascalRoutineName(node: SyntaxNode | null): string {
+    if (!node) return '';
+    if (node.type === 'genericTpl') {
+      const arity = (getChildByField(node, 'args')?.namedChildren ?? [])
+        .filter((arg) => arg.type === 'genericArg')
+        .reduce((count, arg) => count + arg.namedChildren.filter((c) => c.type === 'identifier').length, 0);
+      return `${this.pascalRoutineName(getChildByField(node, 'entity'))}<${arity}>`;
+    }
+    if (node.type === 'genericDot') {
+      return `${this.pascalRoutineName(getChildByField(node, 'lhs'))}.${this.pascalRoutineName(getChildByField(node, 'rhs'))}`;
+    }
+    return getNodeText(node, this.source).trim().toLowerCase();
+  }
+
+  /**
+   * The class a `declType` declares when a type before it that the grammar
+   * cannot read ran into it: `TPercent = 0 .. 100;` (HeidiSQL's
+   * VirtualTrees) or `TBits = set of 0..255;` (mORMot) parses as one type
+   * declaration holding the next class, whose own `TArea =` is left as an
+   * error right before the class body. Null for any other declaration.
+   */
+  private pascalSwallowedTypeName(declType: SyntaxNode): SyntaxNode | null {
+    const parts = declType.namedChildren;
+    const at = parts.findIndex((c) => c.type === 'declClass' || c.type === 'declHelper' || c.type === 'declIntf');
+    const error = at > 0 ? parts[at - 1]! : null;
+    if (error?.type !== 'ERROR') return null;
+    const eq = error.namedChildren[error.namedChildCount - 1];
+    if (eq?.type !== 'kEq') return null;
+    // The last name before the `=`, wherever the broken type put it.
+    let name: SyntaxNode | null = null;
+    const walk = (n: SyntaxNode): void => {
+      if (n.startIndex >= eq.startIndex) return;
+      if (n.type === 'identifier') name = n;
+      else for (const c of n.namedChildren) walk(c);
+    };
+    walk(error);
+    const found = name as SyntaxNode | null;
+    return found && this.source.substring(found.endIndex, eq.startIndex).trim() === '' ? found : null;
+  }
+
+  private indexPascalRoutine(node: Node, header: SyntaxNode): void {
+    const parts = [this.pascalRoutineName(getChildByField(header, 'name'))];
+    for (let parent = header.parent; parent; parent = parent.parent) {
+      if (parent.type === 'declType') parts.unshift(this.pascalRoutineName(this.pascalSwallowedTypeName(parent) ?? getChildByField(parent, 'name')));
+    }
+    const params = this.pascalRoutineParams(header);
+    const implementation = header.parent?.type === 'defProc' ? header.parent : undefined;
+    const candidate: PascalRoutineCandidate = {
+      node,
+      params,
+      signature: params.join(';'),
+      result: this.pascalRoutineResult(header),
+      implemented: implementation !== undefined,
+      overloaded: this.pascalDeclaresOverload(header),
+      body: implementation,
+    };
+    // Bare names belong to free routines, never to a namesake class method.
+    for (let i = 0; i < (node.kind === 'method' ? parts.length - 1 : 1); i++) {
+      const key = parts.slice(i).join('.');
+      const candidates = this.pascalRoutineIndex.get(key);
+      if (candidates) candidates.push(candidate);
+      else this.pascalRoutineIndex.set(key, [candidate]);
+    }
+  }
+
+  /**
+   * Where an implementation's source runs, header to body end. Null when the
+   * parse joined no body to the header. A parse error the routine above ran
+   * into (DelphiMVCFramework's `const [ref] Src` parameter) starts it at
+   * its own header, not the routine above's.
+   */
+  private pascalImplementationRange(node: SyntaxNode, header: SyntaxNode): { start: { row: number; column: number }; end: { row: number; column: number } } | null {
+    if (!node.hasError) return { start: node.startPosition, end: node.endPosition };
+    let body: SyntaxNode | null = null;
+    for (const child of node.namedChildren) {
+      if (child.type === 'defProc' && (body || child.startPosition.column <= node.startPosition.column)) {
+        if (!body) return null;
+        break;
+      }
+      if (!body && (child.type === 'block' || child.type === 'asm')) body = child;
+    }
+    if (!body) return null;
+    const terminator = body.nextSibling;
+    // The header's own keyword, before its name: what comes before it there
+    // is the routine above, which the error ran into.
+    const parts = header.children;
+    const name = getChildByField(header, 'name');
+    let at = name ? parts.findIndex((p) => p.startIndex === name.startIndex) - 1 : -1;
+    if (at >= 0 && PASCAL_ROUTINE_KEYWORDS.has(parts[at]!.type)) {
+      if (at > 0 && parts[at - 1]!.type === 'kClass') at--;
+    } else {
+      at = 0;
+    }
+    return { start: parts[at]?.startPosition ?? header.startPosition, end: (terminator?.type === ';' ? terminator : body).endPosition };
+  }
+
+  /**
+   * Keep the declaration's identity and metadata, but return its
+   * implementation as source. A second implementation of the routine, under
+   * `{$IFDEF}`, joins the first one's range when only directives and
+   * comments stand between them (mORMot's `{$ifdef CPUX64}` assembler beside
+   * its Pascal version); else the first stays the routine's source.
+   */
+  private locatePascalRoutine(routine: Node, candidate: PascalRoutineCandidate | undefined, node: SyntaxNode, header: SyntaxNode): void {
+    const range = this.pascalImplementationRange(node, header);
+    if (!range) return;
+    const first = candidate?.body;
+    if (first && first.startIndex !== node.startIndex) {
+      if (!this.pascalTwinImplementations(first, node)) return;
+    } else {
+      routine.startLine = range.start.row + 1;
+      routine.startColumn = range.start.column;
+    }
+    routine.endLine = range.end.row + 1;
+    routine.endColumn = range.end.column;
+    if (candidate) candidate.body = node;
+  }
+
+  /** Whether only directives and comments stand between two implementations. */
+  private pascalTwinImplementations(first: SyntaxNode, second: SyntaxNode): boolean {
+    for (let sibling = second.previousSibling; sibling; sibling = sibling.previousSibling) {
+      if (sibling.startIndex === first.startIndex) return true;
+      if (sibling.type !== 'pp' && sibling.type !== 'comment') return false;
+    }
+    return false;
+  }
+
+  /**
+   * The declaration an implementation header implements, of the routines of
+   * its name:
+   *  - the one with its parameter and result types. When `{$IFDEF}` branches
+   *    declare it twice alike (SynEdit's `AddKey`), the first not yet
+   *    implemented; an implemented one for a second body.
+   *  - for a header that leaves out its parameters, the routine that is not
+   *    overloaded.
+   *  - else the one not yet implemented that its parameters fit best, with at
+   *    least half their types alike: gnugettext implements an overload
+   *    declared with `Number: Longint` as `Number: Integer`.
+   */
+  private pascalDeclarationOf(candidates: PascalRoutineCandidate[], header: SyntaxNode): PascalRoutineCandidate | undefined {
+    if (candidates.length === 0) return undefined;
+    const params = this.pascalRoutineParams(header);
+    const signature = params.join(';');
+    const result = this.pascalRoutineResult(header);
+    const exact = candidates.filter((c) => c.signature === signature && c.result === result);
+    if (exact.length > 0) return exact.find((c) => !c.implemented) ?? exact[0];
+    if (!getChildByField(header, 'args')) {
+      // `procedure Run; overload;` is an overload of its own, with no parameters.
+      if (this.pascalDeclaresOverload(header)) return undefined;
+      const plain = candidates.length === 1 ? candidates : candidates.filter((c) => !c.overloaded);
+      return plain.find((c) => !c.implemented) ?? (plain.length === 1 && !plain[0]!.overloaded ? plain[0] : undefined);
+    }
+    const open = candidates.filter((c) => !c.implemented);
+    // An unmatched, non-overloaded declaration is unique even when the body
+    // qualifies a type differently.
+    if (candidates.length === 1 && open.length === 1 && !open[0]!.overloaded) return open[0];
+    const typeOf = (param: string): string => {
+      const type = param.slice(param.indexOf(':') + 1);
+      return PASCAL_TYPE_SYNONYMS.get(type) ?? type;
+    };
+    const modifierOf = (param: string): string => param.slice(0, param.indexOf(':'));
+    let best: PascalRoutineCandidate | undefined;
+    let bestScore = -1;
+    let tied = false;
+    for (const c of open) {
+      if (c.params.length !== params.length) continue;
+      let types = 0;
+      let modifiers = 0;
+      for (let i = 0; i < params.length; i++) {
+        if (typeOf(params[i]!) === typeOf(c.params[i]!)) types++;
+        if (modifierOf(params[i]!) === modifierOf(c.params[i]!)) modifiers++;
+      }
+      if (types * 2 < params.length) continue;
+      const score = types * 4 + modifiers * 2 + (c.result === result ? 1 : 0);
+      if (score > bestScore) {
+        best = c;
+        bestScore = score;
+        tied = false;
+      } else if (score === bestScore) {
+        tied = true;
+      }
+    }
+    return tied ? undefined : best;
+  }
+
+  /** Match a Pascal implementation to its declaration without merging overloads. */
   private extractPascalDefProc(node: SyntaxNode): void {
-    // Find the matching declaration node by name to use as call parent
     const declProc = node.namedChildren.find(
       (c: SyntaxNode) => c.type === 'declProc'
     );
@@ -9281,61 +9666,32 @@ export class TreeSitterExtractor {
     const nameNode = getChildByField(declProc, 'name');
     if (!nameNode) return;
     const fullName = getNodeText(nameNode, this.source).trim();
-    // fullName is like "TAuthService.Create"
-    const shortName = fullName.includes('.') ? fullName.split('.').pop()! : fullName;
-    const fullNameKey = fullName.toLowerCase();
-    const shortNameKey = shortName.toLowerCase();
-
-    // Build method index on first use (O(n) once, then O(1) per lookup)
-    if (!this.methodIndex) {
-      this.methodIndex = new Map();
-      for (const n of this.nodes) {
-        if (n.kind === 'method' || n.kind === 'function') {
-          const nameKey = n.name.toLowerCase();
-          // Keep first seen short-name mapping to avoid silently overwriting earlier entries.
-          if (!this.methodIndex.has(nameKey)) {
-            this.methodIndex.set(nameKey, n.id);
-          }
-
-          // For Pascal methods, also index qualified forms (e.g. TAuthService.Create).
-          if (n.kind === 'method') {
-            const qualifiedParts = n.qualifiedName.split('::');
-            if (qualifiedParts.length >= 2) {
-              // Create suffix keys so both "Module.Class.Method" and "Class.Method" can resolve.
-              for (let i = 0; i < qualifiedParts.length - 1; i++) {
-                const scopedName = qualifiedParts.slice(i).join('.').toLowerCase();
-                this.methodIndex.set(scopedName, n.id);
-              }
-            }
-          }
-        }
-      }
-    }
-
-    let parentId =
-      this.methodIndex.get(fullNameKey) ||
-      this.methodIndex.get(shortNameKey);
+    const fullNameKey = this.pascalRoutineName(nameNode);
+    const shortNameKey = fullNameKey.split('.').pop()!.replace(/<\d+>$/, '');
+    const candidates = this.pascalRoutineIndex.get(fullNameKey) ?? [];
+    let candidate = this.pascalDeclarationOf(candidates, declProc);
+    let routine = candidate?.node;
 
     // No existing node? This is an implementation-only **free** procedure/function
     // (`procedure Helper; begin … end;` with no interface declaration and not a
-    // class method). Create a function node so its body's calls attribute to it,
-    // not to the enclosing file/module. A method (`TClass.Method`, a dotted name)
-    // always has a node from its class declaration, so this only fires for free
-    // routines — and the methodIndex lookup above already covers interface-declared
-    // free routines, so there's no duplicate.
-    if (!parentId && !fullName.includes('.')) {
+    // class method). An ambiguous declaration stays unmatched.
+    if (
+      !routine && !fullNameKey.includes('.') &&
+      (candidates.length === 0 || getChildByField(declProc, 'args') || candidates.every((c) => c.implemented))
+    ) {
       const fnNode = this.createNode('function', fullName, declProc, {
         signature: this.extractor?.getSignature?.(declProc, this.signatureSource),
         visibility: this.extractor?.getVisibility?.(declProc),
       });
       if (fnNode) {
-        parentId = fnNode.id;
-        this.methodIndex.set(fullNameKey, fnNode.id);
-        if (!this.methodIndex.has(shortNameKey)) this.methodIndex.set(shortNameKey, fnNode.id);
+        routine = fnNode;
+        candidate = this.pascalRoutineIndex.get(fullNameKey)?.find((c) => c.node === fnNode);
       }
     }
 
-    if (!parentId) parentId = this.nodeStack[this.nodeStack.length - 1];
+    if (routine) this.locatePascalRoutine(routine, candidate, node, declProc);
+    if (candidate) candidate.implemented = true;
+    const parentId = routine?.id ?? this.nodeStack[this.nodeStack.length - 1];
     if (!parentId) return;
 
     // `TList<T>.Add` belongs to `TList`, whose node may spell its parameters
@@ -9344,11 +9700,8 @@ export class TreeSitterExtractor {
     const routineId = parentId;
     // What a routine nested in this one is qualified under: the routine's
     // node, or its name as written when the implementation matched none.
-    const qualifiedName = (): string => {
-      const routine = this.nodes.find((n) => n.id === routineId);
-      return routine && routine.kind !== 'file' ? routine.qualifiedName : fullName.replace(/<[^>]*>/g, '').split('.').join('::');
-    };
-    this.walkPascalRoutine(node, routineId, owner, shortNameKey.replace(/<.*$/, ''), qualifiedName);
+    const qualifiedName = (): string => routine?.qualifiedName ?? fullName.replace(/<[^>]*>/g, '').split('.').join('::');
+    this.walkPascalRoutine(node, routineId, owner, shortNameKey, qualifiedName);
   }
 
   /**
@@ -9550,6 +9903,9 @@ export class TreeSitterExtractor {
       }
     } else if (firstChild.type === 'identifier') {
       calleeName = getNodeText(firstChild, this.source);
+    } else if (firstChild.type === 'inherited') {
+      // `inherited Run(N)`: the ancestor's `Run` (see pushPascalInheritedCall).
+      this.pushPascalInheritedCall(firstChild);
     }
 
     const vagueLink = receiverLink && firstChild.type === 'exprDot' && !calleeName.includes('.');
@@ -9571,7 +9927,7 @@ export class TreeSitterExtractor {
     // `MD5FileSized(…)` in `MD5FileSized(…).IsSame(AKey)` (#2547), or the call
     // whose result is called in `GetHandler()(X)`.
     if (firstChild.type === 'exprDot') this.extractPascalReceiverCalls(firstChild.namedChild(0));
-    else if (firstChild.type !== 'identifier') this.extractPascalReceiverCalls(firstChild);
+    else if (firstChild.type !== 'identifier' && firstChild.type !== 'inherited') this.extractPascalReceiverCalls(firstChild);
 
     // Also visit arguments for nested calls
     const args = node.namedChildren.find(
@@ -9610,6 +9966,10 @@ export class TreeSitterExtractor {
       case 'exprTpl':
         // `TList<Integer>.Create`: a generic type's name, not a value's.
         this.extractPascalReceiverCalls(node.namedChild(0), false);
+        return;
+      case 'inherited':
+        // `inherited GetList.Count`, `inherited Items[I]`: the ancestor's.
+        this.pushPascalInheritedCall(node);
         return;
       case 'exprSubscript': {
         this.extractPascalReceiverCalls(node.namedChild(0), names);
@@ -9757,6 +10117,67 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * A Pascal `inherited` call, which runs a method of an ancestor of the
+   * routine's class: `inherited Run(N)`, `inherited Run`, `Result :=
+   * inherited Value`, or a bare `inherited;`, which runs the routine's own
+   * name with the parameters it was given. Recorded as
+   * `{inherited@Class}.Name`, a bare one as `{inherited/N@Class}.Name` with
+   * the routine's parameter count (see resolution/pascal-scope), which links
+   * the method of the nearest ancestor that declares the name, never the
+   * class's own. Nothing is recorded outside a method, nor for a name the
+   * statement assigns to (`inherited Items[I] := X`, a property's).
+   */
+  private pushPascalInheritedCall(inherited: SyntaxNode): void {
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    const scope = this.pascalScopeAt(inherited.startPosition.row + 1);
+    if (!callerId || !scope?.classQn) return;
+    const target = inherited.parent?.type === 'exprSubscript' ? inherited.parent : inherited;
+    if (target.parent?.type === 'assignment' && target.parent.namedChild(0)?.id === target.id) return;
+    const id = inherited.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+    let name: string;
+    let arity = '';
+    if (id) {
+      name = getNodeText(id, this.source);
+    } else {
+      const own = this.pascalRoutineAround(inherited, scope.routine);
+      if (!own) return;
+      name = own.name;
+      if (own.arity !== null) arity = `/${own.arity}`;
+    }
+    this.unresolvedReferences.push({
+      fromNodeId: callerId,
+      referenceName: `{inherited${arity}@${scope.classQn}}.${name}`,
+      referenceKind: 'calls',
+      line: inherited.startPosition.row + 1,
+      column: inherited.startPosition.column,
+    });
+  }
+
+  /**
+   * The routine a node is written in, for a bare `inherited`: its name as its
+   * header writes it (`TFoo.Bar<T>` → `Bar`) and its parameter count. Where
+   * the tree's routine isn't the one the scope names (`routine`, lowercased;
+   * a broken tree's text decides), that name and no count. Null in an
+   * anonymous method, or outside a routine.
+   */
+  private pascalRoutineAround(node: SyntaxNode, routine: string | null): { name: string; arity: number | null } | null {
+    if (!routine) return null;
+    for (let p = node.parent; p; p = p.parent) {
+      if (p.type === 'lambda') return null;
+      if (p.type !== 'defProc') continue;
+      const header = p.namedChildren.find((c: SyntaxNode) => c.type === 'declProc');
+      let name: SyntaxNode | null = header ? getChildByField(header, 'name') : null;
+      while (name?.type === 'genericDot' || name?.type === 'genericTpl') {
+        name = getChildByField(name, name.type === 'genericDot' ? 'rhs' : 'entity');
+      }
+      const written = name?.type === 'identifier' ? getNodeText(name, this.source) : '';
+      if (written.toLowerCase() !== routine) break;
+      return { name: written, arity: this.pascalRoutineParams(header!).length };
+    }
+    return { name: routine, arity: null };
+  }
+
+  /**
    * Recursively visit a Pascal block/statement tree for call expressions.
    * With `declarations`, a declaration in it is visited as a declaration.
    */
@@ -9801,6 +10222,9 @@ export class TreeSitterExtractor {
         }
       } else if (child.type === 'identifier') {
         this.extractPascalParenlessName(child, node);
+      } else if (child.type === 'inherited') {
+        // `inherited;`, `inherited Run;`, `Result := inherited Value`.
+        this.pushPascalInheritedCall(child);
       } else if (child.type === 'with') {
         this.pascalWithDepth++;
         this.visitPascalBlock(child, declarations);

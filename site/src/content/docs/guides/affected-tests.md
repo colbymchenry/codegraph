@@ -21,6 +21,7 @@ codegraph affected src/auth.ts --filter "e2e/*"      # custom test-file pattern
 | `-j, --json` | Output as JSON | `false` |
 | `-q, --quiet` | Output file paths only | `false` |
 | `-p, --path <path>` | Project path | current project |
+| `--cross-tier` | Also follow links across a process boundary: a client's HTTP call to its server's route, a queue job to its consumer, an event to its handler ([see below](#across-a-process-boundary)) | `false` |
 
 ## What counts as a test
 
@@ -36,6 +37,10 @@ Without `--filter`, `affected` uses the same test detection as search and `codeg
 - **Ending with `/`** (`tests/`): everything under that folder.
 
 So `tests/**/*.py` also takes `tests/x.py`, directly in `tests/`, and `tests/*.py` doesn't take `tests/x.py.bak`.
+
+## Across a process boundary
+
+CodeGraph links a client's HTTP call to the route that serves it, a queue job to its consumer and an event to its handler, so `codegraph_explore` can follow a request from one side to the other. `affected` stops at those links: a test on the other side mocks the boundary, the way an Angular service's spec stubs its HTTP client, so a change to the Spring controller the service calls doesn't affect that spec. Pass `--cross-tier` to follow them too, when your tests make the real call, as end-to-end tests do.
 
 ## CI / hook example
 

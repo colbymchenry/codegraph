@@ -5627,11 +5627,11 @@ void run() {
     });
 
     it('still extracts a method tree-sitter misparses as a constructor (@override + record return)', async () => {
-      // tree-sitter-dart misparses `@override (A, B) reduce()` — the annotation
-      // swallows the record return type, so `reduce()` looks like a single-
-      // identifier constructor_signature. It must NOT be skipped as an unnamed
-      // ctor (its name doesn't match the class); its body call must attribute to
-      // `reduce`, not the class.
+      // tree-sitter-dart before 0038280 misparsed `@override (A, B) reduce()` —
+      // the annotation swallowed the record return type, so `reduce()` looked
+      // like a single-identifier constructor_signature. It must NOT be skipped
+      // as an unnamed ctor (its name doesn't match the class); its body call
+      // must attribute to `reduce`, not the class.
       fs.writeFileSync(
         path.join(tempDir, 'main.dart'),
         `class Base {}

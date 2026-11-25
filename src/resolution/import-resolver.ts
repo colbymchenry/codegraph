@@ -18,6 +18,9 @@ import { dartDirectiveFile } from './dart-libraries';
 import { ambientModuleDeclares, declaringFileAnswers, findAmbientModuleExport, findAmbientModuleFile, inBlock, isDeclarationFile, isInModuleBlock, namespaceBlocks, type NamespaceBlock } from './ambient-modules';
 import { isTestFile } from '../search/query-utils';
 import { moduleReferenceKeys, moduleTail } from '../db/reference-tail';
+import { PHP_DOCUMENT_ROOT } from '../extraction/languages/php';
+import { loadWebRoot } from '../project-config';
+import { underWebRoot } from './php-web-root';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -2012,7 +2015,8 @@ export function isLuaRequireRef(ref: UnresolvedRef): boolean {
  * common case for procedural codebases); php.ini `include_path` is not
  * modeled. Callers pass an already-extracted static path: a literal, or one
  * appended to `__DIR__` / `dirname(__FILE__)`, which the extractor writes as
- * `./x.php` or `../x.php` relative to the including file (#3298).
+ * `./x.php` or `../x.php` relative to the including file (#3298), or one
+ * appended to `$_SERVER['DOCUMENT_ROOT']`, written behind PHP_DOCUMENT_ROOT.
  */
 function resolvePhpIncludePath(
   includePath: string,
@@ -2020,6 +2024,19 @@ function resolvePhpIncludePath(
   context: ResolutionContext
 ): string | null {
   const projectRoot = context.getProjectRoot();
+  // The web server's root is in its own configuration, not the project's
+  // code (#3298): a `codegraph.json` `webRoot` names it, or the project's own
+  // includes show it clearly enough (php-web-root.ts). A guess at the project
+  // root would link `public/index.php`'s include of
+  // `$_SERVER['DOCUMENT_ROOT'] . '/config.php'` to the root's config.php,
+  // not the public/config.php PHP loads, so with neither it links nothing.
+  // Loaded exactly as written, like `./x`, and never outside the project.
+  if (includePath.startsWith(`${PHP_DOCUMENT_ROOT}/`)) {
+    const webRoot = context.getPhpWebRoot ? context.getPhpWebRoot(fromFile) : loadWebRoot(projectRoot);
+    if (webRoot === null) return null;
+    const target = underWebRoot(webRoot, includePath.slice(PHP_DOCUMENT_ROOT.length + 1));
+    return target !== null && context.fileExists(target) ? target : null;
+  }
   const fromDir = path.dirname(path.join(projectRoot, fromFile));
   const basePath = path.resolve(fromDir, includePath);
   const relativePath = path.relative(projectRoot, basePath).replace(/\\/g, '/');

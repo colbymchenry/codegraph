@@ -16,6 +16,11 @@
  * out as a call is, `<` against the callee and `(` against the `>`; a
  * comparison is written `a < b`.
  *
+ * tree-sitter-dart 0038280 (#3270) parses these as the calls they are, as Dart
+ * does whatever the spacing (`a < B > (c)` too), and leaves the nest to a
+ * type argument list split over lines in rare places; the recovery stays for
+ * those, and the calls below must come out the same.
+ *
  * Runs against the native kernel (when built) and the wasm extractor, which
  * must agree.
  */
@@ -75,19 +80,23 @@ describe('Dart generic calls parsed as comparisons: extraction', () => {
       .sort();
 
     expect(refs).toEqual([
+      // Dart reads `a < B > (c)` and `a<b>(c)` as generic calls, and so does
+      // the grammar now; `b` is no type of the project's.
+      'f calls a 7:14',
+      'f calls a 8:13',
       'f calls print 6:7',
       // Line 6 parses as a call: what the recovered calls must look like.
       'f calls ref.read 5:10',
       'f calls ref.watch 4:21',
       'f calls ref.watch 6:17',
+      'f references B 7:16',
       'f references Ref 3:7',
       // The type argument is referenced as a parsed one is; `int` is built in.
       'f references Repo 5:11',
       'g calls ref.read 1:26',
       'g references Ref 1:6',
     ]);
-    // No member read of `ref.read` / `ref.watch`, and the comparisons on
-    // lines 7 and 8 stay comparisons.
+    // No member read of `ref.read` / `ref.watch`.
   });
 });
 
@@ -127,7 +136,7 @@ class RepositoryProvider<T> {
   RepositoryProvider({required T Function(BuildContext context) create});
 }
 `,
-    // Every call below parses as two comparisons.
+    // Every call below parsed as two comparisons before tree-sitter-dart 0038280.
     'lib/app.dart': `import 'bloc.dart';
 import 'data.dart';
 import 'riverpod.dart';
@@ -213,7 +222,7 @@ bool compare(int a, int b, int c) {
     expect(targets('tap', 'calls')).toEqual(['BlocProvider::of', 'CounterCubit::increment']);
     expect(targets('tap', 'references')).toContain('CounterCubit');
 
-    // Comparisons are not calls.
+    // `a < b > (c)` calls `a`, a parameter here, which links nothing.
     expect(targets('compare', 'calls')).toEqual([]);
   });
 });

@@ -483,6 +483,20 @@ export class ExploreDiagnostics {
   }
 
   /**
+   * Explore answered without the ranked allocation (a one-symbol question,
+   * #3407): no candidates were weighed, so the record is the envelope alone,
+   * with `reason` saying which answer it was.
+   */
+  finishDirect(reason: string, finalText: string, hardCeiling: number): void {
+    try {
+      this.note = reason;
+      this.emit(this.buildReport(finalText, finalText.length, hardCeiling, 0));
+    } catch {
+      // A diagnostic must never fail an explore call.
+    }
+  }
+
+  /**
    * Final pass: attribute the FINAL text's bytes back to files (so the hard
    * ceiling's truncation is reflected in what each file actually delivered),
    * then emit.

@@ -60,7 +60,6 @@ import { loadDeprioritizePatterns } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
-import { minRefsForPool } from './resolution/resolver-pool';
 
 // Re-export types for consumers
 export * from './types';
@@ -143,6 +142,8 @@ export interface IndexOptions {
  */
 /** project_metadata key for the Python package-root digest (see sync). */
 const PYTHON_ROOTS_METADATA_KEY = 'python_root_fingerprint';
+/** project_metadata key for the PHP web roots the index placed `$_SERVER['DOCUMENT_ROOT']` includes under (#3298, see sync). */
+const PHP_WEB_ROOTS_METADATA_KEY = 'php_web_roots';
 /** Metadata key: the digest of the workspace packages and path dependencies the index was resolved by. */
 const WORKSPACE_METADATA_KEY = 'js_workspace_fingerprint';
 /** Metadata key: where the walk that read those packages found their manifests (see ManifestStamp); '' for none. */
@@ -779,11 +780,15 @@ export class CodeGraph {
 
           // Fast-init leaves the DB in memory-journal (rollback) mode, where
           // the parallel resolver pool's read connections would contend with
-          // the main writer's exclusive commits. When the pool will actually
-          // run (enough pending refs), restore WAL BEFORE resolution so
-          // readers never block the writer; otherwise stay in the fast mode
-          // until the finally — sequential resolution has no readers.
-          if (fastInit && unresolvedCount >= minRefsForPool()) {
+          // the main writer's exclusive commits. The resolver calls this right
+          // before it starts the pool, whether before its first batch or
+          // mid-run, so WAL is back before any worker reads and readers never
+          // block the writer; a run that never starts one stays in the fast
+          // mode until the finally — sequential resolution has no readers.
+          let walForPool = false;
+          const beforePool = fastInit ? (): void => {
+            if (walForPool) return;
+            walForPool = true;
             try {
               this.db.getDb().pragma('synchronous = NORMAL');
               this.db.getDb().pragma('journal_mode = WAL');
@@ -805,8 +810,8 @@ export class CodeGraph {
                 options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
               );
               walValve.start();
-            } catch { /* keep current mode; resolution still works sequentially */ }
-          }
+            } catch { /* keep current mode; the workers' reads just contend with the commits */ }
+          } : undefined;
 
           options.onProgress?.({
             phase: 'resolving',
@@ -830,9 +835,11 @@ export class CodeGraph {
                 total: totalPasses,
               });
             },
-            walValve ? () => walValve!.backpressure() : undefined,
+            // Looked up on each call: on a fresh index the valve only comes up with the pool.
+            walValve || beforePool ? () => walValve?.backpressure() ?? null : undefined,
             true,
-            true
+            true,
+            beforePool
           );
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolution: ${Date.now() - tResolve}ms`);
           this.lastSynthesisAt = Date.now();
@@ -893,6 +900,7 @@ export class CodeGraph {
         // real full index — a sync touches a subset, so it must NOT advance the
         // extraction stamp (the bulk would still be stale). See extraction-version.ts.
         if (result.success) this.stampPythonRootFingerprint();
+        if (result.success) this.stampPhpWebRoots();
         if (result.success) this.stampWorkspaceFingerprint();
         if (result.success) this.stampWorkspaceManifests(this.orchestrator.takeManifestEvidence());
         if (result.success) this.stampModuleConfigSnapshot();
@@ -1011,6 +1019,13 @@ export class CodeGraph {
   private stampPythonRootFingerprint(fingerprint = this.resolver.getPythonRootFingerprint()): void {
     try {
       this.queries.setMetadata(PYTHON_ROOTS_METADATA_KEY, fingerprint);
+    } catch { /* metadata is advisory */ }
+  }
+
+  /** Record the PHP web roots the index placed `$_SERVER['DOCUMENT_ROOT']` includes under (#3298), for a later sync to compare against. */
+  private stampPhpWebRoots(snapshot = this.resolver.getPhpWebRootSnapshot()): void {
+    try {
+      this.queries.setMetadata(PHP_WEB_ROOTS_METADATA_KEY, snapshot);
     } catch { /* metadata is advisory */ }
   }
 
@@ -1788,6 +1803,28 @@ export class CodeGraph {
           if (before !== now) this.stampPythonRootFingerprint(now);
         }
 
+        // PHP's web root, which an include of `$_SERVER['DOCUMENT_ROOT'] .
+        // '/x.php'` goes under when codegraph.json names none, is read from
+        // every such include in the project and the files their paths name
+        // (#3298). Files that come or go, or an include edited, can move it
+        // for a folder whose files this sync never touched: then re-open PHP's
+        // references for the sweep below, as a moved Python root set re-opens
+        // Python's. A folder that only appears or goes holds files this sync
+        // resolves anyway, and a `webRoot`'s own edits are the module-config
+        // snapshot's. An index stamped by an older engine has no snapshot:
+        // record one rather than re-resolving on upgrade.
+        {
+          const before = this.queries.getMetadata(PHP_WEB_ROOTS_METADATA_KEY);
+          const now = this.resolver.getPhpWebRootSnapshot();
+          if (before !== null && this.resolver.phpWebRootsMoved(before, now)) {
+            this.resolver.clearCaches();
+            this.orchestrator.resurrectResolutionEdgesForLanguage('php');
+            refreshSynthesis = true;
+            this.queries.setMetadata('synthesis_pending', '1');
+          }
+          if (before !== now) this.stampPhpWebRoots(now);
+        }
+
         // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
         // daemon liveness watchdog's SIGKILL (#1122), Ctrl-C, a crash — leaves
         // the refs it never reached in unresolved_refs, and the git-scoped fast
@@ -2323,11 +2360,14 @@ export class CodeGraph {
     synthesize: boolean = true,
     // The caller has just re-detected the frameworks on this index, so the
     // resolver pool's workers needn't each read the project again to do it.
-    frameworksCurrent: boolean = false
+    frameworksCurrent: boolean = false,
+    // Run right before the resolver pool starts (see resolveAndPersistBatched).
+    beforePool?: () => void
   ): Promise<ResolutionResult> {
     return this.resolver.resolveAndPersistBatched(onProgress, undefined, onSynthesisProgress, {
       dbPath: this.db.getPath(),
       shareFrameworks: frameworksCurrent,
+      beforePool,
       // Bulk-edge-load hooks: on big runs the resolver drops the non-unique
       // edge indexes for the batch loop and recreates them before synthesis
       // (which reads kind-keyed). Concurrent readers (a daemon serving this
@@ -2539,6 +2579,25 @@ export class CodeGraph {
    */
   getUnresolvedReferenceSourcesNamed(names: Iterable<string>, kinds: readonly Edge['kind'][]): Map<string, Set<string>> {
     return this.queries.getUnresolvedReferenceSourcesNamed(names, kinds);
+  }
+
+  /**
+   * The references whose last name segment is `name` that the resolver could
+   * not tie to any definition — `h.ServeHTTP(…)` on an interface value,
+   * `x.update()` on a receiver it could not type — at most `limit` in file and
+   * line order, plus how many there are. Imports are left out: a failed import
+   * of a same-named package export names someone else's symbol.
+   */
+  getUnlinkedReferencesNamed(name: string, limit: number): { refs: UnresolvedReference[]; total: number } {
+    return this.queries.getFailedReferencesByTail(name, ['imports'], limit);
+  }
+
+  /**
+   * The references the resolver could not tie to a definition that are written
+   * exactly as one of `names` (`binding.Query`), at most `limit`.
+   */
+  getUnlinkedReferencesWritten(names: readonly string[], limit: number): UnresolvedReference[] {
+    return this.queries.getFailedReferencesByNames(names, limit);
   }
 
   /**

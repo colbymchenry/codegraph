@@ -33,8 +33,8 @@ import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformance
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
 import {
-  clearPascalScopeMemos, gatePascalCall, isPascalParenlessRef, isPascalSystemCall, matchPascalNestedCall,
-  matchPascalParenlessRef, matchPascalSystemCall,
+  clearPascalScopeMemos, gatePascalCall, isPascalInheritedCall, isPascalParenlessRef, isPascalSystemCall, matchPascalHelperCall,
+  matchPascalInheritedCall, matchPascalNestedCall, matchPascalParenlessRef, matchPascalSystemCall,
 } from './pascal-scope';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
@@ -56,12 +56,15 @@ import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { clearRubyConstantPathMemos, matchRubyConstantPathRef } from './ruby-constant-paths';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, CPP_COMPILE_DB_FILES, loadCppIncludeDirsFromCompileDB, loadCppIncludeDirsHeuristic, readCompileDbIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName, packageJsonMain } from './import-resolver';
-import { ResolverPool, minRefsForPool, poolStartSettled, resolveWorkersWorthStarting, shouldEngageAdaptively } from './resolver-pool';
+import { ResolverPool, poolStartBeforeFirstBatch, poolStartSettled, resolveWorkersWorthStarting, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { readCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } from './frameworks';
 import { clearDeclaredDependencies } from './frameworks/package-deps';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
+import { loadWebRoot, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { folderOf, inferPhpWebRoots, phpWebRootSnapshot, phpWebRootsMoved } from './php-web-root';
+import { PHP_DOCUMENT_ROOT } from '../extraction/languages/php';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { FlowChange, planParameterFlows } from './parameter-flow';
 import { MAX_SOURCE_FILE_SIZE_BYTES, readSourceText } from '../file-limits';
@@ -297,8 +300,11 @@ const CPP_BUILT_INS = new Set([
   'move', 'forward', 'swap',
 ]);
 
-/** The module-config files at the project root a resolver reads, present or not (#2977). */
-const MODULE_CONFIG_ROOT_FILES = ['tsconfig.json', 'jsconfig.json', 'tsconfig.base.json', 'go.mod', 'Cargo.toml', ...CPP_COMPILE_DB_FILES] as const;
+/**
+ * The module-config files at the project root a resolver reads, present or not
+ * (#2977): `codegraph.json` for its PHP `webRoot` (#3298).
+ */
+const MODULE_CONFIG_ROOT_FILES = ['tsconfig.json', 'jsconfig.json', 'tsconfig.base.json', 'go.mod', 'Cargo.toml', ...CPP_COMPILE_DB_FILES, PROJECT_CONFIG_FILENAME] as const;
 
 /**
  * Project-relative config path → `<digest>@<stamp>`: a digest of what
@@ -359,6 +365,14 @@ function moduleConfigEntry(abs: string, previous: string | undefined, projectRoo
  */
 function moduleConfigDigest(abs: string, projectRoot: string): string {
   const file = path.basename(abs);
+  // A codegraph.json counts for its `webRoot` alone, which places a PHP
+  // include of `$_SERVER['DOCUMENT_ROOT'] . '/x.php'` (#3298). One that sets
+  // none reads as no file, so writing one to `exclude` a folder, or a snapshot
+  // from before it counted, re-opens nothing.
+  if (file === PROJECT_CONFIG_FILENAME) {
+    const webRoot = loadWebRoot(path.dirname(abs));
+    return webRoot === null ? 'absent' : createHash('sha256').update(`webRoot=${webRoot}`).digest('hex').slice(0, 16);
+  }
   const read = file === 'go.mod' ? loadGoModule(path.dirname(abs))?.modulePath ?? ''
     : file === 'Cargo.toml' ? cargoManifestDigestText(abs)
     : file === 'compile_commands.json' ? (readCompileDbIncludeDirs(abs, projectRoot) ?? []).join('\n')
@@ -436,6 +450,7 @@ export function moduleConfigLanguages(changed: readonly string[]): Set<Language>
   const languages = new Set<Language>();
   for (const rel of changed) {
     if (/(?:^|\/)go\.mod$/.test(rel)) languages.add('go');
+    else if (rel === PROJECT_CONFIG_FILENAME) languages.add('php');
     else if (/(?:^|\/)Cargo\.toml$/.test(rel)) languages.add('rust');
     else if (/(?:^|\/)compile_commands\.json$/.test(rel)) for (const language of ['c', 'cpp'] as const) languages.add(language);
     else if (/\.fsproj$/i.test(rel)) for (const language of ['fsharp', 'csharp', 'razor'] as const) languages.add(language);
@@ -544,6 +559,10 @@ export class ReferenceResolver {
   private projectAliases: AliasMap | null | undefined = undefined;
   // Per directory: the aliases of the nearest non-root tsconfig declaring `paths` or `baseUrl`.
   private dirAliases = new Map<string, AliasMap | null>();
+  // Per folder holding a `$_SERVER['DOCUMENT_ROOT']` include: the PHP web root
+  // the project's includes agree on, or null (#3298, php-web-root.ts). Read
+  // from the graph, so it lives for one pass: clearCaches drops it.
+  private phpWebRoots: Map<string, string | null> | null = null;
   // The Cargo workspace's crates and the include directories a compile
   // database names (null: the project has none). Same lazy convention: read
   // once, whatever the size of the workspace or the database, and dropped by
@@ -854,6 +873,7 @@ export class ReferenceResolver {
     this.searchedModules.clear();
     this.realModulesDirs.clear();
     this.ownPackageNames = null;
+    this.phpWebRoots = null;
     this.installedNames.clear();
     this.knownNames = null;
     this.knownLowerNames = null;
@@ -1336,6 +1356,8 @@ export class ReferenceResolver {
         for (const d of walked) this.dirAliases.set(d, found);
         return found;
       },
+
+      getPhpWebRoot: (fromFile: string) => this.phpWebRootOf(fromFile),
 
       getGoPackageDir: (importPath: string, fromFile?: string) => {
         const own = fromFile === undefined ? null : this.nearestGoModule(goDirOf(fromFile));
@@ -1837,6 +1859,10 @@ export class ReferenceResolver {
     // or variable is no candidate, and neither is a guess by any other strategy.
     if (isObjcDeclaredTypeRef(ref)) return matchByExactName(ref, this.context);
 
+    // A Pascal `inherited` call (`inherited Run(N)`, a bare `inherited;`)
+    // runs the method of the nearest ancestor that declares the name, never
+    // the calling class's own, nor a guess by name.
+    if (isPascalInheritedCall(ref)) return matchPascalInheritedCall(ref, this.context);
     // A Pascal name written without parentheses (#2514) links only to a
     // routine its scope reaches, or through a receiver to a method of the
     // receiver's declared type; data of that name links nothing.
@@ -1850,6 +1876,11 @@ export class ReferenceResolver {
     // and one made in a nested routine is what its scope declares first.
     const nested = matchPascalNestedCall(ref, this.context);
     if (nested) return nested;
+    // A Pascal call through a receiver to a name some helper declares is
+    // settled by the receiver's type: the method the helper in scope for it
+    // adds (`R.Total(3)` through `class helper for TRecord`), else its own.
+    const viaHelper = matchPascalHelperCall(ref, this.context);
+    if (viaHelper) return viaHelper;
     // A Dart member read (`x.area`) links the getter the receiver's type
     // reaches, as a call, or nothing — never a guess by name (#2338).
     if (isDartMemberRead(ref)) return matchDartMemberRead(ref, this.context);
@@ -2882,6 +2913,13 @@ export class ReferenceResolver {
        *  each per-batch DELETE's B-tree work (DatabaseConnection.beginBulkRefLoad). */
       refIndexLoad?: { begin: () => void; end: () => void | Promise<void> };
       backpressure?: () => Promise<void> | null;
+      /**
+       * Called once the pool is going to start, before any worker opens the
+       * database, whether it starts before the first batch or mid-run: a fresh
+       * index moves its fast-init journal to WAL here, so the workers' reads
+       * never wait on this thread's commits, nor its commits on their reads.
+       */
+      beforePool?: () => void;
     },
     synthesize: boolean = true
   ): Promise<ResolutionResult> {
@@ -2927,12 +2965,17 @@ export class ReferenceResolver {
     // stretch on the thread the liveness watchdog watches (#1091), 20 s or more
     // on a project the size of LLVM. The wait is bounded and a failure ends it
     // (poolStartSettled), and any failure downgrades to sequential permanently.
-    // A pool engaged mid-loop keeps the loop running while it boots: a run under
-    // that bar is too small for the first batch to matter.
+    // A full index near that bar starts the pool before its first batch too, but
+    // goes on while it boots: there the first batch is the work the boot can
+    // hide behind, and the pool is ready for the second, where the adaptive
+    // check below would only start it after the first and have it for the third
+    // (two sequential batches of a Kotlin project of 142,000 refs). A pool
+    // engaged mid-loop keeps the loop running while it boots as well.
     let pool: ResolverPool | null = null;
     let poolReady = false;
     // True once pool creation has been attempted by EITHER engage site (the
-    // up-front ref-count gate or the adaptive projection below) — a pool that
+    // start before the first batch, at or near the ref-count gate, or the
+    // adaptive projection below) — a pool that
     // failed or was destroyed must stay down (downgrade is permanent), and
     // tryCreate's sizing probes shouldn't re-run every batch on hosts that
     // declined.
@@ -2940,7 +2983,13 @@ export class ReferenceResolver {
     const createPool = (t0: number, why: string, worth?: number): ResolverPool | null => {
       poolEngageTried = true;
       if (!parallel) return null;
-      const p = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot, parallel.shareFrameworks ? this.getDetectedFrameworks() : undefined, worth);
+      const p = ResolverPool.tryCreate(
+        parallel.dbPath,
+        this.projectRoot,
+        parallel.shareFrameworks ? this.getDetectedFrameworks() : undefined,
+        worth,
+        parallel.beforePool
+      );
       if (p && parallel.shareFrameworks) {
         const scans = this.projectScans();
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] project scans: ${scans.cpp ? 'shared' : 'none'}`);
@@ -2958,9 +3007,10 @@ export class ReferenceResolver {
       );
       return p;
     };
-    if (parallel && total >= minRefsForPool()) {
-      pool = createPool(Date.now(), 'ref-count');
-      if (pool) await poolStartSettled(pool.ready());
+    const startBeforeFirstBatch = parallel ? poolStartBeforeFirstBatch(total, parallel.shareFrameworks === true) : null;
+    if (startBeforeFirstBatch) {
+      pool = createPool(Date.now(), startBeforeFirstBatch === 'up-front' ? 'ref-count' : 'near-gate');
+      if (pool && startBeforeFirstBatch === 'up-front') await poolStartSettled(pool.ready());
     }
     // Adaptive engagement bar (see the batch-loop hook): projected remaining
     // sequential settle above this boots the pool mid-loop. Boot is async and
@@ -3050,10 +3100,10 @@ export class ReferenceResolver {
     // and the source-keyed supertype-walk reads both live on it). Recreated in
     // the inner finally BEFORE synthesis, whose passes read kind-keyed.
     // Measured on a 224k-edge resolution set: insert 2.8s → 1.1s + 0.3s
-    // recreate. Same ref-count gate as the pool so small syncs never pay the
-    // recreate cost.
+    // recreate. Same gate as the pool's start before the first batch, so small
+    // syncs never pay the recreate cost.
     let bulkEdgesActive = false;
-    if (parallel?.bulkEdgeLoad && total >= minRefsForPool()) {
+    if (parallel?.bulkEdgeLoad && startBeforeFirstBatch) {
       try {
         parallel.bulkEdgeLoad.begin();
         bulkEdgesActive = true;
@@ -3063,7 +3113,7 @@ export class ReferenceResolver {
     // the five sync-path unresolved_refs indexes, and the end-of-loop rebuild
     // is near-free (only failed refs survive the loop).
     let bulkRefsActive = false;
-    if (parallel?.refIndexLoad && total >= minRefsForPool()) {
+    if (parallel?.refIndexLoad && startBeforeFirstBatch) {
       try {
         parallel.refIndexLoad.begin();
         bulkRefsActive = true;
@@ -3550,6 +3600,44 @@ export class ReferenceResolver {
   /** The fingerprint of the workspace map this resolver resolves by (see `workspaceFingerprint`). */
   getWorkspaceFingerprint(): string {
     return workspaceFingerprint(this.context.getWorkspacePackages?.() ?? null);
+  }
+
+  /**
+   * The folder `$_SERVER['DOCUMENT_ROOT']` names for a PHP include in
+   * `fromFile` (#3298): the project's `codegraph.json` `webRoot`, else the one
+   * the project's own includes agree on for the file's folder (see
+   * php-web-root.ts), else null.
+   */
+  phpWebRootOf(fromFile: string): string | null {
+    const configured = loadWebRoot(this.projectRoot);
+    if (configured !== null) return configured;
+    return this.inferredPhpWebRoots().get(folderOf(fromFile)) ?? null;
+  }
+
+  /** Every folder holding a `$_SERVER['DOCUMENT_ROOT']` include → the web root inferred for it, read once a pass. */
+  private inferredPhpWebRoots(): Map<string, string | null> {
+    if (this.phpWebRoots === null) {
+      const prefix = `${PHP_DOCUMENT_ROOT}/`;
+      const includes = this.queries.getPhpDocumentRootIncludes(prefix)
+        .map((row) => ({ filePath: row.filePath, written: row.name.slice(prefix.length) }));
+      this.phpWebRoots = includes.length === 0
+        ? new Map()
+        : inferPhpWebRoots(includes, (relPath) => this.context.fileExists(relPath));
+    }
+    return this.phpWebRoots;
+  }
+
+  /**
+   * The web roots PHP's `$_SERVER['DOCUMENT_ROOT']` includes go under now,
+   * for a sync to compare with the index's (#3298; see phpWebRootSnapshot).
+   */
+  getPhpWebRootSnapshot(): string {
+    return phpWebRootSnapshot(loadWebRoot(this.projectRoot), this.inferredPhpWebRoots());
+  }
+
+  /** Whether files a sync never touched must take another web root (see phpWebRootsMoved). */
+  phpWebRootsMoved(before: string, now: string): boolean {
+    return phpWebRootsMoved(before, now);
   }
 
   /** The folder of the workspace package or path dependency `file` is in (see `workspacePackageDirOf`), or null. */

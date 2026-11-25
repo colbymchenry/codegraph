@@ -259,6 +259,13 @@ export interface ResolutionContext {
    */
   getNearestAliases?(fromFile: string): import('./path-aliases').AliasMap | null;
   /**
+   * The folder `$_SERVER['DOCUMENT_ROOT']` names for a PHP include in
+   * `fromFile` (#3298): the project's `codegraph.json` `webRoot`, else the one
+   * the project's own includes agree on (see php-web-root.ts), else null.
+   * Project-relative, `/`-separated, '' for the project root.
+   */
+  getPhpWebRoot?(fromFile: string): string | null;
+  /**
    * The project-relative directory (`/`-separated, `.` for the root) of
    * the Go package an import path names, when it is a package of one of the
    * project's own modules — the `go.mod` at the root or any `go.mod` above

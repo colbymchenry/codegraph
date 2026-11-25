@@ -1,19 +1,20 @@
 fn main() {
     napi_build::setup();
 
-    // Kotlin grammar — vendored C, compiled here instead of a crate dep: the
-    // crates.io tree-sitter-kotlin 0.3.8 pins `tree-sitter >= 0.21, < 0.23`
-    // (the kernel links 0.25) and tree-sitter-kotlin-ng is a DIFFERENT
-    // grammar (8 fields vs 0, renamed kinds — extractor-breaking). Sources
-    // are the fwcd 0.3.8 tag's checked-in generated artifacts, sha-matched
-    // against the crates.io tarball (kotlin checklist §Grammar prep):
-    //   parser.c  54104a7ef1555c265b746c790e0f8bb953cc17806e9df0c3af82f7f62c06a70a
-    //   scanner.c 27f73337ec357fc341fa57538f34c14277b0346980c3405dc30beab6202ec6d0
-    // scanner.c carries docs/grammars/tree-sitter-kotlin.patch (same-line
-    // `e`-word semicolon fix), shared with the wasm build:
-    //   scanner.c 2ca842dd04b60b0a6df59a03e9ad01209d8c5641f079a79a84d65708669b6cb6 (patched)
-    // Flags crib the tarball's own bindings/rust/build.rs.
+    // Kotlin grammar — vendored C, compiled here instead of a crate dep: no
+    // crates.io release carries this revision (tree-sitter-kotlin 0.3.8 also
+    // pins `tree-sitter >= 0.21, < 0.23`; the kernel links 0.25), and
+    // tree-sitter-kotlin-ng is a DIFFERENT grammar (renamed kinds —
+    // extractor-breaking). Sources are fwcd/tree-sitter-kotlin commit
+    // d6af96d2e23ef0a8ff5ab512864378cf08fba311's checked-in generated
+    // artifacts, unpatched, the same ones the vendored wasm is built from
+    // (docs/grammars/tree-sitter-kotlin.md):
+    //   parser.c  d489e0ee02b320ffc1a67c55245b0e150317dfd80321678370c2a2145a0111f3
+    //   scanner.c a3c22a33953365af2b6a9408fd7c3828d4c1e83fb95a4ce29a854410ee16e99b
+    // Flags crib the commit's own bindings/rust/build.rs (c11: the scanner
+    // has a _Static_assert, which MSVC accepts only from /std:c11).
     let mut c = cc::Build::new();
+    c.std("c11");
     c.include("grammars/kotlin");
     c.file("grammars/kotlin/parser.c");
     c.file("grammars/kotlin/scanner.c");
@@ -63,18 +64,16 @@ fn main() {
     scala.compile("tree-sitter-scala");
     println!("cargo:rerun-if-changed=grammars/scala");
 
-    // Dart grammar — vendored C (fourth vendored-grammar-C language): the
-    // production wasm is the tree-sitter-wasms 0.1.13 artifact, whose dart
-    // dependency is an UNPINNED github:UserNobody14/tree-sitter-dart — the
-    // vendored wasm byte-copy (src/extraction/wasm/) plus these same-commit
-    // sources kill that hazard. crates.io tree-sitter-dart is the nielsenko
-    // FORK (different lineage) — rejected. Sources are
-    // UserNobody14/tree-sitter-dart master@d4d8f3e337d8 (dart checklist
-    // §Grammar prep):
-    //   parser.c  5a42b47abb4d494f125dbdee9138979248041689b1aa36355550fa3e28dcb8b8
+    // Dart grammar — vendored C (fourth vendored-grammar-C language). Sources
+    // are UserNobody14/tree-sitter-dart master@0038280b774b (2026-10-18; Dart
+    // 3.13 primary constructors, #3270), byte-identical to the commit's src/,
+    // and src/extraction/wasm/tree-sitter-dart.wasm is built from the same
+    // files (docs/grammars/tree-sitter-dart.md):
+    //   parser.c  9570f47f9912a4b169f5d959f6db06859087eb95c3f1203e312a33c12da66309
     //   scanner.c 07a7b7818b175e9460523e705dd88d20f7b5141bac95c593d4426e6d52284996
-    // scanner.c is load-bearing: string-template char classes and /** */ doc
-    // comments are external tokens.
+    // crates.io tree-sitter-dart is the nielsenko FORK (different lineage) —
+    // rejected. scanner.c is load-bearing: string-template char classes and
+    // /** */ doc comments are external tokens.
     let mut dart = cc::Build::new();
     dart.include("grammars/dart");
     dart.file("grammars/dart/parser.c");
