@@ -6,6 +6,7 @@
  * are compiled, keeping V8 WASM memory pressure low on large codebases.
  */
 
+import { hasFsharpCode } from './fsharp-lexer';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
@@ -51,6 +52,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  fsharp: 'tree-sitter-fsharp.wasm',
 };
 
 /**
@@ -142,6 +144,13 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cu': 'cpp',
   '.cuh': 'cpp',
   '.nix': 'nix',
+  // F#: .fs (implementation) and .fsx (script). GLSL fragment shaders and
+  // Forth use `.fs` too, so a `.fs` file whose head is not F# is skipped when
+  // it is read (`isForeignToExtension`). `.fsi` signature files are left out:
+  // the grammar mis-parses their `val` declarations and every symbol they hold
+  // is declared in the `.fs` anyway.
+  '.fs': 'fsharp',
+  '.fsx': 'fsharp',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -255,6 +264,132 @@ export function isSourceFile(filePath: string, overrides?: Record<string, Langua
   if (dot < 0) return false;
   const ext = filePath.slice(dot).toLowerCase();
   return ext in EXTENSION_MAP || (!!overrides && ext in overrides);
+}
+
+/** Whether `filePath` carries `.fs`, which F# shares with GLSL fragment shaders (`shader.fs` beside `shader.vs`) and Forth. */
+export function hasFsExtension(filePath: string): boolean {
+  return filePath.length > 3 && filePath.slice(-3).toLowerCase() === '.fs';
+}
+
+/** How much of a `.fs` file's head `looksLikeFsharp` reads: an F# file's declarations come first. */
+export const FSHARP_SNIFF_BYTES = 32 * 1024;
+
+/**
+ * A line no GLSL shader or Forth source has: a `namespace` or `module`
+ * declaration — every F# file of a project but the last must open with one
+ * (FS0222) — or an `open` of a namespace. Enough on its own, even beside a
+ * GLSL-looking line, which in F# is a shader kept in a string
+ * (`"""#version 330 …"""`).
+ */
+const FSHARP_DECLARATION_RE = new RegExp(
+  String.raw`^[ \t\uFEFF]*(?:` +
+    String.raw`(?:namespace|module)(?:[ \t]+(?:rec|private|internal|public))*[ \t]+[A-Za-z_\x60][\w.\x60']*[ \t]*(?:=[ \t]*)?` +
+    String.raw`|open[ \t]+(?:type[ \t]+)?[A-Z][\w.\x60]*[ \t]*` +
+  String.raw`)(?:\/\/.*)?\r?$`,
+  'm'
+);
+
+/**
+ * Other F# lines: a `let` binding, a type definition, an attribute, a script
+ * directive. Neither GLSL nor Forth starts a line this way — Forth's `type` is a
+ * word that prints a string, never followed by a name and `=` — so one is F#
+ * even beside a GLSL-looking line, which then sits in a string.
+ */
+const FSHARP_SIGNALS: readonly RegExp[] = [
+  /^[ \t\uFEFF]*let(?:[ \t]+(?:rec|inline|mutable|private|internal|public))*[ \t]+[\w'`(][^=\n]*=/m,
+  /^[ \t\uFEFF]*type[ \t]+(?:(?:private|internal|public)[ \t]+)?[A-Za-z_`][\w'`]*(?:[ \t]*<[^>\n]*>)?(?:[ \t]*\([^)\n]*\))?[ \t]*(?:=|with\b)/m,
+  /^[ \t\uFEFF]*\[<[A-Za-z][\w.]*(?:\(|>\]|[ \t]*;|[ \t]*>)/m,
+  /^[ \t\uFEFF]*#(?:r|load|nowarn|light|I)[ \t]+"/m,
+];
+
+/**
+ * GLSL's preprocessor lines and declarations, which F# never writes outside a
+ * string: F# has `#if` / `#else` / `#endif`, but no `#version` or `#define`,
+ * and never writes a type before the name it declares.
+ */
+const GLSL_SIGNAL_RE = new RegExp(
+  String.raw`^[ \t\uFEFF]*(?:` +
+    String.raw`#[ \t]*(?:version|extension|define|undef|ifdef|ifndef|pragma|include)\b` +
+    String.raw`|precision[ \t]+(?:lowp|mediump|highp)\b` +
+    String.raw`|(?:uniform|varying|attribute)[ \t]+\w+[ \t]+\w` +
+    String.raw`|layout[ \t]*\([ \t]*(?:location|binding|set|std140|std430|local_size_[xyz])\b` +
+    String.raw`|(?:in|out|inout)[ \t]+(?:(?:highp|mediump|lowp|flat|smooth)[ \t]+)*(?:[biud]?vec[234]|float|int|uint|bool|mat[234](?:x[234])?|sampler\w*)[ \t]+\w+[ \t]*;` +
+    String.raw`|void[ \t]+main[ \t]*\(` +
+    // A C-style typed function or variable: `vec3 shade(vec3 n) {`, `const float k = 0.5;` — an
+    // include of helpers has nothing else. F# writes no type before a name.
+    String.raw`|(?:(?:const|highp|mediump|lowp)[ \t]+)*(?:void|float|double|u?int|bool|[biud]?vec[234]|d?mat[234](?:x[234])?|sampler\w+)[ \t]+[A-Za-z_]\w*[ \t]*(?:\(|=[^=]|;|\[)` +
+    // A C block comment: F# starts no line with `/`, which as division needs a left operand.
+    String.raw`|\/\*` +
+  ')' +
+  // GLSL's vector and matrix constructors, which F# does not have: `FragColor = vec4(1.0);`.
+  String.raw`|\b[biud]?vec[234][ \t]*\(|\bd?mat[234](?:x[234])?[ \t]*\(`,
+  'm'
+);
+
+/**
+ * Forth's lines, which F# never writes: a `\\ ` comment at the start of a line
+ * (F# starts no line with a backslash); a colon definition closed by ` ;` on its
+ * line (`: square dup * ;`); a stack comment (`( n -- f )`); loading another
+ * Forth file (`require ./lib.fs`); a base switch alone on its line (`hex`); and
+ * two numbers before a word (`20 1 oprrnnn rlwimi.`), where F# would need a
+ * comma or a semicolon between them.
+ */
+const FORTH_SIGNAL_RE = new RegExp(
+  String.raw`^[ \t\uFEFF]*(?:` +
+    String.raw`\\(?:[ \t]|$)` +
+    String.raw`|:[ \t]+\S+[ \t].*[ \t];[ \t]*(?:\\.*)?$` +
+    String.raw`|(?:require|include|needs)[ \t]+\S+\.fs[ \t]*$` +
+    String.raw`|(?:hex|decimal|octal)[ \t]*$` +
+    String.raw`|[-$]?\d\w*[ \t]+[-$]?\d\w*[ \t]+[A-Za-z~]` +
+  String.raw`)|\([ \t](?:[^()\n]*[ \t])?--(?:[ \t][^()\n]*)?\)`,
+  'm'
+);
+
+/** A Forth colon definition over several lines: `: name` opening a line, and a line closed by `;`. */
+const FORTH_COLON_OPEN_RE = /^[ \t]*:[ \t]+\S+/m;
+const FORTH_COLON_CLOSE_RE = /[ \t];[ \t]*(?:immediate[ \t]*)?$/m;
+
+function looksLikeForth(head: string): boolean {
+  return FORTH_SIGNAL_RE.test(head) || (FORTH_COLON_OPEN_RE.test(head) && FORTH_COLON_CLOSE_RE.test(head));
+}
+
+/**
+ * Whether the head of a `.fs` file is F#, not a GLSL fragment shader or Forth.
+ * An F# line decides for F#; else a GLSL or a Forth line decides against it;
+ * else it is F# — the last file of a program may hold nothing but expressions,
+ * like the `Program.fs` of `dotnet new console -lang F#` (`printfn "Hello from F#"`).
+ * A file with no code in it is not: there is nothing to index, and it would
+ * load the grammar for nothing.
+ */
+export function looksLikeFsharp(head: string): boolean {
+  if (FSHARP_DECLARATION_RE.test(head) || FSHARP_SIGNALS.some((re) => re.test(head))) return true;
+  if (GLSL_SIGNAL_RE.test(head) || looksLikeForth(head)) return false;
+  return hasFsharpCode(head);
+}
+
+
+/** Decodes a head that may end mid-character: the cut character becomes U+FFFD, which no rule reads. */
+const UTF8 = new TextDecoder('utf-8');
+
+/**
+ * Whether the bytes read from `filePath` are not the language its extension
+ * names, so the file is not source after all: a `.ts` that is an MPEG
+ * transport stream (#1910), or a `.fs` that is a GLSL shader or Forth.
+ * Decided from bytes the caller has already read and from those alone, so a
+ * full index, a sync of the one edited file and a fresh re-index agree, and a
+ * tracked file that turns into one is dropped.
+ *
+ * A codegraph.json mapping for `.fs` turns the F# check off: which text
+ * language a `.fs` file is written in is the project's to say. It never turns
+ * the MPEG-TS check off, whatever `.ts` is mapped to: a video is source in no
+ * language, and parsing one costs half a minute for nothing (#1910).
+ */
+export function isForeignToExtension(filePath: string, bytes: Uint8Array, overrides?: Record<string, Language>): 'mpeg-ts' | 'not-fsharp' | null {
+  if (hasMpegTsExtension(filePath) && isMpegTransportStream(bytes.subarray(0, MPEG_TS_SNIFF_BYTES))) return 'mpeg-ts';
+  if (hasFsExtension(filePath) && !overrides?.['.fs'] && !looksLikeFsharp(UTF8.decode(bytes.subarray(0, FSHARP_SNIFF_BYTES)))) {
+    return 'not-fsharp';
+  }
+  return null;
 }
 
 /**
@@ -377,6 +512,11 @@ export async function initGrammars(): Promise<void> {
  * nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli 0.25.10
  * (`generate` + `build --wasm`, ABI 15 — upstream's checked-in parser.c is
  * still ABI 13; all 54 upstream corpus tests pass on the regenerated parser).
+ * F#: tree-sitter-wasms does not ship an F# grammar; we vendor the `fsharp`
+ * grammar of ionide/tree-sitter-fsharp 0.3.12 @ aefd0c8 (MIT; the active fork
+ * of microsoft/tree-sitter-fsharp), unmodified, built with tree-sitter-cli
+ * 0.27.0 `build --wasm` — docs/grammars/tree-sitter-fsharp.md has the
+ * reproducible build and its SHA-256.
  *
  * TypeScript/TSX/JavaScript (+jsx, which shares the javascript grammar): the
  * tree-sitter-wasms builds are 2023-era (^0.20.x); we vendor wasm built from
@@ -396,7 +536,7 @@ export async function initGrammars(): Promise<void> {
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
-  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix', 'fsharp',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -1167,6 +1307,7 @@ export function getLanguageDisplayName(language: Language): string {
     objc: 'Objective-C',
     solidity: 'Solidity',
     nix: 'Nix',
+    fsharp: 'F#',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',

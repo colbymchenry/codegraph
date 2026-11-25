@@ -516,6 +516,7 @@ export class QueryBuilder {
     getUnresolvedDependentsAfter?: SqliteStatement;
     deleteRefsByRowIdsFull?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
+    getFilePathsOfLanguage?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
     getCppIncludeNodes?: SqliteStatement;
     getDominantFile?: SqliteStatement;
@@ -4700,6 +4701,14 @@ export class QueryBuilder {
       language: row.language as Language,
       rowId: row.id,
     }));
+  }
+
+  /** The paths of the files indexed as `language`. */
+  getFilePathsOfLanguage(language: Language): string[] {
+    if (!this.stmts.getFilePathsOfLanguage) {
+      this.stmts.getFilePathsOfLanguage = this.db.prepare('SELECT path FROM files WHERE language = ? ORDER BY path');
+    }
+    return (this.stmts.getFilePathsOfLanguage.all(language) as Array<{ path: string }>).map((r) => r.path);
   }
 
   /**

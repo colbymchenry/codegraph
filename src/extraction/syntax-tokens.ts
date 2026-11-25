@@ -456,7 +456,7 @@ async function tokenizeRegion(
     await loadGrammarsForLanguages([language]);
     const parser = getParser(language);
     if (!parser) return null;
-    const tree = parseWithinBudget(parser, source);
+    const tree = parseWithinBudget(parser, source, language);
     if (!tree?.rootNode) return null;
     try {
       return classifyTree(tree.rootNode, source, language, offset);
