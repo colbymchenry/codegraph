@@ -35,15 +35,16 @@ import CodeGraph from '../src/index';
 // (the steer-to-explore phrasing changed when the Read invitation was removed).
 const SKELETON_MARK = '· skeleton (signatures only';
 
-/** Return the `#### <path> ...` section for a file basename, header through the
- *  line before the next `###`/`####` header (or end of output). */
+/** Return the ``**`<path>`** ...`` section for a file basename, header through the
+ *  line before the next bold header (or end of output). Headers are bold labels,
+ *  not ATX headings (issue #778); file sections start with ``**` ``. */
 function sectionFor(text: string, basename: string): string {
   const lines = text.split('\n');
-  const start = lines.findIndex((l) => l.startsWith('#### ') && l.includes(basename));
+  const start = lines.findIndex((l) => l.startsWith('**`') && l.includes(basename));
   if (start < 0) return '';
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i++) {
-    if (lines[i].startsWith('### ') || lines[i].startsWith('#### ')) {
+    if (lines[i].startsWith('**')) {
       end = i;
       break;
     }
@@ -284,7 +285,7 @@ export class YamlCodec extends Codec {
     const text = result.content?.[0]?.text ?? '';
 
     // Precondition: the spine must have formed, or nothing skeletonizes.
-    expect(text).toContain('## Flow (call path among the symbols you queried)');
+    expect(text).toContain('**Flow (call path among the symbols you queried)');
 
     for (const [file, marker] of [
       ['bridge-interceptor.ts', 'BRIDGE_BODY_MARKER'],
@@ -345,7 +346,7 @@ export class YamlCodec extends Codec {
   it('spares an off-spine sibling when the agent NAMED a callable in it (RealCall fix)', async () => {
     const result = await handler.execute('codegraph_explore', { query: SPARE_QUERY, maxFiles: 15 });
     const text = result.content?.[0]?.text ?? '';
-    expect(text).toContain('## Flow (call path among the symbols you queried)');
+    expect(text).toContain('**Flow (call path among the symbols you queried)');
 
     // auth-interceptor.ts is an off-spine Interceptor sibling — would skeletonize —
     // but the agent named its method `authenticate`, so it stays FULL.

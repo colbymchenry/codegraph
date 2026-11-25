@@ -8,7 +8,8 @@
  * addon) with a per-platform strategy chosen to keep the open-descriptor /
  * kernel-watch cost BOUNDED rather than growing with the number of files:
  *
- *   - macOS / Windows: a SINGLE recursive `fs.watch(root, {recursive:true})`.
+ *   - macOS / Windows: a recursive `fs.watch(root, {recursive:true})`, plus
+ *     bounded supplemental streams for directory symlinks (#770).
  *     libuv maps this to one FSEvents stream (macOS) / one
  *     ReadDirectoryChangesW handle (Windows), so it costs O(1) descriptors no
  *     matter how large the tree. This is the fix for the macOS file-table
@@ -24,20 +25,102 @@
  *     per-file watches are never needed.
  *
  * Excluded trees (node_modules/, dist/, .git/, …) are filtered via the
- * indexer's `buildDefaultIgnore` (built-in default-ignore dirs + the project's
- * .gitignore) — on Linux they're never descended into (so they cost no watch),
- * and on macOS/Windows the single recursive stream still covers them but their
+ * indexer's `buildScopeIgnore` (built-in defaults + root `.gitignore` +
+ * `.git/info/exclude` + `core.excludesFile` + git ignored-untracked dirs) —
+ * on Linux they're never descended into (so they cost no watch), and on
+ * macOS/Windows the single recursive stream still covers them but their
  * events are dropped before any sync is scheduled. Either way the watcher's
- * scope matches the indexer's (#276 / #407).
+ * scope matches `git ls-files --exclude-standard` (#276 / #407 / #1728).
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import type { Ignore } from 'ignore';
-import { isSourceFile, buildDefaultIgnore } from '../extraction';
+import { isSourceFile, buildScopeIgnore, type ScopeIgnore } from '../extraction';
+import { loadExtensionOverrides, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
+import { isCodeGraphDataDir } from '../directory';
 import { watchDisabledReason } from './watch-policy';
+
+/**
+ * Number of consecutive lock-contention retries the watcher tolerates before
+ * it gives up and degrades auto-sync. Brief contention (another writer for a
+ * few cycles) stays under this; a long-lived external writer crosses it.
+ */
+const MAX_LOCK_RETRIES = 5;
+/** A failed re-arm must not turn frequent MCP calls into a lock-polling loop. */
+const LOCK_REARM_COOLDOWN_MS = 30_000;
+/**
+ * Number of consecutive GENERIC (non-lock) sync failures the watcher tolerates
+ * before it degrades auto-sync. A deterministic failure — a tree-sitter
+ * extractor that crashes on one file, DB corruption, `SQLITE_FULL`, an OOM in
+ * batched resolution — recurs every debounce cycle, so left unbounded it would
+ * retry forever (log + work spam) while the auto-update guarantee is silently
+ * dead (#1127). A single clean sync resets the streak, so a transient hiccup
+ * that recovers within the budget never degrades.
+ */
+const MAX_SYNC_FAILURE_RETRIES = 5;
+/** Cap on the exponential retry backoff (either mode) so it never sleeps absurdly long. */
+const MAX_RETRY_BACKOFF_MS = 30_000;
+
+/**
+ * Adaptive debounce: a pending set this small fires after the quick quiet
+ * window instead of the full debounce — a lone save (or editor + test file
+ * pair) syncs near-instantly, while larger bursts keep the full window and
+ * coalesce exactly as before.
+ */
+const QUICK_SYNC_MAX_PENDING = 2;
+const QUICK_SYNC_QUIET_MS = 300;
+
+/**
+ * Scoped-sync ceiling: above this many pending files a full scan-diff is
+ * simpler and comparably fast (a branch checkout emits thousands of events),
+ * and it self-heals anything event coalescing dropped along the way.
+ */
+const SCOPED_SYNC_MAX_PENDING = 500;
+
+/** Actionable degrade message; both exhaustion paths share it verbatim. */
+const EXHAUSTION_REASON =
+  'OS watch/file limit exhausted; auto-sync disabled. Run `codegraph sync` ' +
+  '(or install git sync hooks) to refresh the graph after changes.';
+
+/**
+ * Actionable, NON-fatal warning for Linux inotify watch-count exhaustion.
+ * Unlike {@link EXHAUSTION_REASON} this does not disable the watcher — the
+ * watches already installed keep working — so it names the exact kernel knob to
+ * raise instead.
+ */
+const INOTIFY_LIMIT_REASON =
+  'Linux inotify watch limit reached (fs.inotify.max_user_watches); live ' +
+  'watching now covers only part of the project, so edits in unwatched ' +
+  'directories will not auto-sync. Raise the limit (e.g. `sudo sysctl ' +
+  'fs.inotify.max_user_watches=1048576`, persisted in /etc/sysctl.d) and ' +
+  'restart, or run `codegraph sync` (or install git sync hooks) to refresh.';
+
+/**
+ * True when an error is OS watch/file-descriptor exhaustion (EMFILE/ENFILE).
+ * Prefers the structured `err.code`; falls back to message matching ONLY when
+ * no code is present (some platforms surface a bare Error from `fs.watch`).
+ */
+function isWatchResourceExhaustion(err: unknown): boolean {
+  const e = err as NodeJS.ErrnoException | undefined;
+  if (e?.code === 'EMFILE' || e?.code === 'ENFILE') return true;
+  if (!e?.code && e?.message) {
+    return /EMFILE|ENFILE|too many open files/i.test(e.message);
+  }
+  return false;
+}
+
+/**
+ * True when an error is Linux inotify *watch-count* exhaustion. `fs.watch`
+ * surfaces a hit `fs.inotify.max_user_watches` as ENOSPC ("no space" = no watch
+ * descriptors left, NOT disk space). This only arises on the Linux
+ * per-directory path; it is non-fatal (raise the limit and partial watching
+ * keeps working), so it warns rather than degrading.
+ */
+function isInotifyWatchExhaustion(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | undefined)?.code === 'ENOSPC';
+}
 
 /**
  * Native recursive `fs.watch` is only reliable on macOS and Windows; on Linux
@@ -46,6 +129,20 @@ import { watchDisabledReason } from './watch-policy';
  */
 function supportsRecursiveWatch(): boolean {
   return process.platform === 'darwin' || process.platform === 'win32';
+}
+
+/**
+ * Indirection over `fs.watch` so tests can inject a fake that throws or emits
+ * `EMFILE`/`ENFILE` deterministically (real watch-resource exhaustion can't be
+ * provoked reliably, and `fs.watch` is a non-configurable property so it can't
+ * be spied). Production always uses the real `fs.watch`.
+ */
+type WatchFn = typeof fs.watch;
+let watchImpl: WatchFn = fs.watch;
+
+/** @internal Test-only seam to inject a fake fs.watch implementation. */
+export function __setFsWatchForTests(fn: WatchFn | null): void {
+  watchImpl = fn ?? fs.watch;
 }
 
 /**
@@ -99,6 +196,16 @@ export interface WatchOptions {
   onSyncError?: (error: Error) => void;
 
   /**
+   * Callback fired ONCE when live watching degrades permanently and auto-sync
+   * is disabled — OS watch-resource exhaustion (EMFILE/ENFILE), a write lock
+   * held past the retry budget, or a generic sync failure that persists past
+   * the retry budget (#1127). The string is an actionable, human-readable
+   * reason. Lets a host (MCP server, daemon, CLI) tell the user that the index
+   * will no longer auto-update instead of silently serving stale results.
+   */
+  onDegraded?: (reason: string) => void;
+
+  /**
    * Test-only. When true, `start()` installs NO OS-level fs.watch — the
    * watcher is "inert" and only the {@link __emitWatchEventForTests} /
    * {@link FileWatcher.ingestEventForTests} seam drives its pipeline. This
@@ -148,8 +255,8 @@ export interface PendingFile {
  * debounced sync operations via a provided callback.
  *
  * Design goals:
- * - Bounded resource usage: O(1) descriptors on macOS/Windows (one recursive
- *   watch), O(directories) inotify watches on Linux — never O(files), which
+ * - Bounded resource usage: one recursive stream plus capped symlink streams
+ *   on macOS/Windows, O(directories) inotify watches on Linux — never O(files), which
  *   was the system-crashing fd leak on macOS (#644/#496/#555/#628).
  * - Debounced to avoid thrashing on rapid saves
  * - Filters to supported source files by extension
@@ -160,13 +267,52 @@ export interface PendingFile {
 export class FileWatcher {
   /** macOS/Windows: the single recursive watcher. Null on Linux. */
   private recursiveWatcher: fs.FSWatcher | null = null;
-  /** Linux: one watcher per watched directory (keyed by absolute path). */
+  /** Linux directory watches / macOS and Windows supplemental symlink streams. */
   private dirWatchers = new Map<string, fs.FSWatcher>();
   /** Set once the per-directory watch cap is hit, so we log only once. */
   private dirCapWarned = false;
+  /**
+   * Set once the Linux inotify watch limit (ENOSPC) is hit. Double duty: we
+   * warn only once, AND we stop attempting new directory watches for the rest
+   * of the session — once the kernel budget is exhausted every further
+   * `inotify_add_watch` fails too, so trying the rest of the tree is pure
+   * waste. NON-fatal (does not degrade): installed watches keep working.
+   */
+  private inotifyLimitWarned = false;
+  /**
+   * The reason live watching was disabled at runtime
+   * (watch-resource exhaustion, lock contention past the retry budget, or a
+   * persistent generic sync failure past the retry budget), or null while
+   * healthy. Set by {@link degrade}; a lock-contention recovery keeps it until
+   * a full reconciliation succeeds.
+   */
+  private degradedReason: string | null = null;
+  private degradedByLock = false;
+  private recoveringFromLock = false;
+  private lastLockRearmMs = 0;
+  /** Consecutive lock-contention retries for watcher-triggered syncs. */
+  private lockRetryCount = 0;
+  /** Consecutive generic (non-lock) sync failures; reset only by a clean sync. */
+  private syncFailureRetryCount = 0;
   /** Test-only inert mode: started, but with no OS watcher installed. */
   private inert = false;
+  /**
+   * Resolved realpath of directories already watched (or skipped). Prevents
+   * infinite recursion via symlink cycles — mirrors the same guard used in
+   * the indexer's `walk()` (extraction/index.ts).
+   */
+  private visitedRealDirs = new Set<string>();
+  private knownDirs = new Map<string, string>();
+  private watchedRealDirs = new Map<string, string>();
+  private treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * True when the pending set does NOT exactly describe the change (a
+   * directory removal's children are unknown from the event, #1285) — the
+   * next sync must be a full scan-diff. Cleared only after a successful FULL
+   * sync reconciles the tree.
+   */
+  private needsFullScan = false;
   /**
    * Files seen by the watcher since the last successful sync — populated on
    * every change event, cleared at the start of a sync, and re-populated by
@@ -199,29 +345,46 @@ export class FileWatcher {
    * deterministically gate on watcher readiness.
    */
   private readyWaiters: Array<() => void> = [];
-  // The shared ignore matcher (built-in defaults + project .gitignore), built
-  // once at start(). Same source of truth the indexer uses, so watcher scope
-  // can never diverge from index scope.
-  private ignoreMatcher: Ignore | null = null;
+  // The shared scope matcher from `buildScopeIgnore` (built-in defaults +
+  // root `.gitignore` + `.git/info/exclude` + `core.excludesFile` + dirs
+  // `git ls-files --exclude-standard` reports ignored + `codegraph.json`
+  // exclude/include, with embedded child repos matched by their OWN rules —
+  // #514), built at start() and REBUILT whenever one of the files it is
+  // derived from changes (see `refreshScope`, #1590). Same construction the
+  // indexer uses for scoped sync, so watcher scope cannot diverge from index
+  // scope (#1728). An embedded repo created after start() joins the scope on
+  // the next scope refresh / watcher restart / re-index.
+  private ignoreMatcher: ScopeIgnore | null = null;
 
   private readonly projectRoot: string;
   private readonly debounceMs: number;
-  private readonly syncFn: () => Promise<{ filesChanged: number; durationMs: number }>;
+  private readonly syncFn: (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>;
   private readonly onSyncComplete?: WatchOptions['onSyncComplete'];
   private readonly onSyncError?: WatchOptions['onSyncError'];
+  private readonly onDegraded?: WatchOptions['onDegraded'];
   private readonly inertForTests: boolean;
+  /**
+   * Optional metadata guard supplied by the CodeGraph facade. Windows'
+   * ReadDirectoryChangesW stream includes last-access updates, so a read can
+   * otherwise look exactly like an edit. Returning true means the file's
+   * current size/mtime still match the indexed record and the event is noise.
+   */
+  private readonly isFileStateCurrent?: (relativePath: string) => boolean;
 
   constructor(
     projectRoot: string,
-    syncFn: () => Promise<{ filesChanged: number; durationMs: number }>,
-    options: WatchOptions = {}
+    syncFn: (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>,
+    options: WatchOptions = {},
+    isFileStateCurrent?: (relativePath: string) => boolean
   ) {
     this.projectRoot = projectRoot;
     this.syncFn = syncFn;
     this.debounceMs = options.debounceMs ?? 2000;
     this.onSyncComplete = options.onSyncComplete;
     this.onSyncError = options.onSyncError;
+    this.onDegraded = options.onDegraded;
     this.inertForTests = options.inertForTests ?? false;
+    this.isFileStateCurrent = isFileStateCurrent;
   }
 
   /**
@@ -231,6 +394,12 @@ export class FileWatcher {
   start(): boolean {
     if (this.recursiveWatcher || this.dirWatchers.size > 0 || this.inert) return true; // Already watching
     this.stopped = false;
+    this.degradedReason = null;
+    this.degradedByLock = false;
+    this.recoveringFromLock = false;
+    this.lockRetryCount = 0;
+    this.syncFailureRetryCount = 0;
+    this.needsFullScan = false;
 
     // Some environments make filesystem watching unusable — most notably
     // WSL2 /mnt/ drives, where the underlying fs.watch calls block long
@@ -243,7 +412,7 @@ export class FileWatcher {
     }
 
     // Reuse the indexer's ignore set so the watcher and indexer agree on scope.
-    this.ignoreMatcher = buildDefaultIgnore(this.projectRoot);
+    this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
 
     try {
       if (this.inertForTests) {
@@ -252,8 +421,14 @@ export class FileWatcher {
       } else if (supportsRecursiveWatch()) {
         this.startRecursive();
       } else {
-        this.startPerDirectory();
+        this.refreshWatchTree();
       }
+
+      // The per-directory (Linux) path catches watch-resource exhaustion inside
+      // watchDirectory and degrades synchronously rather than throwing, so it never
+      // reaches the catch below. Surface that as a failed start here so both
+      // strategies report exhaustion identically (start() === false).
+      if (this.degradedReason) return false;
 
       // No async crawl to wait on: as soon as the watch set is installed we
       // have a clean baseline (pendingFiles is only populated by post-start
@@ -272,114 +447,168 @@ export class FileWatcher {
       });
       return true;
     } catch (err) {
-      // Watcher setup failed (e.g., permission denied, missing directory).
-      logWarn('Could not start file watcher', { error: String(err) });
-      this.stop();
+      // Watcher setup failed. Watch-resource exhaustion (EMFILE/ENFILE on the
+      // recursive path) is terminal — degrade cleanly with one actionable
+      // warning instead of leaving a half-broken watcher. Everything else
+      // (permission denied, missing directory) keeps the prior quiet-stop.
+      if (isWatchResourceExhaustion(err)) {
+        this.degrade(EXHAUSTION_REASON, { error: String(err) });
+      } else {
+        logWarn('Could not start file watcher', { error: String(err) });
+        this.stop();
+      }
       return false;
     }
   }
 
   /**
-   * macOS/Windows: one recursive watcher for the whole tree. O(1) descriptors.
+   * macOS/Windows: one root stream, supplemented for directory symlinks.
    * `filename` arrives relative to the project root (with subdirectories), so
    * it maps straight to a project-relative path.
    */
   private startRecursive(): void {
-    this.recursiveWatcher = fs.watch(
+    this.recursiveWatcher = watchImpl(
       this.projectRoot,
       { recursive: true, persistent: true },
-      (_event, filename) => {
-        if (this.stopped || filename == null) return;
-        this.handleChange(normalizePath(String(filename)));
-      }
+      (_event, filename) => this.handleDirEvent(this.projectRoot, filename)
     );
     this.recursiveWatcher.on('error', (err: unknown) => {
+      if (isWatchResourceExhaustion(err)) {
+        this.degrade(EXHAUSTION_REASON, { error: String(err) });
+        return;
+      }
       logWarn('File watcher error', { error: String(err) });
     });
+    this.refreshWatchTree();
   }
 
-  /**
-   * Linux: walk the (non-ignored) tree and watch each directory. One inotify
-   * watch per directory reports create/modify/delete for that directory's
-   * direct children, so we never watch individual files.
-   */
-  private startPerDirectory(): void {
-    this.watchTree(this.projectRoot, /* markExisting */ false);
+  /** Reconcile logical directory paths with real targets, including retargeted links. */
+  private refreshWatchTree(): void {
+    if (this.stopped || this.inert) return;
+    this.visitedRealDirs.clear();
+    const directories = new Map<string, string>();
+    const desired = new Map<string, string>();
+    const recursive = supportsRecursiveWatch();
+    const walk = (dir: string, linked: boolean): void => {
+      if (this.shouldIgnoreDir(dir)) return;
+      let real: string;
+      try {
+        real = fs.realpathSync(dir);
+        if (this.visitedRealDirs.has(real)) return;
+        this.visitedRealDirs.add(real);
+        directories.set(dir, real);
+        if (!recursive || linked) desired.set(dir, real);
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const child = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            walk(child, false);
+          } else if (entry.isSymbolicLink()) {
+            // Follow directory symlinks just like the indexer's walk. Realpath
+            // deduplication includes ordinary directories and the root itself.
+            try {
+              if (fs.statSync(child).isDirectory()) walk(child, true);
+            } catch { /* broken link */ }
+          }
+        }
+      } catch { /* removed or unreadable directory */ }
+    };
+    walk(this.projectRoot, false);
+    this.knownDirs = directories;
+    for (const dir of this.dirWatchers.keys()) {
+      if (desired.get(dir) !== this.watchedRealDirs.get(dir)) this.unwatchDir(dir);
+    }
+    for (const [dir, real] of desired) this.watchDirectory(dir, real, recursive);
   }
 
-  /**
-   * Add an inotify watch for `dir` and recurse into its non-ignored
-   * subdirectories. When `markExisting` is true (a directory that appeared
-   * AFTER startup), the source files already inside it are recorded as pending
-   * — this closes the `mkdir + write` race where files created before the new
-   * directory's watch is installed would otherwise be missed until the next
-   * full sync. The initial startup walk passes false (the engine's catch-up
-   * sync owns the baseline).
-   */
-  private watchTree(dir: string, markExisting: boolean): void {
+  /** Coalesce directory topology events before walking; file edits never walk the tree. */
+  private scheduleTreeRefresh(): void {
+    if (this.treeRefreshTimer || this.inert || this.stopped) return;
+    this.treeRefreshTimer = setTimeout(() => {
+      this.treeRefreshTimer = null;
+      this.refreshWatchTree();
+      if (this.stopped) return;
+      // A new/retargeted directory can already contain files before its watch
+      // is installed; a full reconcile closes that race and removes old paths.
+      this.needsFullScan = true;
+      this.scheduleSync();
+    }, 50);
+  }
+
+  private watchDirectory(dir: string, real: string, recursive: boolean): void {
+    if (this.stopped || (this.degradedReason && !this.recoveringFromLock) || this.inotifyLimitWarned) return;
     if (this.dirWatchers.has(dir)) return;
-    if (this.dirWatchers.size >= maxDirWatches()) {
+    // Recursive streams cost more than inotify entries. Keep a separate hard
+    // ceiling while honouring a lower user-configured directory watch budget.
+    const cap = recursive ? Math.min(256, maxDirWatches()) : maxDirWatches();
+    if (this.dirWatchers.size >= cap) {
       if (!this.dirCapWarned) {
         this.dirCapWarned = true;
-        logWarn('File watcher hit directory-watch cap; remaining subtrees rely on manual/periodic sync', {
-          cap: maxDirWatches(),
-        });
+        logWarn('File watcher hit directory-watch cap; remaining subtrees rely on manual/periodic sync', { cap });
       }
       return;
     }
 
     let w: fs.FSWatcher;
     try {
-      w = fs.watch(dir, { persistent: true }, (_event, filename) =>
+      w = watchImpl(dir, { persistent: true, recursive }, (_event, filename) =>
         this.handleDirEvent(dir, filename)
       );
-    } catch {
-      // ENOENT / EACCES / too-many-open-files — skip this directory quietly.
-      return;
-    }
-    w.on('error', () => this.unwatchDir(dir));
-    this.dirWatchers.set(dir, w);
-
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const child = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (this.shouldIgnoreDir(child)) continue;
-        this.watchTree(child, markExisting);
-      } else if (markExisting && entry.isFile()) {
-        this.handleChange(normalizePath(path.relative(this.projectRoot, child)));
+    } catch (err) {
+      // EMFILE/ENFILE means the PROCESS is out of descriptors — every further
+      // directory would fail too, so degrade the whole watcher rather than
+      // limping along with a partial watch set.
+      if (isWatchResourceExhaustion(err)) {
+        this.degrade(EXHAUSTION_REASON, { error: String(err), dir });
+      } else if (isInotifyWatchExhaustion(err)) {
+        // ENOSPC = inotify watch budget exhausted. NON-fatal: keep the watches
+        // we have and tell the user the knob to raise (warn once).
+        this.warnInotifyLimit({ error: String(err), dir });
       }
+      // ENOENT / EACCES on a single directory stays non-fatal: skip it quietly.
+      return;
     }
-  }
-
-  /**
-   * Linux per-directory event handler. `filename` is relative to `dir`. A new
-   * sub-directory is picked up by extending the watch tree; everything else is
-   * routed through the shared change handler.
-   */
-  private handleDirEvent(dir: string, filename: string | Buffer | null): void {
-    if (this.stopped || filename == null) return;
-    const full = path.join(dir, String(filename));
-
-    // A newly-created directory needs its own watch (recursive isn't available
-    // on Linux). statSync is cheap and these events are rare relative to file
-    // edits. If the path vanished (rapid create/delete) the stat throws and we
-    // fall through to the change handler, which no-ops on a non-source path.
-    try {
-      if (fs.statSync(full).isDirectory()) {
-        if (!this.shouldIgnoreDir(full)) this.watchTree(full, /* markExisting */ true);
+    w.on('error', (err: unknown) => {
+      if (isWatchResourceExhaustion(err)) {
+        this.degrade(EXHAUSTION_REASON, { error: String(err), dir });
         return;
       }
-    } catch {
-      // deleted/inaccessible — treat as a normal change below
-    }
+      if (isInotifyWatchExhaustion(err)) {
+        this.warnInotifyLimit({ error: String(err), dir });
+      }
+      this.unwatchDir(dir);
+    });
+    this.dirWatchers.set(dir, w);
 
-    this.handleChange(normalizePath(path.relative(this.projectRoot, full)));
+    this.watchedRealDirs.set(dir, real);
+  }
+
+  /** Events are relative to a watch's logical path, even for an external target. */
+  private handleDirEvent(dir: string, filename: string | Buffer | null): void {
+    if (this.stopped) return;
+    if (filename == null) {
+      this.scheduleTreeRefresh();
+      return;
+    }
+    const full = path.join(dir, String(filename));
+    const rel = normalizePath(path.relative(this.projectRoot, full));
+    if (!rel || rel === '.') {
+      this.scheduleTreeRefresh();
+      return;
+    }
+    // Churn under an ignored directory (node_modules, dist, .git) is dropped
+    // before any per-event fs call; `.git/info/exclude` still reaches the scope
+    // refresh in handleChange (#1728).
+    if (rel !== '.git/info/exclude' && this.shouldIgnoreDir(path.dirname(full))) return;
+    try {
+      if (fs.statSync(full).isDirectory()) {
+        if (this.shouldIgnoreDir(full)) return;
+        // Existing directory notifications can represent a retargeted link.
+        if (this.knownDirs.get(full) !== fs.realpathSync(full)) this.scheduleTreeRefresh();
+        return;
+      }
+    } catch { /* deleted/inaccessible */ }
+    if (this.knownDirs.has(full) && !this.shouldIgnoreDir(full)) this.scheduleTreeRefresh();
+    this.handleChange(rel);
   }
 
   /**
@@ -394,9 +623,51 @@ export class FileWatcher {
    */
   private handleChange(rel: string): void {
     if (!rel || rel === '.' || rel.startsWith('..')) return;
+    // `.git/info/exclude` is otherwise always-ignored with the rest of `.git/`,
+    // but it feeds `buildScopeIgnore` — allow it through as a scope refresh
+    // when the platform delivers the event (recursive watchers may; Linux
+    // per-directory watching does not descend into `.git/`) (#1728).
+    if (rel === '.git/info/exclude') {
+      this.refreshScope(rel);
+      return;
+    }
     if (this.isAlwaysIgnored(rel)) return;
+    // The two root files the scope matcher is derived from are handled BEFORE
+    // the matcher is consulted: a user `exclude` pattern that happens to cover
+    // them (`*.json`, `.*`) must not be able to hide their own edits (#1590).
+    if (rel === PROJECT_CONFIG_FILENAME || rel === '.gitignore') {
+      this.refreshScope(rel);
+      return;
+    }
     if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
-    if (!isSourceFile(rel)) return;
+    // A nested `.gitignore` (an embedded child repo's own rules, #514, or a
+    // subdirectory rule the git-backed full scan honors) is only a scope
+    // change when it sits INSIDE the current scope — checked after the matcher
+    // on purpose, so the thousands of package-local `.gitignore`s an
+    // `npm install` writes under an ignored `node_modules/` never trigger a
+    // rebuild storm.
+    if (rel.endsWith('/.gitignore')) {
+      this.refreshScope(rel);
+      return;
+    }
+    if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot), this.projectRoot)) {
+      this.maybeScheduleForRemovedDir(rel);
+      return;
+    }
+
+    try {
+      if (this.isFileStateCurrent?.(rel)) {
+        logDebug('Ignoring file event with unchanged indexed metadata', { file: rel });
+        return;
+      }
+    } catch (error) {
+      // The guard is an optimization, never a correctness boundary. If the
+      // stat/DB lookup fails, keep the event so a sync can reconcile it.
+      logDebug('Could not verify file event metadata; treating it as a change', {
+        file: rel,
+        error: String(error),
+      });
+    }
 
     logDebug('File change detected', { file: rel });
     if (this.ready) {
@@ -410,6 +681,65 @@ export class FileWatcher {
     this.scheduleSync();
   }
 
+  /**
+   * A scope-defining file changed (`codegraph.json`, a `.gitignore`): rebuild
+   * the ignore matcher and make the next sync a FULL reconcile (#1590).
+   *
+   * The matcher used to be built once in `start()` and kept for the watcher's
+   * lifetime — in a long-lived MCP daemon that meant a `codegraph.json`
+   * created or edited after startup was invisible to the live watcher, while
+   * `codegraph sync` (a fresh process) honoured it immediately: the CLI
+   * removed a newly excluded file and the watcher re-added it seconds later.
+   * `loadExtensionOverrides()` on the same filter line was already read live
+   * (mtime-cached), so two fields of the same config file disagreed.
+   *
+   * Rebuilding costs one `git ls-files` pass (embedded-repo discovery), which
+   * is fine per config edit — never per event. Replacing the field is enough
+   * for both strategies: the recursive handler and the per-directory
+   * `shouldIgnoreDir` walk read `this.ignoreMatcher` on every call. The full
+   * scan is required because a scope change has no per-file events: newly
+   * excluded files must be REMOVED from the index and newly included ones
+   * added, and only the scan-diff (which builds its own fresh matcher) knows
+   * which those are.
+   */
+  private refreshScope(rel: string): void {
+    logDebug('Scope config changed; rebuilding watcher scope', { file: rel });
+    this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
+    this.scheduleTreeRefresh();
+    this.needsFullScan = true;
+    this.scheduleSync();
+  }
+
+  /**
+   * A deleted DIRECTORY arrives as one event on the directory's own path —
+   * no source extension, so the source-file filter drops it, and the files
+   * underneath may never get events of their own (Windows's recursive
+   * watcher reports only the top-most removed entry; macOS FSEvents can
+   * coalesce a tree deletion the same way). The index then kept every child
+   * record until some unrelated edit happened to trigger a sync (#1285).
+   *
+   * If a non-source path no longer exists on disk, treat it as a potential
+   * subtree removal and schedule the debounced sync — its scan-diff removes
+   * whatever is gone, which is the ground truth for what was underneath.
+   * pendingFiles is left alone (we can't know the children from the event).
+   * An event for an EXISTING non-source file stays fully ignored, so build
+   * churn on live files never schedules work; a deleted non-source file
+   * costs at most one no-op scan-diff, absorbed by the debounce.
+   */
+  private maybeScheduleForRemovedDir(rel: string): void {
+    try {
+      fs.statSync(path.join(this.projectRoot, rel));
+      return; // still on disk — an ordinary non-source change, ignore
+    } catch {
+      /* gone — fall through */
+    }
+    logDebug('Non-source path removed; scheduling sync for possible directory removal', {
+      path: rel,
+    });
+    this.needsFullScan = true;
+    this.scheduleSync();
+  }
+
   /** Close and forget the watch for a directory that errored/was removed. */
   private unwatchDir(dir: string): void {
     const w = this.dirWatchers.get(dir);
@@ -420,15 +750,16 @@ export class FileWatcher {
         /* already closed */
       }
       this.dirWatchers.delete(dir);
+      this.watchedRealDirs.delete(dir);
     }
   }
 
   /** Our own dirs are always ignored, regardless of .gitignore. */
   private isAlwaysIgnored(rel: string): boolean {
-    return (
-      rel === '.codegraph' || rel.startsWith('.codegraph/') ||
-      rel === '.git' || rel.startsWith('.git/')
-    );
+    // Ignore any CodeGraph data dir — the active one AND a
+    // sibling like `.codegraph-win` a second environment (Windows/WSL) created
+    // in the same tree, so neither side watches the other's index (#636).
+    return rel.split('/').some(part => isCodeGraphDataDir(part) || part === '.git');
   }
 
   /**
@@ -445,10 +776,96 @@ export class FileWatcher {
   }
 
   /**
+   * Disable live watching after a terminal runtime failure
+   * (watch-resource exhaustion, lock contention past the retry budget, or a
+   * persistent generic sync failure past the retry budget).
+   * Idempotent: logs one actionable warning, fires {@link WatchOptions.onDegraded}
+   * once, and stops the watcher. A subsequent start() clears the latch.
+   */
+  private degrade(reason: string, context: Record<string, unknown> = {}, byLock = false): void {
+    if (this.degradedReason && !this.recoveringFromLock) return;
+    this.degradedReason = reason;
+    this.degradedByLock = byLock;
+    this.recoveringFromLock = false;
+    logWarn('File watcher disabled', { projectRoot: this.projectRoot, reason, ...context });
+    this.onDegraded?.(reason);
+    this.stop();
+  }
+
+  /**
+   * Warn ONCE that the Linux inotify watch budget is exhausted (ENOSPC), and
+   * stop adding new watches for the rest of this session — every further
+   * `inotify_add_watch` would fail too, so walking the rest of the tree is
+   * waste. Unlike {@link degrade} this is NON-fatal: the watches already
+   * installed keep firing, and `codegraph sync` covers the unwatched remainder.
+   * The message names the kernel knob to raise (`fs.inotify.max_user_watches`).
+   */
+  private warnInotifyLimit(context: Record<string, unknown> = {}): void {
+    if (this.inotifyLimitWarned) return;
+    this.inotifyLimitWarned = true;
+    logWarn(INOTIFY_LIMIT_REASON, { watchedDirs: this.dirWatchers.size, ...context });
+  }
+
+  /**
+   * Whether live watching has degraded or is still catching up after re-arm.
+   * Distinct from {@link isActive}: a degraded watcher is inactive, but an
+   * inactive watcher is not necessarily degraded (it may simply be stopped or
+   * never started). Hosts use this to tell the user auto-sync is off.
+   */
+  isDegraded(): boolean {
+    return this.degradedReason !== null;
+  }
+
+  /** The reason live watching degraded, or null if it is healthy. */
+  getDegradedReason(): string | null {
+    return this.degradedReason;
+  }
+
+  /** Watches are live again, but the full catch-up has not committed yet. */
+  isRecoveringFromLock(): boolean {
+    return this.recoveringFromLock;
+  }
+
+  /**
+   * Re-arm a watcher disabled by lock contention when a caller next uses the
+   * graph. Keep the whole-index stale banner until a FULL scan reconciles edits
+   * missed while watches were off. Resource exhaustion and deterministic sync
+   * failures are not automatically retried. Repeated unsuccessful re-arms are
+   * throttled so many MCP sessions cannot hammer a long-lived writer.
+   */
+  rearmAfterLockContention(): boolean {
+    if (!this.degradedByLock || this.isActive()) return false;
+    const now = Date.now();
+    if (this.lastLockRearmMs && now - this.lastLockRearmMs < LOCK_REARM_COOLDOWN_MS) return false;
+    const reason = this.degradedReason;
+    this.lastLockRearmMs = now;
+    if (!this.start()) {
+      // A disabled platform can reject start() without calling degrade().
+      // Preserve the old stale-index signal in that case; a new resource
+      // failure has its own more precise degraded reason.
+      if (!this.degradedReason) {
+        this.degradedReason = reason;
+        this.degradedByLock = true;
+      }
+      return false;
+    }
+    this.degradedReason = reason;
+    this.recoveringFromLock = true;
+    this.needsFullScan = true;
+    this.scheduleSync();
+    return true;
+  }
+
+  /**
    * Stop watching for file changes.
    */
   stop(): void {
     this.stopped = true;
+    if (this.treeRefreshTimer) clearTimeout(this.treeRefreshTimer);
+    this.treeRefreshTimer = null;
+    this.knownDirs.clear();
+    this.watchedRealDirs.clear();
+    this.recoveringFromLock = false;
 
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
@@ -472,6 +889,12 @@ export class FileWatcher {
     }
     this.dirWatchers.clear();
     this.dirCapWarned = false;
+    this.inotifyLimitWarned = false;
+    this.lockRetryCount = 0;
+    this.syncFailureRetryCount = 0;
+    // NB: degradedReason is intentionally NOT reset here — it must survive the
+    // stop() that degrade() triggers so isDegraded() stays true. start() clears it.
+    this.visitedRealDirs.clear();
     this.inert = false;
 
     this.pendingFiles.clear();
@@ -522,16 +945,41 @@ export class FileWatcher {
   }
 
   /**
-   * Schedule a debounced sync.
+   * Schedule a normal debounced sync after a source edit.
    */
   private scheduleSync(): void {
+    if (this.debounceTimer) {
+      clearTimeout(this.debounceTimer);
+    }
+    // Adaptive quiet window: a lone save (or a pair — editor + its test file)
+    // fires fast so the graph feels instant; anything bigger keeps the full
+    // configured window so an agent's multi-file burst still coalesces into
+    // one sync exactly as before. Re-arming on each event preserves the
+    // trailing-edge semantics either way: if more events arrive inside the
+    // quick window, the reschedule sees the larger pending set and extends to
+    // the full window. Never exceeds the configured debounce (a user-lowered
+    // CODEGRAPH_WATCH_DEBOUNCE_MS stays authoritative), floor 100ms.
+    const quickMs = Math.max(100, Math.min(QUICK_SYNC_QUIET_MS, this.debounceMs));
+    const delay = this.pendingFiles.size <= QUICK_SYNC_MAX_PENDING ? quickMs : this.debounceMs;
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null;
+      this.flush();
+    }, delay);
+  }
+
+  /**
+   * Schedule a retry after a recoverable sync failure (lock contention). Kept
+   * separate from {@link scheduleSync} so prolonged contention backs off
+   * exponentially instead of hammering the lock every debounce cycle.
+   */
+  private scheduleRetrySync(delayMs: number): void {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
     }
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
       this.flush();
-    }, this.debounceMs);
+    }, delayMs);
   }
 
   /**
@@ -553,8 +1001,27 @@ export class FileWatcher {
     this.syncStartedMs = Date.now();
     this.syncing = true;
 
+    // Scoped fast path: when every pending change is a known file event, hand
+    // the exact paths to sync and skip its O(repo) scan-diff. Anything the
+    // events can't fully describe — a directory removal, an empty pending set
+    // (retry paths), or an event storm past the ceiling — runs the full
+    // scan-diff, which remains the ground truth.
+    const scoped =
+      !this.needsFullScan && this.pendingFiles.size > 0 && this.pendingFiles.size <= SCOPED_SYNC_MAX_PENDING
+        ? [...this.pendingFiles.keys()]
+        : undefined;
+
+    // Consume this request before yielding so a topology/scope change during
+    // the full sync remains pending for the next reconcile.
+    if (!scoped) this.needsFullScan = false;
     try {
-      const result = await this.syncFn();
+      const result = await this.syncFn(scoped);
+      if (this.recoveringFromLock && !scoped && !this.needsFullScan) {
+        this.degradedReason = null;
+        this.recoveringFromLock = false;
+      }
+      this.lockRetryCount = 0; // a clean sync clears any contention backoff
+      this.syncFailureRetryCount = 0; // ...and any generic-failure backoff
       // Remove entries whose most recent event predates this sync — those
       // edits are now in the DB. Entries with lastSeenMs > syncStartedMs
       // arrived mid-sync; whether the in-flight sync captured them depends
@@ -569,17 +1036,52 @@ export class FileWatcher {
       }
       this.onSyncComplete?.(result);
     } catch (err) {
+      if (!scoped) this.needsFullScan = true;
       if (err instanceof LockUnavailableError) {
+        this.lockRetryCount += 1;
         // Lock-failure no-op (another writer holds the lock). pendingFiles
-        // stays intact and the `finally` block reschedules. Debug-only —
-        // a long external index would otherwise spam stderr every cycle.
+        // stays intact and the `finally` block reschedules with backoff. Keep
+        // brief contention quiet (debug-only — a long external index would
+        // otherwise spam stderr every cycle), but stop retrying forever: once a
+        // writer holds the lock past the budget, degrade auto-sync explicitly.
         logDebug('Watch sync skipped: file lock unavailable', {
           pendingFiles: this.pendingFiles.size,
+          retryCount: this.lockRetryCount,
         });
+        if (this.lockRetryCount > MAX_LOCK_RETRIES) {
+          this.degrade(
+            'CodeGraph file lock held by another process past the retry budget; ' +
+              'auto-sync disabled. Run `codegraph sync` once the other writer finishes ' +
+              '(or install git sync hooks) to refresh the graph.',
+            { pendingFiles: this.pendingFiles.size, retryCount: this.lockRetryCount },
+            true
+          );
+        }
       } else {
+        this.lockRetryCount = 0; // a non-lock failure isn't contention; reset that streak
+        this.syncFailureRetryCount += 1;
         const error = err instanceof Error ? err : new Error(String(err));
-        logWarn('Watch sync failed', { error: error.message });
+        logWarn('Watch sync failed', {
+          error: error.message,
+          retryCount: this.syncFailureRetryCount,
+        });
         this.onSyncError?.(error);
+        // A persistent (deterministic) sync failure — a broken extractor on a
+        // specific file, DB corruption, SQLITE_FULL, an OOM in resolution —
+        // would otherwise retry forever at the debounce cadence, spamming logs
+        // and work while the auto-update guarantee is silently dead (#1127).
+        // Bound it exactly like lock contention: the `finally` block backs off
+        // exponentially, and past the budget we degrade so the dead guarantee
+        // is surfaced (onDegraded / isDegraded) instead of hidden. A single
+        // clean sync resets the streak, so a transient hiccup never degrades.
+        if (this.syncFailureRetryCount > MAX_SYNC_FAILURE_RETRIES) {
+          this.degrade(
+            `CodeGraph auto-sync failed ${this.syncFailureRetryCount} times in a row; ` +
+              'auto-sync disabled. Run `codegraph sync` (or install git sync hooks) to ' +
+              `refresh the graph after changes. Last error: ${error.message}`,
+            { error: error.message, retryCount: this.syncFailureRetryCount }
+          );
+        }
       }
       // Failure: leave pendingFiles untouched. Every edit it tracks is
       // still unindexed; the rescheduled sync sees the same set.
@@ -587,9 +1089,26 @@ export class FileWatcher {
       this.syncing = false;
 
       // If pending files remain (mid-sync events, or this sync failed),
-      // schedule another pass.
-      if (this.pendingFiles.size > 0 && !this.stopped) {
-        this.scheduleSync();
+      // schedule another pass. After EITHER failure mode — lock contention or a
+      // generic sync failure — back off exponentially (debounceMs · 2^(n-1),
+      // capped) instead of retrying at the normal debounce cadence; a clean
+      // sync resets both counters so normal edits keep the fast debounce. Use
+      // the larger streak so interleaved failures still back off. A degrade()
+      // above already set `stopped`, so this won't reschedule a watcher that
+      // has given up. A directory removal whose full sync failed adds no
+      // pending file, only `needsFullScan` — it still owes the full reconcile
+      // it asked for (#1964).
+      if ((this.pendingFiles.size > 0 || this.needsFullScan) && !this.stopped) {
+        const retryCount = Math.max(this.lockRetryCount, this.syncFailureRetryCount);
+        if (retryCount > 0) {
+          const retryDelayMs = Math.min(
+            this.debounceMs * 2 ** Math.max(0, retryCount - 1),
+            MAX_RETRY_BACKOFF_MS
+          );
+          this.scheduleRetrySync(retryDelayMs);
+        } else {
+          this.scheduleSync();
+        }
       }
     }
   }

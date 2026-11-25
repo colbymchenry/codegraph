@@ -58,6 +58,12 @@ scripts/agent-eval/audit.sh <VERSION> <repo-name> <repo-url> "<question>" <MODE>
   codegraph-tool calls, duration, **total cost**.
 - Interactive (`parse-session.mjs`): the `VERDICT: codegraph_explore used Nx |
   Read N | Grep/Bash N` and `TOKENS:` lines.
+- Both paths also print the three feedback metrics — residual context occupancy,
+  explore sufficiency, allocation efficiency — and a headless A/B ends with a
+  side-by-side `ARM COMPARISON` table. Report that table, and check its
+  contamination row first: `CLI calls that RETURNED output` > 0 means the arm
+  reached codegraph through Bash and its numbers are void. How to read the rest:
+  `docs/benchmarks/agent-eval-feedback-metrics.md`.
 
 Lead with cost + tool/Read counts — they are the reliable signals; raw token
 in/out are confounded by subagent delegation and prompt caching. State whether

@@ -37,26 +37,45 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, StdioOptions } from 'child_process';
-import { findNearestCodeGraphRoot, getCodeGraphDir } from '../directory';
+import { resolveServerRoot, getCodeGraphDir } from '../directory';
 import { StdioTransport } from './transport';
 import { MCPEngine } from './engine';
 import { MCPSession } from './session';
 import {
   Daemon,
   clearStaleDaemonLock,
+  installChangedReason,
   isProcessAlive,
   tryAcquireDaemonLock,
 } from './daemon';
-import { connectWithHello, runLocalHandshakeProxy } from './proxy';
-import { getDaemonSocketPath } from './daemon-paths';
+import { clearStaleDaemonArtifacts, stopOlderDaemon } from './daemon-registry';
+import { connectWithHello, DAEMON_HELLO_TIMEOUT_MS, runLocalHandshakeProxy } from './proxy';
+import { CodeGraphPackageJsonPath, CodeGraphPackageVersion } from './version';
+import {
+  readWriterLock,
+  assertNoRebuild,
+  releaseWriterLock,
+  tryAcquireWriterLock,
+  writerLockHeldMessage,
+} from './writer-lock';
+import {
+  canProbeDaemonIdentity,
+  decodeLockInfo,
+  getDaemonPidPath,
+  getDaemonSocketCandidates,
+  probeDaemonIdentity,
+} from './daemon-paths';
+import { getTelemetry } from '../telemetry';
+import { checkForUpdateInBackground } from '../upgrade/update-check';
+import { EARLY_PPID } from './early-ppid';
+import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from './ppid-watchdog';
+import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
+import { armStartupHandshakeTimeout } from './startup-handshake';
+import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
-/**
- * How often to poll `process.ppid` to detect parent process death (see #277).
- * 5s is a deliberate trade-off: the failure mode being guarded against is rare
- * (parent SIGKILL'd), and longer poll = less wakeup overhead while idle.
- */
-const DEFAULT_PPID_POLL_MS = 5000;
+/** Default worker cap for a direct (single-client) session; see MCPEngineOptions.queryPoolDefaultMax (#1465). */
+const DIRECT_QUERY_POOL_MAX = 2;
 
 /**
  * Env var that marks a process as the *detached daemon* itself (set by
@@ -67,6 +86,13 @@ const DEFAULT_PPID_POLL_MS = 5000;
 const DAEMON_INTERNAL_ENV = 'CODEGRAPH_DAEMON_INTERNAL';
 
 /**
+ * Env var naming the launcher that holds the project's writer slot for the
+ * daemon it spawns, after stopping an older one (#2335). That daemon takes the
+ * slot over instead of finding it held.
+ */
+const DAEMON_HANDOVER_ENV = 'CODEGRAPH_DAEMON_HANDOVER';
+
+/**
  * Retries for the detached daemon arbitrating the O_EXCL lock against a racing
  * sibling. Tiny — the lock resolves on the first round in practice; the retries
  * only cover clearing a genuinely stale (dead-pid) lockfile.
@@ -75,47 +101,135 @@ const TAKEOVER_MAX_RETRIES = 5;
 const TAKEOVER_RETRY_DELAY_MS = 100;
 
 /**
- * How long a launcher waits for a freshly-spawned daemon to bind its socket
- * before giving up and running in-process. The daemon binds the socket *before*
- * the (backgrounded) engine/grammar warm-up, so this only needs to cover node
- * process startup. 60 × 100ms = 6s of headroom for a cold/slow box; on the
- * common path the socket appears within a few rounds.
+ * How long a daemon the writer slot is held for (#2335) waits out a racing
+ * candidate that took the daemon lock first. That candidate cannot get the
+ * slot, so it leaves; this bounds a wait that never ends.
  */
-// Poll finely (25ms) so the proxy attaches the instant the freshly-spawned
-// daemon binds, instead of waiting up to a coarse 100ms after — shaves the
-// cold-start handshake (the window the headless agent races). Same ~6s total
-// give-up budget (240 × 25ms), just finer granularity; socket-connect probes
-// are cheap. Paired with deferring the CodeGraph load (engine.ts) off the bind
-// path, this narrows the "No such tool available" race window.
-const DAEMON_CONNECT_MAX_RETRIES = 240;
-const DAEMON_CONNECT_RETRY_DELAY_MS = 25;
+const HANDOVER_CANDIDATE_WAIT_MS = 5_000;
 
 /**
- * Resolve the PPID watchdog poll interval from an env override. A value of
- * `0` disables the watchdog entirely (escape hatch for embedded scenarios
- * where the parent legitimately re-parents the server on purpose). Anything
- * non-numeric or negative falls back to the default.
+ * A fallback that serves reads without a watcher or a writer lock (#1963).
+ * Say so on stderr: otherwise a session that quietly stopped syncing looks
+ * the same as a healthy one in the logs.
  */
-function parsePpidPollMs(raw: string | undefined): number {
-  if (raw === undefined || raw === '') return DEFAULT_PPID_POLL_MS;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return DEFAULT_PPID_POLL_MS;
-  if (parsed < 0) return DEFAULT_PPID_POLL_MS;
-  return Math.floor(parsed);
+function readOnlyFallback(holder: string): MCPEngine {
+  process.stderr.write(`[CodeGraph MCP] Serving reads in-process without auto-sync: ${holder}.\n`);
+  return new MCPEngine({ readOnly: true });
 }
 
 /**
- * Parse the host PID propagated across the `--liftoff-only` re-exec
- * ({@link HOST_PPID_ENV}). Returns a positive integer PID, or null when
- * unset/invalid — the direct-launch path, where the watchdog falls back to
- * `process.ppid` divergence. PIDs of 0/1 are rejected (0 = unknown, 1 = init,
- * i.e. already orphaned), so the watchdog doesn't latch onto init.
+ * Create an in-process fallback only when it cannot conflict with a live
+ * legacy daemon. Plain-PID locks cannot prove daemon identity, but they still
+ * prove that a process owns the legacy writer slot.
  */
-function parseHostPpid(raw: string | undefined): number | null {
-  if (raw === undefined || raw === '') return null;
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed <= 1) return null;
-  return parsed;
+function makeFallbackEngine(root: string): MCPEngine {
+  assertNoRebuild(root);
+  let existing: ReturnType<typeof decodeLockInfo> = null;
+  try {
+    existing = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') {
+      throw new Error(`The daemon lock could not be read (${code ?? 'unknown error'}); refusing an in-process fallback.`);
+    }
+  }
+  if (
+    existing &&
+    isProcessAlive(existing.pid) &&
+    !canProbeDaemonIdentity(existing)
+  ) {
+    throw new Error(
+      `Cannot start an in-process fallback while live legacy daemon pid ${existing.pid} holds the project lock.`
+    );
+  }
+  const writer = readWriterLock(root);
+  if (writer && writer.pid > 0 && isProcessAlive(writer.pid)) {
+    // Another process owns updates. A fallback may still serve read-only WAL
+    // queries without claiming a second writer or starting a watcher (#1963).
+    return readOnlyFallback(`writer lock held by PID ${writer.pid} (${writer.mode} mode)`);
+  }
+  if (existing && isProcessAlive(existing.pid)) {
+    return readOnlyFallback(`live daemon PID ${existing.pid} holds the project lock`);
+  }
+  // This session's own install was upgraded or removed underneath it (#2335):
+  // its code no longer loads whole, so as the project's writer it would only
+  // keep a daemon from the current install from starting. Its daemon exits
+  // for the same reason, which is how it got here.
+  if (CodeGraphPackageVersion !== '0.0.0-unknown' &&
+      installChangedReason(CodeGraphPackageJsonPath, CodeGraphPackageVersion) !== null) {
+    return readOnlyFallback('this session\'s CodeGraph install was upgraded or removed; restart the session to use the current one');
+  }
+  return new MCPEngine({ writerLockRoot: root, queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
+}
+
+/**
+ * How long a launcher waits for a freshly-spawned daemon to answer before
+ * giving up and running in-process. The daemon binds the socket *before* the
+ * (backgrounded) engine/grammar warm-up, so this only needs to cover node
+ * process startup: 6s of headroom for a cold/slow box; on the common path the
+ * socket appears within a few rounds.
+ *
+ * A budget of wall time, not a count of probes. A process that holds the pipe
+ * but never says hello — in practice a daemon whose main thread is blocked —
+ * makes every probe wait out its whole hello timeout, so the old 240 probes
+ * held a session's first tool call for about 12 minutes. Spent, the session is
+ * served in-process exactly as when the daemon never binds, and the proxy keeps
+ * retrying with backoff (#2277): a daemon its liveness watchdog kills (60s by
+ * default) is replaced by the next retry, never bypassed for good.
+ */
+const DAEMON_CONNECT_BUDGET_MS = 6_000;
+// Poll finely (25ms) so the proxy attaches the instant the freshly-spawned
+// daemon binds, instead of waiting up to a coarse 100ms after — shaves the
+// cold-start handshake (the window the headless agent races); socket-connect
+// probes are cheap. Paired with deferring the CodeGraph load (engine.ts) off the
+// bind path, this narrows the "No such tool available" race window.
+const DAEMON_CONNECT_RETRY_DELAY_MS = 25;
+
+/**
+ * Probe the daemon's socket candidates in order (the in-project path first);
+ * the first that answers wins. With a `deadline`, no hello wait runs past it.
+ * The connect and the clock are injectable for tests.
+ */
+export async function connectAnyDaemonCandidate(
+  candidates: readonly string[],
+  deadline = Infinity,
+  connect: typeof connectWithHello = connectWithHello,
+  now: () => number = Date.now,
+): Promise<Awaited<ReturnType<typeof connectWithHello>>> {
+  for (const candidate of candidates) {
+    const left = deadline - now();
+    if (left <= 0) return null;
+    const s = await connect(candidate, CodeGraphPackageVersion, Math.min(DAEMON_HELLO_TIMEOUT_MS, left));
+    // A wrong-version daemon IS up — definitive; propagate so the caller
+    // replaces it (an older release) or serves in-process instead of
+    // spawning + polling for 6s. Don't keep probing fallbacks past it.
+    if (s) return s;
+  }
+  return null;
+}
+
+/**
+ * Probe for a daemon every `retryDelayMs` until one answers or `budgetMs` of
+ * wall time is spent. `probe` gets the deadline, and caps its own hello wait to
+ * it. Resolves the socket, or null once the budget is spent or a daemon of
+ * another version answers. The clock is injectable for tests.
+ */
+export async function pollForDaemon<S>(
+  probe: (deadline: number) => Promise<S | 'older-version' | 'version-mismatch' | null>,
+  budgetMs: number = DAEMON_CONNECT_BUDGET_MS,
+  retryDelayMs: number = DAEMON_CONNECT_RETRY_DELAY_MS,
+  clock: { now(): number; sleep(ms: number): Promise<void> } = { now: Date.now, sleep },
+): Promise<S | null> {
+  const deadline = clock.now() + budgetMs;
+  for (;;) {
+    await clock.sleep(retryDelayMs);
+    if (clock.now() >= deadline) return null;
+    const answer = await probe(deadline);
+    // Another version answering, older or not, waits for the next retry: one
+    // replacement per attempt, so this can never loop.
+    if (answer === 'older-version' || answer === 'version-mismatch') return null;
+    if (answer) return answer;
+  }
 }
 
 /** Whether `CODEGRAPH_NO_DAEMON` was set to a truthy value. */
@@ -132,10 +246,57 @@ function daemonInternalSet(): boolean {
 }
 
 /**
+ * Prefix every `process.stderr.write` chunk with an ISO-8601 timestamp. Called
+ * once, only when this process becomes the detached daemon — whose stderr is
+ * appended to `.codegraph/daemon.log`. Before #1431 no log line carried a
+ * timestamp, so watchdog kills and restarts could be counted but never placed
+ * in time. (The watchdog child writes its kill notice through its own
+ * inherited fd 2, bypassing this wrapper — it stamps that line itself.)
+ */
+export function timestampStderrLines(): void {
+  const orig = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+    return (orig as (...args: unknown[]) => boolean)(stampLogChunk(chunk), ...rest);
+  }) as typeof process.stderr.write;
+}
+
+/** Prepend `[<ISO-8601>] ` to a log chunk; unknown chunk types pass through. */
+export function stampLogChunk(chunk: string | Uint8Array): string | Uint8Array {
+  try {
+    const stamp = `[${new Date().toISOString()}] `;
+    if (typeof chunk === 'string') return stamp + chunk;
+    if (Buffer.isBuffer(chunk)) return Buffer.concat([Buffer.from(stamp), chunk]);
+  } catch { /* stamping is best-effort; never block the write */ }
+  return chunk;
+}
+
+/**
+ * Watchdog `progressPaths` for a server keyed on `root`'s index: the SQLite DB
+ * + its WAL. With these, the #850 liveness watchdog only kills on heartbeat
+ * silence when the DB files are NOT advancing — the same slow-disk deferral
+ * the CLI `index`/`init` path got in #1231. Without it, one >timeout
+ * synchronous statement on a big DB (multi-GB index behind Windows Defender)
+ * SIGKILLs a perfectly healthy daemon — and a daemon SIGKILL'd at the end of
+ * nearly every session is what ratcheted the WAL leak in #1431. A true wedge
+ * still dies: a wedged loop writes nothing, so the files stay still.
+ */
+export function watchdogProgressPaths(root: string | null): { progressPaths?: string[] } {
+  if (!root) return {};
+  const dbPath = path.join(getCodeGraphDir(root), 'codegraph.db');
+  return { progressPaths: [dbPath, `${dbPath}-wal`] };
+}
+
+/**
  * Resolve the project root the daemon machinery should key on. Returns
  * `null` when no `.codegraph/` is reachable from the candidate path — in
  * that case the caller must run in direct mode, since the daemon lockfile
  * and socket both live under `.codegraph/`.
+ *
+ * Uses the same resolution as the engine (#1606): up-walk first, then the
+ * bounded workspace down-scan that adopts a SINGLE indexed sub-project. A
+ * workspace root above one indexed child therefore gets the shared daemon
+ * (one watcher, one writer, keyed on the child) instead of a direct-mode
+ * server per host.
  *
  * The result is canonicalized with `realpathSync` so every client converges on
  * the same socket/lock path regardless of how it expressed the path: a client
@@ -146,7 +307,7 @@ function daemonInternalSet(): boolean {
  */
 function resolveDaemonRoot(explicitPath: string | null): string | null {
   const candidate = explicitPath ?? process.cwd();
-  const root = findNearestCodeGraphRoot(candidate);
+  const root = resolveServerRoot(candidate).root;
   if (!root) return null;
   try { return fs.realpathSync(root); } catch { return root; }
 }
@@ -160,9 +321,10 @@ function resolveDaemonRoot(explicitPath: string | null): string | null {
  * `process.execArgv` (carries `--liftoff-only`, so the daemon never re-execs)
  * and `process.argv[1]` (this script). The spawned process self-arbitrates the
  * O_EXCL lock, so racing launchers may each spawn one — losers exit and every
- * launcher proxies through the single winner.
+ * launcher proxies through the single winner. `handover` tells the daemon this
+ * launcher holds the writer slot for it (see {@link DAEMON_HANDOVER_ENV}).
  */
-function spawnDetachedDaemon(root: string): void {
+function spawnDetachedDaemon(root: string, handover = false): void {
   const scriptPath = process.argv[1];
   if (!scriptPath) {
     // No resolvable CLI entry point to re-invoke — let the caller fall back to
@@ -179,6 +341,13 @@ function spawnDetachedDaemon(root: string): void {
     stdio = 'ignore'; // no log file — discard daemon output rather than fail
   }
   try {
+    // The daemon has no host: scrub the threaded host pid so it can't leak
+    // into the daemon's env (and from there into anything the daemon spawns),
+    // where a long-dead session's host pid would trigger spurious shutdowns.
+    const env: NodeJS.ProcessEnv = { ...process.env, [DAEMON_INTERNAL_ENV]: '1' };
+    delete env[HOST_PPID_ENV];
+    if (handover) env[DAEMON_HANDOVER_ENV] = String(process.pid);
+    else delete env[DAEMON_HANDOVER_ENV];
     const child = spawn(
       process.execPath,
       [...process.execArgv, scriptPath, 'serve', '--mcp', '--path', root],
@@ -186,9 +355,15 @@ function spawnDetachedDaemon(root: string): void {
         detached: true,
         stdio,
         windowsHide: true,
-        env: { ...process.env, [DAEMON_INTERNAL_ENV]: '1' },
+        env,
       },
     );
+    // An upgrade can delete the install this launcher runs from — its daemon
+    // then exits (#2335) and a respawn finds no executable. spawn reports that
+    // as an asynchronous 'error' event, which would crash this process if
+    // nobody listened. No daemon binds either way; the caller's poll gives up
+    // and the session is served in-process.
+    child.on('error', () => { /* no daemon — see above */ });
     child.unref();
   } finally {
     // The child holds its own dup of the log fd now; the launcher doesn't need it.
@@ -196,6 +371,76 @@ function spawnDetachedDaemon(root: string): void {
       try { fs.closeSync(logFd); } catch { /* ignore */ }
     }
   }
+}
+
+/**
+ * How long a launcher replacing an older daemon waits for one that is partway
+ * through its shutdown, past the stop's own 3s wait. Tool calls are held
+ * meanwhile, so it is short: a daemon that takes longer leaves the session
+ * served in-process until the proxy's next retry (#2277) finds it gone.
+ */
+const OLDER_DAEMON_SHUTDOWN_GRACE_MS = 5_000;
+
+/**
+ * Stop the daemon serving `root` from an older install so the caller can start
+ * one from this install (#2335). A daemon keeps the code it started with: one
+ * that outlived an upgrade went on loading grammars from the removed install
+ * and wrote every file it re-indexed as empty, and as the project's writer it
+ * kept every newer session from syncing. {@link stopOlderDaemon} finds it by
+ * the project lock, verifies it, and never stops one of the same, a newer or an
+ * unknown version. `answered` says an older daemon answered this launcher's
+ * own probe. Resolves `stopped` (this launcher now holds the project's writer
+ * slot for the daemon it starts next), `none` (no older daemon holds the
+ * project), or `kept` (one does, unverified or still shutting down).
+ */
+async function replaceOlderDaemon(root: string, answered: boolean): Promise<'stopped' | 'none' | 'kept'> {
+  const result = await stopOlderDaemon(root, CodeGraphPackageVersion, {
+    shutdownGraceMs: OLDER_DAEMON_SHUTDOWN_GRACE_MS,
+  });
+  // No older daemon in the lock (none, or already replaced), or it had exited.
+  if (!result || result.outcome === 'not-running') return 'none';
+  const daemon = result.version
+    ? `the CodeGraph ${result.version} daemon (pid ${result.pid})`
+    : 'an older CodeGraph daemon';
+  if (result.outcome === 'term' || result.outcome === 'kill') {
+    process.stderr.write(
+      `[CodeGraph MCP] Stopped ${daemon} serving this project; starting one from this install (${CodeGraphPackageVersion}).\n`
+    );
+    return 'stopped';
+  }
+  if (result.outcome === 'still-running') {
+    process.stderr.write(`[CodeGraph MCP] Asked ${daemon} serving this project to stop, but it has not exited yet.\n`);
+  } else if (answered) {
+    process.stderr.write(
+      `[CodeGraph MCP] Found ${daemon} serving this project but could not verify it, so left it running; serving this session in-process.\n`
+    );
+  }
+  return 'kept';
+}
+
+/**
+ * Wait out the daemon candidate `pid` holding the daemon lock while launcher
+ * `handoverFrom` holds the writer slot for this daemon (#2335): the candidate
+ * cannot get the slot, so it releases the lock and exits. Resolves true once
+ * `pid` no longer holds the lock; false at once when no slot is held for this
+ * daemon, and false when that stops being so or the wait runs out.
+ */
+async function outwaitCandidate(root: string, handoverFrom: number | null, pid: number): Promise<boolean> {
+  const heldForUs = (): boolean => {
+    const writer = readWriterLock(root);
+    return handoverFrom !== null && writer?.pid === handoverFrom && writer.mode === 'handover';
+  };
+  if (!heldForUs()) return false;
+  process.stderr.write(`[CodeGraph daemon] Waiting for daemon candidate pid ${pid} to give up the lock; the writer lock is held for this daemon.\n`);
+  const deadline = Date.now() + HANDOVER_CANDIDATE_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (!heldForUs()) return false;
+    let holder: number | undefined;
+    try { holder = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'))?.pid; } catch { holder = undefined; }
+    if (holder !== pid || !isProcessAlive(pid)) return true;
+    await sleep(25);
+  }
+  return false;
 }
 
 /**
@@ -217,13 +462,19 @@ export class MCPServer {
   private engine: MCPEngine | null = null;
   private daemon: Daemon | null = null;
   private ppidWatchdog: ReturnType<typeof setInterval> | null = null;
-  // PPID watchdog baseline — captured at construction so we always have a
-  // baseline, even if start() runs after a fork-style reparent.
-  private originalPpid: number = process.ppid;
+  // Worker-thread liveness watchdog (#850). Long-lived modes only; SIGKILLs the
+  // process if the main thread wedges in a non-yielding sync loop.
+  private livenessWatchdog: WatchdogHandle | null = null;
+  // PPID watchdog baseline — from the CLI entry's earliest-possible capture
+  // (early-ppid.ts). Capturing here (construction) already lost the race when
+  // the launcher was killed during module loading (#1185).
+  private originalPpid: number = EARLY_PPID;
   private hostPpid: number | null = parseHostPpid(process.env[HOST_PPID_ENV]);
   // Idempotency guard for stop().
   private stopped = false;
   private mode: 'unstarted' | 'direct' | 'proxy' | 'daemon' = 'unstarted';
+  /** Project root whose writer.pid we hold in direct mode (#1740); released on stop. */
+  private writerLockRoot: string | null = null;
 
   constructor(projectPath?: string) {
     this.projectPath = projectPath || null;
@@ -243,6 +494,19 @@ export class MCPServer {
    * mode — a misbehaving daemon must never block a session from starting.
    */
   async start(): Promise<void> {
+    // Long-lived process (direct / proxy / daemon alike): flush buffered
+    // telemetry opportunistically. Fire-and-forget + unref'd — adds nothing
+    // to the handshake path and never keeps the process alive.
+    getTelemetry().startInterval();
+
+    // #1243: the MCP config launches the local binary, so a server left
+    // running drifts behind releases with no signal. Refresh the shared
+    // update-check cache in the background and log ONE stderr notice when a
+    // newer version exists (stderr only — stdout is the protocol channel).
+    // The notice also reaches the agent via the initialize instructions and
+    // codegraph_status. Fire-and-forget: adds nothing to the handshake path.
+    checkForUpdateInBackground();
+
     // The detached daemon process itself. Checked before the opt-out so the
     // daemon honors the same env it was spawned with (it never sets NO_DAEMON).
     if (daemonInternalSet()) {
@@ -285,12 +549,16 @@ export class MCPServer {
    * connected session; in direct mode it mirrors the pre-#411 behavior (close
    * cg, exit). Proxy mode never routes through here — the proxy exits itself.
    */
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
     if (this.ppidWatchdog) {
       clearInterval(this.ppidWatchdog);
       this.ppidWatchdog = null;
+    }
+    if (this.livenessWatchdog) {
+      this.livenessWatchdog.stop();
+      this.livenessWatchdog = null;
     }
     if (this.daemon) {
       void this.daemon.stop('stop()');
@@ -302,8 +570,12 @@ export class MCPServer {
       this.session = null;
     }
     if (this.engine) {
-      this.engine.stop();
+      await this.engine.stop();
       this.engine = null;
+    }
+    if (this.writerLockRoot) {
+      releaseWriterLock(this.writerLockRoot);
+      this.writerLockRoot = null;
     }
     process.exit(0);
   }
@@ -313,8 +585,23 @@ export class MCPServer {
     if (reason && process.env.CODEGRAPH_MCP_DEBUG) {
       process.stderr.write(`[CodeGraph MCP] Direct mode: ${reason}.\n`);
     }
-    this.engine = new MCPEngine();
-    const transport = new StdioTransport();
+
+    // #1740: refuse a second direct writer on an initialized project. Daemon
+    // mode multiplexes clients; direct mode is single-writer-per-project.
+    const writerRoot = resolveDaemonRoot(this.projectPath);
+    if (writerRoot) {
+      assertNoRebuild(writerRoot);
+      const writer = tryAcquireWriterLock(writerRoot, 'direct');
+      if (writer.kind === 'taken') {
+        const msg = writerLockHeldMessage(writer.existing, writer.pidPath);
+        process.stderr.write(`[CodeGraph MCP] ${msg}\n`);
+        process.exit(1);
+      }
+      this.writerLockRoot = writerRoot;
+    }
+
+    this.engine = new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
+    const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
     this.session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.projectPath,
     });
@@ -327,14 +614,28 @@ export class MCPServer {
     this.session.start();
 
     // Detect parent-process death — same logic as pre-refactor. When stdin
-    // closes we go through StdioTransport's `process.exit(0)` already, but
+    // closes the transport drains the engine through stop(), but
     // SIGKILL of the parent doesn't reliably close stdin on Linux (#277).
-    process.stdin.on('end', () => this.stop());
-    process.stdin.on('close', () => this.stop());
+    // Also treat a stdin `'error'` (a socket-backed stdin can fail with
+    // ECONNRESET/hangup instead of a clean close) as shutdown, and destroy the
+    // stream so a hung fd can't busy-spin the event loop (#799).
+    treatStdinFailureAsShutdown(() => this.stop());
+    // Backstop for a launch abandoned during startup (#1185): launcher killed
+    // before EARLY_PPID could see it + host holding our pipes open. A server
+    // that never receives a byte of MCP traffic isn't serving anyone. Armed
+    // after session.start() attached the real stdin consumer.
+    armStartupHandshakeTimeout(() => {
+      process.stderr.write(
+        '[CodeGraph MCP] No MCP traffic since startup; assuming an abandoned launch and shutting down (#1185). ' +
+        'Tune with CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS (0 disables).\n'
+      );
+      this.stop();
+    });
 
     this.mode = 'direct';
     this.installSignalHandlers();
     this.installPpidWatchdog();
+    this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(resolveDaemonRoot(this.projectPath)));
   }
 
   /**
@@ -347,31 +648,72 @@ export class MCPServer {
    * and reaps itself via client-refcount + idle timeout (see {@link Daemon}).
    */
   private async startDaemonProcess(): Promise<void> {
+    // In daemon mode stderr IS `.codegraph/daemon.log`; stamp every line so
+    // kills/restarts can be placed in time (#1431 — the log was undatable).
+    timestampStderrLines();
     const root = resolveDaemonRoot(this.projectPath) ?? this.projectPath ?? process.cwd();
+    // Read once and dropped, so nothing this daemon spawns inherits it.
+    const handoverPid = Number(process.env[DAEMON_HANDOVER_ENV]);
+    const handoverFrom = Number.isInteger(handoverPid) && handoverPid > 0 ? handoverPid : null;
+    delete process.env[DAEMON_HANDOVER_ENV];
     for (let attempt = 0; attempt < TAKEOVER_MAX_RETRIES; attempt++) {
       const lock = tryAcquireDaemonLock(root);
 
       if (lock.kind === 'acquired') {
-        const daemon = new Daemon(root);
+        const daemon = new Daemon(root, { handoverFrom });
         await daemon.start();
         this.daemon = daemon;
         this.mode = 'daemon';
+        // The detached daemon has no PPID watchdog or stdin lifeline, so a
+        // wedged main thread would pin a core forever (#850). The liveness
+        // watchdog is its only recovery path.
+        this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(root));
         return; // the net.Server keeps the process alive
       }
 
       // Taken. If the holder is alive, another daemon already serves (or is
       // binding) — we're redundant; exit cleanly so the launcher proxies to it.
       const existing = lock.existing;
+      let disprovedLiveIdentity = false;
       if (existing && existing.pid > 0 && isProcessAlive(existing.pid)) {
-        process.stderr.write(
-          `[CodeGraph daemon] Another daemon (pid ${existing.pid}) already holds the lock; exiting.\n`
-        );
-        process.exit(0);
+        // Give a newly-elected daemon time to bind, then require its socket hello
+        // to match the lock PID/version. PID existence alone accepts an unrelated
+        // process after OS PID reuse and permanently wedges startup (#1553).
+        const age = Date.now() - existing.startedAt;
+        const startupGraceMs = 10_000;
+        const stillStarting = existing.startedAt > 0 && age >= 0 && age < startupGraceMs;
+        // Legacy plain-PID locks have no socket identity to test. Preserve those
+        // live holders: an inconclusive probe is not permission to create a
+        // second writer.
+        if (
+          !canProbeDaemonIdentity(existing) ||
+          stillStarting ||
+          await probeDaemonIdentity(existing)
+        ) {
+          // A daemon the writer slot is held for outwaits a candidate still
+          // starting in its way, which cannot get the slot and leaves (#2335).
+          if (stillStarting && await outwaitCandidate(root, handoverFrom, existing.pid)) continue;
+          process.stderr.write(
+            `[CodeGraph daemon] Another daemon (pid ${existing.pid}) already holds the lock; exiting.\n`
+          );
+          process.exit(0);
+        }
+        disprovedLiveIdentity = true;
       }
 
-      // Holder is dead (or the record is unreadable) — clear it (pid-verified,
-      // so we never delete a live daemon's lock) and retry the acquire.
-      clearStaleDaemonLock(lock.pidPath, existing?.pid);
+      // The holder is dead, the record is unreadable, or a completed socket
+      // hello disproved a live PID's identity. Revalidate the exact record and
+      // retry the acquire only after cleanup succeeds safely.
+      if (disprovedLiveIdentity) {
+        // Re-probe and claim writer.pid before cleanup. A daemon that is merely
+        // delayed already owns that writer lock, and a paired live-PID record is
+        // ambiguous under the legacy lock format, so both cases fail closed.
+        await clearStaleDaemonArtifacts(root);
+      } else if (lock.lockContents !== null) {
+        clearStaleDaemonLock(lock.pidPath, existing?.pid, {
+          expectedLockContents: lock.lockContents,
+        });
+      }
       await sleep(TAKEOVER_RETRY_DELAY_MS);
     }
 
@@ -382,29 +724,46 @@ export class MCPServer {
   /**
    * Proxy mode (the common case). Serve the MCP handshake LOCALLY for instant
    * tool registration, forwarding tool calls to the shared daemon — which is
-   * connected in the background (probed, then spawned + polled if absent) so the
+   * connected in the background (probed, then spawned + polled if absent; one of
+   * an older release is stopped first, #2335) so the
    * handshake never waits ~600ms on it. Runs until the host disconnects; the
    * proxy falls back to an in-process engine if the daemon never binds, so this
    * never wedges a session.
    */
   private async runProxyWithLocalHandshake(root: string): Promise<void> {
-    const socketPath = getDaemonSocketPath(root);
+    // The daemon may relocate its socket past an in-project filesystem that can't
+    // host one (ExFAT/FAT volumes, WSL2 DrvFs; #997) to the deterministic tmpdir
+    // fallback. We don't read the bound path from the lockfile — both sides walk
+    // the SAME ordered candidate list, so we converge on whichever the daemon
+    // bound with zero coordination. The in-project candidate is tried first, so a
+    // normal repo pays nothing extra (it connects on the very first probe).
+    const candidates = getDaemonSocketCandidates(root);
+    const connectAnyCandidate = (deadline?: number) => connectAnyDaemonCandidate(candidates, deadline);
     const getDaemonSocket = async () => {
-      // Fast path: a daemon may already be listening.
-      const probe = await connectWithHello(socketPath);
+      // Fast path: a daemon may already be listening (on either candidate).
+      const probe = await connectAnyCandidate();
       if (probe === 'version-mismatch') return null; // definitive — serve in-process, don't poll for 6s
-      if (probe) return probe;
-      // None reachable — spawn one (detached) and poll for its bind.
-      spawnDetachedDaemon(root);
-      for (let attempt = 0; attempt < DAEMON_CONNECT_MAX_RETRIES; attempt++) {
-        await sleep(DAEMON_CONNECT_RETRY_DELAY_MS);
-        const s = await connectWithHello(socketPath);
-        if (s === 'version-mismatch') return null;
-        if (s) return s;
+      if (probe && probe !== 'older-version') return probe;
+      // A daemon of an older release answered — or none did, while the project
+      // lock may still name one on a socket we don't probe (on Windows, daemons
+      // before #2278 named their pipe after the root as typed). Either way it
+      // makes way for one from this install (#2335).
+      const answered = probe === 'older-version';
+      const older = await replaceOlderDaemon(root, answered);
+      if (older === 'kept' && answered) return null;
+      // None reachable — spawn one (detached) and poll for its bind. After a
+      // replacement this launcher holds the writer slot for it meanwhile.
+      try {
+        spawnDetachedDaemon(root, older === 'stopped');
+        // Null when nothing answered in time — never bound, or a holder that
+        // never says hello: the proxy serves this session in-process.
+        return await pollForDaemon(connectAnyCandidate);
+      } finally {
+        // The new daemon has taken the slot over, or never came; a no-op unless still ours.
+        if (older === 'stopped') releaseWriterLock(root);
       }
-      return null; // never bound — the proxy serves this session in-process
     };
-    await runLocalHandshakeProxy({ getDaemonSocket, makeEngine: () => new MCPEngine(), root });
+    await runLocalHandshakeProxy({ getDaemonSocket, makeEngine: () => makeFallbackEngine(root), root });
   }
 
   /** Standard SIGINT/SIGTERM handlers that route to our `stop()` (direct mode). */
@@ -423,13 +782,13 @@ export class MCPServer {
     const pollMs = parsePpidPollMs(process.env.CODEGRAPH_PPID_POLL_MS);
     if (pollMs <= 0) return;
     this.ppidWatchdog = setInterval(() => {
-      const current = process.ppid;
-      const ppidChanged = current !== this.originalPpid;
-      const hostGone = this.hostPpid !== null && !isProcessAlive(this.hostPpid);
-      if (ppidChanged || hostGone) {
-        const reason = ppidChanged
-          ? `ppid ${this.originalPpid} -> ${current}`
-          : `host pid ${this.hostPpid} exited`;
+      const reason = supervisionLostReason({
+        originalPpid: this.originalPpid,
+        currentPpid: process.ppid,
+        hostPpid: this.hostPpid,
+        isAlive: isProcessAlive,
+      });
+      if (reason) {
         process.stderr.write(
           `[CodeGraph MCP] Parent process exited (${reason}); shutting down.\n`
         );

@@ -47,21 +47,140 @@ const SENSITIVE_PATHS = new Set([
 ]);
 
 /**
- * Validate that a resolved file path stays within the project root.
- * Prevents path traversal attacks (e.g. node.filePath = "../../etc/passwd").
+ * Config "languages" whose nodes are pure key/value DATA lifted from a config
+ * file (e.g. Spring `application.{yml,properties}`), not source code.
+ */
+export const CONFIG_LEAF_LANGUAGES: ReadonlySet<string> = new Set(['yaml', 'properties']);
+
+/**
+ * A config-leaf node is a single key lifted out of a pure config/data file —
+ * `kind: 'constant'` in a {@link CONFIG_LEAF_LANGUAGES} language. Its on-disk
+ * line is `key = <value>`, and that value is routinely a secret (DB password,
+ * API key, JDBC URL with embedded creds). CodeGraph must surface the KEY only
+ * and never read/return the value, or it pushes secrets into agent context
+ * unbidden — the value isn't needed for resolution, and an agent that genuinely
+ * needs it can read the file directly. (#383)
+ */
+export function isConfigLeafNode(node: { kind: string; language?: string }): boolean {
+  return node.kind === 'constant' && !!node.language && CONFIG_LEAF_LANGUAGES.has(node.language);
+}
+
+/**
+ * Whether `child` is `parent` itself or sits underneath it. Case-insensitive on
+ * Windows — NTFS is case-insensitive, and realpathSync can hand back a different
+ * case than the lexical root, which would otherwise false-reject a valid file.
+ */
+function isWithinDir(child: string, parent: string): boolean {
+  let c = child;
+  let p = parent;
+  if (process.platform === 'win32') {
+    c = c.toLowerCase();
+    p = p.toLowerCase();
+  }
+  return c === p || c.startsWith(p + path.sep);
+}
+
+/**
+ * The lexical half of {@link validatePathWithinRoot}, on its own.
+ *
+ * Returns the resolved absolute path when `filePath` stays inside
+ * `projectRoot` after `../` segments are applied, or null when it escapes.
+ * No filesystem access — for callers on a hot path that only need to refuse a
+ * lexical escape, and for which the realpath half would be both unnecessary
+ * and far too expensive (the existence probe in resolution's `fileExists`,
+ * #1631: two `realpathSync` calls per probe made it ~70x slower).
+ *
+ * This is NOT a substitute for `validatePathWithinRoot` on any path whose
+ * contents get served — those must keep the symlink-aware check (#527).
+ */
+export function lexicalPathWithinRoot(projectRoot: string, filePath: string): string | null {
+  const resolved = path.resolve(projectRoot, filePath);
+  return isWithinDir(resolved, path.resolve(projectRoot)) ? resolved : null;
+}
+
+/**
+ * Validate that a file path stays within the project root, resolving symlinks.
+ *
+ * Two layers: a cheap lexical check that catches `../` traversal, then a
+ * realpath check that catches symlink escapes — an in-repo symlink whose
+ * logical path is inside the root but whose real target points outside it
+ * (issue #527). A symlink that stays within the root is still allowed, so
+ * legitimate in-tree symlinks keep working. Both content-serving read sinks
+ * (codegraph_node `includeCode`, codegraph_explore source) go through here, so
+ * this is the chokepoint that keeps out-of-root file contents from leaking.
+ *
+ * `allowSymlinkEscape` waives **only** the realpath-escape rejection (the
+ * lexical `../` guard still applies) for the INDEXING read path. The directory
+ * walk deliberately descends into in-root symlinks whose targets live outside
+ * the root (e.g. a `game/` symlink in a Dota custom-game tree, #935); discovery
+ * and the reader must agree, or every file the walk enumerated fails to index.
+ * Indexing only reads paths it just discovered, into a local index — it never
+ * serves them to an agent, so this does not widen the #527 leak surface. The
+ * content-serving sinks must never pass this flag.
  *
  * @param projectRoot - The project root directory
- * @param filePath - The relative file path to validate
- * @returns The resolved absolute path, or null if it escapes the root
+ * @param filePath - The (relative or absolute) file path to validate
+ * @param options.allowSymlinkEscape - Follow in-root symlinks out of the root
+ *   (indexing read path only); defaults to the strict, leak-safe behavior.
+ * @returns The resolved absolute path (realpath when it exists), or null if it
+ *   escapes the root. A path that does not exist yet is judged by its nearest
+ *   existing ancestor, and every path under a root that does not exist is null.
  */
-export function validatePathWithinRoot(projectRoot: string, filePath: string): string | null {
-  const resolved = path.resolve(projectRoot, filePath);
-  const normalizedRoot = path.resolve(projectRoot);
-
-  if (!resolved.startsWith(normalizedRoot + path.sep) && resolved !== normalizedRoot) {
+export function validatePathWithinRoot(
+  projectRoot: string,
+  filePath: string,
+  options?: { allowSymlinkEscape?: boolean }
+): string | null {
+  // 1. Lexical containment — cheap, catches `../` traversal. Applies even on
+  //    the indexing read path: a crafted `../` escape is still rejected.
+  const resolved = lexicalPathWithinRoot(projectRoot, filePath);
+  if (resolved === null) {
     return null;
   }
-  return resolved;
+  const normalizedRoot = path.resolve(projectRoot);
+
+  // 2. Symlink-aware containment — resolve symlinks on both sides and re-check,
+  //    so an in-repo symlink whose real target escapes the root is rejected.
+  //    The indexing read path (allowSymlinkEscape) skips only this rejection so
+  //    it stays consistent with the directory walk, which already followed the
+  //    in-root symlink to enumerate these files (#935).
+  let realRoot: string;
+  try {
+    realRoot = fs.realpathSync(normalizedRoot);
+  } catch {
+    return null;
+  }
+
+  try {
+    const realResolved = fs.realpathSync(resolved);
+    if (options?.allowSymlinkEscape) {
+      return realResolved;
+    }
+    return isWithinDir(realResolved, realRoot) ? realResolved : null;
+  } catch (err) {
+    // A missing leaf may still sit below an EXISTING symlink. Resolve the
+    // nearest existing ancestor before allowing a write path: otherwise
+    // `project/.codegraph/ui -> /outside` plus a missing `trails/` directory
+    // passes the lexical check and mkdir follows the symlink out of the root.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+  }
+
+  let ancestor = path.dirname(resolved);
+  while (isWithinDir(ancestor, normalizedRoot)) {
+    try {
+      const realAncestor = fs.realpathSync(ancestor);
+      if (options?.allowSymlinkEscape || isWithinDir(realAncestor, realRoot)) {
+        return resolved;
+      }
+      return null;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) return null;
+      ancestor = parent;
+    }
+  }
+  return null;
 }
 
 /**
@@ -106,47 +225,6 @@ export function validateProjectPath(dirPath: string): string | null {
 }
 
 /**
- * Check if a file path resolves to a location within the given root directory.
- *
- * Prevents path traversal attacks by ensuring the resolved absolute path
- * starts with the resolved root path. Handles '..' sequences, symlink-like
- * relative paths, and platform-specific separators.
- *
- * @param filePath - The path to check (can be relative or absolute)
- * @param rootDir - The root directory that filePath must stay within
- * @returns true if filePath resolves to a location within rootDir
- */
-export function isPathWithinRoot(filePath: string, rootDir: string): boolean {
-  const resolvedPath = path.resolve(rootDir, filePath);
-  const resolvedRoot = path.resolve(rootDir);
-  return resolvedPath.startsWith(resolvedRoot + path.sep) || resolvedPath === resolvedRoot;
-}
-
-/**
- * Like isPathWithinRoot but also resolves symlinks via fs.realpathSync.
- *
- * This catches symlink escapes where the logical path appears to be within
- * root but the real path on disk points elsewhere. Falls back to logical
- * path checking if realpath resolution fails (e.g. broken symlink).
- */
-export function isPathWithinRootReal(filePath: string, rootDir: string): boolean {
-  // First do the cheap logical check
-  if (!isPathWithinRoot(filePath, rootDir)) {
-    return false;
-  }
-
-  // Then verify with realpath to catch symlink escapes
-  try {
-    const realPath = fs.realpathSync(path.resolve(rootDir, filePath));
-    const realRoot = fs.realpathSync(rootDir);
-    return realPath.startsWith(realRoot + path.sep) || realPath === realRoot;
-  } catch {
-    // If realpath fails (broken symlink, permissions), fall back to logical check
-    return true;
-  }
-}
-
-/**
  * Safely parse JSON with a fallback value.
  * Prevents crashes from corrupted database metadata.
  */
@@ -175,6 +253,17 @@ export function normalizePath(filePath: string): string {
 }
 
 /**
+ * Escape `text` to match itself literally inside a regular expression.
+ * Symbol names are not always plain words: C++'s `operator++` and
+ * `operator()`, Scala's `++`, a Kotlin name in backticks. Pass every name
+ * through this before writing it into a `new RegExp(…)` pattern, or the name
+ * is read as pattern syntax and may not compile at all.
+ */
+export function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
  * Cross-process file lock using a lock file with PID tracking.
  *
  * Prevents multiple processes (e.g., git hooks, CLI, MCP server) from
@@ -183,9 +272,6 @@ export function normalizePath(filePath: string): string {
 export class FileLock {
   private lockPath: string;
   private held = false;
-
-  /** Locks older than this are considered stale regardless of PID status */
-  private static readonly STALE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 
   constructor(lockPath: string) {
     this.lockPath = lockPath;
@@ -200,18 +286,16 @@ export class FileLock {
       try {
         const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
         const pid = parseInt(content, 10);
-        const stat = fs.statSync(this.lockPath);
-        const lockAge = Date.now() - stat.mtimeMs;
-
-        // Treat locks older than the timeout as stale, regardless of PID
-        if (lockAge < FileLock.STALE_TIMEOUT_MS && !isNaN(pid) && this.isProcessAlive(pid)) {
+        // A long sync can hold the lock for hours. Its age says nothing about
+        // whether the writer is still alive; only a dead PID is stale.
+        if (!isNaN(pid) && this.isProcessAlive(pid)) {
           throw new Error(
             `CodeGraph database is locked by another process (PID ${pid}). ` +
             `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
           );
         }
 
-        // Stale lock (dead process or timed out) - remove it
+        // Stale lock (dead process or malformed PID) - remove it
         fs.unlinkSync(this.lockPath);
       } catch (err) {
         if (err instanceof Error && err.message.includes('locked by another')) {

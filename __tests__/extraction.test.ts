@@ -8,10 +8,13 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { execFileSync } from 'child_process';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory } from '../src/extraction';
-import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
+import { extractFromSource, scanDirectory, scanDirectoryAsync, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore, type ScanSkipStats } from '../src/extraction';
+import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile, shopifyThemeRoot } from '../src/extraction/grammars';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
+import { generateNodeId } from '../src/extraction/tree-sitter-helpers';
 
 beforeAll(async () => {
   await initGrammars();
@@ -29,6 +32,76 @@ function cleanupTempDir(dir: string): void {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe('same-line node identity (#1349)', () => {
+  let dir: string;
+  let cg: CodeGraph | undefined;
+  let kernel: string | undefined;
+
+  beforeEach(() => {
+    dir = createTempDir();
+    kernel = process.env.CODEGRAPH_KERNEL;
+  });
+
+  afterEach(() => {
+    cg?.destroy();
+    cg = undefined;
+    cleanupTempDir(dir);
+    if (kernel === undefined) delete process.env.CODEGRAPH_KERNEL;
+    else process.env.CODEGRAPH_KERNEL = kernel;
+  });
+
+  it.each(['default', 'wasm'])('persists both accessors and their separate call edges (%s)', async (backend) => {
+    if (backend === 'wasm') process.env.CODEGRAPH_KERNEL = '0';
+    else delete process.env.CODEGRAPH_KERNEL;
+    fs.writeFileSync(path.join(dir, 'point.ts'), [
+      'function read() { return 1; } function write(v: number) {}',
+      'export class Point { /* é😀 */ get x() { return read(); } set x(v: number) { write(v); }',
+      '  get y() { return read(); }',
+      '  set y(v: number) { write(v); }',
+      '}',
+    ].join('\n'));
+    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+    cg.resolveReferences();
+    const nodes = cg.getNodesInFile('point.ts');
+    const x = nodes.filter((n) => n.name === 'x').sort((a, b) => a.startColumn - b.startColumn);
+    expect(x).toHaveLength(2);
+    expect(new Set(nodes.map((n) => n.id)).size).toBe(nodes.length);
+    expect(nodes.filter((n) => n.name === 'y')).toHaveLength(2);
+    expect(x[0]!.id).toBe(generateNodeId('point.ts', 'method', 'x', 2));
+    expect(x[1]!.id).toBe(`${x[0]!.id}:${x[1]!.startColumn}`);
+    const cls = nodes.find((n) => n.name === 'Point')!;
+    for (const accessor of x) {
+      expect(cg.getIncomingEdges(accessor.id)).toContainEqual(expect.objectContaining({ source: cls.id, kind: 'contains' }));
+    }
+    expect(cg.getCallees(x[0]!.id).map((c) => c.node.name)).toEqual(['read']);
+    expect(cg.getCallees(x[1]!.id).map((c) => c.node.name)).toEqual(['write']);
+    for (const node of nodes.filter((n) => n.name !== 'x' && n.kind !== 'file')) {
+      expect(node.id).toBe(generateNodeId(node.filePath, node.kind, node.name, node.startLine));
+    }
+  });
+
+  it.each([
+    ['template.liquid', 'é😀 {% render "x" %}{% render "x" %}{% assign v = 1 %}{% assign v = 2 %}', 'component'],
+    ['Service.cfc', '<cfcomponent><!--- é😀 ---><cffunction name="x"></cffunction><cffunction name="x"></cffunction></cfcomponent>', 'method'],
+  ] as const)('persists repeated same-line declarations in %s', async (file, source, kind) => {
+    fs.writeFileSync(path.join(dir, file), source);
+    cg = CodeGraph.initSync(dir, { config: { include: [file], exclude: [] } });
+    await cg.indexAll();
+    const nodes = cg.getNodesInFile(file);
+    const xs = nodes.filter((n) => n.name === 'x' && n.kind === kind);
+    expect(xs).toHaveLength(2);
+    expect(new Set(xs.map((n) => n.id)).size).toBe(2);
+    for (const node of xs) {
+      expect(cg.getIncomingEdges(node.id).some((e) => e.kind === 'contains')).toBe(true);
+    }
+    if (file.endsWith('.liquid')) {
+      expect(nodes.filter((n) => n.kind === 'import' && n.name === 'x')).toHaveLength(2);
+      expect(nodes.filter((n) => n.name === 'v')).toHaveLength(2);
+    }
+  });
+});
 
 describe('Language Detection', () => {
   it('should detect TypeScript files', () => {
@@ -101,6 +174,126 @@ describe('Language Detection', () => {
     expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
   });
 
+  it('should detect Metal shader files as C++ (#1121)', () => {
+    expect(detectLanguage('Shaders.metal')).toBe('cpp');
+    expect(isSourceFile('Renderer/Shaders.metal')).toBe(true);
+  });
+
+  it('should detect CUDA files as C++ (#387)', () => {
+    expect(detectLanguage('kernels/scan.cu')).toBe('cpp');
+    expect(detectLanguage('include/reduce.cuh')).toBe('cpp');
+    expect(isSourceFile('csrc/flash_attn/softmax.cu')).toBe(true);
+    expect(isSourceFile('include/block_reduce.cuh')).toBe(true);
+  });
+
+  it('should detect Erlang files', () => {
+    expect(detectLanguage('src/my_server.erl')).toBe('erlang');
+    expect(detectLanguage('include/records.hrl')).toBe('erlang');
+    expect(detectLanguage('bin/release_tool.escript')).toBe('erlang');
+    // OTP app resource files route by full suffix — `.src` alone is too generic.
+    expect(detectLanguage('src/myapp.app.src')).toBe('erlang');
+    expect(detectLanguage('ebin/myapp.app')).toBe('erlang');
+    expect(detectLanguage('legacy/module.src')).toBe('unknown');
+    expect(isSourceFile('src/myapp.app.src')).toBe(true);
+    expect(isSourceFile('ebin/myapp.app')).toBe(true);
+    expect(isSourceFile('legacy/module.src')).toBe(false);
+  });
+
+  it('should detect Solidity files', () => {
+    expect(detectLanguage('contracts/Vault.sol')).toBe('solidity');
+  });
+
+  it('should detect Terraform files', () => {
+    expect(detectLanguage('main.tf')).toBe('terraform');
+    expect(detectLanguage('variables.tf')).toBe('terraform');
+    expect(detectLanguage('terraform.tfvars')).toBe('terraform');
+    expect(detectLanguage('versions.tofu')).toBe('terraform');
+  });
+
+  it('should detect ArkTS files', () => {
+    expect(detectLanguage('entry/src/main/ets/pages/Index.ets')).toBe('arkts');
+    // Plain `.ts` in a HarmonyOS project is still TypeScript.
+    expect(detectLanguage('entry/src/main/ets/common/utils.ts')).toBe('typescript');
+  });
+
+  it('should detect Nix files', () => {
+    expect(detectLanguage('default.nix')).toBe('nix');
+    expect(detectLanguage('pkgs/development/tools/misc/codegraph/default.nix')).toBe('nix');
+    expect(isSourceFile('default.nix')).toBe(true);
+  });
+
+  it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
+    // Lean Unreal-Engine style header: the class is annotated with an export
+    // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
+    // so the macro-blind `class\s+\w+\s*[:{]` branch alone can't see it. It must
+    // still detect as C++ — otherwise the C extractor (classTypes: []) drops the
+    // class definition entirely. (#1093 follow-up)
+    const macroClassHeader = `#pragma once
+#include "CoreMinimal.h"
+
+UCLASS()
+class ENGINE_API UNetConnectionRepControl : public UObject
+{
+\tGENERATED_BODY()
+\tbool IsRepControlEnable() const;
+};
+`;
+    expect(detectLanguage('NetConnectionRepControl.h', macroClassHeader)).toBe('cpp');
+    // Macro class with no base clause, brace on the next line, still C++.
+    expect(detectLanguage('Foo.h', 'MYMODULE_API_DECL\nclass MYMODULE_API FFoo\n{\n\tint X;\n};\n')).toBe('cpp');
+    // Export-macro struct with inheritance is likewise C++-only.
+    expect(detectLanguage('Bar.h', 'struct ENGINE_API FBar : public FBase {};\n')).toBe('cpp');
+    // Guard: a genuine C header must NOT be dragged to C++ by the new branch.
+    expect(detectLanguage('cfoo.h', '#ifndef CFOO_H\nstruct Point { int x; int y; };\nvoid f(struct Point p);\n#endif\n')).toBe('c');
+  });
+
+  it('should detect a .h whose only C++ signal is a plain base clause as cpp (#1592)', () => {
+    // No export macro, no `class` keyword, no access section, no `virtual`:
+    // the derived struct's base clause is the only C++ construct, and the
+    // #1159 branch only knows the macro-annotated form. Misdetected as C, the
+    // C extractor drops `Derived` and mints a phantom `function Base`.
+    expect(detectLanguage('min.h', 'struct Base {};\nstruct Derived : Base {};\n')).toBe('cpp');
+    expect(detectLanguage('pub.h', 'struct Derived : public Base {};\n')).toBe('cpp');
+    expect(detectLanguage('scoped.h', 'struct Derived : ns::Base {};\n')).toBe('cpp');
+    expect(detectLanguage('tmpl.h', 'struct Derived : Base<int, Foo<T>> {};\n')).toBe('cpp');
+    expect(detectLanguage('final.h', 'struct Derived final : Base {};\n')).toBe('cpp');
+    expect(detectLanguage('multi.h', 'class Derived : public A, private B\n{\n};\n')).toBe('cpp');
+    expect(detectLanguage('virt.h', 'struct Derived : virtual Base {};\n')).toBe('cpp');
+
+    // The base clause sits PAST the 8 KB sample, behind a long C-compatible
+    // preamble (guards, defines, plain typedefs) — the second pass must scan
+    // the whole file, not just the sample.
+    const preamble = '#ifndef BIG_H\n#define BIG_H\n' + '#define VALUE_0 0\n'.repeat(700);
+    expect(preamble.length).toBeGreaterThan(8192);
+    expect(detectLanguage('big.h', `${preamble}struct Base {};\nstruct Derived : Base {};\n#endif\n`)).toBe('cpp');
+
+    // Controls — all genuine C, none may flip to C++:
+    // a bit-field (`:` after a member name inside the body),
+    expect(detectLanguage('bits.h', 'struct S { unsigned int a : 3; unsigned int b : 5; };\n')).toBe('c');
+    // a ternary whose `:` follows a `sizeof(struct …)` / cast,
+    expect(detectLanguage('tern.h', 'static inline int sz(int x) { return x ? sizeof(struct foo) : 0; }\n#define P(a,b) ((a) ? (struct foo *)(a) : (b))\n')).toBe('c');
+    // a label / identifier that merely starts with `struct`,
+    expect(detectLanguage('label.h', 'static void g(void) {\nstruct_end:\n  return;\n}\nint struct_a, struct_b;\n')).toBe('c');
+    // a doc comment whose prose reads like a base clause,
+    expect(detectLanguage('doc.h', '/* struct timeval: seconds, microseconds */\nstruct timeval { long tv_sec; long tv_usec; };\n// struct foo: x, y\n')).toBe('c');
+    // and the two existing controls.
+    expect(detectLanguage('cfoo.h', '#ifndef CFOO_H\nstruct Point { int x; int y; };\nvoid f(struct Point p);\n#endif\n')).toBe('c');
+    expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
+  });
+
+  it('should extract a derived struct from a plain base-clause .h, with no phantom function (#1592)', () => {
+    const result = extractFromSource('src/min.h', 'struct Base {};\nstruct Derived : Base {};\n');
+    const derived = result.nodes.find((n) => n.name === 'Derived');
+    expect(derived).toBeDefined();
+    expect(derived?.kind).toBe('struct');
+    expect(derived?.language).toBe('cpp');
+    // The C mis-route read `Derived : Base {}` as a K&R-ish function `Base`
+    // returning `Derived` — that phantom must be gone.
+    expect(result.nodes.some((n) => n.name === 'Base' && n.kind === 'function')).toBe(false);
+    expect(result.nodes.filter((n) => n.name === 'Base')).toHaveLength(1);
+    expect(result.nodes.find((n) => n.name === 'Base')?.kind).toBe('struct');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -129,6 +322,147 @@ describe('Language Support', () => {
     expect(languages).toContain('swift');
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
+    expect(languages).toContain('solidity');
+    expect(languages).toContain('nix');
+  });
+});
+
+describe('Nix Extraction', () => {
+  it('should distinguish Nix variable and function bindings', () => {
+    const code = `
+let
+  plainValue = 10;
+  simpleFn = arg: arg + 1;
+  destructuredFn = { lib, stdenv }: lib.getName stdenv;
+  curriedFn = a: b: builtins.toString (a + b);
+in
+{
+  exportedValue = plainValue;
+  exportedFn = curriedFn;
+}
+`;
+
+    const result = extractFromSource('default.nix', code);
+
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'plainValue')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'exportedValue')).toBeDefined();
+
+    const simpleFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'simpleFn');
+    const destructuredFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'destructuredFn');
+    const curriedFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'curriedFn');
+
+    expect(simpleFn?.signature).toBe('(arg)');
+    expect(destructuredFn?.signature).toBe('{ lib, stdenv }');
+    expect(curriedFn?.signature).toBe('a : b');
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('lib.getName');
+    expect(calls.filter((name) => name === 'builtins.toString')).toHaveLength(1);
+  });
+
+  it('should extract inherited Nix attributes as variables', () => {
+    const code = `
+let
+  inherit lib;
+  inherit (pkgs) stdenv writeShellScriptBin;
+in
+stdenv.mkDerivation {}
+`;
+
+    const result = extractFromSource('default.nix', code);
+    const variables = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+
+    expect(variables).toContain('lib');
+    expect(variables).toContain('stdenv');
+    expect(variables).toContain('writeShellScriptBin');
+  });
+
+  it('should emit only static project path imports for Nix import calls', () => {
+    const code = `
+let
+  local = import ./x.nix;
+  defaultFile = builtins.import ./dir;
+  packageSet = import <nixpkgs> {};
+  fromSources = import sources.nixpkgs {};
+  dynamic = import selectedPath;
+in
+local
+`;
+
+    const result = extractFromSource('default.nix', code);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+
+    expect(imports).toEqual(['./x.nix', './dir']);
+    expect(importRefs).toEqual(['./x.nix', './dir']);
+  });
+
+  it('should emit file imports for NixOS module imports/modules lists (literal paths only)', () => {
+    const code = `
+{ config, lib, ... }:
+{
+  imports = [ ./hardware.nix ../common inputs.foo.nixosModules.bar ];
+  home-manager.users.demo.imports = [ ./home.nix ];
+  flake.modules = [ ./configuration.nix ];
+  notAModuleList = [ ./ignored.nix ];
+}
+`;
+
+    const result = extractFromSource('configuration.nix', code);
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+
+    expect(importRefs).toEqual(['./hardware.nix', '../common', './home.nix', './configuration.nix']);
+    // The dynamic entry (inputs.foo.nixosModules.bar) must not create a ref.
+    expect(importRefs).not.toContain('inputs.foo.nixosModules.bar');
+  });
+
+  it('should emit file imports for callPackage with a literal path and skip dynamic ones', () => {
+    const code = `
+{ pkgs, newScope }:
+let
+  hello = pkgs.callPackage ./pkgs/hello { };
+  tools = pkgs.callPackages ../tools/all.nix { };
+  dynamic = pkgs.callPackage pkgPath { };
+in
+{
+  inherit hello tools dynamic;
+}
+`;
+
+    const result = extractFromSource('overlay.nix', code);
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+
+    expect(importRefs).toEqual(['./pkgs/hello', '../tools/all.nix']);
+    // The call edge to callPackage itself is still recorded.
+    expect(calls).toContain('pkgs.callPackage');
+  });
+
+  it('should mark returned top-level Nix attrset members exported and keep let or nested attrs private', () => {
+    const code = `
+{ lib, stdenv }:
+let
+  localValue = 10;
+in
+{
+  exported = localValue;
+  package = { name }: stdenv.mkDerivation { inherit name; };
+  nested = {
+    privateNested = true;
+  };
+  inherit (lib) licenses;
+}
+`;
+
+    const result = extractFromSource('default.nix', code);
+    const node = (name: string) => result.nodes.find((n) => n.name === name);
+
+    expect(node('localValue')?.isExported).toBe(false);
+    expect(node('exported')?.isExported).toBe(true);
+    expect(node('package')?.kind).toBe('function');
+    expect(node('package')?.isExported).toBe(true);
+    expect(node('privateNested')?.isExported).toBe(false);
+    expect(node('licenses')?.isExported).toBe(true);
   });
 });
 
@@ -184,6 +518,89 @@ export class PaymentService {
     expect(chargeMethod).toBeDefined();
   });
 
+  it('captures docstrings for export- and const-wrapped declarations (#780)', () => {
+    const code = `
+// plain class control
+class Ledger {}
+
+// exported class
+export class Invoice {}
+
+// export default
+export default function settle() { return true; }
+
+// exported arrow const
+export const refund = (amount: number) => amount;
+
+// non-export arrow const
+const audit = (amount: number) => amount;
+`;
+    const byName = new Map(extractFromSource('doc.ts', code).nodes.map((n) => [n.name, n]));
+    expect(byName.get('Ledger')?.docstring).toBe('plain class control'); // control still works
+    expect(byName.get('Invoice')?.docstring).toBe('exported class');
+    expect(byName.get('settle')?.docstring).toBe('export default');
+    expect(byName.get('refund')?.docstring).toBe('exported arrow const');
+    expect(byName.get('audit')?.docstring).toBe('non-export arrow const');
+  });
+
+  it('does not mis-attribute a class comment to an uncommented member (#780)', () => {
+    const code = `
+// Comment for Box
+export class Box {
+  noComment() {}
+  // own comment
+  withComment() {}
+}
+`;
+    const byName = new Map(extractFromSource('box.ts', code).nodes.map((n) => [n.name, n]));
+    expect(byName.get('Box')?.docstring).toBe('Comment for Box');
+    expect(byName.get('noComment')?.docstring ?? null).toBeNull(); // no over-walk
+    expect(byName.get('withComment')?.docstring).toBe('own comment');
+  });
+
+  it('captures docstrings for decorated Python declarations, stripping `#` (#780)', () => {
+    const code = [
+      '# decorated function',
+      '@app.route("/x")',
+      'def py_handler():',
+      '    return 1',
+      '',
+      '',
+      '# plain function control',
+      'def py_plain():',
+      '    return 1',
+      '',
+      '',
+      '# decorated class',
+      '@dataclass',
+      'class PyModel:',
+      '    pass',
+      '',
+    ].join('\n');
+    const byName = new Map(extractFromSource('mod.py', code).nodes.map((n) => [n.name, n]));
+    expect(byName.get('py_handler')?.docstring).toBe('decorated function');
+    expect(byName.get('py_plain')?.docstring).toBe('plain function control'); // `#` stripped
+    expect(byName.get('PyModel')?.docstring).toBe('decorated class');
+  });
+
+  it('cleans comment markers across language styles (#780)', () => {
+    const doc = (file: string, code: string, name: string) =>
+      new Map(extractFromSource(file, code).nodes.map((n) => [n.name, n])).get(name)?.docstring;
+
+    // Rust doc lines (`///`, `//!`) — the trailing slash used to leak through.
+    expect(doc('m.rs', '/// rust doc line\nfn rs_fn() {}', 'rs_fn')).toBe('rust doc line');
+    // Lua line + long-bracket comments.
+    expect(doc('m.lua', '-- lua line\nfunction lua_fn() end', 'lua_fn')).toBe('lua line');
+    expect(doc('b.lua', '--[[ lua block ]]\nfunction lua_b() end', 'lua_b')).toBe('lua block');
+    // Pascal brace and paren-star comments.
+    const pasUnit = (c: string) =>
+      `unit U;\ninterface\n${c}\nprocedure P;\nimplementation\nprocedure P;\nbegin\nend;\nend.\n`;
+    expect(doc('a.pas', pasUnit('{ pascal brace }'), 'P')).toBe('pascal brace');
+    expect(doc('c.pas', pasUnit('(* pascal paren *)'), 'P')).toBe('pascal paren');
+    // C block comment still clean (no regression).
+    expect(doc('m.c', '/* c block */\nvoid c_fn(void) {}', 'c_fn')).toBe('c block');
+  });
+
   it('should extract interfaces', () => {
     const code = `
 export interface User {
@@ -221,6 +638,55 @@ interface Hprops {
     expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
   });
 
+  it('indexes interface members, not just the interface itself', () => {
+    // tree-sitter-typescript spells interface members `method_signature` /
+    // `property_signature`, distinct from the class-member types the extractor
+    // listed, so they were never captured (#1638). Java/C# are unaffected —
+    // their grammars reuse `method_declaration`, already in their methodTypes.
+    // The cost lands on `.d.ts` platform APIs: with no declaration node, call
+    // sites through the interface have nothing to attach an edge to.
+    const code = `
+export interface PlatformApi {
+  fetchPage(id: string): Promise<string>;
+  version: string;
+}
+`;
+    const result = extractFromSource('api.d.ts', code);
+
+    const iface = result.nodes.find((n) => n.kind === 'interface' && n.name === 'PlatformApi');
+    const method = result.nodes.find((n) => n.kind === 'method' && n.name === 'fetchPage');
+    const prop = result.nodes.find((n) => n.kind === 'property' && n.name === 'version');
+    expect(iface).toBeDefined();
+    expect(method).toBeDefined();
+    expect(prop).toBeDefined();
+
+    // Attached to the interface, not merely present. A member the graph holds
+    // but hangs off the file is not a declaration a call edge can be resolved
+    // through, which is the whole point of extracting it.
+    const contained = result.edges
+      .filter((e) => e.kind === 'contains' && e.source === iface!.id)
+      .map((e) => e.target);
+    expect(contained).toContain(method!.id);
+    expect(contained).toContain(prop!.id);
+  });
+
+  it('does not mint a top-level function from a type literal method signature', () => {
+    // The failure mode the class-like guard on `method_signature` exists for
+    // (#1638). `extractMethod` treats a method node with no class-like parent
+    // as a free function — right for `method_definition`, wrong for a bodiless
+    // signature, whose only home outside an interface is a type literal. Those
+    // members are already extracted onto the alias (#359), so without the guard
+    // the file gains a phantom `function stop` beside the real `Handle::stop`.
+    const result = extractFromSource('t.ts', `
+export type Handle = { stop(): void; label: string };
+`);
+
+    const alias = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Handle');
+    expect(alias).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'method' && n.name === 'stop')).toBeDefined();
+    expect(result.nodes.filter((n) => n.kind === 'function' && n.name === 'stop')).toEqual([]);
+  });
+
   it('should extract type references from interface method signatures', () => {
     const code = `
 import type { IPage } from '../PromoterList';
@@ -237,6 +703,54 @@ interface MethodForm {
     expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
   });
 
+  it('extracts type references from in-body local variable annotations', () => {
+    // A function that uses a type ONLY in its body — `const items: Foo[] = []` —
+    // still depends on Foo. The body walker used to capture calls but never type
+    // annotations, so impact / `affected` missed the dependency. Must cover
+    // function, class-method, and object-literal-method bodies — and must NOT
+    // turn the locals themselves into graph nodes (that would explode the graph).
+    const code = `
+import { Foo } from './types';
+
+export function build(): void {
+  const items: Foo[] = [];
+  void items;
+}
+
+export class K {
+  run(): void {
+    const a: Foo = { x: 1 };
+    void a;
+  }
+}
+
+export const handler = {
+  handle(): void {
+    const b: Foo = { x: 1 };
+    void b;
+  },
+};
+`;
+    const result = extractFromSource('inbody.ts', code);
+
+    const fooRefs = result.unresolvedReferences.filter(
+      (r) => r.referenceKind === 'references' && r.referenceName === 'Foo'
+    );
+    // One per body scope: build(), K.run(), handler.handle().
+    expect(fooRefs.length).toBeGreaterThanOrEqual(3);
+
+    // Each reference is attributed to its enclosing function/method node — never
+    // to a local-variable node, because locals are intentionally not extracted.
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    for (const ref of fooRefs) {
+      const owner = byId.get(ref.fromNodeId);
+      expect(owner).toBeDefined();
+      expect(['function', 'method']).toContain(owner!.kind);
+    }
+    // The locals (items/a/b) must not leak in as symbols.
+    expect(result.nodes.some((n) => ['items', 'a', 'b'].includes(n.name))).toBe(false);
+  });
+
   it('should track function calls', () => {
     const code = `
 function main() {
@@ -249,6 +763,86 @@ function main() {
     expect(result.unresolvedReferences.length).toBeGreaterThan(0);
     const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
     expect(calls.some((c) => c.referenceName === 'processData')).toBe(true);
+  });
+
+  // tree-sitter-typescript parses `await f<T>(x)` as a call whose callee is
+  // `await f`, so the ref was named `await f` and matched nothing (#2586).
+  it.each([['user.ts'], ['user.tsx']])('an awaited call with type arguments names its callee: %s (#2586)', (file) => {
+    const code = [
+      'export async function awaited() { return await fetchApi<User>("/me"); }',
+      'export async function assigned() { const u = await fetchApi<User>("/me"); return u; }',
+      'export async function viaNamespace() { return await api.fetchApi<User>("/me"); }',
+      'export async function viaThis() { return await this.load<User>("/me"); }',
+      '',
+    ].join('\n');
+    const result = extractFromSource(file, code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const byFn = (name: string) => {
+      const fn = result.nodes.find((n) => n.name === name)!;
+      return calls.filter((c) => c.fromNodeId === fn.id).map((c) => c.referenceName);
+    };
+    expect(byFn('awaited')).toEqual(['fetchApi']);
+    expect(byFn('assigned')).toEqual(['fetchApi']);
+    expect(byFn('viaNamespace')).toEqual(['api.fetchApi']);
+    expect(byFn('viaThis')).toEqual(['load']);
+    expect(calls.some((c) => c.referenceName.startsWith('await'))).toBe(false);
+    // The reference sits where the callee starts, as for `await f(x)` — not on
+    // the `await`, which the call node starts at.
+    const lines = code.split('\n');
+    const columnOf = (name: string) => {
+      const fn = result.nodes.find((n) => n.name === name)!;
+      return calls.find((c) => c.fromNodeId === fn.id)!.column;
+    };
+    expect(columnOf('awaited')).toBe(lines[0]!.indexOf('fetchApi'));
+    expect(columnOf('viaNamespace')).toBe(lines[2]!.indexOf('api.fetchApi'));
+  });
+
+  it('an awaited generic call to a name a package exports links to nothing in the project (#2586)', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'app', dependencies: { 'idb-keyval': '6.2.1' } }));
+      fs.mkdirSync(path.join(dir, 'src'));
+      // excalidraw's `await get<SavedChats>(key, store)` from idb-keyval, beside
+      // a project class whose static `get` the name alone would match.
+      fs.writeFileSync(path.join(dir, 'src', 'storage.ts'),
+        'import { get } from "idb-keyval";\nexport async function load() { return await get<string>("k"); }\n');
+      fs.writeFileSync(path.join(dir, 'src', 'cache.ts'), 'export class Cache {\n  static get = (s: string) => s;\n}\n');
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const load = cg.getNodesByKind('function').find((n) => n.name === 'load')!;
+        expect(cg.getOutgoingEdges(load.id).filter((e) => e.kind === 'calls')).toEqual([]);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }, 60_000);
+
+  it.each([['user.ts'], ['user.tsx'], ['user.ets']])('an awaited generic call peels every await and skips comments: %s (#2586)', (file) => {
+    const code = [
+      'export async function chainedParen() { return (await fetchApi<User>("/me")).json(); }',
+      'export async function chainedThen() { return await api.get<User>("/me").then(r => r); }',
+      'export async function commented() { return await /* typed */ fetchApi<User>("/me"); }',
+      'export async function lineCommented() { return await // typed\n fetchApi<User>("/me"); }',
+      'export async function doubled() { return await await fetchApi<User>("/me"); }',
+      '',
+    ].join('\n');
+    const result = extractFromSource(file, code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const byFn = (name: string) => {
+      const fn = result.nodes.find((n) => n.name === name)!;
+      return calls.filter((c) => c.fromNodeId === fn.id).map((c) => c.referenceName).sort();
+    };
+    expect(byFn('commented')).toEqual(['fetchApi']);
+    expect(byFn('lineCommented')).toEqual(['fetchApi']);
+    expect(byFn('doubled')).toEqual(['fetchApi']);
+    expect(calls.some((c) => /^await|^\/[*/]/.test(c.referenceName))).toBe(false);
+    // ArkTS keeps its own chain encoding; TS/TSX name the inner callee.
+    if (file !== 'user.ets') {
+      expect(byFn('chainedParen')).toEqual(['fetchApi', 'fetchApi().json']);
+      expect(byFn('chainedThen')).toEqual(['api.get', 'api.get().then']);
+    }
   });
 });
 
@@ -352,6 +946,63 @@ export const fetchData = async () => {
   });
 });
 
+describe('Generator Function Extraction (#1741)', () => {
+  const functionNames = (file: string, code: string) =>
+    extractFromSource(file, code)
+      .nodes.filter((n) => n.kind === 'function')
+      .map((n) => n.name)
+      .sort();
+
+  it('extracts function* and async function* declarations in TypeScript', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+function plain() { return 1; }
+function* gen() { yield 2; }
+async function asyncFn() { return 3; }
+async function* asyncGen() { yield 4; }
+`;
+    expect(functionNames('gens.ts', code)).toEqual(['asyncFn', 'asyncGen', 'gen', 'plain']);
+  });
+
+  it('extracts function* and async function* declarations in JavaScript', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+function plain() { return 1; }
+function* gen() { yield 2; }
+async function asyncFn() { return 3; }
+async function* asyncGen() { yield 4; }
+`;
+    expect(functionNames('gens.js', code)).toEqual(['asyncFn', 'asyncGen', 'gen', 'plain']);
+  });
+
+  it('extracts const-assigned generator and async generator expressions (TS)', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+const g = function* () { yield 1; };
+const ag = async function* () { yield 2; };
+export const exportedGen = function* () { yield 3; };
+`;
+    const result = extractFromSource('gen-expr.ts', code);
+    const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name).sort();
+    expect(names).toEqual(['ag', 'exportedGen', 'g']);
+    expect(result.nodes.find((n) => n.name === 'exportedGen')?.isExported).toBe(true);
+    expect(result.nodes.find((n) => n.name === 'g')?.isExported).toBeFalsy();
+  });
+
+  it('extracts const-assigned generator and async generator expressions (JS)', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+const g = function* () { yield 1; };
+const ag = async function* () { yield 2; };
+export const exportedGen = function* () { yield 3; };
+`;
+    const result = extractFromSource('gen-expr.js', code);
+    const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name).sort();
+    expect(names).toEqual(['ag', 'exportedGen', 'g']);
+    expect(result.nodes.find((n) => n.name === 'exportedGen')?.isExported).toBe(true);
+  });
+});
+
 describe('Type Alias Extraction', () => {
   it('should extract exported type aliases in TypeScript', () => {
     const code = `
@@ -402,6 +1053,69 @@ type Internal = string;
     const exported = typeAliases.filter((n) => n.isExported);
     expect(exported).toHaveLength(2);
     expect(exported.map((n) => n.name).sort()).toEqual(['DateFormat', 'UnitSystem']);
+  });
+
+  // A service/contract registry written as a tuple of generic instantiations —
+  // the names are string-literal type arguments, not declarations, so static
+  // extraction otherwise never indexes them (issue #634).
+  it('extracts string-literal contract names from a generic tuple type alias (#634)', () => {
+    const code = `
+interface Service<Name extends string, Req, Resp> { name: Name; }
+export type MyServiceList = [
+  Service<'query_apply_record', { pageNo: number }, { ok: boolean }>,
+  Service<'apply_confirm', { code: string }, { ok: boolean }>
+];
+`;
+    const result = extractFromSource('services/api.ts', code);
+
+    const names = result.nodes.filter(
+      (n) => n.kind === 'method' && n.qualifiedName.startsWith('MyServiceList::')
+    );
+    expect(names.map((n) => n.name).sort()).toEqual(['apply_confirm', 'query_apply_record']);
+
+    const queryNode = names.find((n) => n.name === 'query_apply_record');
+    expect(queryNode?.qualifiedName).toBe('MyServiceList::query_apply_record');
+    // Signature carries the full contract entry so search results show context.
+    expect(queryNode?.signature).toContain("Service<'query_apply_record'");
+
+    // The string-literal name is contained by the type alias.
+    const alias = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'MyServiceList');
+    const containsEdge = result.edges.find(
+      (e) => e.kind === 'contains' && e.source === alias?.id && e.target === queryNode?.id
+    );
+    expect(containsEdge).toBeDefined();
+  });
+
+  it('does not extract string literals from utility types or nested generics (#634)', () => {
+    const code = `
+interface User { id: string; name: string; }
+interface Service<Name extends string, Req, Resp> { name: Name; }
+export type Picked = Pick<User, 'id' | 'name'>;
+export type Rec = Record<'foo' | 'bar', number>;
+// Tuple entry, but the name is a non-identifier route path; the nested Pick's
+// 'id' must also stay out (only DIRECT literal args of a tuple's generic count).
+export type Routes = [Service<'/api/users', Pick<User, 'id'>, {}>];
+// Bare string-literal tuple — not generic type arguments.
+export type Names = ['alpha', 'beta'];
+`;
+    const result = extractFromSource('noise.ts', code);
+
+    // Since #1638 the fixture's own interfaces legitimately declare `id` / `name`
+    // (`User::id`, `User::name`, `Service::name`), so membership in the name list
+    // no longer implies a leak. What #634 guards is the *source*: a node minted
+    // from a string literal in `Pick<User, 'id'>` or a tuple has no declaring
+    // interface, so exclude anything a `contains` edge ties to one.
+    const ifaceIds = new Set(result.nodes.filter((n) => n.kind === 'interface').map((n) => n.id));
+    const declaredInInterface = new Set(
+      result.edges.filter((e) => e.kind === 'contains' && ifaceIds.has(e.source)).map((e) => e.target)
+    );
+    const leaked = result.nodes.filter(
+      (n) =>
+        (n.kind === 'method' || n.kind === 'property') &&
+        ['id', 'name', 'foo', 'bar', 'alpha', 'beta'].includes(n.name) &&
+        !declaredInInterface.has(n.id)
+    );
+    expect(leaked).toEqual([]);
   });
 });
 
@@ -532,6 +1246,80 @@ const token = getTokenMp();
     );
     expect(call).toBeDefined();
   });
+
+  describe('initializer walk is scoped to the declared symbol (#693 for TS/JS)', () => {
+    const code = `
+const eager = load();
+const obj = { handler: () => target(), plain: target() };
+const list = [() => target()];
+export const exported = { handler: () => target() };
+`;
+    const callersOf = (name: string) => {
+      const result = extractFromSource('app.ts', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      return result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+        .map((u) => byId.get(u.fromNodeId))
+        .map((n) => (n ? `${n.kind}:${n.qualifiedName}` : '?'))
+        .sort();
+    };
+
+    it("a plain call initializer names the CONSTANT as caller, not the file", () => {
+      // The walk ran with only the file on the stack, so `load` recorded the
+      // file as its caller — useless for callers/impact.
+      expect(callersOf('load')).toEqual(['constant:eager']);
+    });
+
+    it('a non-exported object literal contributes calls (it was skipped outright)', () => {
+      // A named literal's function members are its own nodes, exported or not
+      // (#2300), so each arrow's call comes from its `handler`; the literal's
+      // eager value and the array's arrow attribute to the declared constant.
+      expect(callersOf('target')).toEqual([
+        'constant:list',
+        'constant:obj',
+        'function:exported::handler',
+        'function:obj::handler',
+      ]);
+    });
+  });
+
+  // A destructuring declaration mints no symbol, so its initializer was never
+  // walked at module scope: `const { a } = useFoo(1)` recorded no call at all,
+  // where the same line inside a function did (#2340).
+  it.each(['ts', 'tsx', 'js', 'jsx'])('records the calls of a module-scope destructuring declaration (%s, #2340)', (ext) => {
+    const code = [
+      'const { a } = useFoo(1)',
+      'let [b, c] = pair()',
+      'var { d: { e } } = nested()',
+      'const { f = fallback() } = withDefault()',
+      'const [g = other(), ...rest] = list()',
+      'export const { h } = exported()',
+      'const { i } = await load(() => inArrow())',
+      'export function probe() { const { j } = inner(); return j }',
+      '',
+    ].join('\n');
+    const result = extractFromSource(`app.${ext}`, code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => `${byId.get(r.fromNodeId)?.kind}:${r.referenceName}@${r.line}`)
+      .sort();
+    expect(calls).toEqual([
+      'file:exported@6',
+      'file:fallback@4',
+      'file:inArrow@7',
+      'file:list@5',
+      'file:load@7',
+      'file:nested@3',
+      'file:other@5',
+      'file:pair@2',
+      'file:useFoo@1',
+      'file:withDefault@4',
+      'function:inner@8', // inside a function: the function's, as before
+    ]);
+    // Still no symbol for a destructured binding.
+    expect(result.nodes.filter((n) => n.kind === 'constant' || n.kind === 'variable')).toEqual([]);
+  });
 });
 
 describe('File Node Extraction', () => {
@@ -620,6 +1408,42 @@ class UserService:
     expect(classNode).toBeDefined();
     expect(classNode?.name).toBe('UserService');
   });
+
+  it('walks a module-level assignment initializer scoped to the name (#693 for Python)', () => {
+    // The assignment minted a node and stopped, so everything a module builds
+    // at import time — `app = FastAPI()`, `ENGINE = create_engine(url)` — was
+    // missing from the graph. A tuple target mints no symbol, so its
+    // right-hand side attributes to the enclosing scope instead of vanishing.
+    const code = `
+def target(): pass
+def compute(): return 1
+
+APP = compute()
+handler = lambda: target()
+MAPPING = {"a": compute()}
+first, second = compute(), target()
+
+class K:
+    ATTR = compute()
+`;
+    const result = extractFromSource('app.py', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const owners = result.unresolvedReferences
+      .filter((u) => u.referenceKind === 'calls')
+      .map((u) => {
+        const n = byId.get(u.fromNodeId);
+        return `${u.referenceName}<-${n ? `${n.kind}:${n.name}` : '?'}`;
+      })
+      .sort();
+    expect(owners).toEqual([
+      'compute<-class:K', // a class attribute still rides the class (no node of its own)
+      'compute<-file:app.py', // the tuple target mints nothing
+      'compute<-variable:APP',
+      'compute<-variable:MAPPING',
+      'target<-file:app.py',
+      'target<-variable:handler',
+    ]);
+  });
 });
 
 describe('Go Extraction', () => {
@@ -690,6 +1514,35 @@ pub struct User {
     expect(structNode?.name).toBe('User');
   });
 
+  it('should extract unit and tuple structs, not just brace structs', () => {
+    // A unit struct has no body field, but it IS a complete definition —
+    // Rust has no forward declarations. Skipping it dropped the type and
+    // every `impl Trait for UnitStruct` edge with it.
+    const code = `
+pub struct Unit;
+pub struct Tuple(pub u32);
+pub struct Brace { pub x: u32 }
+`;
+    const result = extractFromSource('shapes.rs', code);
+
+    const structs = result.nodes.filter((n) => n.kind === 'struct').map((n) => n.name).sort();
+    expect(structs).toEqual(['Brace', 'Tuple', 'Unit']);
+  });
+
+  it('should link impl Trait for a unit struct', () => {
+    const code = `
+pub struct Unit;
+pub trait Greet { fn hi(&self) -> String; }
+impl Greet for Unit { fn hi(&self) -> String { "unit".into() } }
+`;
+    const result = extractFromSource('greet.rs', code);
+
+    const unit = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Unit');
+    expect(unit).toBeDefined();
+    const trait = result.nodes.find((n) => n.kind === 'trait' && n.name === 'Greet');
+    expect(trait).toBeDefined();
+  });
+
   it('should extract trait declarations', () => {
     const code = `
 pub trait Repository {
@@ -730,6 +1583,154 @@ impl Cache for MyCache {
     const myCacheNode = result.nodes.find((n) => n.name === 'MyCache' && n.kind === 'struct');
     expect(myCacheNode).toBeDefined();
     expect(implRef?.fromNodeId).toBe(myCacheNode?.id);
+  });
+
+  it('qualifies methods of a generic or lifetime impl by the implementing type, not the trait (#1588)', () => {
+    const code = `
+pub trait Source {
+    fn read(&mut self) -> usize;
+}
+
+pub struct FileSource { pub n: usize }
+impl Source for FileSource {
+    fn read(&mut self) -> usize { self.n }
+}
+
+pub struct BufSource<T> { pub inner: T }
+impl<T> Source for BufSource<T> {
+    fn read(&mut self) -> usize { 0 }
+}
+
+pub struct Parents<'a> { cur: &'a u32 }
+impl<'a> Iterator for Parents<'a> {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> { None }
+}
+
+pub struct Wrapper { pub n: usize }
+impl Source for &Wrapper {
+    fn read(&mut self) -> usize { 1 }
+}
+
+pub mod m { pub struct Scoped { pub n: usize } }
+impl Source for m::Scoped {
+    fn read(&mut self) -> usize { 2 }
+}
+
+pub struct Own { pub n: usize }
+impl From<u32> for Own {
+    fn from(n: u32) -> Self { Own { n: n as usize } }
+}
+`;
+    const result = extractFromSource('src.rs', code);
+
+    // Every impl method is qualified by the IMPLEMENTING type. Before, a
+    // parameterized implementing type (`BufSource<T>`, `Parents<'a>`, `&Wrapper`)
+    // left the trait's identifier as the only bare type_identifier child of the
+    // impl, so those methods were recorded as `Source::read` / `Iterator::next`.
+    const methodQns = result.nodes
+      .filter((n) => n.kind === 'method')
+      .map((n) => n.qualifiedName)
+      .sort();
+    expect(methodQns).toEqual([
+      'BufSource::read',
+      'FileSource::read',
+      'Own::from',
+      'Parents::next',
+      'Scoped::read',
+      'Source::read',
+      'Wrapper::read',
+    ]);
+    // The trait's qualified name now names exactly one node: its declaration.
+    const traitRead = result.nodes.filter((n) => n.qualifiedName === 'Source::read');
+    expect(traitRead).toHaveLength(1);
+    expect(traitRead[0]!.startLine).toBe(3);
+
+    // The implements back-reference comes FROM the implementing type's node
+    // for every impl shape, named by the trait's full text.
+    const implementsFrom = (typeName: string): string[] => {
+      const typeNode = result.nodes.find((n) => n.name === typeName && n.kind === 'struct');
+      expect(typeNode, typeName).toBeDefined();
+      return result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'implements' && r.fromNodeId === typeNode!.id)
+        .map((r) => r.referenceName);
+    };
+    expect(implementsFrom('FileSource')).toEqual(['Source']);
+    expect(implementsFrom('BufSource')).toEqual(['Source']);
+    expect(implementsFrom('Parents')).toEqual(['Iterator']);
+    expect(implementsFrom('Wrapper')).toEqual(['Source']);
+    expect(implementsFrom('Scoped')).toEqual(['Source']);
+    expect(implementsFrom('Own')).toEqual(['From<u32>']);
+
+    // …and the owner `contains` edge lands on the implementing type too.
+    const buf = result.nodes.find((n) => n.name === 'BufSource' && n.kind === 'struct')!;
+    const bufRead = result.nodes.find((n) => n.qualifiedName === 'BufSource::read')!;
+    expect(
+      result.edges.some((e) => e.kind === 'contains' && e.source === buf.id && e.target === bufRead.id)
+    ).toBe(true);
+  });
+
+  it('keeps the owner shape for `self.<method>()` and `self.<field>.<method>()`, a longer receiver chain whole, and collapses a parenthesized receiver (#1585, #1861, #2836)', () => {
+    const code = `
+pub struct Outer { pub inner: Inner, pub deep: Deep }
+impl Outer {
+    pub fn run(&mut self) {
+        self.inner.run();
+        self.deep.inner.run();
+        self.make().run();
+        (self.inner).run();
+        self.run();
+        let local = Inner { n: 0 };
+        local.run();
+    }
+}
+`;
+    const result = extractFromSource('outer.rs', code);
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    // The single-hop field receiver keeps its owner, whose type the resolver
+    // reads off the owner struct (#1585), and so does the bare `self`
+    // receiver, whose type is the calling method's own owner (#1861). A
+    // longer chain of fields and method calls is kept whole, a call written
+    // `name()` (#2836): `self.make().run()` contributes `self.make`, the inner
+    // call, and `self.make().run`.
+    expect(calls.filter((c) => c.startsWith('self.')).sort()).toEqual([
+      'self.deep.inner.run',
+      'self.inner.run',
+      'self.make',
+      'self.make().run',
+      'self.run',
+    ]);
+    // A local receiver keeps its name as before…
+    expect(calls).toContain('local.run');
+    // …and the parenthesized receiver still collapses to the method name.
+    expect(calls.filter((c) => c === 'run')).toHaveLength(1);
+    const outerRun = result.nodes.find((n) => n.qualifiedName === 'Outer::run');
+    expect(outerRun).toBeDefined();
+    const fieldRef = result.unresolvedReferences.find((r) => r.referenceName === 'self.inner.run');
+    expect(fieldRef?.fromNodeId).toBe(outerRun!.id);
+    expect(fieldRef?.line).toBe(5);
+  });
+
+  it('gives no receiver to an impl whose target names no single type', () => {
+    // A tuple / `dyn Trait` / primitive implementing type has no struct to
+    // hang the methods off, so they are extracted as plain functions — the
+    // pre-#1588 behavior for these shapes, minus the trait mis-qualification.
+    const code = `
+pub trait Base { fn id(&self) -> u32; }
+impl Base for (u32, u32) {
+    fn id(&self) -> u32 { 0 }
+}
+impl Base for dyn Base {
+    fn id(&self) -> u32 { 1 }
+}
+`;
+    const result = extractFromSource('src.rs', code);
+    const ids = result.nodes.filter((n) => n.name === 'id');
+    expect(ids.map((n) => n.qualifiedName).sort()).toEqual(['Base::id', 'id', 'id']);
+    expect(ids.filter((n) => n.kind === 'function')).toHaveLength(2);
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'implements')).toHaveLength(0);
   });
 
   it('should extract trait supertraits as extends references', () => {
@@ -774,6 +1775,71 @@ impl Counter {
       (r) => r.referenceKind === 'implements'
     );
     expect(implRefs).toHaveLength(0);
+  });
+
+  it('walks a const/static initializer scoped to the declared symbol (#693 for Rust)', () => {
+    // The declaration minted a node and stopped, so a handler table, a
+    // lazily-built singleton or any computed const linked to nothing.
+    const code = `
+const LEN: usize = compute_len();
+static REGISTRY: Lazy<Cfg> = Lazy::new(|| build_cfg());
+`;
+    const result = extractFromSource('lib.rs', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const owner = (name: string) => {
+      const u = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === name
+      );
+      const n = u ? byId.get(u.fromNodeId) : undefined;
+      return n ? `${n.kind}:${n.name}` : undefined;
+    };
+    expect(owner('compute_len')).toBe('variable:LEN');
+    expect(owner('build_cfg')).toBe('variable:REGISTRY');
+  });
+
+  it('should extract union declarations and their impl edges', () => {
+    const code = `
+pub union Reg {
+    pub raw: u32,
+    pub halves: [u16; 2],
+}
+
+pub trait Describe {
+    fn describe(&self) -> u32;
+}
+
+impl Describe for Reg {
+    fn describe(&self) -> u32 {
+        unsafe { self.raw }
+    }
+}
+`;
+    const result = extractFromSource('reg.rs', code);
+
+    // A union is a first-class type definition, not an alias — it must be a
+    // node, or the impl below has no source endpoint to hang off.
+    const reg = result.nodes.find((n) => n.name === 'Reg');
+    expect(reg).toBeDefined();
+    expect(reg?.kind).toBe('union');
+
+    const implRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'implements' && r.referenceName === 'Describe'
+    );
+    expect(implRef).toBeDefined();
+    expect(implRef?.fromNodeId).toBe(reg?.id);
+
+    // The impl's method attaches to the union, not to the file — without a Reg
+    // node it was an orphan whose qualifiedName pointed at a type that did not
+    // exist in the graph.
+    const implMethod = result.nodes.find(
+      (n) => n.kind === 'method' && n.qualifiedName?.includes('Reg')
+    );
+    expect(implMethod).toBeDefined();
+    expect(
+      result.edges.some(
+        (e) => e.kind === 'contains' && e.source === reg?.id && e.target === implMethod?.id
+      )
+    ).toBe(true);
   });
 });
 
@@ -938,6 +2004,37 @@ public class Splitter {
     );
     expect(sepStart, 'override inside the lambda-returned anon class should be a method node').toBeDefined();
   });
+
+  it('walks a field initializer scoped to the field (#693 for Java)', () => {
+    // The dispatcher only scanned a field_declaration for function-as-value
+    // candidates, so a lambda or anonymous class holding the work — the
+    // Android listener idiom — contributed no call edge and `target` looked
+    // callerless.
+    const code = `
+package p;
+class T {
+    private final Runnable fieldLambda = () -> target();
+    private final Runnable anonClass = new Runnable() {
+        public void run() { target(); }
+    };
+    private final int eager = compute();
+    void directCall() { target(); }
+    private void target() {}
+    private static int compute() { return 1; }
+}
+`;
+    const result = extractFromSource('T.java', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const callersOf = (name: string) =>
+      result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+        .map((u) => byId.get(u.fromNodeId)?.name)
+        .sort();
+
+    // `run` is the anonymous class's override, itself extracted under the field.
+    expect(callersOf('target')).toEqual(['directCall', 'fieldLambda', 'run']);
+    expect(callersOf('compute')).toEqual(['eager']);
+  });
 });
 
 describe('C# Extraction', () => {
@@ -964,6 +2061,120 @@ public class OrderService
     expect(classNode).toBeDefined();
     expect(classNode?.name).toBe('OrderService');
     expect(classNode?.visibility).toBe('public');
+  });
+
+  it('indexes every record form with the right kind (#831)', () => {
+    // The grammar parses ALL record forms as record_declaration — there is no
+    // record_struct_declaration node — so the value-type forms are told apart
+    // by their `struct` keyword child. Positional one-liners have no body
+    // block and must still index (the no-body gate is for C/C++ forward
+    // declarations, not records).
+    const code = `
+namespace Fixture;
+
+public record SimplePositional(int A);
+public record WithBody(int A) { public int DoubleIt() => A * 2; }
+public record class ExplicitClassRec(string Name);
+public record struct ValueRec(int X);
+public readonly record struct ReadonlyRec(int X, int Y);
+public record DerivedRec(int A, string B) : SimplePositional(A);
+public record GenericRec<T>(T Value);
+public partial record PartialRec(int A);
+`;
+    const result = extractFromSource('Records.cs', code);
+    const kindOf = (name: string) => result.nodes.find((n) => n.name === name)?.kind;
+
+    expect(kindOf('SimplePositional')).toBe('class');
+    expect(kindOf('WithBody')).toBe('class');
+    expect(kindOf('ExplicitClassRec')).toBe('class');
+    expect(kindOf('DerivedRec')).toBe('class');
+    expect(kindOf('GenericRec')).toBe('class');
+    expect(kindOf('PartialRec')).toBe('class');
+    // Value-type records are structs, not classes.
+    expect(kindOf('ValueRec')).toBe('struct');
+    expect(kindOf('ReadonlyRec')).toBe('struct');
+    // Members of a bodied record still extract.
+    expect(kindOf('DoubleIt')).toBe('method');
+  });
+
+  it('indexes primary-constructor classes, including keyed-DI attribute params (#237)', () => {
+    // C# 12 primary constructors (`class Foo(IDep dep) { … }`) are parsed
+    // natively by the vendored tree-sitter-c-sharp 0.23.x grammar. The worst
+    // shape under the previous (older) grammar — an attribute-with-args on a
+    // ctor param (`[FromKeyedServices("primary")] …`, the ASP.NET keyed-DI
+    // pattern) — used to parse as an ERROR that swallowed the whole class, so
+    // the class and all its methods vanished. They now index in every case.
+    const code = `
+public class DataService(IMemoryCache cache)
+{
+    public void Warm() { }
+}
+
+public class InstanceService(InstanceManager m, ProfileManager p)
+{
+    public void DeployAndLaunchAsync() { }
+    public void Deploy() { }
+}
+
+public partial class UpdateService(int x) : ILifetimeService
+{
+    public void Run() { }
+}
+
+public class K1KeyedDi([FromKeyedServices("primary")] IMemoryCache cache)
+{
+    public void Warm() { }
+}
+
+public record CatalogBrand(int Id, string Name);
+`;
+    const result = extractFromSource('Services.cs', code);
+    const classNames = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+    expect(classNames).toContain('DataService');
+    expect(classNames).toContain('InstanceService');
+    expect(classNames).toContain('UpdateService'); // partial + base list
+    expect(classNames).toContain('K1KeyedDi'); // attribute-arg ctor param — used to vanish entirely
+    expect(classNames).toContain('CatalogBrand'); // record
+
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toContain('DeployAndLaunchAsync');
+    expect(methods).toContain('Deploy');
+    expect(methods).toContain('Run');
+  });
+
+  it('keeps a class indexable when a nested enum has #if-guarded members (#237)', () => {
+    // A `#if` directive inside an enum member list (the multi-targeting pattern
+    // in libraries like Newtonsoft.Json) makes the grammar emit an ERROR that,
+    // for a nested enum, detaches the enclosing class's member list — dropping
+    // most of the class's methods. A pre-parse pass blanks the directive lines
+    // (keeping both branches), so the class and all its methods still index.
+    const code = `
+public class Reader
+{
+    private enum ReadType
+    {
+#if HAVE_DATE_TIME_OFFSET
+        ReadAsDateTimeOffset,
+#endif
+        ReadAsDouble,
+        ReadAsString,
+    }
+
+    public void Open() { }
+    public void Close() { }
+    public int ReadInt() { return 0; }
+}
+`;
+    const result = extractFromSource('Reader.cs', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    // All three methods after the #if-bearing enum must survive.
+    expect(methods).toContain('Open');
+    expect(methods).toContain('Close');
+    expect(methods).toContain('ReadInt');
+    // Both enum branches are kept.
+    const enumMembers = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+    expect(enumMembers).toContain('ReadAsDateTimeOffset');
+    expect(enumMembers).toContain('ReadAsDouble');
   });
 });
 
@@ -1138,6 +2349,88 @@ protocol UploadConvertible: URLRequestConvertible {
     expect(extendsRefs.find((r) => r.referenceName === 'RawRepresentable')).toBeDefined();
     // UploadConvertible extends URLRequestConvertible
     expect(extendsRefs.find((r) => r.referenceName === 'URLRequestConvertible')).toBeDefined();
+  });
+
+  it('indexes Swift properties so they are findable: computed → property, stored → field, static → constant/variable (#1020)', () => {
+    const code = `
+struct ReproConfig {
+    let reproStoredValue: Int
+    var reproComputedFlag: Bool {
+        reproStoredValue > 0
+    }
+    static let sharedLimit = 10
+    static var sharedCount = 0
+    func reproControlMethod() -> Bool {
+        reproComputedFlag
+    }
+}
+
+final class ReproService {
+    private let reproClassStored: String = "x"
+    var reproClassComputed: Int { reproClassStored.count }
+}
+`;
+    const result = extractFromSource('Repro.swift', code);
+    const byName = (name: string) => result.nodes.find((n) => n.name === name);
+
+    // Computed properties are the regression this fix targets: before #1020 they
+    // were dropped entirely, so search/explore returned nothing for them.
+    expect(byName('reproComputedFlag')?.kind).toBe('property');
+    expect(byName('reproClassComputed')?.kind).toBe('property');
+
+    // Stored instance properties stay `field` (fixed earlier in #708 — guard it).
+    expect(byName('reproStoredValue')?.kind).toBe('field');
+    expect(byName('reproClassStored')?.kind).toBe('field');
+
+    // `static let`/`static var` members remain shared constant/variable nodes.
+    expect(byName('sharedLimit')?.kind).toBe('constant');
+    expect(byName('sharedCount')?.kind).toBe('variable');
+
+    // The control method is unaffected.
+    expect(byName('reproControlMethod')?.kind).toBe('method');
+  });
+
+  it("attributes a computed property's getter calls to the property, not the type (SwiftUI body flow) (#1020)", () => {
+    const code = `
+struct GreetingView {
+    let name: String
+    var body: some View {
+        let prefix = "Hi"
+        return VStack {
+            Text(greeting(prefix))
+        }
+    }
+    func greeting(_ p: String) -> String { p }
+}
+`;
+    const result = extractFromSource('View.swift', code);
+    const body = result.nodes.find((n) => n.kind === 'property' && n.name === 'body');
+    expect(body).toBeDefined();
+
+    // The getter's call to greeting() must originate from `body` (so a SwiftUI
+    // view's render flow is reachable through the property), not flatten onto the
+    // enclosing struct.
+    const callsFromBody = result.unresolvedReferences.filter(
+      (r) => r.fromNodeId === body!.id && r.referenceKind === 'calls'
+    );
+    expect(callsFromBody.some((r) => r.referenceName === 'greeting')).toBe(true);
+
+    // The getter is walked as a body, so a local declared inside it is NOT
+    // node-ified (locals are the data-flow frontier we leave uncovered). Before
+    // this fix the generic walker treated such a local as a struct `field`.
+    expect(result.nodes.find((n) => n.name === 'prefix')).toBeUndefined();
+  });
+
+  it('indexes a Swift protocol property requirement as a findable property (#1020)', () => {
+    const code = `
+protocol Themable {
+    var accentColor: Color { get }
+    var title: String { get set }
+}
+`;
+    const result = extractFromSource('Themable.swift', code);
+    expect(result.nodes.find((n) => n.name === 'accentColor')?.kind).toBe('property');
+    expect(result.nodes.find((n) => n.name === 'title')?.kind).toBe('property');
   });
 });
 
@@ -1344,6 +2637,120 @@ class Bar {
     expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
     const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
     expect(cls?.qualifiedName).toBe('Bar');
+  });
+
+  describe('property initializers are walked, attributed to the property (#693 for Kotlin)', () => {
+    // The property hook consumes the whole property_declaration subtree, so
+    // before this the initializer was only scanned for function-as-value
+    // candidates and every call inside it vanished from the graph. Android/MSDK
+    // callbacks are declared exactly this way (`private val l = Listener { … }`),
+    // so anything reached only through one looked like it had no callers at all.
+    const code = `
+package repro
+
+class Repro {
+    private val fieldLambda: () -> Unit = { target() }
+    private val samField = Runnable { target() }
+    private val plain = target()
+    private val delegated by lazy { target() }
+    private val anonObject = object : Runnable { override fun run() { target() } }
+
+    fun directCall() { target() }
+    fun lambdaInMethod() { run { target() } }
+
+    private fun target() {}
+}
+
+object Holder {
+    val topLevelLambda: () -> Unit = { hit() }
+    private fun hit() {}
+}
+`;
+    const callersOf = (target: string) => {
+      const result = extractFromSource('Repro.kt', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      return result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === target)
+        .map((u) => byId.get(u.fromNodeId)?.name)
+        .sort();
+    };
+
+    it('a lambda / SAM / plain / delegated / object initializer calls FROM the property', () => {
+      // `run` is the anonymous object's override, extracted as its own node
+      // under `anonObject` — the same shape Go's initializer walk produces.
+      expect(callersOf('target')).toEqual([
+        'delegated',
+        'directCall',
+        'fieldLambda',
+        'lambdaInMethod',
+        'plain',
+        'run',
+        'samField',
+      ]);
+    });
+
+    it('a property in an `object` singleton is a caller too', () => {
+      expect(callersOf('hit')).toEqual(['topLevelLambda']);
+    });
+
+    it('an accessor body belongs to its property, written on either line', () => {
+      // `val x: T get() = …` nests the accessor UNDER the declaration; written
+      // on its own line the grammar makes it a following SIBLING instead. Both
+      // used to lose their calls (the nested one) or hand them to the enclosing
+      // class (the sibling); both now attribute to the property.
+      const src = `
+package p
+
+class C {
+    val sameLine: Int get() = compute()
+    val nextLine: Int
+        get() = compute()
+    var written: Int = 0
+        set(v) { store(v) }
+    private fun compute(): Int = 1
+    private fun store(v: Int) {}
+}
+`;
+      const result = extractFromSource('C.kt', src);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const ownersOf = (name: string) =>
+        result.unresolvedReferences
+          .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+          .map((u) => {
+            const n = byId.get(u.fromNodeId);
+            return n ? `${n.kind}:${n.name}` : '?';
+          })
+          .sort();
+      expect(ownersOf('compute')).toEqual(['field:nextLine', 'field:sameLine']);
+      expect(ownersOf('store')).toEqual(['field:written']);
+    });
+
+    it('an `init` block and a destructuring RHS no longer vanish', () => {
+      // Both mint no symbol of their own, so the hook consumed them and their
+      // code disappeared entirely; they now attribute to the enclosing scope.
+      const src = `
+package p
+
+class C {
+    init { val q = initCall() }
+    val (a, b) = makePair()
+}
+
+val (t1, t2) = topMakePair()
+`;
+      const result = extractFromSource('C.kt', src);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const owner = (name: string) => {
+        const u = result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'calls' && r.referenceName === name
+        );
+        const n = u ? byId.get(u.fromNodeId) : undefined;
+        return n ? `${n.kind}:${n.name}` : undefined;
+      };
+      expect(owner('initCall')).toBe('class:C');
+      expect(owner('makePair')).toBe('class:C');
+      expect(owner('topMakePair')).toBe('namespace:p');
+    });
   });
 });
 
@@ -2066,6 +3473,43 @@ use Closure;
       expect(names).toContain('Illuminate\\Support\\Str');
       expect(names).toContain('Closure');
     });
+
+    it('should extract include/require (+_once) static paths as imports (#660)', () => {
+      const code = `<?php
+require_once("lib.php");
+include 'other.php';
+require 'r.php';
+include_once("io.php");
+`;
+      const result = extractFromSource('page.php', code);
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('lib.php');
+      expect(names).toContain('other.php');
+      expect(names).toContain('r.php');
+      expect(names).toContain('io.php');
+    });
+
+    it('should skip dynamic include/require with no static path (#660)', () => {
+      const code = `<?php
+require_once(__DIR__ . '/dyn.php');
+include $file;
+include "tpl/{$name}.php";
+`;
+      const result = extractFromSource('page.php', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import');
+      expect(imports).toHaveLength(0);
+    });
+
+    it('should extract include alongside namespace use without interference (#660)', () => {
+      const code = `<?php
+use App\\Service\\Mailer;
+require_once("bootstrap.php");
+`;
+      const result = extractFromSource('page.php', code);
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('App\\Service\\Mailer');
+      expect(names).toContain('bootstrap.php');
+    });
   });
 
   describe('Ruby imports', () => {
@@ -2185,6 +3629,1503 @@ end
       const authMethod = result.nodes.find((n) => n.name === 'authenticate');
       expect(authMethod).toBeDefined();
       expect(authMethod?.qualifiedName).toBe('Discourse::Auth::AuthProvider::authenticate');
+    });
+  });
+
+  describe('PHP return type capture (#608)', () => {
+    it('captures self/static factory returns as the `self` marker; primitives as undefined', () => {
+      const code = `<?php
+class ApiClient {
+    public static function for(string $c): self { return new self; }
+    public static function make(): static { return new static; }
+    public function send(array $p): array { return []; }
+}`;
+      const result = extractFromSource('ApiClient.php', code);
+      expect(result.nodes.find((n) => n.name === 'for' && n.kind === 'method')?.returnType).toBe('self');
+      expect(result.nodes.find((n) => n.name === 'make' && n.kind === 'method')?.returnType).toBe('self');
+      // `array` is not a class to chain on → no return type recorded.
+      expect(result.nodes.find((n) => n.name === 'send' && n.kind === 'method')?.returnType).toBeUndefined();
+    });
+
+    it('captures a concrete return type as its short class name', () => {
+      const code = `<?php
+namespace App;
+class WidgetFactory { public static function make(): Widget { return new Widget(); } }`;
+      const result = extractFromSource('WidgetFactory.php', code);
+      expect(result.nodes.find((n) => n.name === 'make' && n.kind === 'method')?.returnType).toBe('Widget');
+    });
+  });
+
+  describe('C/C++ return type capture (#645)', () => {
+    it('captures the normalized return type of a C++ method/function', () => {
+      const code = `
+struct Widget { void draw(); };
+class Factory { public: static Widget create(); };
+Widget Factory::create() { return Widget(); }
+void doNothing() {}
+`;
+      const result = extractFromSource('f.cpp', code);
+
+      const create = result.nodes.find(
+        (n) => n.name === 'create' && (n.kind === 'method' || n.kind === 'function')
+      );
+      expect(create?.returnType).toBe('Widget');
+
+      // A `void` return records no type, so resolution never tries to resolve a
+      // method on it.
+      const doNothing = result.nodes.find((n) => n.name === 'doNothing');
+      expect(doNothing).toBeDefined();
+      expect(doNothing?.returnType).toBeUndefined();
+    });
+
+    it('unwraps a smart-pointer return type to its pointee', () => {
+      const code = `
+#include <memory>
+struct Widget {};
+std::unique_ptr<Widget> makeWidget() { return nullptr; }
+`;
+      const result = extractFromSource('f.cpp', code);
+
+      const make = result.nodes.find((n) => n.name === 'makeWidget');
+      expect(make?.returnType).toBe('Widget');
+    });
+  });
+
+  describe('C++ macro-prefixed class/struct misparse (#946 → recovered in #1061)', () => {
+    // An export/visibility macro before the class name (`class MACRO Name :
+    // public Base { … }`) makes tree-sitter read `class MACRO` as an elaborated
+    // type and the whole declaration as a function_definition named after the
+    // class — a phantom `function` that polluted callers/impact/blast-radius.
+    // #946 dropped that phantom; #1061's preParse (`blankCppExportMacros`) now
+    // blanks the ALL-CAPS macro before parsing, so the class parses normally and
+    // is *recovered* — node, members, and base edge all present — not just
+    // de-phantomed. The #946 drop survives as the fallback for any residual
+    // misparse the blanking doesn't catch.
+    it('recovers a macro-annotated class that inherits (no phantom, real class + base edge)', () => {
+      const code = `#pragma once
+#define MAPCORE_EXPORT __attribute__((visibility("default")))
+
+class DataProvider {
+public:
+    virtual bool Request(void* param) = 0;
+};
+
+class MAPCORE_EXPORT LocalDataProvider : public DataProvider
+{
+public:
+    LocalDataProvider(int dataType);
+    virtual bool Request(void* param) override;
+};
+`;
+      // A header rich in C++ (class / public: / virtual) detects as C++ — the
+      // issue's exact scenario (a `.h` file). Guard it so a detection regression
+      // can't make this test pass for the wrong reason.
+      expect(detectLanguage('provider.h', code)).toBe('cpp');
+      const result = extractFromSource('provider.h', code);
+
+      // The misparse used to surface as `function | LocalDataProvider` spanning
+      // the whole class body — a false caller in the graph. It's gone.
+      expect(
+        result.nodes.find((n) => n.name === 'LocalDataProvider' && n.kind === 'function')
+      ).toBeUndefined();
+
+      // …and the class is now recovered (was dropped under #946), with its
+      // `extends DataProvider` edge — the whole point of #1061.
+      expect(result.nodes.find((n) => n.name === 'LocalDataProvider')?.kind).toBe('class');
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'DataProvider'
+        )
+      ).toBeTruthy();
+
+      // The sibling class without the macro is unaffected — still a class.
+      expect(result.nodes.find((n) => n.name === 'DataProvider')?.kind).toBe('class');
+    });
+
+    it('recovers the struct variant too, without disturbing a genuine class', () => {
+      const code = `
+#define API __declspec(dllexport)
+struct API Widget : public Base { int x; };
+class Plain : public Base { public: int y; };
+`;
+      const result = extractFromSource('widget.cpp', code);
+
+      // `struct MACRO Name : Base { … }` misparses the same way — no phantom
+      // function, and the struct is recovered with its base edge.
+      expect(
+        result.nodes.find((n) => n.name === 'Widget' && n.kind === 'function')
+      ).toBeUndefined();
+      expect(result.nodes.find((n) => n.name === 'Widget')?.kind).toBe('struct');
+
+      // A normal class with a base clause and no macro is untouched.
+      expect(result.nodes.find((n) => n.name === 'Plain')?.kind).toBe('class');
+      const exts = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'extends')
+        .map((r) => r.referenceName);
+      expect(exts.filter((n) => n === 'Base').length).toBe(2); // Widget + Plain both extend Base
+    });
+  });
+
+  describe('C++ export-macro class recovery (#1061)', () => {
+    // Unreal-Engine style: `class MYGAME_API UMyComponent : public UActorComponent`.
+    // The leading `*_API` macro alone (base clause or not) triggers the #946
+    // misparse and dropped the class — breaking subclass / type-hierarchy /
+    // inheritance-impact queries for effectively every gameplay class in a UE
+    // project. blankCppExportMacros recovers them.
+    it('recovers UE *_API classes and the inheritance edge (the issue repro)', () => {
+      const code = `class ENGINE_API UActorComponent { };
+class MYGAME_API UMyComponent : public UActorComponent { };
+`;
+      const result = extractFromSource('ue.cpp', code);
+      const classes = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+      expect(classes).toContain('UActorComponent'); // macro, no base — also was dropped
+      expect(classes).toContain('UMyComponent');
+      expect(result.nodes.find((n) => n.kind === 'function')).toBeUndefined(); // no phantom
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'UActorComponent'
+        )
+      ).toBeTruthy();
+    });
+
+    it('blankCppExportMacros blanks only the header macro, offset-preserving', () => {
+      // Blanking replaces the macro with equal-length spaces, so the output is
+      // byte-for-byte the same length and identical *except* the macro is gone —
+      // every downstream line/column stays exact.
+      const check = (inp: string, macro: string, rest: string) => {
+        const out = blankCppExportMacros(inp);
+        expect(out.length).toBe(inp.length); // every byte offset preserved
+        expect(out).not.toContain(macro); // the macro token is blanked
+        expect(out.replace(/ +/g, ' ')).toBe(rest); // nothing else changed
+      };
+      // Generalizes across the export-macro space: UE _API, Qt/Boost _EXPORT,
+      // LLVM _ABI, bare API.
+      check(
+        'class MYGAME_API UMyComponent : public UActorComponent { };',
+        'MYGAME_API',
+        'class UMyComponent : public UActorComponent { };'
+      );
+      check('struct MAPCORE_EXPORT W : B {}', 'MAPCORE_EXPORT', 'struct W : B {}');
+      check('class LLVM_ABI Foo {}', 'LLVM_ABI', 'class Foo {}');
+    });
+
+    it('does NOT blank an all-caps class NAME or an elaborated-type var decl', () => {
+      // The name itself being ALL-CAPS (with or without a base) must survive —
+      // the macro is only the token *before* the name, gated on a `: { ` def.
+      for (const c of [
+        'class FOO { int x; };',
+        'class FOO : public Base { int x; };',
+        'struct BAR : public Base { int y; };',
+        'enum class COLOR { Red, Green };',
+        // elaborated-type variable declarations end in ; = [ — never : {
+        'struct FOO bar;',
+        'class FOO obj = make();',
+        'struct FOO arr[10];',
+        // a *_API macro used as an ordinary value elsewhere
+        'int x = SOME_API; void f() { use(MYMODULE_API); }',
+      ]) {
+        expect(blankCppExportMacros(c)).toBe(c);
+      }
+      // And the all-caps-named class keeps its base edge through real extraction.
+      const result = extractFromSource('ctrl.cpp', 'class FOO : public Base { int x; };');
+      expect(result.nodes.find((n) => n.name === 'FOO')?.kind).toBe('class');
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'Base'
+        )
+      ).toBeTruthy();
+    });
+  });
+
+  describe('Metal shader extraction (#1121)', () => {
+    // Metal Shading Language (≈ C++14) parses with the C++ grammar. MSL puts
+    // `[[attribute]]` annotations AFTER the declarator — a position
+    // tree-sitter-cpp misparses: a struct field with a trailing attribute
+    // emitted a spurious `extends` ref from the struct to the field's own type.
+    // blankMetalAttributes (preParse, `.metal`-gated) blanks them so extraction
+    // matches plain C++.
+    const METAL = `#include <metal_stdlib>
+using namespace metal;
+
+struct VertexIn {
+    float3 position [[attribute(0)]];
+    float2 texCoord [[attribute(1)]];
+};
+
+struct VertexOut {
+    float4 position [[position]];
+    float2 texCoord;
+};
+
+struct Uniforms {
+    float4x4 modelViewProjection;
+};
+
+static float4 applyGamma(float4 color) {
+    return pow(color, float4(1.0 / 2.2));
+}
+
+vertex VertexOut vertexShader(VertexIn in [[stage_in]],
+                              constant Uniforms &uniforms [[buffer(0)]]) {
+    VertexOut out;
+    out.position = uniforms.modelViewProjection * float4(in.position, 1.0);
+    out.texCoord = in.texCoord;
+    return out;
+}
+
+fragment float4 fragmentShader(VertexOut in [[stage_in]],
+                               texture2d<float> colorTexture [[texture(0)]],
+                               sampler textureSampler [[sampler(0)]]) {
+    float4 color = colorTexture.sample(textureSampler, in.texCoord);
+    return applyGamma(color);
+}
+
+kernel void computeBlur(texture2d<float, access::read> inTexture [[texture(0)]],
+                        texture2d<float, access::write> outTexture [[texture(1)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    float4 color = inTexture.read(gid);
+    outTexture.write(color, gid);
+}
+`;
+
+    it('extracts vertex/fragment/kernel functions, structs, and calls from a .metal file', () => {
+      const result = extractFromSource('Shaders.metal', METAL);
+      expect(result.errors).toHaveLength(0);
+
+      const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(functions).toEqual(
+        expect.arrayContaining(['applyGamma', 'vertexShader', 'fragmentShader', 'computeBlur'])
+      );
+      const structs = result.nodes.filter((n) => n.kind === 'struct').map((n) => n.name);
+      expect(structs).toEqual(expect.arrayContaining(['VertexIn', 'VertexOut', 'Uniforms']));
+      expect(result.nodes.find((n) => n.kind === 'import')?.name).toBe('metal_stdlib');
+
+      // Attribute blanking is offset-preserving, so positions stay exact.
+      const vertexFn = result.nodes.find((n) => n.name === 'vertexShader')!;
+      expect(vertexFn.startLine).toBe(22);
+
+      // The shader call graph connects: fragmentShader → applyGamma.
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'calls' && r.referenceName === 'applyGamma'
+        )
+      ).toBeTruthy();
+
+      // The regression the blanking fixes: field attributes (`float3 position
+      // [[attribute(0)]];`) misparsed into `extends` refs from the struct to the
+      // field's type — a wrong inheritance edge whenever the repo defines that
+      // type itself (simd typedefs in a shared ShaderTypes.h are common).
+      expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'extends')).toHaveLength(0);
+    });
+
+    it('blankMetalAttributes blanks every attribute form, offset-preserving', () => {
+      const inp = [
+        'float4 position [[position]];',
+        'constant Uniforms &u [[buffer(0)]]',
+        'float2 uv [[user(locn0)]];',
+        'device float *out [[buffer(0), raster_order_group(0)]]',
+      ].join('\n');
+      const out = blankMetalAttributes(inp);
+      expect(out.length).toBe(inp.length); // every byte offset preserved
+      expect(out).not.toContain('[[');
+      // Nothing but the attributes changed: collapsing the blank runs gives the
+      // plain declarations back, newlines untouched.
+      expect(out.split('\n').map((l) => l.replace(/ +/g, ' ').trimEnd())).toEqual([
+        'float4 position ;',
+        'constant Uniforms &u',
+        'float2 uv ;',
+        'device float *out',
+      ]);
+    });
+
+    it('blankMetalAttributes never touches non-attribute [[ sequences', () => {
+      for (const c of [
+        'auto x = arr[[]{ return 0; }()];', // lambda in subscript — the only other [[ in C++-family code
+        'int y = a[b[i]];', // nested subscript
+        'int z = 1;', // no [[ at all — early-return path
+      ]) {
+        expect(blankMetalAttributes(c)).toBe(c);
+      }
+    });
+  });
+
+  describe('C++ in-body reflection-macro annotations do not collapse the class (UE)', () => {
+    // Unreal reflection markup — `UPROPERTY(...)`, `UFUNCTION(...)`,
+    // `GENERATED_BODY()`, `UE_DEPRECATED_*(...)`, `DECLARE_DELEGATE_*(...)` — are
+    // no-semicolon macro CALLS decorating members. tree-sitter doesn't know they
+    // are macros, so each drops into error recovery; in a heavily-reflected class
+    // the errors accumulate until the enclosing class_specifier can't close and
+    // the whole class (its base clause and members) collapses into an ERROR node
+    // and disappears from the graph. blankCppAnnotationMacroCalls strips them,
+    // offset-preserving, so the class parses normally.
+    it('recovers a heavily-reflected class with multiple inheritance + members', () => {
+      const code = `UCLASS(MinimalAPI)
+class UMyMovement : public UPawnMovementComponent, public IRVOAvoidanceInterface, public INetworkPredictionInterface
+{
+\tGENERATED_BODY()
+public:
+\tUE_DEPRECATED_FORGAME(5.0, "Deprecated; note the commas, and (parens) inside the string")
+\tUPROPERTY(Category="Move", EditAnywhere, BlueprintReadWrite, meta=(ClampMin="0", UIMin="0"))
+\tfloat MaxWalkSpeed;
+
+\tUFUNCTION(BlueprintCallable, Category="Move")
+\tfloat ComputeSpeed() const { return MaxWalkSpeed * 2.0f; }
+};
+`;
+      const result = extractFromSource('movement.cpp', code);
+      const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'UMyMovement');
+      expect(cls).toBeTruthy();
+      // The class body parses, so its inline method definition is extracted too —
+      // proof the class_specifier closed instead of collapsing into an ERROR node.
+      expect(result.nodes.some((n) => n.name === 'ComputeSpeed')).toBe(true);
+      // The base clause survives (inheritance queries keep working).
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'UPawnMovementComponent'
+        )
+      ).toBeTruthy();
+    });
+
+    it('strips line-leading no-semicolon ALL-CAPS calls, offset-preserving', () => {
+      const inp = `\tUPROPERTY(EditAnywhere, meta=(ClampMin="0"))\n\tfloat X;\n`;
+      const out = blankCppAnnotationMacroCalls(inp);
+      expect(out.length).toBe(inp.length); // every byte offset preserved
+      expect(out).not.toContain('UPROPERTY');
+      expect(out).toContain('float X;');
+      // A macro whose args carry commas/parens inside a string still balances.
+      const inp2 = `UE_DEPRECATED_FORGAME(5.0, "a, b (c)")\nUPROPERTY(Foo)\nfloat Y;\n`;
+      const out2 = blankCppAnnotationMacroCalls(inp2);
+      expect(out2.length).toBe(inp2.length);
+      expect(out2).not.toContain('UE_DEPRECATED_FORGAME');
+      expect(out2).not.toContain('UPROPERTY');
+      expect(out2).toContain('float Y;');
+    });
+
+    it('does NOT blank expression / condition / statement / init-list macro uses', () => {
+      for (const c of [
+        'void f() {\n\tif (CHECK_FLAG(x)) { g(); }\n}',   // condition — not line-leading
+        'void f() {\n\tLOG_MESSAGE("hi");\n}',             // statement call — trailing ;
+        'C::C()\n\t: MEMBER_A(1)\n\t, MEMBER_B(2)\n{}',    // init-list — comma / not line-leading
+        'C::C() :\n\tMEMBER_A(1),\n\tMEMBER_B(2)\n{}',     // init-list wrapped — trailing , / {
+        'auto y =\n\tMAKE_THING(a) + 1;',                  // line-leading but an expression fragment
+      ]) {
+        expect(blankCppAnnotationMacroCalls(c)).toBe(c);
+      }
+    });
+  });
+
+  describe('C++ member/method-level export macros do not orphan declarations (UE)', () => {
+    // The `*_API` visibility macro doesn't only prefix the class header — it
+    // prefixes almost every exported member/method of a big UE class
+    // (`ENGINE_API virtual void Tick(…)`, `static ENGINE_API void Foo(…)`).
+    // blankCppExportMacros only recovers the class-HEADER form; without blanking
+    // the member form, tree-sitter reads `MACRO <ret> <name>(` as an extra type
+    // token and each declaration drops into error recovery.
+    it('recovers a class + base + members when members are *_API-prefixed', () => {
+      const code = `class ENGINE_API AActor : public UObject
+{
+\tGENERATED_BODY()
+public:
+\tENGINE_API virtual void Tick(float DeltaSeconds);
+\tstatic ENGINE_API void AddReferencedObjects(int32 Count);
+\tENGINE_API float GetLifeSpan() const { return LifeSpan; }
+};
+`;
+      const result = extractFromSource('actor.cpp', code);
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'AActor')).toBe(true);
+      // The inline definition (its body prefixed by ENGINE_API) is extracted —
+      // proof the class_specifier closed instead of collapsing into an ERROR.
+      expect(result.nodes.some((n) => n.name === 'GetLifeSpan')).toBe(true);
+      // The base clause survives (inheritance queries keep working).
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'UObject'
+        )
+      ).toBeTruthy();
+    });
+
+    it('blanks only the suffix macro before a declaration, offset-preserving', () => {
+      const inp = `ENGINE_API void Tick();\nstatic MYMOD_EXPORT int32 X;\nLLVM_ABI bool Y();\n`;
+      const out = blankCppApiPrefixMacros(inp);
+      expect(out.length).toBe(inp.length); // every byte offset preserved
+      expect(out).not.toContain('ENGINE_API');
+      expect(out).not.toContain('MYMOD_EXPORT');
+      expect(out).not.toContain('LLVM_ABI');
+      expect(out).toContain('void Tick();');
+      expect(out).toContain('int32 X;');
+      expect(out).toContain('bool Y();');
+      expect(out).toMatch(/static\s+int32 X;/); // `static` kept, only the macro blanked
+    });
+
+    it('does NOT blank an *_API token used as a value or in non-declaration position', () => {
+      for (const c of [
+        'int x = SOME_API;',              // rvalue — trailing ;
+        'if (mode == FOO_API) { g(); }',  // comparison — trailing )
+        'return DEFAULT_API, other;',     // comma operand
+        'auto v = NS_API::Make();',       // qualified name — trailing ::
+        'x = A_API + B_API;',             // operands of + / trailing ;
+      ]) {
+        expect(blankCppApiPrefixMacros(c)).toBe(c);
+      }
+    });
+
+    it('leaves a genuine _API-suffixed word alone when it is itself the name', () => {
+      // A longer word merely CONTAINING _API (not ending in it) must not match.
+      const inp = 'FOO_APIENTRY handler;';
+      expect(blankCppApiPrefixMacros(inp)).toBe(inp);
+    });
+  });
+
+  describe('C++ mid-line UE annotation macros do not collapse the enum/class (UE)', () => {
+    // UMETA / UPARAM / UE_DEPRECATED can sit MID-LINE (not line-leading), where
+    // blankCppAnnotationMacroCalls structurally can't reach them: an enum value's
+    // `UMETA(...)`, or a deprecation tag wedged into a class-scope `using`
+    // (`using X UE_DEPRECATED(5.5, "…") = …;`) — which alone collapsed UWorld in
+    // World.h. blankCppInlineAnnotationMacros strips them, offset-preserving.
+    it('recovers a class whose in-body using-alias carries a mid-line UE_DEPRECATED', () => {
+      const code = `class ENGINE_API UWorld : public UObject
+{
+\tGENERATED_BODY()
+public:
+\tusing FOnNetTickEvent UE_DEPRECATED(5.5, "use TMulticastDelegate<void(float)>") = TMulticastDelegate<void(float)>;
+\tENGINE_API float GetTimeSeconds() const { return TimeSeconds; }
+};
+`;
+      const result = extractFromSource('world.cpp', code);
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'UWorld')).toBe(true);
+      // The member after the poison using-alias is reached — the class closed.
+      expect(result.nodes.some((n) => n.name === 'GetTimeSeconds')).toBe(true);
+      expect(
+        result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'UObject'
+        )
+      ).toBeTruthy();
+    });
+
+    it('blanks mid-line UMETA/UPARAM/UE_DEPRECATED with balanced parens, offset-preserving', () => {
+      const inp = `enum class EMode : uint8 {\n\tWalk UMETA(DisplayName="Walk (fast), safe"),\n\tRun\n};\n`;
+      const out = blankCppInlineAnnotationMacros(inp);
+      expect(out.length).toBe(inp.length);
+      expect(out).not.toContain('UMETA');
+      expect(out).toContain('Walk');
+      expect(out).toContain('Run');
+      const inp2 = `void F(UPARAM(ref) int& x) {}\n`;
+      const out2 = blankCppInlineAnnotationMacros(inp2);
+      expect(out2.length).toBe(inp2.length);
+      expect(out2).not.toContain('UPARAM');
+      expect(out2).toContain('int& x');
+    });
+
+    it('does NOT touch source without those UE-only macro names', () => {
+      const c = 'enum class E { A, B };\nvoid metadata(int meta) { return; }\n';
+      expect(blankCppInlineAnnotationMacros(c)).toBe(c);
+    });
+  });
+
+  describe('C++ dense Unreal-Engine header regression (#1160/#1158)', () => {
+    // Regression guard for the three UE blank passes together, on a HEAVILY
+    // reflected class in the shape that broke real engine headers
+    // (`CharacterMovementComponent.h` carries ~240 in-body reflection macros).
+    // On the real headers the accumulated tree-sitter errors collapse the whole
+    // `class_specifier` into an ERROR node and the class itself vanishes; that
+    // full collapse is emergent from real-header content we can't ship here
+    // (Unreal's source is EULA-licensed), so this reproduces the *recoverable*
+    // signal it leaves: with the blank passes reverted, tree-sitter drops every
+    // one of these decorated members and the `UMETA` enum into error recovery,
+    // so the assertions below flip from pass to fail. Verified against the
+    // pre-fix build: `Compute0`, the last member, and `EDenseMode` are all
+    // absent before the fix and present after — reverting any of
+    // blankCppAnnotationMacroCalls / blankCppApiPrefixMacros /
+    // blankCppInlineAnnotationMacros regresses at least one of them.
+    const N = 120; // 120 UPROPERTY + 120 UFUNCTION = ~240 in-body macros
+    function denseReflectedHeader(): string {
+      let members = '';
+      for (let i = 0; i < N; i++) {
+        // line-leading UPROPERTY with nested meta=(...) (blankCppAnnotationMacroCalls)
+        members += `\tUPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Move", meta=(ClampMin="0.0", EditCondition="bOn${i}", AllowedClasses="/Script/Engine.Texture"))\n\tTSubclassOf<AActor> Prop${i};\n`;
+        // line-leading UFUNCTION + member-level ENGINE_API + UPARAM(ref) param
+        // (all three passes) on an inline definition (has a body → is a node)
+        members += `\tUFUNCTION(BlueprintCallable, Category="Move", meta=(DisplayName="Compute ${i}"))\n\tENGINE_API float Compute${i}(UPARAM(ref) float& In) const { return In * ${i}.0f; }\n`;
+      }
+      return `UCLASS(MinimalAPI, Blueprintable)
+class ENGINE_API UDenseMovement : public UPawnMovementComponent, public IRVOAvoidanceInterface, public INetworkPredictionInterface
+{
+\tGENERATED_BODY()
+public:
+\tDECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnMoved, float, Speed, FVector, Loc);
+\tusing FLegacyTick UE_DEPRECATED(5.5, "use TDelegate<void(float)>") = TMulticastDelegate<void(float)>;
+${members}};
+
+UENUM(BlueprintType)
+enum class EDenseMode : uint8
+{
+\tWalking UMETA(DisplayName="Walk (fast), safe"),
+\tFlying  UMETA(DisplayName="Fly"),
+\tCustom  UMETA(Hidden),
+};
+`;
+    }
+
+    it('recovers a ~240-macro reflected class, its base clause, and every decorated member', () => {
+      const result = extractFromSource('DenseMovement.h', denseReflectedHeader());
+      // The class and its whole multiple-inheritance base clause survive.
+      expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'UDenseMovement')).toBe(true);
+      for (const base of ['UPawnMovementComponent', 'IRVOAvoidanceInterface', 'INetworkPredictionInterface']) {
+        expect(
+          result.unresolvedReferences.find((r) => r.referenceKind === 'extends' && r.referenceName === base)
+        ).toBeTruthy();
+      }
+      // The real guard: the decorated inline members parse instead of being lost
+      // to error recovery — the first, a middle, and the LAST (proof the whole
+      // dense body closed, not just the head).
+      expect(result.nodes.some((n) => n.name === 'Compute0')).toBe(true);
+      expect(result.nodes.some((n) => n.name === 'Compute60')).toBe(true);
+      expect(result.nodes.some((n) => n.name === `Compute${N - 1}`)).toBe(true);
+    });
+
+    it('recovers a UENUM whose values carry mid-line UMETA', () => {
+      const result = extractFromSource('DenseMovement.h', denseReflectedHeader());
+      // A mid-line UMETA drops the enum into error recovery pre-fix;
+      // blankCppInlineAnnotationMacros restores it.
+      expect(result.nodes.some((n) => n.kind === 'enum' && n.name === 'EDenseMode')).toBe(true);
+    });
+  });
+
+  describe('C/C++ single-argument function macros (#1373)', () => {
+    it.each(['c', 'cpp'] as const)('recovers single-argument function macros in %s (#1373)', (language) => {
+      const code = '#define NATIVE_FN(name) int name(void)\n'
+        + 'NATIVE_FN(get_version) { return helper(); }\n'
+        + 'int use_it(void) { return get_version(); }\n';
+      const result = extractFromSource(`main.${language}`, code, language);
+      const functions = result.nodes.filter((n) => n.kind === 'function');
+      expect(functions.map((n) => n.name)).toEqual(['get_version', 'use_it']);
+      expect(functions[0]).toMatchObject({ qualifiedName: 'get_version', startLine: 2, endLine: 2, startColumn: 0 });
+      expect(result.unresolvedReferences).toEqual(expect.arrayContaining([
+        expect.objectContaining({ fromNodeId: functions[0].id, referenceName: 'helper', referenceKind: 'calls' }),
+        expect.objectContaining({ fromNodeId: functions[1].id, referenceName: 'get_version', referenceKind: 'calls' }),
+      ]));
+    });
+
+    it.each(['c', 'cpp'] as const)('does not guess single-argument macro names in %s (#1373)', (language) => {
+      for (const prefix of [
+        '',
+        '// #define NATIVE_FN(name) int name(void)\n',
+        '#define NATIVE_FN(name) int fixed(name)\n',
+        '#define NATIVE_FN(name) int test_ ## name(void)\n',
+        '#define NATIVE_FN(name) register_test(name)\n',
+        '#define NATIVE_FN(name) typedef int name(void)\n',
+        '#define NATIVE_FN(name) int name(void)\n#define NATIVE_FN int\n',
+        '#define NATIVE_FN(name) int name(void)\n#ifdef OTHER\n#undef NATIVE_FN\n#endif\n',
+        '#define NATIVE_FN(name) int name(void)\n#undef NATIVE_FN\n',
+        '#define NATIVE_FN(name) int name(void)\n#define NATIVE_FN(name) int fixed(name)\n',
+      ]) {
+        const result = extractFromSource(`main.${language}`, prefix + 'NATIVE_FN(candidate) { return 1; }\n', language);
+        expect(result.nodes.filter((n) => n.kind === 'function').map((n) => n.name)).not.toContain('candidate');
+      }
+      const alternate = extractFromSource(`main.${language}`, [
+        '#ifdef OTHER', '#define NATIVE_FN(name) int name(void)', '#else',
+        'NATIVE_FN(candidate) { return 1; }', '#endif', '',
+      ].join('\n'), language);
+      expect(alternate.nodes.filter((n) => n.kind === 'function').map((n) => n.name)).not.toContain('candidate');
+      const ordinary = extractFromSource(`main.${language}`, 'int (parenthesized)(void) { return 1; }\n', language);
+      expect(ordinary.nodes.find((n) => n.kind === 'function')?.name).toBe('(parenthesized)');
+      if (language === 'c') {
+        const knr = extractFromSource('knr.c', 'int old_style(arg) int arg; { return arg; }\n', 'c');
+        expect(knr.nodes.find((n) => n.kind === 'function')?.name).toBe('old_style');
+      }
+    });
+
+  });
+
+  describe('CUDA extraction (#387)', () => {
+    // CUDA parses with the C++ grammar. Three CUDA-only shapes misparse:
+    // execution-space specifiers (`__global__ void f(…)`) shunt the real return
+    // type into an ERROR node, `__shared__ float tile[256]` mangles the declared
+    // name to `float`, and — the critical one — `k<<<grid, block>>>(args)` lexes
+    // as shift operators around an empty-named template so NO call_expression
+    // (and therefore no host→kernel call edge) exists. blankCudaConstructs
+    // (preParse, `.cu`/`.cuh`-gated) blanks all three so extraction matches
+    // plain C++.
+    const CUDA = `#include <cuda_runtime.h>
+#include "kernels.cuh"
+
+__constant__ float d_scale[16];
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__global__ void scale_kernel(float* out, const float* __restrict__ in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float tile[256];
+    if (i < n) {
+        tile[threadIdx.x] = in[i];
+        __syncthreads();
+        out[i] = warp_reduce_sum(tile[threadIdx.x]) * d_scale[0];
+    }
+}
+
+__global__ void __launch_bounds__(256, 4) bounded_kernel(float* data, int n) {
+    if (blockIdx.x * blockDim.x + threadIdx.x < n) data[0] *= 2.0f;
+}
+
+template <typename T, int BLOCK>
+__global__ void templated_kernel(T* data, int n) {
+    if (blockIdx.x * BLOCK + threadIdx.x < n) data[0] += T(1);
+}
+
+class GpuBuffer {
+public:
+    explicit GpuBuffer(size_t n) { cudaMalloc(&ptr_, n * sizeof(float)); }
+    ~GpuBuffer() { cudaFree(ptr_); }
+private:
+    float* ptr_ = nullptr;
+};
+
+void launch_scale(float* out, const float* in, int n, cudaStream_t stream) {
+    dim3 block(256);
+    dim3 grid((n + block.x - 1) / block.x);
+    scale_kernel<<<grid, block, 0, stream>>>(out, in, n);
+    bounded_kernel<<<grid,
+                     block>>>(out, n);
+    templated_kernel<float, 256><<<grid, block>>>(out, n);
+}
+`;
+
+    it('extracts kernels, device functions, and host→kernel launch calls from a .cu file', () => {
+      const result = extractFromSource('kernels/scan.cu', CUDA);
+      expect(result.errors).toHaveLength(0);
+
+      const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(functions).toEqual(
+        expect.arrayContaining([
+          'warp_reduce_sum',
+          'scale_kernel',
+          'bounded_kernel',
+          'templated_kernel',
+          'launch_scale',
+        ])
+      );
+      expect(result.nodes.filter((n) => n.kind === 'class').map((n) => n.name)).toContain('GpuBuffer');
+      expect(result.nodes.find((n) => n.kind === 'import')?.name).toBe('cuda_runtime.h');
+
+      // No misparse artifacts: pre-blank, `__shared__ float tile[256]` parsed
+      // with `float` as the declared name. (Top-level C++ variables aren't
+      // extracted as nodes — matching plain-C++ behavior is the target.)
+      expect(result.nodes.map((n) => n.name)).not.toContain('float');
+
+      // Blanking is offset-preserving, so positions stay exact.
+      expect(result.nodes.find((n) => n.name === 'scale_kernel')!.startLine).toBe(13);
+
+      // THE point of CUDA support: every `<<<…>>>` launch form — plain,
+      // launch-bounds, multi-line config, and templated — emits a `calls`
+      // reference, so the host→kernel edge exists in the graph. Pre-blank,
+      // the chevrons lexed as shifts and none of these existed.
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      // The templated launch is normalized to the bare kernel name (template
+      // args stripped at extraction, like base-class extends refs — #1043), so
+      // it resolves to the kernel the template was defined as.
+      expect(calls).toEqual(
+        expect.arrayContaining([
+          'scale_kernel',
+          'bounded_kernel',
+          'templated_kernel',
+          'warp_reduce_sum',
+        ])
+      );
+    });
+
+    it('blankCudaConstructs blanks every CUDA form, offset- and newline-preserving', () => {
+      const inp = [
+        '__global__ void __launch_bounds__(256, 4) step(float* p) {',
+        '    __shared__ float tile[32];',
+        '}',
+        '__host__ __device__ int both() { return 0; }',
+        'void run(float* p, int n) {',
+        '    step<<<grid,',
+        '           block, 0, stream>>>(p);',
+        '}',
+      ].join('\n');
+      const out = blankCudaConstructs(inp);
+      expect(out.length).toBe(inp.length); // every byte offset preserved
+      expect(out.split('\n').length).toBe(inp.split('\n').length); // newlines survive the multi-line launch config
+      expect(out).not.toMatch(/__global__|__launch_bounds__|__shared__|__host__|__device__|<<<|>>>/);
+      // Collapsing blank runs gives plain C++ back.
+      expect(out.split('\n').map((l) => l.replace(/ +/g, ' ').trimEnd())).toEqual([
+        ' void step(float* p) {',
+        ' float tile[32];',
+        '}',
+        ' int both() { return 0; }',
+        'void run(float* p, int n) {',
+        ' step',
+        ' (p);',
+        '}',
+      ]);
+    });
+
+    it('blankCudaConstructs never touches non-CUDA chevrons or identifiers', () => {
+      for (const c of [
+        'std::cout << "a" << b << c;', // shift chains — never three consecutive <
+        'auto x = f(a >> 3, b >> 3);', // right shifts
+        'std::vector<std::vector<std::vector<int>>> deep;', // template >>> closer with no <<< opener
+        'printf("<<<unterminated");', // <<< in a string with no >>> anywhere
+        'int __restrict__like = 1;', // dunder-ish identifier not in the specifier list
+        'int z = 1;', // nothing CUDA at all — early-return path
+      ]) {
+        expect(blankCudaConstructs(c)).toBe(c);
+      }
+      // A stray `<<<` (committed merge-conflict marker) must not blank the code
+      // between markers. Two independent guards: statements between markers
+      // carry `;` (excluded from the span)…
+      const conflict = [
+        '<<<<<<< HEAD',
+        'int a = compute(1);',
+        '=======',
+        'int a = compute(2);',
+        '>>>>>>> feature-branch',
+      ].join('\n');
+      expect(blankCudaConstructs(conflict)).toBe(conflict);
+      // …and a `;`-free region still fails the brace-balance check (the `{`s
+      // opened between the markers never close before the `>>>`).
+      const semicolonFree = [
+        '<<<<<<< HEAD',
+        'void foo() {',
+        '=======',
+        'void bar() {',
+        '>>>>>>> feature-branch',
+      ].join('\n');
+      expect(blankCudaConstructs(semicolonFree)).toBe(semicolonFree);
+    });
+
+    it('blanks brace-initialized launch configs (`dim3{…}`), balanced-only', () => {
+      const inp = 'run_it<<<dim3{1, 2, 1}, dim3{256, 1, 1}, 0, stream>>>(data, n);';
+      const out = blankCudaConstructs(inp);
+      expect(out.length).toBe(inp.length);
+      expect(out.replace(/ +/g, ' ')).toBe('run_it (data, n);');
+    });
+
+    it('recovers the real kernel name from a macro-definition idiom, gtest/pybind untouched', () => {
+      const code = `#define DEFINE_MY_FWD_KERNEL(kernelName, ...) \\
+template<typename Traits, __VA_ARGS__> \\
+__global__ void kernelName(const Params params)
+
+DEFINE_MY_FWD_KERNEL(fwd_kernel, bool Is_causal, int kBlockM) {
+    do_work(params);
+}
+
+TEST_F(MyFixture, HandlesEmptyInput) {
+    check(1);
+}
+`;
+      const result = extractFromSource('kernels/impl.cu', code);
+      const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      // The macro invocation's first argument is the defined name.
+      expect(functions).toContain('fwd_kernel');
+      expect(functions).not.toContain('DEFINE_MY_FWD_KERNEL');
+      // gtest's TEST_F(Fixture, Name) has TWO lone identifiers — ambiguous, so
+      // it keeps the macro name rather than guessing.
+      expect(functions).toContain('TEST_F');
+      expect(functions).not.toContain('MyFixture');
+    });
+
+    it('links launches through a local function pointer to the real kernel(s)', () => {
+      // The flash-attention launch-template shape end-to-end: a macro-defined
+      // kernel + `auto kernel = &fn<…>` + branch reassignment + launch through
+      // the local. The call refs must name the real kernels, not `kernel`.
+      const code = `template <typename T, bool Flag>
+__global__ void fwd_kernel(T* data, int n) {
+    if (blockIdx.x * blockDim.x + threadIdx.x < n) data[0] += T(1);
+}
+
+template <typename T>
+__global__ void fwd_splitkv_kernel(T* data, int n) {
+    if (blockIdx.x * blockDim.x + threadIdx.x < n) data[0] += T(2);
+}
+
+template <typename T>
+void run_fwd(T* data, int n, cudaStream_t stream) {
+    auto kernel = &fwd_kernel<T, true>;
+    if (n % 2 == 0) {
+        kernel = &fwd_kernel<T, false>;
+    } else if (n % 3 == 0) {
+        kernel = &fwd_splitkv_kernel<T>;
+    }
+    kernel<<<(n + 255) / 256, 256, 0, stream>>>(data, n);
+}
+`;
+      const result = extractFromSource('kernels/launch.cu', code);
+      expect(result.errors).toHaveLength(0);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      // Every DISTINCT branch target recorded once — the two fwd_kernel<…>
+      // instantiations strip to one target, the splitkv branch adds a second.
+      // The local's name never leaks as a callee.
+      expect(calls.filter((c) => c === 'fwd_kernel')).toHaveLength(1);
+      expect(calls.filter((c) => c === 'fwd_splitkv_kernel')).toHaveLength(1);
+      expect(calls).not.toContain('kernel');
+    });
+
+    it('CUDA blanking is gated by extension or content — plain C++ shift/template chevrons are untouched', () => {
+      const cpp = `#include <vector>
+int shift_it(int a, int b) { return a << b << 1; }
+std::vector<std::vector<std::vector<int>>> matrix() { return {}; }
+`;
+      const result = extractFromSource('math.cpp', cpp);
+      expect(result.errors).toHaveLength(0);
+      const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(functions).toEqual(expect.arrayContaining(['shift_it', 'matrix']));
+    });
+
+    it('CUDA in extension-less headers is caught by content: launch templates in .h connect host→kernel', () => {
+      // Much real CUDA lives in .h: cutlass launches most of its kernels from
+      // headers, flash-attention's launch templates are .h, llm.c keeps device
+      // helpers in C-detected .h. `looksLikeCudaSource` content-gates the same
+      // blank there — no CUDA marker is valid C++ anywhere, so this can't
+      // affect a genuinely-plain C++ header.
+      const header = `#pragma once
+#include <cuda_runtime.h>
+
+template <typename T>
+__global__ void fill_kernel(T* out, T value, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = value;
+}
+
+template <typename T>
+void launch_fill(T* out, T value, int n, cudaStream_t stream) {
+    fill_kernel<T><<<(n + 255) / 256, 256, 0, stream>>>(out, value, n);
+}
+`;
+      const result = extractFromSource('include/fill_launch_template.h', header);
+      expect(result.errors).toHaveLength(0);
+      const functions = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(functions).toEqual(expect.arrayContaining(['fill_kernel', 'launch_fill']));
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('fill_kernel');
+    });
+  });
+
+  describe('C++ namespace qualifiedName prefixing', () => {
+    // C++ namespaces previously left no trace in qualifiedNames, so a
+    // namespace-qualified call (`flash::compute(...)`) could never match its
+    // definition — every `ns::fn()` call site was a permanently dead edge.
+    // The namespace name now prefixes contained symbols' qualifiedNames
+    // (prefix-only: no namespace node is minted — `namespace cutlass {` opens
+    // in thousands of files and a node per block would crowd search, #1093).
+    it('prefixes contained symbols and handles nesting; anonymous stays bare', () => {
+      const code = `namespace flash {
+namespace detail {
+void helper() {}
+}
+void compute_attn(int x) { detail::helper(); }
+class Softmax {
+public:
+    void rescale() {}
+};
+}
+namespace {
+void file_local() {}
+}
+void global_fn() { flash::compute_attn(1); }
+`;
+      const result = extractFromSource('dispatch.cpp', code);
+      expect(result.errors).toHaveLength(0);
+      const byName = new Map(result.nodes.map((n) => [n.name, n]));
+      expect(byName.get('compute_attn')?.qualifiedName).toBe('flash::compute_attn');
+      expect(byName.get('helper')?.qualifiedName).toBe('flash::detail::helper');
+      expect(byName.get('Softmax')?.qualifiedName).toBe('flash::Softmax');
+      // Class scope still stacks under the namespace prefix.
+      expect(byName.get('rescale')?.qualifiedName).toBe('flash::Softmax::rescale');
+      // Anonymous namespace contents and true globals stay bare.
+      expect(byName.get('file_local')?.qualifiedName).toBe('file_local');
+      expect(byName.get('global_fn')?.qualifiedName).toBe('global_fn');
+      // The qualified call refs are emitted as spelled.
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toEqual(expect.arrayContaining(['flash::compute_attn', 'detail::helper']));
+    });
+
+    it('C++17 nested namespace form prefixes as written', () => {
+      const code = `namespace a::b {
+int f() { return 1; }
+}
+`;
+      const result = extractFromSource('nested.cpp', code);
+      expect(result.nodes.find((n) => n.name === 'f')?.qualifiedName).toBe('a::b::f');
+    });
+
+    // Out-of-line member definitions take their qualifiedName from the
+    // declarator's receiver (`ManifestStartup::Apply`), which is spelled
+    // RELATIVE to the enclosing namespace — the namespace prefix must compose
+    // in, or the method's qualifiedName diverges from its own class node's
+    // and `ns::Class::Method(...)` call sites never resolve (#1291).
+    it('out-of-line method definitions inside a namespace carry the namespace prefix', () => {
+      const code = `namespace simulator {
+class ManifestStartup {
+public:
+    struct Input { int x; };
+    struct Output { int y; };
+    static Output Apply(const Input& input);
+};
+ManifestStartup::Output ManifestStartup::Apply(const Input& input) { return {}; }
+}
+`;
+      const result = extractFromSource('manifest_startup.cpp', code);
+      const apply = result.nodes.filter((n) => n.name === 'Apply');
+      // The out-of-line definition's QN matches the class node's prefix.
+      expect(apply.map((n) => n.qualifiedName)).toContain('simulator::ManifestStartup::Apply');
+      expect(result.nodes.find((n) => n.kind === 'class')?.qualifiedName).toBe(
+        'simulator::ManifestStartup'
+      );
+    });
+
+    it('a receiver that re-spells the namespace path is not double-prefixed', () => {
+      const code = `namespace sim {
+class M { public: static void f(); static void g(); };
+void sim::M::f() {}
+void M::g() {}
+}
+void sim::M::f2() {}
+`;
+      const result = extractFromSource('m.cpp', code);
+      const qns = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+      expect(qns).toContain('sim::M::f'); // fully re-spelled inside the namespace
+      expect(qns).toContain('sim::M::g'); // relative form
+      expect(qns).toContain('sim::M::f2'); // global scope, spelled absolute
+      expect(qns.find((q) => q?.includes('sim::sim'))).toBeUndefined();
+    });
+  });
+
+  describe('C++ forward declarations do not mint phantom class nodes (#1093)', () => {
+    // `class Foo;` parses as a bodiless class_specifier. Repeated across headers,
+    // each forward decl minted a phantom bodiless `class` node that crowded out —
+    // and could be picked as the blast-radius representative over — the single
+    // real definition. Bodiless struct/enum specifiers were already skipped;
+    // classes now are too, but ONLY for C/C++ (opt-in flag), never for languages
+    // where a bodiless class is a complete definition.
+    it('keeps only the real definition, dropping repeated forward decls', () => {
+      const code = `
+class APXCharacter;   // forward decl (header 1)
+class APXCharacter;   // forward decl (header 2)
+friend class APXCharacter;   // elaborated / friend forward reference
+
+class APXCharacter {  // the one real definition
+  int hp;
+  void takeDamage(int amount) { hp -= amount; }
+};
+`;
+      const result = extractFromSource('character.cpp', code);
+      const classes = result.nodes.filter(
+        (n) => n.kind === 'class' && n.name === 'APXCharacter'
+      );
+      // Exactly one class node, and it's the definition (carries the member).
+      expect(classes).toHaveLength(1);
+      expect(classes[0].startLine).toBe(6);
+      expect(
+        result.nodes.some((n) => n.kind === 'method' && n.name === 'takeDamage')
+      ).toBe(true);
+    });
+
+    it('elaborated type references in declarations create no phantom class', () => {
+      // `class Foo obj;` is a variable declaration using an elaborated type, not
+      // a class definition — it must not mint a `Foo` class node.
+      const result = extractFromSource('use.cpp', 'class Foo;\nvoid f() { class Foo *p = nullptr; (void)p; }\n');
+      expect(result.nodes.filter((n) => n.kind === 'class' && n.name === 'Foo')).toHaveLength(0);
+    });
+
+    it('does NOT affect languages where a bodiless class is complete', () => {
+      // Kotlin `class Empty` and Scala `trait`/`case object`/`class` with no body
+      // are complete definitions — the C/C++-only skip must leave them indexed.
+      const kt = extractFromSource('Empty.kt', 'class Empty\nclass Full { val x = 1 }\n');
+      const ktClasses = kt.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+      expect(ktClasses).toContain('Empty');
+      expect(ktClasses).toContain('Full');
+
+      const scala = extractFromSource('M.scala', 'trait Marker\ncase object Red\nclass Foo\n');
+      const scalaNames = scala.nodes
+        .filter((n) => ['class', 'trait', 'interface', 'module'].includes(n.kind))
+        .map((n) => n.name);
+      expect(scalaNames).toEqual(expect.arrayContaining(['Marker', 'Red', 'Foo']));
+    });
+  });
+
+  describe('C++ reference-return method/function names (#1093 follow-up)', () => {
+    // An inline method/function returning a reference parses with a
+    // `reference_declarator` wrapping the `function_declarator`. That wrapper
+    // wasn't unwrapped (only `pointer_declarator` was), so the name captured the
+    // whole declarator — `const int& getRef() const {…}` became the method named
+    // "& getRef() const" instead of "getRef", polluting search and callers. Very
+    // common in Unreal Engine headers (`const FGameplayTagContainer& GetActiveTags() const`).
+    const namesOf = (code: string) =>
+      extractFromSource('r.cpp', code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+
+    it('names an inline reference-returning method by its identifier, not the declarator', () => {
+      const names = namesOf('class C {\npublic:\n  const int& getRef() const { return x; }\n  int& mutRef() { return x; }\n  int x;\n};');
+      expect(names).toContain('getRef');
+      expect(names).toContain('mutRef');
+      // No name leaks the reference sigil or the parameter/qualifier tail.
+      expect(names.some((n) => /[&()]/.test(n))).toBe(false);
+    });
+
+    it('handles rvalue-reference returns and reference-returning free functions', () => {
+      expect(namesOf('class C { int&& take() { return 1; } };')).toContain('take');
+      expect(namesOf('const int& globalRef() { static int x; return x; }')).toContain('globalRef');
+    });
+
+    it('leaves pointer, value, and out-of-line reference returns unchanged (controls)', () => {
+      expect(namesOf('class C { int* getPtr() { return &x; } int x; };')).toContain('getPtr');
+      expect(namesOf('class C { int getVal() const { return x; } int x; };')).toContain('getVal');
+      // Out-of-line `T& C::f()` already resolves via the qualified-name hook.
+      expect(namesOf('const int& C::getRef() const { return x; }')).toContain('getRef');
+    });
+  });
+
+  describe('C++ user-defined conversion operator names (#1093 follow-up)', () => {
+    // A conversion operator's declarator is an `operator_cast` (target type +
+    // `() const` tail). It was named with the whole declarator —
+    // `operator EALSMovementState() const` — so it didn't match the symbolic-
+    // overload style (`operator+`) and carried parameter noise. It's now named
+    // `operator <type>`. Common in Unreal Engine enum-wrapper structs.
+    const namesOf = (code: string) =>
+      extractFromSource('o.cpp', code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+
+    it('names a conversion operator as "operator <type>", not the full declarator', () => {
+      const names = namesOf('struct S {\n  operator int() const { return 1; }\n  operator bool() { return true; }\n  int x;\n};');
+      expect(names).toContain('operator int');
+      expect(names).toContain('operator bool');
+      expect(names.some((n) => n.includes('(') || n.includes('const'))).toBe(false);
+    });
+
+    it('handles a user-type conversion operator', () => {
+      expect(
+        namesOf('struct FALSMovementState {\n  operator EALSMovementState() const { return State; }\n  EALSMovementState State;\n};')
+      ).toContain('operator EALSMovementState');
+    });
+
+    it('leaves symbolic operator overloads unchanged (control)', () => {
+      const names = namesOf('struct S {\n  S operator+(const S& o) const { return o; }\n  int& operator[](int i) { return x; }\n  int x;\n};');
+      expect(names).toContain('operator+');
+      expect(names).toContain('operator[]'); // reference-returning subscript, name still clean
+    });
+  });
+
+  describe('C++ explicit operator-call refs (#1247)', () => {
+    // tree-sitter-cpp can't parse an operator_name in field position:
+    // `a.operator+(b)` yields `call_expression(function: identifier «a»,
+    // ERROR(operator_name), argument_list)` instead of a field_expression
+    // callee, so the emitted ref was just the receiver (`a`) and the call never
+    // resolved. The extractor recovers the operator_name from the ERROR child
+    // and emits `<receiver>.operator+` like any other member call.
+    const HEADER = 'struct V {\n  V operator+(const V& o) const;\n  V operator[](int i) const;\n  V operator()(int i) const;\n  bool operator==(const V& o) const;\n  int get() const;\n};\n';
+    const callRefsOf = (body: string) =>
+      extractFromSource('op.cpp', HEADER + body)
+        .unresolvedReferences.filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+
+    it('recovers receiver.operator+ from the explicit call form', () => {
+      expect(callRefsOf('V f(const V& a, const V& b) { return a.operator+(b); }\n')).toContain('a.operator+');
+    });
+
+    it('recovers pointer receivers (p->operator+ → p.operator+)', () => {
+      expect(callRefsOf('V f(const V* p, const V& b) { return p->operator+(b); }\n')).toContain('p.operator+');
+    });
+
+    it('recovers subscript, call, and comparison operator forms', () => {
+      const refs = callRefsOf(
+        'V f1(const V& a) { return a.operator[](3); }\n' +
+        'V f2(V& a) { return a.operator()(1); }\n' +
+        'bool f3(const V& a, const V& b) { return a.operator==(b); }\n'
+      );
+      expect(refs).toContain('a.operator[]');
+      expect(refs).toContain('a.operator()');
+      expect(refs).toContain('a.operator==');
+    });
+
+    it('normalizes spaced call-site operator names to the compact definition form', () => {
+      // nlohmann/json calls `it.operator * ()` / `other.operator < (*this)`
+      // while defining `operator*` / `operator<` compact.
+      const refs = callRefsOf(
+        'bool f(const V& a, const V& b) { return a.operator == (b); }\n' +
+        'V g(const V& a) { return a.operator [] (3); }\n'
+      );
+      expect(refs).toContain('a.operator==');
+      expect(refs).toContain('a.operator[]');
+    });
+
+    it('drops the ref for a complex receiver instead of guessing (no wrong edge)', () => {
+      // `object->operator[](val)` through a member chain ending in a call —
+      // the receiver type isn't inferable and a bare `operator[]` ref would
+      // let exact-name matching guess among unrelated operators.
+      const refs = callRefsOf(
+        'struct W { V* obj(); };\n' +
+        'V f(W& w, const V& b) { return w.obj()->operator+(b); }\n'
+      );
+      expect(refs.some((r) => r.includes('operator+'))).toBe(false);
+      expect(refs).toContain('w.obj'); // the inner call itself still refs normally
+    });
+
+    it('emits the bare operator name for a this-> receiver', () => {
+      const refs = extractFromSource(
+        'op.cpp',
+        'struct V {\n  V operator+(const V& o) const;\n  V twice() const { return this->operator+(*this); }\n};\n'
+      ).unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(refs).toContain('operator+');
+      expect(refs.some((r) => r.includes('this'))).toBe(false);
+    });
+
+    it('leaves plain member calls unchanged (control)', () => {
+      expect(callRefsOf('int f(const V& a) { return a.get(); }\n')).toContain('a.get');
+    });
+  });
+
+  describe('C++ macro-prefixed function names (#1093 follow-up)', () => {
+    // An unknown inline-specifier macro before the return type
+    // (`FORCEINLINE FString GetName(…)`) threw tree-sitter into error recovery:
+    // the macro became the return type and — for a non-primitive return — the
+    // return type was glued onto the name (`"FString GetName"`), so the function
+    // was unfindable by name and its callers didn't link. `blankCppInlineMacros`
+    // blanks the known UE inline macros before parsing (offset-preserving), the
+    // same recover-don't-drop approach as the macro-annotated-class fix. Pervasive
+    // in Unreal Engine (`FORCEINLINE`).
+    const infoOf = (code: string) =>
+      extractFromSource('m.cpp', code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => ({ name: n.name, ret: n.returnType }));
+
+    it('recovers the real name AND return type of a FORCEINLINE function', () => {
+      expect(infoOf('static FORCEINLINE FString GetName(int V) { return H(V); }')).toEqual([
+        { name: 'GetName', ret: 'FString' },
+      ]);
+    });
+
+    it('handles the templated UE helper shape (GetEnumerationToString)', () => {
+      const names = infoOf(
+        'template <typename E> static FORCEINLINE FString GetEnumerationToString(const E V) { return H(V); }'
+      ).map((x) => x.name);
+      expect(names).toContain('GetEnumerationToString');
+    });
+
+    it('handles FORCENOINLINE / FORCEINLINE_DEBUGGABLE, methods, void, and reference returns', () => {
+      expect(infoOf('FORCENOINLINE FString A(int V){return H(V);}').map((x) => x.name)).toContain('A');
+      expect(infoOf('FORCEINLINE_DEBUGGABLE FString B(int V){return H(V);}').map((x) => x.name)).toContain('B');
+      expect(infoOf('struct S { FORCEINLINE FString GetName(int V) { return H(V); } };').map((x) => x.name)).toContain('GetName');
+      expect(infoOf('static FORCEINLINE void DoThing(int V) { H(V); }').map((x) => x.name)).toContain('DoThing');
+      expect(infoOf('static FORCEINLINE const FString& GetRef(int V) { return H(V); }').map((x) => x.name)).toContain('GetRef');
+    });
+
+    it('handles common third-party inline macros (pugixml, Godot, Boost, generic)', () => {
+      // pugixml: PUGI__FN before the return type; PUGIXML_FUNCTION (linkage)
+      // between the return type and the name — both recovered.
+      expect(infoOf('PUGI__FN void* default_allocate(size_t n) { return H(n); }').map((x) => x.name)).toContain('default_allocate');
+      expect(infoOf('PUGI__FN_NO_INLINE bool strequal(const char_t* a) { return H(a); }').map((x) => x.name)).toContain('strequal');
+      expect(infoOf('std::string PUGIXML_FUNCTION as_utf8(const wchar_t* s) { return H(s); }').map((x) => x.name)).toContain('as_utf8');
+      // Godot / Boost / generic inline hints
+      expect(infoOf('_FORCE_INLINE_ String get_name() const { return H(); }').map((x) => x.name)).toContain('get_name');
+      expect(infoOf('_ALWAYS_INLINE_ Vector2 get_pos() { return H(); }').map((x) => x.name)).toContain('get_pos');
+      expect(infoOf('BOOST_FORCEINLINE result_type call() { return H(); }').map((x) => x.name)).toContain('call');
+      expect(infoOf('ALWAYS_INLINE MyType compute() { return H(); }').map((x) => x.name)).toContain('compute');
+    });
+
+    it('leaves ordinary functions and real all-caps return types untouched (controls)', () => {
+      expect(infoOf('FString GetName(int V) { return H(V); }')).toEqual([{ name: 'GetName', ret: 'FString' }]);
+      // A real all-caps type that is NOT a listed inline macro stays the return type.
+      expect(infoOf('HRESULT DoIt(int V) { return H(V); }')).toEqual([{ name: 'DoIt', ret: 'HRESULT' }]);
+    });
+
+    it('blankCppInlineMacros preserves offsets and only touches specifier-position macros', () => {
+      // Blanked with equal-length spaces (byte offsets preserved).
+      expect(blankCppInlineMacros('FORCEINLINE FString F()')).toBe('            FString F()');
+      expect(blankCppInlineMacros('FORCEINLINE FString F()')).toHaveLength('FORCEINLINE FString F()'.length);
+      // Not in specifier position → untouched: string literals, expressions,
+      // longer word (`FORCEINLINE_COUNT`), and the fast path.
+      expect(blankCppInlineMacros('const char* s = "FORCEINLINE";')).toBe('const char* s = "FORCEINLINE";');
+      expect(blankCppInlineMacros('x = FORCEINLINE + 1;')).toBe('x = FORCEINLINE + 1;');
+      expect(blankCppInlineMacros('int FORCEINLINE_COUNT = 3;')).toBe('int FORCEINLINE_COUNT = 3;');
+      expect(blankCppInlineMacros('no macros here')).toBe('no macros here');
+    });
+  });
+
+  describe('C++ universal macro-mangled name recovery', () => {
+    // Curated pre-parse blanking can't list every library's inline macro, so a
+    // post-parse salvage recovers the real function name from ANY leftover
+    // `MACRO Ret name(…)` mangle — no list needed. It only ever touches an
+    // already-mangled name, so it can't corrupt a clean one.
+    const namesOf = (code: string, file = 's.cpp') =>
+      extractFromSource(file, code).nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+
+    it('recovers the name from a completely unknown macro (no list entry)', () => {
+      expect(namesOf('WEBKIT_EXPORT WTFString computeThing(int x) { return H(x); }')).toContain('computeThing');
+      expect(namesOf('SOMELIB_INLINE MyResult doWork(int x) { return H(x); }')).toContain('doWork');
+      expect(namesOf('MZ_FORCEINLINE char_t* to_str(double v) { return H(v); }')).toContain('to_str');
+    });
+
+    it('recoverMangledCppName only touches already-mangled names, with guards', () => {
+      // Recovered:
+      expect(recoverMangledCppName('WTFString computeThing')).toBe('computeThing');
+      expect(recoverMangledCppName('char_t* to_str(double v)')).toBe('to_str');
+      expect(recoverMangledCppName('unspecified_bool_type() const')).toBe('unspecified_bool_type');
+      // Left unchanged — clean names, operators, destructors, the `Ret (name)`
+      // idiom, and non-identifier tails:
+      expect(recoverMangledCppName('computeThing')).toBe('computeThing');
+      expect(recoverMangledCppName('operator EALSMovementState')).toBe('operator EALSMovementState');
+      expect(recoverMangledCppName('~Widget')).toBe('~Widget');
+      expect(recoverMangledCppName('bool (likely)')).toBe('bool (likely)');
+      expect(recoverMangledCppName('void (free)')).toBe('void (free)');
+      expect(recoverMangledCppName('QDockWidget *')).toBe('QDockWidget *');
+    });
+
+    it('does not disturb clean C++ names or non-C++ (Kotlin backtick) names', () => {
+      expect(namesOf('int foo(int x) { return x; }')).toEqual(['foo']);
+      // Kotlin backtick identifiers legitimately contain spaces; the salvage is
+      // C/C++-only, so they are untouched.
+      const kt = extractFromSource('T.kt', 'class T {\n  fun `decode simple cert`() { }\n}').nodes
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .map((n) => n.name);
+      expect(kt).toContain('`decode simple cert`');
+    });
+
+    it('curated list now also covers Qt / Folly / Abseil / LLVM / V8 / Eigen / rapidjson (full recovery)', () => {
+      const info = (c: string) =>
+        extractFromSource('x.cpp', c).nodes
+          .filter((n) => n.kind === 'method' || n.kind === 'function')
+          .map((n) => ({ name: n.name, ret: n.returnType }));
+      expect(info('FOLLY_ALWAYS_INLINE Str f(int x) { return H(x); }')).toEqual([{ name: 'f', ret: 'Str' }]);
+      expect(namesOf('Q_INVOKABLE void onClicked() { H(); }')).toContain('onClicked');
+      expect(namesOf('ABSL_ATTRIBUTE_ALWAYS_INLINE int hash(int x) { return H(x); }')).toContain('hash');
+      expect(namesOf('EIGEN_STRONG_INLINE Scalar dot(const V& v) { return H(v); }')).toContain('dot');
+      expect(namesOf('V8_INLINE MaybeLocal Get(int i) { return H(i); }')).toContain('Get');
+      expect(namesOf('RAPIDJSON_FORCEINLINE bool Parse(const char* s) { return H(s); }')).toContain('Parse');
+    });
+
+    it('curated list spans the broader ecosystem (Mozilla, GLM, Bullet, OpenCV, Skia, EASTL, protobuf, fmt, Windows conventions)', () => {
+      const info = (c: string) =>
+        extractFromSource('x.cpp', c).nodes
+          .filter((n) => n.kind === 'method' || n.kind === 'function')
+          .map((n) => ({ name: n.name, ret: n.returnType }));
+      expect(info('MOZ_ALWAYS_INLINE Value get(int i) { return H(i); }')).toEqual([{ name: 'get', ret: 'Value' }]);
+      expect(info('GLM_FUNC_QUALIFIER vec3 cross(const vec3& a) { return H(a); }')).toEqual([{ name: 'cross', ret: 'vec3' }]);
+      expect(info('SIMD_FORCE_INLINE btScalar dot(const btVector3& v) const { return H(v); }')).toEqual([{ name: 'dot', ret: 'btScalar' }]);
+      expect(info('CV_INLINE Mat clone() const { return H(); }')).toEqual([{ name: 'clone', ret: 'Mat' }]);
+      expect(namesOf('PROTOBUF_ALWAYS_INLINE int size() const { return H(); }')).toContain('size');
+      expect(namesOf('FMT_CONSTEXPR auto parse(int x) { return H(x); }')).toContain('parse');
+      expect(namesOf('SK_ALWAYS_INLINE SkScalar width() const { return H(); }')).toContain('width');
+      expect(namesOf('EA_FORCE_INLINE size_type size() const { return H(); }')).toContain('size');
+      // Windows calling-convention macros sit between return type and name; the
+      // macro is blanked so the real return type survives.
+      expect(info('HRESULT WINAPI CreateThing(int x) { return H(x); }')).toEqual([{ name: 'CreateThing', ret: 'HRESULT' }]);
+      expect(info('ULONG STDMETHODCALLTYPE AddRef() { return H(); }')).toEqual([{ name: 'AddRef', ret: 'ULONG' }]);
+    });
+  });
+
+  describe('C++ templated base-class inheritance (#1043)', () => {
+    // Inheriting from a template (`class D : public Base<int>`) recorded the base
+    // ref as the full instantiation `Base<int>`, which never name-matched the
+    // template indexed as the bare node `Base`. The `<…>` args are stripped so the
+    // `extends` reference matches.
+    it('strips template args from a templated base so the extends ref is the bare name', () => {
+      const code = `
+template<typename T> class Base {};
+template<typename D> class CRTPBase {};
+namespace ns { template<typename T> class Tpl {}; }
+class Plain {};
+
+class Widget : public Base<int> {};
+class App : public CRTPBase<App> {};
+class Q : public ns::Tpl<int> {};
+class Both : public Base<char>, public Plain {};
+`;
+      const extendsRefs = extractFromSource('f.cpp', code).unresolvedReferences.filter(
+        (r) => r.referenceKind === 'extends'
+      );
+      const names = extendsRefs.map((r) => r.referenceName);
+
+      // Templated bases carry the bare name, NOT the `<…>` instantiation.
+      expect(names).toContain('Base'); // from Base<int> / Base<char>
+      expect(names).toContain('CRTPBase'); // from CRTPBase<App> (CRTP)
+      expect(names).toContain('ns::Tpl'); // qualified head preserved, args dropped
+      expect(names).toContain('Plain'); // non-templated base unchanged
+      // No reference still carries angle brackets.
+      expect(names.find((n) => n.includes('<'))).toBeUndefined();
+    });
+
+    it('stripCppTemplateArgs removes balanced <…> at any depth and is a no-op without them', () => {
+      expect(stripCppTemplateArgs('Base<int>')).toBe('Base');
+      expect(stripCppTemplateArgs('ns::Tpl<int>')).toBe('ns::Tpl');
+      expect(stripCppTemplateArgs('ns::Tpl<Foo<int>>')).toBe('ns::Tpl'); // nested
+      expect(stripCppTemplateArgs('Outer<int>::Inner')).toBe('Outer::Inner'); // mid-name
+      expect(stripCppTemplateArgs('Base')).toBe('Base'); // no-op
+      expect(stripCppTemplateArgs('ns::Plain')).toBe('ns::Plain'); // no-op qualified
+    });
+  });
+
+  describe('C leading attribute macro before typedef return type (#1211)', () => {
+    // `SEC_ATTR UINT32 LostName(VOID)` — tree-sitter's C grammar reads the
+    // unknown macro as the type, the typedef'd return as the declarator, and
+    // stores the PARAMETER LIST as the function name ("(VOID)"). The
+    // structural pre-parse blank recovers the definition; the issue's whole
+    // isolation table is pinned here.
+    it("recovers the issue's full isolation table under their real names", () => {
+      const code = `#define SEC_ATTR __attribute__((section(".init")))
+typedef unsigned int UINT32;
+#define VOID void
+
+SEC_ATTR VOID   GoodName(VOID)  { }
+SEC_ATTR UINT32 LostName(VOID)  { return 0; }
+UINT32 NoAttr(void) { return 0; }
+SEC_ATTR int BuiltinRet(void) { return 0; }
+__attribute__((section(".init"))) UINT32 RawAttr(void) { return 0; }
+SEC_ATTR UINT32 OneNamedArg(UINT32 x) { return x; }
+SEC_ATTR UINT32* PtrRet(VOID) { return 0; }
+`;
+      const result = extractFromSource('attrs.c', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toEqual(
+        expect.arrayContaining([
+          'GoodName', 'LostName', 'NoAttr', 'BuiltinRet', 'RawAttr', 'OneNamedArg', 'PtrRet',
+        ])
+      );
+      // The bug shape: a parameter list stored as a name.
+      expect(fns.find((n) => n.includes('('))).toBeUndefined();
+    });
+
+    it('blankCLeadingAttrMacros only touches the MACRO-ret-name-( definition shape', () => {
+      // Blanked: the definition shape (offset-preserving).
+      expect(blankCLeadingAttrMacros('SEC_ATTR UINT32 f(void) {}')).toBe(
+        '         UINT32 f(void) {}'
+      );
+      // Untouched: a plain typedef'd return with ONE identifier before `(`.
+      expect(blankCLeadingAttrMacros('UINT32 helper(void) {}')).toBe('UINT32 helper(void) {}');
+      // Untouched: an ALL-CAPS function CALL at line start.
+      expect(blankCLeadingAttrMacros('MY_ASSERT(x);')).toBe('MY_ASSERT(x);');
+      // Untouched: #define lines (start with #, not line-leading CAPS).
+      const def = '#define SEC_ATTR __attribute__((section(".init")))';
+      expect(blankCLeadingAttrMacros(def)).toBe(def);
+      // Untouched: multi-word builtin returns (the grammar keeps the name there).
+      expect(blankCLeadingAttrMacros('SEC_ATTR unsigned int f(void) {}')).toBe(
+        'SEC_ATTR unsigned int f(void) {}'
+      );
+      // Untouched: mid-line uses.
+      expect(blankCLeadingAttrMacros('x = SEC_ATTR UINT32 y(z);')).toBe(
+        'x = SEC_ATTR UINT32 y(z);'
+      );
+    });
+  });
+
+  describe('C++ out-of-line template method receivers (#1286)', () => {
+    // `template<typename T> T Box<T>::get()` used to store qualified_name
+    // `Box<T>::get` — the `<T>` qualifier never matched the class node indexed
+    // as `Box`, and long multi-line parameter lists could push qualified_name
+    // past NAME_MAX. Inline definitions of the same method produce `Box::get`,
+    // so the out-of-line form must normalize to the identical name.
+    it('strips the template parameter list from the receiver qualifier', () => {
+      const code = `template <typename T>
+class Box {
+public:
+    T get() const;
+    void set(T v);
+private:
+    T value;
+};
+
+template <typename T> T Box<T>::get() const { return value; }
+template <typename T> void Box<T>::set(T v) { value = v; }
+`;
+      const result = extractFromSource('box.cpp', code);
+      expect(result.errors).toHaveLength(0);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const qns = methods.map((n) => n.qualifiedName).sort();
+      // Out-of-line definitions carry the SAME qualifier as the class node.
+      expect(qns).toContain('Box::get');
+      expect(qns).toContain('Box::set');
+      expect(qns.find((q) => q?.includes('<'))).toBeUndefined();
+      // Names themselves stay clean.
+      expect(methods.map((n) => n.name).sort()).toEqual(expect.arrayContaining(['get', 'set']));
+    });
+
+    it('multi-line template parameter lists cannot leak into qualified_name (NAME_MAX overflow shape)', () => {
+      // The ICU capi_helper.h shape: enormous multi-line parameter names made
+      // qualified_name 272 bytes (> NAME_MAX 255) including embedded newlines.
+      const code = `template <typename CType,
+          typename CPPType,
+          int32_t kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>
+class ApiHelper {
+public:
+    CPPType* validate();
+};
+
+template <typename CType,
+          typename CPPType,
+          int32_t kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>
+CPPType* ApiHelper<CType,
+                   CPPType,
+                   kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>::validate() {
+    return nullptr;
+}
+`;
+      const result = extractFromSource('capi_helper.h', code);
+      const validate = result.nodes.find((n) => n.kind === 'method' && n.name === 'validate' && n.qualifiedName?.includes('::'));
+      expect(validate).toBeDefined();
+      expect(validate!.qualifiedName).toBe('ApiHelper::validate');
+      expect(validate!.qualifiedName!.length).toBeLessThan(255);
+      expect(validate!.qualifiedName).not.toMatch(/[<>\n]/);
+    });
+  });
+
+  describe('C++ stack-allocation construction (#1035)', () => {
+    // `Calculator calc(0)` (direct-init) and `Widget w{1, 2}` (brace-init) carry
+    // the constructor args directly on the declarator — no call/new node — so
+    // they emitted no constructor reference, unlike heap `new Calculator(0)`. An
+    // `instantiates` ref to the constructed type is now emitted for both.
+    const instNames = (code: string) =>
+      extractFromSource('f.cpp', `void run() {\n${code}\n}`)
+        .unresolvedReferences.filter((r) => r.referenceKind === 'instantiates')
+        .map((r) => r.referenceName);
+
+    it('emits an instantiates ref for direct-init and brace-init', () => {
+      expect(instNames('Calculator calc(0);')).toEqual(['Calculator']);
+      expect(instNames('Widget w{1, 2};')).toEqual(['Widget']);
+    });
+
+    it('records constructor defaults and array element arities (#1839)', () => {
+      const result = extractFromSource('f.cpp', 'struct Widget { Widget(int x = 1); };\nvoid run() { Widget a[2]; Widget b[3]{{2}, {3}}; }');
+      expect(result.nodes.find((n) => n.kind === 'method')?.signature).toBe('(int x = 1);');
+      expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName))
+        .toEqual(['Widget::Widget/0', 'Widget::Widget/1', 'Widget::Widget/1', 'Widget::Widget/0']);
+    });
+
+    it('strips template args and namespace to the bare class name', () => {
+      // `std::vector<int> v(10)` → `vector`; `ns::Widget w(0)` → `Widget`.
+      expect(instNames('std::vector<int> v(10);')).toEqual(['vector']);
+      expect(instNames('ns::Widget w(0);')).toEqual(['Widget']);
+    });
+
+    it('does not emit for primitives, default construction, or the most-vexing parse', () => {
+      expect(instNames('int x(5);')).toEqual([]); // primitive direct-init
+      expect(instNames('int y{6};')).toEqual([]); // primitive brace-init
+      expect(instNames('auto z = make();')).toEqual([]); // auto + call (handled elsewhere)
+      expect(instNames('Calculator deferred;')).toEqual([]); // default construction, no args
+      expect(instNames('Calculator calc();')).toEqual([]); // function declaration (most-vexing parse)
+    });
+
+    it('emits a single instantiates ref for a multi-declarator statement', () => {
+      // `Calculator a(1), b(2);` shares one `type` field; both construct a
+      // Calculator, so one ref suffices (it dedups to one edge regardless).
+      expect(instNames('Calculator a(1), b(2);')).toEqual(['Calculator']);
     });
   });
 
@@ -2360,6 +5301,213 @@ import 'package:flutter/material.dart';
       const importNode = result.nodes.find((n) => n.kind === 'import');
       expect(importNode).toBeDefined();
       expect(importNode?.name).toBe('price');
+    });
+
+    /* Inside a {% liquid %} tag, each body line is a tag with no braces of
+       its own. Patterns anchored on `{%` miss these references. */
+    it('should extract render inside a {% liquid %} block', () => {
+      const code = [
+        '{% liquid',
+        '  assign heading = section.settings.title',
+        "  render 'card', title: heading",
+        '%}',
+      ].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('card');
+    });
+
+    it('should extract assign inside a {% liquid %} block', () => {
+      const code = ['{% liquid', '  assign heading = section.settings.title', '%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+      expect(vars).toContain('heading');
+    });
+
+    /* `{% capture name %}…{% endcapture %}` declares a variable as `assign`
+       does; only assigns were read (#2498). */
+    it.each([
+      ['{% capture captured %}Hello{% endcapture %}', 'captured', 1, 0],
+      ['{%- capture trimmed -%}Hi{%- endcapture -%}', 'trimmed', 1, 0],
+      ['{% capture tight-%}Hi{% endcapture %}', 'tight', 1, 0],
+      ["<p>{% capture 'single' %}Hi{% endcapture %}</p>", 'single', 1, 3],
+      ['{% capture "double" %}Hi{% endcapture %}', 'double', 1, 0],
+      ['{% liquid\n  capture bare\n    echo "Hi"\n  endcapture\n%}', 'bare', 2, 2],
+      ['{% liquid\r\n  capture crlf # a note\r\n  endcapture\r\n%}', 'crlf', 2, 2],
+      ["{%- liquid\n  capture 'quoted_line'\n  endcapture\n-%}", 'quoted_line', 2, 2],
+    ] as const)('reads a capture declaration from %j', (code, name, line, column) => {
+      const result = extractFromSource('sections/card.liquid', code);
+      const variables = result.nodes.filter((n) => n.kind === 'variable');
+      expect(variables.map((n) => [n.name, n.qualifiedName, n.startLine, n.startColumn]))
+        .toEqual([[name, `sections/card.liquid::${name}`, line, column]]);
+      const file = result.nodes.find((n) => n.kind === 'file')!;
+      expect(result.edges).toContainEqual({ source: file.id, target: variables[0]!.id, kind: 'contains' });
+    });
+
+    it('reads no capture from comments, raw regions, prose or a tag without a name', () => {
+      const code = [
+        '{% comment %}{% capture ghost %}x{% endcapture %}{% endcomment %}',
+        '{%- raw -%}{% capture ghost %}x{% endcapture %}{%- endraw -%}',
+        '{% # capture ghost %}',
+        '{% liquid', '  # capture ghost', '  comment', '  capture ghost', '  endcomment', '%}',
+        '{% capture %}x{% endcapture %}',
+        '<p>We capture ghost moments.</p>',
+        '{% assign text = "{% capture ghost %}" %}',
+      ].join('\n');
+      const result = extractFromSource('sections/card.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name)).toEqual(['text']);
+    });
+
+    it('never cuts a capture name short', () => {
+      // Liquid allows `-` and `.` in a name, which the assign rule doesn't read
+      // either; such a name gets no node rather than a wrong one.
+      const code = ['{% capture ghost-name %}x{% endcapture %}', '{% capture ghost.name %}x{% endcapture %}'].join('\n');
+      expect(extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable')).toEqual([]);
+    });
+
+    it('keeps an assign and captures of the same name on one line apart', () => {
+      const code = '{% assign title = 1 %}{% capture title %}one{% endcapture %}{% capture title %}two{% endcapture %}';
+      const variables = extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable');
+      expect(variables.map((n) => [n.name, n.startColumn]))
+        .toEqual([['title', 0], ['title', code.indexOf('{% capture')], ['title', code.lastIndexOf('{% capture')]]);
+      expect(new Set(variables.map((n) => n.id)).size).toBe(3);
+      // The assign keeps the id it had before captures were read.
+      expect(variables[0]!.id).toBe(generateNodeId('sections/card.liquid', 'variable', 'title', 1));
+    });
+
+    it('still reads the tags inside a capture', () => {
+      const code = "{% capture card_html %}{% render 'card' %}{% assign inner = 1 %}{% endcapture %}";
+      const result = extractFromSource('sections/product.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name).sort()).toEqual(['card_html', 'inner']);
+      expect(result.unresolvedReferences.map((r) => r.referenceName)).toEqual(['snippets/card.liquid']);
+    });
+
+    it('should extract section inside a {% liquid %} block', () => {
+      const code = ['{% liquid', "  section 'header'", '%}'].join('\n');
+      const result = extractFromSource('layout/theme.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('header');
+    });
+
+    it('should report the real line number for a tag inside a {% liquid %} block', () => {
+      const code = ['<div>', '{% liquid', '  assign x = 1', "  render 'card'", '%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const card = result.nodes.find((n) => n.kind === 'import' && n.name === 'card');
+      expect(card?.startLine).toBe(4);
+    });
+
+    it('should not count a tag twice when both spellings appear', () => {
+      const code = ["{% render 'card' %}", '{% liquid', "  render 'card'", '%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const cards = result.nodes.filter((n) => n.kind === 'import' && n.name === 'card');
+      expect(cards.length).toBe(2);
+      expect(new Set(cards.map((n) => n.startLine)).size).toBe(2);
+    });
+
+    it('should not read a bare `render` outside a {% liquid %} block as a tag', () => {
+      // Prose and filters mentioning the word must not become references.
+      const code = ['<p>We render the card below.</p>', "{{ product | render_as: 'card' }}"].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).not.toContain('card');
+    });
+
+    it('should handle whitespace control on the {% liquid %} tag itself', () => {
+      const code = ['{%- liquid', "  render 'card'", '-%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('card');
+    });
+
+    it('does not scan tag-like strings or inline comments twice', () => {
+      const code = [
+        `{% assign example = "{% render 'ghost'" %}`,
+        `{% # {% render 'ghost' %}`,
+        '{% liquid', `  assign example = "{% include 'ghost'"`,
+        "  # section 'ghost'", "  echo 'render ghost'", '%}',
+        "{% liquid render 'live' %}", "{% liquid include 'after' %}",
+      ].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'import').map((n) => [n.name, n.startLine, n.startColumn]))
+        .toEqual([['live', 8, 10], ['after', 9, 10]]);
+      expect(result.unresolvedReferences.map((r) => r.referenceName))
+        .toEqual(['snippets/live.liquid', 'snippets/after.liquid']);
+    });
+
+    it.each(['\n', '\r\n'])('preserves Liquid block positions with %j line endings', (newline) => {
+      const code = [
+        '<div>', '{%- liquid', "  assign heading = 'x'", "\tinclude 'legacy'",
+        "  render 'card'", "  section 'footer'", '-%}', "  {% render 'after' %}",
+      ].join(newline);
+      const result = extractFromSource('sections/featured.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'variable' || n.kind === 'import')
+        .map((n) => [n.name, n.startLine, n.startColumn, n.endColumn]).sort())
+        .toEqual([
+          ['after', 8, 2, 19], ['card', 5, 2, 15], ['footer', 6, 2, 18],
+          ['heading', 3, 2, 18], ['legacy', 4, 1, 17],
+        ]);
+      expect(result.unresolvedReferences.map((r) => [r.referenceName, r.line, r.column]).sort())
+        .toEqual([
+          ['sections/footer.liquid', 6, 2], ['snippets/after.liquid', 8, 2],
+          ['snippets/card.liquid', 5, 2], ['snippets/legacy.liquid', 4, 1],
+        ]);
+    });
+
+    it.each(['comment', 'raw'])('ignores %s regions in both tag spellings', (tag) => {
+      const code = [
+        `{%- ${tag} -%}`, "{% render 'ghost' %}", "{% include 'ghost' %}",
+        "{% section 'ghost' %}", '{% assign ghost = 1 %}',
+        '{% liquid', "  render 'ghost'", '%}', `{%- end${tag} -%}`,
+        '{% liquid', `  ${tag}`, "  render 'ghost'", "  include 'ghost'",
+        "  section 'ghost'", '  assign ghost = 1', `  end${tag}`,
+        "  # render 'ghost'", "  render 'live'", '%}', "{% include 'after' %}",
+      ].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+      expect(result.nodes.filter((n) => n.kind !== 'file').map((n) => n.name))
+        .toEqual(['live', 'live', 'after', 'after']);
+      expect(result.unresolvedReferences.map((r) => [r.referenceName, r.line]))
+        .toEqual([['snippets/live.liquid', 18], ['snippets/after.liquid', 20]]);
+    });
+
+    /* A layout renders a section group, the JSON file `sections/<group>.json`,
+       with the plural tag; only the singular one was read (#2494). */
+    it.each([
+      "{% sections 'header-group' %}",
+      '{%- sections "header-group" -%}',
+      "{% liquid\n  sections 'header-group'\n%}",
+    ])('reads a section group from %j', (code) => {
+      const result = extractFromSource('layout/theme.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'import').map((n) => n.name)).toEqual(['header-group']);
+      expect(result.unresolvedReferences.map((r) => r.referenceName)).toEqual(['sections/header-group.json']);
+    });
+
+    it('keeps a section and a section group of the same name apart', () => {
+      const result = extractFromSource('layout/theme.liquid', "{% section 'header' %}{% sections 'header' %}");
+      expect(result.unresolvedReferences.map((r) => [r.referenceName, r.line, r.column]))
+        .toEqual([['sections/header.liquid', 1, 0], ['sections/header.json', 1, 22]]);
+      expect(result.nodes.filter((n) => n.kind === 'component').map((n) => n.qualifiedName))
+        .toEqual(['layout/theme.liquid::section:header', 'layout/theme.liquid::sections:header']);
+      expect(new Set(result.nodes.map((n) => n.id)).size).toBe(result.nodes.length);
+    });
+
+    it.each(['comment', 'raw'])('indexes no schema written inside %s', (tag) => {
+      // An example schema in a comment is not the section's, and a lone
+      // opening tag in one must not swallow the real schema after it (#2494).
+      const code = [
+        `{% ${tag} %}`, '{% schema %}', '{"name": "Ghost"}', '{% endschema %}', `{% end${tag} %}`,
+        `{%- ${tag} -%}{% schema %}{%- end${tag} -%}`,
+        '{% schema %}', '{"name": "Live"}', '{% endschema %}',
+      ].join('\n');
+      const result = extractFromSource('sections/header.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'constant').map((n) => [n.name, n.startLine]))
+        .toEqual([['Live', 7]]);
     });
 
     it('should extract multiple imports', () => {
@@ -3009,6 +6157,89 @@ end`;
     expect(components.length).toBe(2);
   });
 
+  describe('component source ranges (#1350)', () => {
+    let tempDir: string;
+    let cg: CodeGraph | undefined;
+
+    beforeEach(() => {
+      tempDir = createTempDir();
+    });
+
+    afterEach(() => {
+      cg?.close();
+      cg = undefined;
+      cleanupTempDir(tempDir);
+    });
+
+    it.each(['dfm', 'fmx'])('persists complete nested %s bodies and retrieves event bindings', async (extension) => {
+      const source = `inherited Form1: TForm1
+  inline Frame1: TFrame
+    object Button1: TButton
+      Caption = 'Click'
+      Items.Strings = (
+        'First'
+        'Second')
+      Panels = <
+        item
+          Width = 100
+        end
+        item
+          Width = 200
+        end>
+      OnClick = Button1Click
+    end
+    OnEnter = FrameEnter
+  end
+  object Label1: TLabel
+    Caption = 'Sibling'
+  end
+end`;
+      const fileName = `Form1.${extension}`;
+      fs.writeFileSync(path.join(tempDir, fileName), source);
+      cg = CodeGraph.initSync(tempDir);
+      expect((await cg.indexAll()).filesIndexed).toBe(1);
+
+      const nodes = cg.getNodesInFile(fileName);
+      const components = nodes.filter((node) => node.kind === 'component');
+      expect(components.map(({ name, startLine, endLine, endColumn }) => ({
+        name, startLine, endLine, endColumn,
+      }))).toEqual(expect.arrayContaining([
+        { name: 'Form1', startLine: 1, endLine: 22, endColumn: 3 },
+        { name: 'Frame1', startLine: 2, endLine: 18, endColumn: 5 },
+        { name: 'Button1', startLine: 3, endLine: 16, endColumn: 7 },
+        { name: 'Label1', startLine: 19, endLine: 21, endColumn: 5 },
+      ]));
+      expect(components).toHaveLength(4);
+
+      const extracted = extractFromSource(fileName, source);
+      const file = extracted.nodes.find((node) => node.kind === 'file')!;
+      const form = components.find((node) => node.name === 'Form1')!;
+      const frame = components.find((node) => node.name === 'Frame1')!;
+      const button = components.find((node) => node.name === 'Button1')!;
+      const label = components.find((node) => node.name === 'Label1')!;
+      for (const [parent, child] of [[file, form], [form, frame], [frame, button], [form, label]]) {
+        expect(extracted.edges).toContainEqual({ source: parent!.id, target: child!.id, kind: 'contains' });
+      }
+      expect(extracted.unresolvedReferences).toEqual([
+        expect.objectContaining({ fromNodeId: button.id, referenceName: 'Button1Click' }),
+        expect.objectContaining({ fromNodeId: frame.id, referenceName: 'FrameEnter' }),
+      ]);
+      expect(file.endLine).toBe(22);
+
+      const { ToolHandler } = await import('../src/mcp/tools');
+      const handler = new ToolHandler(cg);
+      for (const [tool, args] of [
+        ['codegraph_node', { symbol: 'Button1', includeCode: true }],
+        ['codegraph_explore', { query: 'Button1' }],
+      ] as const) {
+        const result = await handler.execute(tool, args);
+        expect(result.isError).toBeUndefined();
+        expect(result.content[0]!.text).toContain("Caption = 'Click'");
+        expect(result.content[0]!.text).toContain('OnClick = Button1Click');
+      }
+    });
+  });
+
   describe('Full fixture: MainForm.dfm', () => {
     const code = `object frmMain: TfrmMain
   Left = 0
@@ -3090,6 +6321,1985 @@ end`;
         ])
       );
     });
+  });
+});
+
+describe('Kotlin Multiplatform expect/actual', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links expect declarations to platform actual implementations and surfaces them in impact', async () => {
+    const common = path.join(tempDir, 'src', 'commonMain');
+    const jvm = path.join(tempDir, 'src', 'jvmMain');
+    fs.mkdirSync(common, { recursive: true });
+    fs.mkdirSync(jvm, { recursive: true });
+
+    // common source set: expect declarations + a caller that uses them
+    fs.writeFileSync(
+      path.join(common, 'SystemProps.kt'),
+      `package demo.internal
+
+expect fun systemProp(name: String): String?
+
+expect class Platform {
+    fun describe(): String
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(common, 'Caller.kt'),
+      `package demo
+
+import demo.internal.systemProp
+import demo.internal.Platform
+
+fun useIt(): String {
+    val v = systemProp("os.name")
+    return Platform().describe() + v
+}
+`
+    );
+    // jvm source set: actual implementations
+    fs.writeFileSync(
+      path.join(jvm, 'SystemProps.kt'),
+      `package demo.internal
+
+actual fun systemProp(name: String): String? = System.getProperty(name)
+
+actual class Platform {
+    actual fun describe(): String = "JVM"
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // The expect/actual markers are captured onto the node's decorators.
+    const fns = cg.getNodesByKind('function');
+    const actualFn = fns.find(
+      (n) => n.name === 'systemProp' && n.decorators?.includes('actual')
+    );
+    const expectFn = fns.find(
+      (n) => n.name === 'systemProp' && n.decorators?.includes('expect')
+    );
+    expect(actualFn).toBeDefined();
+    expect(expectFn).toBeDefined();
+    expect(actualFn!.filePath).not.toBe(expectFn!.filePath);
+
+    // Editing the JVM actual must surface the common expect AND its caller —
+    // before the expect/actual bridge the actual had zero dependents.
+    const impact = cg.getImpactRadius(actualFn!.id, 3);
+    const impacted = [...impact.nodes.values()].map((n) => n.name);
+    expect(impacted).toContain('systemProp'); // the common expect
+    expect(impacted).toContain('useIt'); // the caller, reached transitively
+
+    // The bridging edge is a heuristic `calls` edge tagged by the synthesizer.
+    const bridge = impact.edges.find(
+      (e) =>
+        e.target === actualFn!.id &&
+        e.provenance === 'heuristic' &&
+        (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy ===
+          'kotlin-expect-actual'
+    );
+    expect(bridge).toBeDefined();
+    expect(bridge!.source).toBe(expectFn!.id);
+  });
+
+  it('links an expect class to an actual typealias (different node kinds)', async () => {
+    const common = path.join(tempDir, 'src', 'commonMain');
+    const jvm = path.join(tempDir, 'src', 'jvmMain');
+    fs.mkdirSync(common, { recursive: true });
+    fs.mkdirSync(jvm, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(common, 'Lock.kt'),
+      `package demo
+
+expect class Lock {
+    fun acquire()
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(jvm, 'Lock.kt'),
+      `package demo
+
+actual typealias Lock = java.util.concurrent.locks.ReentrantLock
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const aliasNode = cg
+      .getNodesByKind('type_alias')
+      .find((n) => n.name === 'Lock' && n.decorators?.includes('actual'));
+    expect(aliasNode).toBeDefined();
+
+    // The actual typealias is now a cross-file dependency target (linked from
+    // the expect class), so it participates in impact rather than being orphaned.
+    const impact = cg.getImpactRadius(aliasNode!.id, 3);
+    const bridge = impact.edges.find(
+      (e) =>
+        e.target === aliasNode!.id &&
+        (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy ===
+          'kotlin-expect-actual'
+    );
+    expect(bridge).toBeDefined();
+  });
+});
+
+describe('Scala cross-file dependencies', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links parameterized supertypes, type annotations, and implicit params across files', async () => {
+    const src = path.join(tempDir, 'src', 'main', 'scala', 'demo');
+    fs.mkdirSync(src, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(src, 'Semigroup.scala'),
+      `package demo
+
+trait Semigroup[A] {
+  def combine(x: A, y: A): A
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'Monoid.scala'),
+      `package demo
+
+trait Monoid[A] extends Semigroup[A] {
+  def empty: A
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'Instances.scala'),
+      `package demo
+
+object Instances {
+  implicit val intMonoid: Monoid[Int] = new Monoid[Int] {
+    def empty: Int = 0
+    def combine(x: Int, y: Int): Int = x + y
+  }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'Folding.scala'),
+      `package demo
+
+object Folding {
+  def fold[A](xs: List[A])(implicit M: Monoid[A]): A =
+    xs.foldLeft(M.empty)(M.combine)
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const monoid = cg.getNodesByKind('trait').find((n) => n.name === 'Monoid');
+    const semigroup = cg.getNodesByKind('trait').find((n) => n.name === 'Semigroup');
+    expect(monoid).toBeDefined();
+    expect(semigroup).toBeDefined();
+    expect(monoid!.filePath).not.toBe(semigroup!.filePath);
+
+    // Parameterized supertype `extends Semigroup[A]` must create an extends edge —
+    // the whole point of the fix (the `[A]` used to defeat name matching).
+    const semaImpact = cg.getImpactRadius(semigroup!.id, 3);
+    expect([...semaImpact.nodes.values()].map((n) => n.name)).toContain('Monoid');
+
+    // Editing Monoid surfaces the cross-file users: the instance val typed
+    // `Monoid[Int]` and the method taking it as an implicit (curried) param.
+    const impacted = [...cg.getImpactRadius(monoid!.id, 3).nodes.values()].map((n) => n.name);
+    expect(impacted).toContain('intMonoid'); // field type annotation
+    expect(impacted).toContain('fold'); // trailing implicit parameter list
+  });
+});
+
+describe('PHP namespace + import resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('resolves `use` imports to the namespace-qualified definition and type-hints across files', async () => {
+    const src = path.join(tempDir, 'src');
+    // Two interfaces with the SAME simple name in different namespaces — the
+    // exact ambiguity (Laravel has 7+ `Factory`) that bare-name matching can't
+    // resolve. The namespace qualifies them; the `use` import disambiguates.
+    fs.mkdirSync(path.join(src, 'Cache'), { recursive: true });
+    fs.mkdirSync(path.join(src, 'Mail'), { recursive: true });
+    fs.mkdirSync(path.join(src, 'App'), { recursive: true });
+    fs.writeFileSync(
+      path.join(src, 'Cache', 'Factory.php'),
+      `<?php
+namespace Contracts\\Cache;
+
+interface Factory {
+    public function store(): object;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'Mail', 'Factory.php'),
+      `<?php
+namespace Contracts\\Mail;
+
+interface Factory {
+    public function mailer(): object;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'App', 'Service.php'),
+      `<?php
+namespace App;
+
+use Contracts\\Cache\\Factory;
+
+class Service {
+    public function make(): Factory {
+        return resolve(Factory::class);
+    }
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // The PHP namespace is captured into the qualified name, so the two
+    // same-named interfaces are distinguishable.
+    const cacheFactory = cg
+      .getNodesByKind('interface')
+      .find((n) => n.qualifiedName === 'Contracts\\Cache::Factory');
+    const mailFactory = cg
+      .getNodesByKind('interface')
+      .find((n) => n.qualifiedName === 'Contracts\\Mail::Factory');
+    expect(cacheFactory).toBeDefined();
+    expect(mailFactory).toBeDefined();
+
+    // Service `use`s Contracts\Cache\Factory, so editing THAT interface reaches
+    // Service.php — and editing the same-named Contracts\Mail\Factory must NOT
+    // (the import resolved to the right namespace, not an arbitrary `Factory`).
+    const serviceFile = 'src/App/Service.php';
+    const cacheReaches = [...cg.getImpactRadius(cacheFactory!.id, 3).nodes.values()].some(
+      (n) => (n.filePath ?? '').endsWith(serviceFile)
+    );
+    const mailReaches = [...cg.getImpactRadius(mailFactory!.id, 3).nodes.values()].some(
+      (n) => (n.filePath ?? '').endsWith(serviceFile)
+    );
+    expect(cacheReaches).toBe(true);
+    expect(mailReaches).toBe(false);
+  });
+});
+
+describe('Ruby mixins (include/extend/prepend)', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links include/extend/prepend to the mixed-in module across files', async () => {
+    const lib = path.join(tempDir, 'lib');
+    fs.mkdirSync(lib, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(lib, 'concerns.rb'),
+      `module Trackable
+  def track; end
+end
+
+module Cacheable
+  def cache; end
+end
+
+module Loggable
+  def log; end
+end
+`
+    );
+    fs.writeFileSync(
+      path.join(lib, 'model.rb'),
+      `class Model
+  include Trackable
+  prepend Cacheable
+  extend Loggable
+end
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const model = cg.getNodesByKind('class').find((n) => n.name === 'Model');
+    expect(model).toBeDefined();
+
+    // All three mixin forms create an `implements` edge Model → module, so
+    // editing a concern surfaces every class that mixes it in (across files).
+    for (const moduleName of ['Trackable', 'Cacheable', 'Loggable']) {
+      const mod = cg.getNodesByKind('module').find((n) => n.name === moduleName);
+      expect(mod, moduleName).toBeDefined();
+      const impacted = [...cg.getImpactRadius(mod!.id, 3).nodes.values()].map((n) => n.name);
+      expect(impacted, `${moduleName} should be depended on by Model`).toContain('Model');
+    }
+  });
+
+  it('resolves require / require_relative to the required file', async () => {
+    const lib = path.join(tempDir, 'lib');
+    fs.mkdirSync(path.join(lib, 'app'), { recursive: true });
+
+    // A leaf file whose class is referenced only dynamically — so without
+    // require resolution it would look like nothing depends on it.
+    fs.writeFileSync(
+      path.join(lib, 'app', 'fetcher.rb'),
+      `module App
+  class Fetcher
+    def fetch; end
+  end
+end
+`
+    );
+    // Pulled in by a load-path `require` …
+    fs.writeFileSync(
+      path.join(lib, 'app', 'worker.rb'),
+      `require "app/fetcher"
+
+module App
+  class Worker; end
+end
+`
+    );
+    // … and a sibling pulled in by `require_relative`.
+    fs.writeFileSync(
+      path.join(lib, 'app', 'boot.rb'),
+      `require_relative "fetcher"
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // The require edges target fetcher.rb's FILE node. Editing it should reach
+    // BOTH the load-path requirer (worker.rb) and the require_relative one
+    // (boot.rb) — without require resolution its file would have no dependents.
+    const fetcher = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('app/fetcher.rb'));
+    expect(fetcher, 'fetcher.rb indexed').toBeDefined();
+    const reached = [...cg.getImpactRadius(fetcher!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(reached.some((p) => p.endsWith('app/worker.rb'))).toBe(true);
+    expect(reached.some((p) => p.endsWith('app/boot.rb'))).toBe(true);
+  });
+});
+
+describe('C++ pure-virtual method nodes (#1727)', () => {
+  // Pure-virtual methods are field_declarations (`virtual int read(int key) = 0;`),
+  // not function_definitions — they previously minted no method node, so calls
+  // through an abstract base and cpp-override synthesis had nothing to attach to.
+  // Java interface methods already get nodes; C++ should behave similarly.
+  it('indexes Store::read from the issue fixture and records the call', () => {
+    const code = `
+class Store {
+public:
+    virtual ~Store() {}
+    virtual int read(int key) = 0;
+};
+
+class DiskStore : public Store {
+public:
+    int read(int key) override { return key + 1; }
+};
+
+class MemStore : public Store {
+public:
+    int read(int key) override { return key + 2; }
+};
+
+int fetch(Store* s, int k) {
+    return s->read(k);
+}
+`;
+    const result = extractFromSource('store.cc', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+    expect(methods).toContain('Store::read');
+    expect(methods).toContain('DiskStore::read');
+    expect(methods).toContain('MemStore::read');
+
+    const baseRead = result.nodes.find((n) => n.qualifiedName === 'Store::read');
+    expect(baseRead?.isAbstract).toBe(true);
+
+    // Call site unresolved ref targets the method name (resolver types the receiver).
+    expect(
+      result.unresolvedReferences.some(
+        (r) => r.referenceKind === 'calls' && (r.referenceName === 'read' || r.referenceName.endsWith('.read') || r.referenceName.endsWith('->read') || r.referenceName === 's.read')
+      )
+    ).toBe(true);
+  });
+
+  it('indexes pure virtuals with pointer/reference return types and operators', () => {
+    const code = `
+class Cloneable {
+public:
+    virtual Cloneable* clone() = 0;
+    virtual const Foo& get() = 0;
+    virtual Cloneable& operator=(const Cloneable&) = 0;
+    int notPure(int x);
+    int data = 0;
+};
+`;
+    const result = extractFromSource('clone.hpp', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toContain('clone');
+    expect(methods).toContain('get');
+    expect(methods).toContain('operator=');
+    // Non-pure prototype and data member must NOT become methods here.
+    expect(methods).not.toContain('notPure');
+    expect(methods).not.toContain('data');
+    expect(result.nodes.find((n) => n.name === 'clone')?.isAbstract).toBe(true);
+  });
+
+});
+
+describe('C++ free-function name extraction', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('names a free function correctly when it has qualified-type params or a trailing return type', async () => {
+    const src = path.join(tempDir, 'src');
+    fs.mkdirSync(src, { recursive: true });
+
+    // TableFileName has a `const std::string&` parameter; BuildName uses an
+    // `auto … -> std::string` trailing return type. Both used to be named
+    // `string` (picked up from the parameter / return type), so callers never
+    // resolved and the defining file looked like nothing depended on it.
+    fs.writeFileSync(
+      path.join(src, 'names.cc'),
+      `#include <string>
+
+std::string TableFileName(const std::string& dbname, int number) {
+  return dbname;
+}
+
+auto BuildName(const std::string& a) -> std::string {
+  return a;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(src, 'user.cc'),
+      `#include <string>
+
+std::string use() {
+  return TableFileName("db", 1) + BuildName("x");
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // The functions are extracted under their real names, not `string`.
+    const fns = cg.getNodesByKind('function');
+    const tableFn = fns.find((n) => n.name === 'TableFileName');
+    const buildFn = fns.find((n) => n.name === 'BuildName');
+    expect(tableFn, 'TableFileName extracted (not "string")').toBeDefined();
+    expect(buildFn, 'BuildName extracted (not "string")').toBeDefined();
+
+    // And the cross-file calls resolve to them, so editing names.cc surfaces user.cc.
+    for (const fn of [tableFn!, buildFn!]) {
+      const reached = [...cg.getImpactRadius(fn.id, 3).nodes.values()].map((n) => n.filePath ?? '');
+      expect(reached.some((p) => p.endsWith('user.cc')), `${fn.name} should be called from user.cc`).toBe(true);
+    }
+  });
+});
+
+describe('C/C++ union declarations', () => {
+  it('extracts a named union as a type node, but not a forward declaration', () => {
+    const code = `
+union packet_hdr {
+  unsigned int raw;
+  unsigned short port;
+};
+
+/* forward declaration — not a definition */
+union opaque_hdr;
+
+static unsigned int hdr_raw(union packet_hdr *h) { return h->raw; }
+`;
+    const result = extractFromSource('packet.c', code);
+
+    const hdr = result.nodes.find((n) => n.name === 'packet_hdr');
+    expect(hdr).toBeDefined();
+    expect(hdr?.kind).toBe('union');
+
+    // Same rule as `struct Foo;`: bodiless is a forward declaration, so it must
+    // not mint a phantom node beside the real definition.
+    expect(result.nodes.some((n) => n.name === 'opaque_hdr')).toBe(false);
+
+    // Exactly one node for the type — the definition — so a call site or a
+    // `union packet_hdr *` parameter has a single resolution target.
+    expect(result.nodes.filter((n) => n.name === 'packet_hdr')).toHaveLength(1);
+  });
+
+  it('gives a typedef union the typedef name, not a second <anonymous> node', () => {
+    const code = `
+typedef union {
+  unsigned int u;
+  float f;
+} word_t;
+`;
+    const result = extractFromSource('word.c', code);
+
+    const word = result.nodes.find((n) => n.name === 'word_t');
+    expect(word?.kind).toBe('union');
+    // Resolved through the typedef the same way `typedef struct { … } X;` is,
+    // so the anonymous union body does not become its own node.
+    expect(result.nodes.some((n) => n.name === '<anonymous>')).toBe(false);
+  });
+
+  it('extracts a C++ union with member functions', () => {
+    const code = `
+union Value {
+  int i;
+  double d;
+  int as_int() const { return i; }
+};
+`;
+    const result = extractFromSource('value.cpp', code);
+
+    const value = result.nodes.find((n) => n.name === 'Value');
+    expect(value?.kind).toBe('union');
+
+    const asInt = result.nodes.find((n) => n.name === 'as_int');
+    expect(asInt).toBeDefined();
+    expect(
+      result.edges.some((e) => e.kind === 'contains' && e.source === value?.id && e.target === asInt?.id)
+    ).toBe(true);
+  });
+});
+
+describe('Dart mixins and type references', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links `with` mixins and method parameter/return types across files', async () => {
+    const lib = path.join(tempDir, 'lib');
+    fs.mkdirSync(lib, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(lib, 'models.dart'),
+      `class User {
+  final String name;
+  User(this.name);
+}
+
+mixin Loggable {
+  void log() {}
+}
+
+abstract class Repository {
+  User find(int id);
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(lib, 'service.dart'),
+      `import 'models.dart';
+
+class UserService extends Repository with Loggable {
+  @override
+  User find(int id) => User('x');
+
+  List<User> all() => [];
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const inModels = (name: string) =>
+      cg.getNodesByKind('class').concat(cg.getNodesByKind('module'))
+        .find((n) => n.name === name && n.filePath.endsWith('models.dart'));
+
+    // The `with Loggable` mixin records a dependency — editing the mixin surfaces
+    // the class that mixes it in (across files). Loggable is a `mixin`, indexed
+    // as a class-like node.
+    const loggable = cg.getNodesByKind('class').find((n) => n.name === 'Loggable')
+      ?? cg.getNodesByKind('module').find((n) => n.name === 'Loggable');
+    expect(loggable, 'Loggable mixin indexed').toBeDefined();
+    const mixinUsers = [...cg.getImpactRadius(loggable!.id, 3).nodes.values()].map((n) => n.name);
+    expect(mixinUsers).toContain('UserService');
+
+    // `User` is used only as a method parameter/return type in service.dart —
+    // editing it must still surface service.dart via the type references.
+    const user = inModels('User') ?? cg.getNodesByKind('class').find((n) => n.name === 'User');
+    expect(user, 'User indexed').toBeDefined();
+    const userDeps = [...cg.getImpactRadius(user!.id, 3).nodes.values()].map((n) => n.filePath ?? '');
+    expect(userDeps.some((p) => p.endsWith('service.dart'))).toBe(true);
+  });
+});
+
+describe('Static-member / value-read references', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a type referenced only via a static field / enum value (and ignores lowercase receivers)', async () => {
+    fs.writeFileSync(
+      path.join(tempDir, 'JsonScope.java'),
+      `class JsonScope {
+  static final int EMPTY_DOCUMENT = 1;
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Reader.java'),
+      `class Reader {
+  private int helper;
+  int peek() {
+    return JsonScope.EMPTY_DOCUMENT;
+  }
+  int noop() {
+    return this.helper;
+  }
+}
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // JsonScope is used ONLY as `JsonScope.EMPTY_DOCUMENT` (a static-field value
+    // read — never constructed or called), so before the static-member pass it
+    // had no dependents. Editing it now surfaces Reader.java.
+    const scope = cg.getNodesByKind('class').find((n) => n.name === 'JsonScope');
+    expect(scope, 'JsonScope indexed').toBeDefined();
+    const reached = [...cg.getImpactRadius(scope!.id, 3).nodes.values()].map((n) => n.filePath ?? '');
+    expect(reached.some((p) => p.endsWith('Reader.java'))).toBe(true);
+
+    // A lowercase receiver (`this.helper`) must NOT be emitted as a type ref —
+    // only Capitalized receivers (types) are. No node named `this`/`helper`
+    // should appear as a reference target from peek/noop beyond JsonScope.
+    const refTargets = cg
+      .getNodesByKind('class')
+      .filter((n) => n.name === 'this' || n.name === 'helper');
+    expect(refTargets.length).toBe(0);
+  });
+
+  it('does not link a static-member read across language families (coincidental name)', async () => {
+    // A native (Kotlin) `Build.VERSION` reads the Android system class — it must
+    // NOT link to a coincidentally same-named TS class (the cross-language false
+    // positive that name-matching produces; `references` edges are language-local).
+    fs.writeFileSync(
+      path.join(tempDir, 'Build.ts'),
+      `export class Build {\n  static version = 1;\n}\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Device.kt'),
+      `package app\nclass Device {\n  fun sdk(): Int = Build.VERSION\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const tsBuild = cg.getNodesByKind('class').find((n) => n.name === 'Build' && n.filePath.endsWith('Build.ts'));
+    expect(tsBuild).toBeDefined();
+    // The Kotlin file is `app/Device.kt`; the TS Build must have NO dependent there.
+    const deps = [...cg.getImpactRadius(tsBuild!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('Device.kt'))).toBe(false);
+  });
+});
+
+describe('Cross-language type/import gate (RN name collisions)', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('a TS PascalCase type ref lands on the TS type, never a same-named native class', async () => {
+    // react-native-async-storage's example app has a TS `type TestRunner` AND a
+    // Kotlin `class TestRunner`. The React PascalCase resolver name-matched the
+    // Kotlin `class` (its COMPONENT_KINDS includes `class`) with no language
+    // check at confidence 0.8, outranking the (cross-language-penalized 0.5)
+    // TS name-match — so a TS ref to `TestRunner` crossed web→jvm. The ref here
+    // is intentionally NOT imported: a clean relative import would mask the bug
+    // by resolving via the import map before the framework strategy can win.
+    // So the TS type is a global, declared in a script `.d.ts`: the one kind of
+    // type a module names without importing it.
+    fs.writeFileSync(
+      path.join(tempDir, 'package.json'),
+      JSON.stringify({ dependencies: { 'react-native': '*' } })
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'useTests.d.ts'),
+      `type TestRunner = { run: () => void };\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'basic.tsx'),
+      `export function useBasicTest(r: TestRunner): TestRunner {\n  return r;\n}\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'TestUtils.kt'),
+      `package app\nclass TestRunner {\n  fun run() {}\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const ktRunner = cg
+      .getNodesByKind('class')
+      .find((n) => n.name === 'TestRunner' && n.filePath.endsWith('TestUtils.kt'));
+    expect(ktRunner, 'Kotlin TestRunner class').toBeDefined();
+    const ktDeps = [...cg.getImpactRadius(ktRunner!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(ktDeps.some((p) => p.endsWith('basic.tsx')), 'Kotlin class has NO TS dependent').toBe(false);
+
+    const tsRunner = cg.getNodesByKind('type_alias').find((n) => n.name === 'TestRunner');
+    expect(tsRunner, 'TS TestRunner type_alias').toBeDefined();
+    const tsDeps = [...cg.getImpactRadius(tsRunner!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(tsDeps.some((p) => p.endsWith('basic.tsx')), 'TS type captured the ref (re-pointed)').toBe(true);
+  });
+
+  it('gates a cross-family import name collision but keeps same-family imports', async () => {
+    // A TS `import { Widget }` that only matches a Swift `class Widget` must not
+    // create a web→apple dependency — but a sibling TS module imported by
+    // another TS file (same family) must still resolve (no over-gating).
+    fs.writeFileSync(path.join(tempDir, 'Widget.swift'), `class Widget {\n  func render() {}\n}\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'widget.ts'),
+      `import { Widget } from './native';\nexport function mount(w: Widget) {}\n`
+    );
+    fs.writeFileSync(path.join(tempDir, 'util.ts'), `export class Helper {}\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'app.ts'),
+      `import { Helper } from './util';\nexport const h = new Helper();\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const swiftWidget = cg
+      .getNodesByKind('class')
+      .find((n) => n.name === 'Widget' && n.filePath.endsWith('.swift'));
+    expect(swiftWidget, 'Swift Widget class').toBeDefined();
+    const wDeps = [...cg.getImpactRadius(swiftWidget!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(wDeps.some((p) => p.endsWith('widget.ts')), 'Swift class has NO TS dependent').toBe(false);
+
+    // Same-family control — the TS Helper must still see its TS dependent.
+    const helper = cg.getNodesByKind('class').find((n) => n.name === 'Helper');
+    expect(helper, 'TS Helper class').toBeDefined();
+    const hDeps = [...cg.getImpactRadius(helper!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(hDeps.some((p) => p.endsWith('app.ts')), 'same-family TS import preserved').toBe(true);
+  });
+});
+
+describe('Python absolute module import resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a bare `import pkg.module` of an internal module to its file', async () => {
+    // `import conduit.apps.signals` (a Django-style side-effect import, and any
+    // dotted absolute module import) had no edge to the module file — only
+    // `from x import y` was linked — so a module imported by its dotted path
+    // looked like nothing depended on it.
+    fs.mkdirSync(path.join(tempDir, 'conduit/apps'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'conduit/__init__.py'), '');
+    fs.writeFileSync(path.join(tempDir, 'conduit/apps/__init__.py'), '');
+    fs.writeFileSync(path.join(tempDir, 'conduit/apps/signals.py'), `def handler():\n    pass\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'conduit/apps/app.py'),
+      `import conduit.apps.signals\nimport os\n\nVALUE = 1\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const signals = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('conduit/apps/signals.py'));
+    expect(signals, 'signals.py indexed').toBeDefined();
+    const deps = [...cg.getImpactRadius(signals!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('app.py')), 'importer depends on the module').toBe(true);
+    // `import os` (stdlib) must NOT fabricate an edge — no os.py file in the repo.
+    const osNode = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('/os.py'));
+    expect(osNode, 'no stdlib os.py node').toBeUndefined();
+  });
+
+  it('Django include() links the root URLconf to the included app urls module', async () => {
+    // `url(r'^api/', include('app.urls'))` should record a dependency from the
+    // root urlconf onto the included app's `urls.py` — so editing an app's routes
+    // surfaces the project urlconf that mounts them.
+    fs.mkdirSync(path.join(tempDir, 'app'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'requirements.txt'), `django==4.0\n`);
+    fs.writeFileSync(path.join(tempDir, 'app/__init__.py'), '');
+    fs.writeFileSync(path.join(tempDir, 'app/views.py'), `def home(request):\n    return None\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'app/urls.py'),
+      `from django.conf.urls import url\nfrom . import views\nurlpatterns = [url(r'^$', views.home)]\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'urls.py'),
+      `from django.conf.urls import include, url\nurlpatterns = [url(r'^app/', include('app.urls'))]\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const appUrls = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('app/urls.py'));
+    expect(appUrls, 'app/urls.py indexed').toBeDefined();
+    const deps = [...cg.getImpactRadius(appUrls!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('urls.py') && !p.endsWith('app/urls.py')), 'root urlconf depends on the included app urls').toBe(true);
+  });
+
+  it('resolves `from pkg import submodule` to the submodule under that package, not a same-named one', async () => {
+    // FastAPI router-aggregator pattern: `from app.api.routes import authentication`
+    // with same-named modules in sibling packages must resolve via the import's
+    // SOURCE (the package), not a coincidental same-basename file elsewhere.
+    fs.mkdirSync(path.join(tempDir, 'app/api/routes'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'app/api/dependencies'), { recursive: true });
+    for (const p of ['app/__init__.py', 'app/api/__init__.py', 'app/api/routes/__init__.py', 'app/api/dependencies/__init__.py']) {
+      fs.writeFileSync(path.join(tempDir, p), '');
+    }
+    fs.writeFileSync(path.join(tempDir, 'app/api/routes/authentication.py'), `def login():\n    pass\n`);
+    fs.writeFileSync(path.join(tempDir, 'app/api/dependencies/authentication.py'), `def get_user():\n    pass\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'app/api/routes/api.py'),
+      `from app.api.routes import authentication\n\nROUTER = authentication\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const routesAuth = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('routes/authentication.py'));
+    const depsAuth = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('dependencies/authentication.py'));
+    expect(routesAuth && depsAuth).toBeTruthy();
+    const routesDeps = [...cg.getImpactRadius(routesAuth!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    const depsDeps = [...cg.getImpactRadius(depsAuth!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(routesDeps.some((p) => p.endsWith('routes/api.py')), 'submodule under the imported package is the dependent').toBe(true);
+    expect(depsDeps.some((p) => p.endsWith('routes/api.py')), 'same-named module in a sibling package is NOT').toBe(false);
+  });
+});
+
+describe('Razor / Blazor markup extraction', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links @model and Blazor component tags to their C# types; ignores HTML elements', async () => {
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'LoginViewModel.cs'),
+      `namespace App { public class LoginViewModel { public string Email { get; set; } } }`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'ToastComponent.cs'),
+      `namespace App { public class ToastComponent { } }`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Views/Login.cshtml'),
+      `@model LoginViewModel\n<div class="form">\n  <input asp-for="Email" />\n</div>\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Index.razor'),
+      `<div>\n  <ToastComponent />\n</div>\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // `@model LoginViewModel` → the view-model class.
+    const vm = cg.getNodesByKind('class').find((n) => n.name === 'LoginViewModel');
+    expect(vm, 'LoginViewModel class').toBeDefined();
+    const vmDeps = [...cg.getImpactRadius(vm!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(vmDeps.some((p) => p.endsWith('Login.cshtml')), '@model links the view').toBe(true);
+
+    // `<ToastComponent />` → the component class.
+    const toast = cg.getNodesByKind('class').find((n) => n.name === 'ToastComponent');
+    expect(toast, 'ToastComponent class').toBeDefined();
+    const toastDeps = [...cg.getImpactRadius(toast!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(toastDeps.some((p) => p.endsWith('Index.razor')), 'Blazor tag links the component').toBe(true);
+
+    // HTML elements (`<div>`, `<input>`) must NOT become component references.
+    const htmlNodes = cg.getNodesByKind('class').filter((n) => n.name === 'div' || n.name === 'input');
+    expect(htmlNodes.length, 'no node for HTML elements').toBe(0);
+  });
+
+  it('C# namespaces qualify type names so same-named types are distinct', async () => {
+    fs.writeFileSync(path.join(tempDir, 'entity.cs'), `namespace App.Entities { public class CatalogBrand { } }`);
+    fs.writeFileSync(path.join(tempDir, 'dto.cs'), `namespace App.Models { public class CatalogBrand { } }`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+
+    const brands = cg.getNodesByKind('class').filter((n) => n.name === 'CatalogBrand');
+    expect(brands.length, 'both CatalogBrand classes indexed').toBe(2);
+    const qns = brands.map((b) => b.qualifiedName).sort();
+    expect(qns[0]).not.toBe(qns[1]); // distinct qualified names (namespace-scoped)
+    expect(qns.some((q) => q.includes('Entities') && q.endsWith('CatalogBrand'))).toBe(true);
+    expect(qns.some((q) => q.includes('Models') && q.endsWith('CatalogBrand'))).toBe(true);
+  });
+
+  it('disambiguates a Razor type ref via @using (incl. folder _Imports.razor)', async () => {
+    // `CatalogBrand` exists as both a domain entity and a DTO; the component
+    // `@using`s the DTO's namespace (here via the folder _Imports.razor), so the
+    // ref must resolve to the DTO, not the same-named entity.
+    fs.mkdirSync(path.join(tempDir, 'Models'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'Entities'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'Pages'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'Models/CatalogBrand.cs'), `namespace App.Models { public class CatalogBrand { public int Id { get; set; } } }`);
+    fs.writeFileSync(path.join(tempDir, 'Entities/CatalogBrand.cs'), `namespace App.Entities { public class CatalogBrand { public int Id { get; set; } } }`);
+    fs.writeFileSync(path.join(tempDir, 'Pages/_Imports.razor'), `@using App.Models\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'Pages/List.razor'),
+      `<h1>List</h1>\n@code {\n  private CatalogBrand _b = new CatalogBrand();\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const dto = cg.getNodesByKind('class').find((n) => n.qualifiedName === 'App.Models::CatalogBrand');
+    const entity = cg.getNodesByKind('class').find((n) => n.qualifiedName === 'App.Entities::CatalogBrand');
+    expect(dto && entity, 'both CatalogBrand classes').toBeTruthy();
+    const dtoDeps = [...cg.getImpactRadius(dto!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    const entityDeps = [...cg.getImpactRadius(entity!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(dtoDeps.some((p) => p.endsWith('List.razor')), 'resolves to the @using\'d DTO').toBe(true);
+    expect(entityDeps.some((p) => p.endsWith('List.razor')), 'NOT the same-named entity').toBe(false);
+  });
+
+  it('delegates Blazor @code block C# to cover types used in component logic', async () => {
+    fs.writeFileSync(
+      path.join(tempDir, 'CatalogService.cs'),
+      `namespace App { public class CatalogService { public void Load() { } } }`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'List.razor'),
+      `<h1>Catalog</h1>\n\n@code {\n  private CatalogService _svc = new CatalogService();\n  void Refresh() { _svc.Load(); }\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const svc = cg.getNodesByKind('class').find((n) => n.name === 'CatalogService');
+    expect(svc, 'CatalogService class').toBeDefined();
+    const deps = [...cg.getImpactRadius(svc!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('List.razor')), '@code usage links the component to the service').toBe(true);
+  });
+});
+
+describe('Default import resolution (renamed default export)', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a renamed default import to the module file', async () => {
+    // Express route aggregator: `import articlesController from './controller'`
+    // where the module does `export default router`. The renamed local can't be
+    // found as a symbol, so the controller file had no dependent — the dependency
+    // is on the module file regardless of the default export's name.
+    fs.mkdirSync(path.join(tempDir, 'app'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'app/controller.ts'), `const router = { get() {} };\nexport default router;\n`);
+    fs.writeFileSync(path.join(tempDir, 'app/routes.ts'), `import myController from './controller';\nexport const api = myController;\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const controller = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('app/controller.ts'));
+    expect(controller, 'controller.ts indexed').toBeDefined();
+    const deps = [...cg.getImpactRadius(controller!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('routes.ts')), 'importer depends on the default-exporting module').toBe(true);
+  });
+});
+
+describe('Chained method-call resolution (C# extension methods)', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('resolves a chained extension-method call (a.b.Method()) to its definition', async () => {
+    // ASP.NET DI registration: `builder.Services.AddCoreServices(...)` calls a
+    // static extension method elsewhere. A multi-dot receiver chain matched no
+    // method-call pattern before, so the extension method had no caller.
+    fs.mkdirSync(path.join(tempDir, 'cfg'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'cfg/Ext.cs'),
+      `namespace App {\n  public static class Ext {\n    public static object AddCoreServices(this object services, int x) { return services; }\n  }\n}\n`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'Program.cs'),
+      `namespace App {\n  public class Program {\n    public void Run(object builder) {\n      builder.Services.AddCoreServices(1);\n    }\n  }\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const ext = cg
+      .getNodesByKind('method')
+      .find((n) => n.name === 'AddCoreServices')
+      ?? cg.getNodesByKind('function').find((n) => n.name === 'AddCoreServices');
+    expect(ext, 'AddCoreServices defined').toBeDefined();
+    const callers = [...cg.getImpactRadius(ext!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(callers.some((p) => p.endsWith('Program.cs')), 'chained extension call resolves to its definition').toBe(true);
+  });
+});
+
+describe('Same-directory include + KMP import resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('a C/C++ #include resolves to the same-directory header, not a same-named one elsewhere', async () => {
+    // A multi-platform native module has a header of the same basename per
+    // platform. `windows/Provider.cpp`'s `#include "Storage.h"` means its OWN
+    // sibling header — not `apple/Storage.h` (which sorts first and so was
+    // picked arbitrarily before, leaving the real local header with 0 deps).
+    fs.mkdirSync(path.join(tempDir, 'apple'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'windows'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'apple', 'Storage.h'), `#pragma once\nstruct Storage { int n; };\n`);
+    fs.writeFileSync(path.join(tempDir, 'windows', 'Storage.h'), `#pragma once\nstruct Storage { int n; };\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'windows', 'Provider.cpp'),
+      `#include "Storage.h"\nint use() { Storage s; return s.n; }\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const winHeader = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('windows/Storage.h'));
+    const appleHeader = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('apple/Storage.h'));
+    expect(winHeader, 'windows/Storage.h indexed').toBeDefined();
+    expect(appleHeader, 'apple/Storage.h indexed').toBeDefined();
+    const winDeps = [...cg.getImpactRadius(winHeader!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    const appleDeps = [...cg.getImpactRadius(appleHeader!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(winDeps.some((p) => p.endsWith('Provider.cpp')), 'same-dir header gets the includer').toBe(true);
+    expect(appleDeps.some((p) => p.endsWith('Provider.cpp')), 'other-platform header does NOT').toBe(false);
+  });
+
+  it('a Kotlin Multiplatform commonMain import resolves to the expect, not a platform actual', async () => {
+    const common = path.join(tempDir, 'src/commonMain/kotlin/app');
+    const android = path.join(tempDir, 'src/androidMain/kotlin/app');
+    fs.mkdirSync(common, { recursive: true });
+    fs.mkdirSync(android, { recursive: true });
+    fs.writeFileSync(path.join(common, 'Platform.kt'), `package app\nexpect class PlatformContext\n`);
+    fs.writeFileSync(path.join(android, 'Platform.android.kt'), `package app\nactual class PlatformContext\n`);
+    fs.writeFileSync(
+      path.join(common, 'Db.kt'),
+      `package app\nimport app.PlatformContext\nclass Db {\n  fun open(ctx: PlatformContext) {}\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const expectCtx = cg
+      .getNodesByKind('class')
+      .find((n) => n.name === 'PlatformContext' && n.filePath.endsWith('commonMain/kotlin/app/Platform.kt'));
+    expect(expectCtx, 'commonMain expect PlatformContext').toBeDefined();
+    const deps = [...cg.getImpactRadius(expectCtx!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('Db.kt')), 'commonMain import lands on the expect, not the actual').toBe(true);
+  });
+});
+
+describe('Delphi form code-behind pairing', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a `.dfm` form to its sibling `.pas` code-behind unit', async () => {
+    // A Delphi form unit owns its visual form definition via `{$R *.dfm}`, not a
+    // `uses` clause — so a `.dfm` used only as a form definition looked orphaned.
+    fs.writeFileSync(path.join(tempDir, 'UFRMAbout.dfm'),
+      `object FRMAbout: TFRMAbout\n  Caption = 'About'\nend\n`);
+    fs.writeFileSync(path.join(tempDir, 'UFRMAbout.pas'),
+      `unit UFRMAbout;\ninterface\nuses Forms;\ntype\n  TFRMAbout = class(TForm)\n  end;\nimplementation\n{$R *.dfm}\nend.\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const dfm = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('UFRMAbout.dfm'));
+    expect(dfm, 'UFRMAbout.dfm file node').toBeDefined();
+    const deps = cg.getFileDependents(dfm!.filePath);
+    expect(deps.some((p) => p.endsWith('UFRMAbout.pas')), 'the .pas unit links its .dfm form').toBe(true);
+  });
+});
+
+describe('Liquid Shopify JSON template section resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('resolves Liquid block snippets and sections without linking commented references', async () => {
+    for (const dir of ['sections', 'snippets', 'layout']) fs.mkdirSync(path.join(tempDir, dir));
+    for (const file of ['snippets/card.liquid', 'snippets/legacy.liquid', 'snippets/ghost.liquid', 'sections/footer.liquid']) {
+      fs.writeFileSync(path.join(tempDir, file), '<div>content</div>');
+    }
+    fs.writeFileSync(path.join(tempDir, 'layout/theme.liquid'), [
+      '{% liquid', "  assign heading = 'x'", "  render 'card'", "  include 'legacy'",
+      "  section 'footer'", '  comment', "  render 'ghost'", '  endcomment', '%}',
+      '{% raw %}', "{% render 'ghost' %}", '{% endraw %}',
+    ].join('\n'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    for (const name of ['card', 'legacy', 'footer', 'ghost']) {
+      const file = cg.getNodesByKind('file').find((n) => n.name === `${name}.liquid`)!;
+      expect(file).toBeDefined();
+      expect(cg.getFileDependents(file.filePath).some((p) => p.endsWith('layout/theme.liquid')))
+        .toBe(name !== 'ghost');
+    }
+    expect(cg.getNodesByKind('variable').some((n) => n.name === 'heading')).toBe(true);
+  });
+
+  it('indexes capture declarations as variables that search finds, in or out of a Shopify theme', async () => {
+    // A captured variable could not be found, while an assigned one could (#2498).
+    fs.mkdirSync(path.join(tempDir, '_includes'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, '_includes/card.liquid'), [
+      "{% assign existing = 'ok' %}",
+      '{% capture captured %}Hello{% endcapture %}',
+      '{% liquid', '  capture bare_capture', "    echo 'x'", '  endcapture', '%}',
+    ].join('\n'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+
+    for (const [name, line] of [['existing', 1], ['captured', 2], ['bare_capture', 4]] as const) {
+      const hit = cg.searchNodes(name, { kinds: ['variable'] }).find((r) => r.node.name === name);
+      expect(hit?.node, name).toMatchObject({ filePath: '_includes/card.liquid', language: 'liquid', startLine: line });
+      expect(cg.getIncomingEdges(hit!.node.id)).toContainEqual(expect.objectContaining({ kind: 'contains' }));
+    }
+  });
+
+  it('links a Shopify JSON template section `type` to its sections/<type>.liquid', async () => {
+    // Shopify OS 2.0 templates are JSON, referencing sections by `type` — not
+    // a `{% section %}` Liquid tag — so a section used only from a JSON template
+    // looked unused. The JSON is now indexed and its `type`s linked.
+    fs.mkdirSync(path.join(tempDir, 'sections'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'templates/customers'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'layout'), { recursive: true });
+    // Every Shopify theme has layout/theme.liquid beside templates/ and sections/.
+    fs.writeFileSync(path.join(tempDir, 'layout/theme.liquid'), `{{ content_for_layout }}\n`);
+    fs.writeFileSync(path.join(tempDir, 'sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
+    fs.writeFileSync(path.join(tempDir, 'sections/main-login.liquid'), `<form>{{ 'customer.login' | t }}</form>\n`);
+    fs.writeFileSync(path.join(tempDir, 'templates/product.json'), JSON.stringify({ sections: { main: { type: 'main-product' } }, order: ['main'] }));
+    // Nested template dir (templates/customers/login.json) must resolve too.
+    fs.writeFileSync(path.join(tempDir, 'templates/customers/login.json'), JSON.stringify({ sections: { main: { type: 'main-login' } }, order: ['main'] }));
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const product = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('sections/main-product.liquid'));
+    const login = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('sections/main-login.liquid'));
+    expect(product, 'main-product section').toBeDefined();
+    expect(login, 'main-login section').toBeDefined();
+    expect(cg.getFileDependents(product!.filePath).some((p) => p.endsWith('templates/product.json')), 'top-level JSON template links its section').toBe(true);
+    expect(cg.getFileDependents(login!.filePath).some((p) => p.endsWith('customers/login.json')), 'nested JSON template links its section').toBe(true);
+  });
+
+  const jsonTemplate = (type: string): string => JSON.stringify({ sections: { main: { type } }, order: ['main'] });
+  const indexedJson = (): string[] =>
+    cg.getNodesByKind('file').map((n) => n.filePath).filter((p) => p.endsWith('.json')).sort();
+
+  it('leaves JSON under templates/ or sections/ out when no Shopify theme holds it', async () => {
+    // jasontaylordev/CleanArchitecture ships a .NET project template under
+    // templates/, and a CMS keeps its content under sections/: JSON in folders
+    // with those names, but nothing beside them makes a Shopify theme, so it is
+    // not Liquid — even when a Liquid file is named like one of its "types".
+    fs.mkdirSync(path.join(tempDir, 'templates/ca-use-case/.template.config'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'sections'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'templates/ca-use-case/.template.config/dotnetcli.host.json'), JSON.stringify({ symbolInfo: { UseCase: { longName: 'name' } } }));
+    fs.writeFileSync(path.join(tempDir, 'templates/ca-use-case/.template.config/template.json'), JSON.stringify({ identity: 'CleanArchitecture.UseCase', sections: { main: { type: 'hero' } } }));
+    fs.writeFileSync(path.join(tempDir, 'sections/home.json'), jsonTemplate('hero'));
+    fs.writeFileSync(path.join(tempDir, 'sections/hero.liquid'), `<h1>{{ page.title }}</h1>\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    expect(indexedJson()).toEqual([]);
+    const hero = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('sections/hero.liquid'));
+    expect(hero, 'the Liquid file itself is still indexed').toBeDefined();
+    expect(cg.getFileDependents(hero!.filePath)).toEqual([]);
+  });
+
+  it('finds a Shopify theme in a subdirectory by its config/settings_schema.json', async () => {
+    // A theme under theme/ with no layout/theme.liquid committed: its settings
+    // schema marks it. The same JSON under tools/templates/ is in no theme.
+    for (const dir of ['theme/config', 'theme/sections', 'theme/templates', 'tools/templates']) {
+      fs.mkdirSync(path.join(tempDir, dir), { recursive: true });
+    }
+    fs.writeFileSync(path.join(tempDir, 'theme/config/settings_schema.json'), JSON.stringify([{ name: 'theme_info' }]));
+    fs.writeFileSync(path.join(tempDir, 'theme/sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
+    fs.writeFileSync(path.join(tempDir, 'theme/templates/product.json'), jsonTemplate('main-product'));
+    fs.writeFileSync(path.join(tempDir, 'tools/templates/product.json'), jsonTemplate('main-product'));
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    expect(indexedJson()).toEqual(['theme/templates/product.json']);
+    expect(cg.getFileDependents('theme/sections/main-product.liquid')).toEqual(['theme/templates/product.json']);
+    // Extracting without storing tells them apart the same way.
+    const refsOf = (file: string) => cg.extractFromSource(file, jsonTemplate('main-product')).unresolvedReferences.map((r) => r.referenceName);
+    expect(refsOf('theme/templates/product.json')).toEqual(['sections/main-product.liquid']);
+    expect(refsOf('tools/templates/product.json')).toEqual([]);
+  });
+
+  it('drops JSON templates once their folder is no longer a theme, and takes them back when it is', async () => {
+    // The same path an index built before this check takes: JSON it stored as
+    // Liquid outside any theme leaves on the next sync, without a re-index.
+    for (const dir of ['layout', 'sections', 'templates']) fs.mkdirSync(path.join(tempDir, dir), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'layout/theme.liquid'), `{{ content_for_layout }}\n`);
+    fs.writeFileSync(path.join(tempDir, 'sections/main-product.liquid'), `<div>{{ product.title }}</div>\n`);
+    fs.writeFileSync(path.join(tempDir, 'templates/page.json'), jsonTemplate('main-product'));
+    fs.writeFileSync(path.join(tempDir, 'templates/product.json'), jsonTemplate('main-product'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    expect(indexedJson()).toEqual(['templates/page.json', 'templates/product.json']);
+
+    fs.rmSync(path.join(tempDir, 'layout'), { recursive: true, force: true });
+    // A sync of only the reported paths (the watcher's) and a full sync agree.
+    await cg.sync({ paths: ['templates/product.json'] });
+    expect(indexedJson()).toEqual(['templates/page.json']);
+    await cg.sync();
+    expect(indexedJson()).toEqual([]);
+
+    fs.mkdirSync(path.join(tempDir, 'config'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'config/settings_schema.json'), '[]');
+    await cg.sync();
+    expect(indexedJson()).toEqual(['templates/page.json', 'templates/product.json']);
+  });
+
+  it('reads JSON under templates/ or sections/ as Liquid only inside a theme under the project root', () => {
+    fs.mkdirSync(path.join(tempDir, 'shop/layout'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'shop/layout/theme.liquid'), '');
+
+    for (const file of ['shop/templates/product.json', 'shop/templates/customers/login.json', 'shop/sections/header-group.json']) {
+      expect(isSourceFile(file, undefined, tempDir), file).toBe(true);
+      expect(detectLanguage(file, undefined, undefined, tempDir), file).toBe('liquid');
+      // Without the project root there is no theme to look for.
+      expect(isSourceFile(file), file).toBe(false);
+      expect(detectLanguage(file), file).toBe('unknown');
+    }
+    // Beside the theme, not in it; and the theme's other JSON was never a template.
+    for (const file of ['templates/product.json', 'other/sections/header-group.json', 'shop/config/settings_data.json']) {
+      expect(isSourceFile(file, undefined, tempDir), file).toBe(false);
+      expect(detectLanguage(file, undefined, undefined, tempDir), file).toBe('unknown');
+    }
+    // Outside a theme, JSON gets whatever the project maps `.json` to, as any other JSON does.
+    expect(detectLanguage('templates/product.json', undefined, { '.json': 'yaml' }, tempDir)).toBe('yaml');
+    expect(detectLanguage('shop/templates/product.json', undefined, { '.json': 'yaml' }, tempDir)).toBe('liquid');
+  });
+
+  const writeFiles = (files: Record<string, string>, root = tempDir): void => {
+    for (const [file, text] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+      fs.writeFileSync(path.join(root, file), text);
+    }
+  };
+  // A theme at the project root, a theme in a folder marked only by its settings
+  // schema, and one in a folder with no 404 section and no price snippet of its
+  // own — the shape of panoply/syncify's example themes.
+  const severalThemes = {
+    'layout/theme.liquid': `{% section 'header' %}{{ content_for_layout }}\n`,
+    'sections/header.liquid': `{% render 'price' %}\n`,
+    'sections/main.liquid': `<main></main>\n`,
+    'snippets/price.liquid': `{{ product.price | money }}\n`,
+    'straps/dusk/config/settings_schema.json': '[]',
+    'straps/dusk/sections/404.liquid': `<h1>{{ 'templates.404.title' | t }}</h1>\n`,
+    'straps/dusk/templates/404.json': jsonTemplate('404'),
+    'examples/tailwind/layout/theme.liquid': `{% section 'header' %}{{ content_for_layout }}\n`,
+    'examples/tailwind/sections/header.liquid': `{% liquid\n  render 'price'\n  render 'icon'\n%}\n`,
+    'examples/tailwind/sections/main.liquid': `<main class="p-4"></main>\n`,
+    'examples/tailwind/snippets/icon.liquid': `<svg></svg>\n`,
+    'examples/tailwind/templates/index.json': jsonTemplate('main'),
+    'examples/tailwind/templates/404.json': jsonTemplate('404'),
+    // Liquid in no theme: an app's theme extension.
+    'extensions/reviews/blocks/stars.liquid': `{% render 'star' %}\n`,
+    'extensions/reviews/snippets/star.liquid': `<svg></svg>\n`,
+  };
+
+  it("links a theme's sections and snippets only inside that theme", async () => {
+    // Shopify looks a `{% render %}`, a `{% section %}` or a JSON template's
+    // section `type` up in the theme the file belongs to, never in another one.
+    // Matched by path tail, a theme without the 404 section linked to another
+    // theme's, and a theme in a folder even linked the project root's
+    // sections/header.liquid over its own.
+    writeFiles(severalThemes);
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const linksOf = (file: string): string[] => cg.getFileDependencies(file).sort();
+    expect(linksOf('layout/theme.liquid')).toEqual(['sections/header.liquid']);
+    expect(linksOf('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+    expect(linksOf('straps/dusk/templates/404.json')).toEqual(['straps/dusk/sections/404.liquid']);
+    expect(linksOf('examples/tailwind/layout/theme.liquid')).toEqual(['examples/tailwind/sections/header.liquid']);
+    expect(linksOf('examples/tailwind/templates/index.json')).toEqual(['examples/tailwind/sections/main.liquid']);
+    // What the theme lacks stays unlinked: no other theme's 404 section or price snippet.
+    expect(linksOf('examples/tailwind/templates/404.json')).toEqual([]);
+    expect(linksOf('examples/tailwind/sections/header.liquid')).toEqual(['examples/tailwind/snippets/icon.liquid']);
+    // Outside any theme, a path still resolves as before.
+    expect(linksOf('extensions/reviews/blocks/stars.liquid')).toEqual(['extensions/reviews/snippets/star.liquid']);
+  });
+
+  it("keeps a theme's references inside it when its own section is deleted", async () => {
+    // Sync resolves again what named a deleted file; another theme's 404
+    // section is no stand-in for the theme's own.
+    writeFiles({ ...severalThemes, 'examples/tailwind/sections/404.liquid': `<h1>404</h1>\n` });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    expect(cg.getFileDependencies('examples/tailwind/templates/404.json')).toEqual(['examples/tailwind/sections/404.liquid']);
+
+    fs.rmSync(path.join(tempDir, 'examples/tailwind/sections/404.liquid'));
+    await cg.sync();
+    expect(cg.getFileDependencies('examples/tailwind/templates/404.json')).toEqual([]);
+  });
+
+  it('links a section or snippet that appears after the files naming it', async () => {
+    // Sync retries a reference it could not resolve once a file it may name
+    // appears. A section or snippet reference was parked under its extension,
+    // `liquid`, which no file is named, so it stayed unlinked until the file
+    // naming it changed or the project was indexed again.
+    const later: Record<string, string> = {
+      'sections/404.liquid': `<h1>404</h1>\n`,
+      'snippets/price.liquid': severalThemes['snippets/price.liquid'],
+      // Only straps/dusk had a 404 section, which is no stand-in for this theme's own.
+      'examples/tailwind/sections/404.liquid': `<h1>404</h1>\n`,
+      'extensions/reviews/snippets/star.liquid': severalThemes['extensions/reviews/snippets/star.liquid'],
+    };
+    const initial = Object.fromEntries(Object.entries(severalThemes).filter(([file]) => !(file in later)));
+    writeFiles({ ...initial, 'templates/404.json': jsonTemplate('404') });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    const naming = ['templates/404.json', 'sections/header.liquid', 'examples/tailwind/templates/404.json',
+      'examples/tailwind/sections/header.liquid', 'extensions/reviews/blocks/stars.liquid'];
+    const links = (graph = cg) => Object.fromEntries(naming.map((file) => [file, graph.getFileDependencies(file).sort()]));
+    expect(links()).toEqual({
+      'templates/404.json': [],
+      'sections/header.liquid': [],
+      'examples/tailwind/templates/404.json': [],
+      'examples/tailwind/sections/header.liquid': ['examples/tailwind/snippets/icon.liquid'],
+      'extensions/reviews/blocks/stars.liquid': [],
+    });
+
+    writeFiles(later);
+    expect((await cg.sync()).filesAdded).toBe(4);
+    const synced = links();
+    expect(synced).toEqual({
+      'templates/404.json': ['sections/404.liquid'],
+      'sections/header.liquid': ['snippets/price.liquid'],
+      'examples/tailwind/templates/404.json': ['examples/tailwind/sections/404.liquid'],
+      // The root theme's new price snippet is not this theme's.
+      'examples/tailwind/sections/header.liquid': ['examples/tailwind/snippets/icon.liquid'],
+      'extensions/reviews/blocks/stars.liquid': ['extensions/reviews/snippets/star.liquid'],
+    });
+    expect(cg.getPendingReferenceCount()).toBe(0);
+    // A fresh index of the same files links the same. (Indexing again over
+    // this index would skip the unchanged files that name the new ones.)
+    const freshDir = createTempDir();
+    writeFiles({ ...severalThemes, 'templates/404.json': jsonTemplate('404'), ...later }, freshDir);
+    const fresh = CodeGraph.initSync(freshDir);
+    try {
+      await fresh.indexAll();
+      expect(links(fresh)).toEqual(synced);
+    } finally {
+      fresh.close();
+      fs.rmSync(freshDir, { recursive: true, force: true });
+    }
+
+    // A deleted snippet's references wait for it the same way.
+    fs.rmSync(path.join(tempDir, 'snippets/price.liquid'));
+    await cg.sync();
+    expect(cg.getFileDependencies('sections/header.liquid')).toEqual([]);
+    writeFiles({ 'snippets/price.liquid': later['snippets/price.liquid']! });
+    await cg.sync();
+    expect(cg.getFileDependencies('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+  }, 60_000);
+
+  // The notice Shopify's theme editor writes at the top of every JSON template
+  // and section group it saves.
+  const editorNotice = [
+    '/*',
+    ' * ------------------------------------------------------------',
+    ' * IMPORTANT: The contents of this file are auto-generated.',
+    ' * ------------------------------------------------------------',
+    ' */',
+  ];
+  const referencesFrom = (file: string): Array<[string | undefined, number | undefined, number | undefined]> => {
+    const fileNode = cg.getNodesInFile(file).find((n) => n.kind === 'file')!;
+    return cg.getOutgoingEdges(fileNode.id)
+      .filter((e) => e.kind === 'references')
+      .map((e): [string | undefined, number | undefined, number | undefined] => [cg.getNode(e.target)?.filePath, e.line, e.column])
+      .sort((a, b) => a[1]! - b[1]!);
+  };
+
+  it.each(['\n', '\r\n'])('links the sections an editor-saved template and section group list, where each `type` is (%j)', async (newline) => {
+    // JSON.parse rejects the editor's comment, so such a file linked none of
+    // its sections, and a file without one linked them at line 1 (#2494).
+    writeFiles({
+      'layout/theme.liquid': `{% sections 'header-group' %}{{ content_for_layout }}\n`,
+      'sections/header-group.json': [
+        ...editorNotice, '{', '  "type": "header",', '  "name": "Header",', '  "sections": {',
+        '    "bar": { "type": "announcement-bar" },', '    "header": {', '      "type": "header"', '    }',
+        '  },', '  "order": ["bar", "header"]', '}',
+      ].join(newline),
+      'sections/announcement-bar.liquid': `<div></div>\n`,
+      'sections/header.liquid': `<header></header>\n`,
+      'sections/main-product.liquid': `<div>{{ product.title }}</div>\n`,
+      'templates/product.json': [
+        ...editorNotice, '{', '  "sections": {', '    "main": {', '      "type": "main-product",',
+        '      "settings": { "note": "https://example.com/*not-a-comment*/ // nor this" }', '    },',
+        '    "again": { "type": "main-product" }', '  },', '  "order": ["main", "again"]', '}',
+      ].join(newline),
+      'templates/index.json': `{\n  "sections": {\n    "main": { "type": "header" }\n  },\n  "order": ["main"]\n}\n`,
+    });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    expect(referencesFrom('templates/product.json')).toEqual([['sections/main-product.liquid', 9, 14]]);
+    expect(referencesFrom('sections/header-group.json')).toEqual([
+      ['sections/announcement-bar.liquid', 10, 21],
+      ['sections/header.liquid', 12, 14],
+    ]);
+    expect(referencesFrom('templates/index.json')).toEqual([['sections/header.liquid', 3, 22]]);
+    expect(referencesFrom('layout/theme.liquid')).toEqual([['sections/header-group.json', 1, 0]]);
+  });
+
+  it('reads a JSON template with trailing commas, which Shopify accepts in theme JSON', () => {
+    const text = '// a note\n{"sections": {"main": {"type": "main-product",}, "hero": {"type": "hero"},}, "order": ["main", "hero",],}';
+    expect(extractFromSource('templates/product.json', text, 'liquid').unresolvedReferences.map((r) => r.referenceName))
+      .toEqual(['sections/main-product.liquid', 'sections/hero.liquid']);
+  });
+
+  it.each([
+    ['a missing brace', '{"sections": {"main": {"type": "main-product"}}'],
+    ['an unclosed comment', '/* saved by the editor {"sections": {"main": {"type": "main-product"}}}'],
+    ['a missing comma', '{"sections": {"main": {"type": "main-product"} "hero": {"type": "hero"}}}'],
+  ])('links nothing from a JSON template with %s', (_case, text) => {
+    expect(extractFromSource('templates/product.json', text, 'liquid').unresolvedReferences).toEqual([]);
+  });
+
+  it("links a layout's section groups inside its own theme, and on to the sections they list", async () => {
+    // `{% sections 'header-group' %}` renders the theme's
+    // sections/header-group.json, whose sections render snippets (#2494).
+    writeFiles({
+      ...severalThemes,
+      'layout/theme.liquid': `{% sections 'header-group' %}{{ content_for_layout }}\n`,
+      'sections/header-group.json': [...editorNotice, jsonTemplate('header')].join('\n'),
+      // This theme has no header group of its own, and the root theme's is not its.
+      'examples/tailwind/layout/theme.liquid': `{% liquid\n  sections 'header-group'\n%}{{ content_for_layout }}\n`,
+    });
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const linksOf = (file: string): string[] => cg.getFileDependencies(file).sort();
+    expect(linksOf('layout/theme.liquid')).toEqual(['sections/header-group.json']);
+    expect(linksOf('sections/header-group.json')).toEqual(['sections/header.liquid']);
+    expect(linksOf('sections/header.liquid')).toEqual(['snippets/price.liquid']);
+    expect(linksOf('examples/tailwind/layout/theme.liquid')).toEqual([]);
+
+    // Once the theme has a header group of its own, sync links the layout to it.
+    writeFiles({ 'examples/tailwind/sections/header-group.json': [...editorNotice, jsonTemplate('header')].join('\n') });
+    await cg.sync();
+    expect(linksOf('examples/tailwind/layout/theme.liquid')).toEqual(['examples/tailwind/sections/header-group.json']);
+    expect(linksOf('examples/tailwind/sections/header-group.json')).toEqual(['examples/tailwind/sections/header.liquid']);
+  }, 60_000);
+
+  it('finds the theme a file is in from the theme folder it sits in', () => {
+    const markers = new Set(['layout/theme.liquid', 'examples/tailwind/config/settings_schema.json']);
+    const exists = (relativePath: string): boolean => markers.has(relativePath);
+    expect(shopifyThemeRoot('sections/header.liquid', exists)).toBe('');
+    expect(shopifyThemeRoot('templates/customers/login.json', exists)).toBe('');
+    expect(shopifyThemeRoot('examples/tailwind/snippets/icon.liquid', exists)).toBe('examples/tailwind');
+    // A copy kept elsewhere under the root theme is not part of it, nor is a file beside its folders.
+    expect(shopifyThemeRoot('vendor/legacy/snippets/icon.liquid', exists)).toBeUndefined();
+    expect(shopifyThemeRoot('theme.liquid', exists)).toBeUndefined();
+  });
+});
+
+describe('Lua/Luau require resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('resolves a dotted Lua require and an instance-path Luau require to their module files', async () => {
+    // The require is the ONLY link (no method call), so coverage here proves the
+    // require resolver specifically, not method-call name-matching.
+    // Lua dotted module path: require("myapp.config") → lua/myapp/config.lua.
+    fs.mkdirSync(path.join(tempDir, 'lua/myapp'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'lua/myapp/config.lua'), `local M = {}\nfunction M.setup() end\nreturn M\n`);
+    fs.writeFileSync(path.join(tempDir, 'lua/myapp/init.lua'), `local config = require("myapp.config")\nreturn config\n`);
+    // Luau Roblox instance-path require (only the leaf survives extraction):
+    // require(script.Util.helper) → src/Util/helper.luau.
+    fs.mkdirSync(path.join(tempDir, 'src/Util'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/Util/helper.luau'), `local H = {}\nfunction H.go() end\nreturn H\n`);
+    fs.writeFileSync(path.join(tempDir, 'src/init.luau'), `local helper = require(script.Util.helper)\nreturn helper\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const config = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('myapp/config.lua'));
+    const helper = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('Util/helper.luau'));
+    expect(config, 'config.lua file node').toBeDefined();
+    expect(helper, 'helper.luau file node').toBeDefined();
+    const cfgDeps = cg.getFileDependents(config!.filePath);
+    const helpDeps = cg.getFileDependents(helper!.filePath);
+    expect(cfgDeps.some((p) => p.endsWith('myapp/init.lua')), 'dotted Lua require resolves to the module').toBe(true);
+    expect(helpDeps.some((p) => p.endsWith('src/init.luau')), 'instance-path Luau require resolves to the module').toBe(true);
+  });
+});
+
+describe('Rust module-path call resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('a bare submodule call (`users::router()`) resolves self-relative to the submodule fn', async () => {
+    // The canonical Axum router-assembly pattern: a parent module calls each
+    // submodule's `router()`. `users::` / `profiles::` are SELF-relative
+    // submodule prefixes (2018 edition) — `mod users;` makes `users` a child of
+    // the CURRENT module, NOT `crate::users`. Before the fix the bare prefix was
+    // resolved crate-relative only (looking for `src/users.rs`), so it found
+    // nothing and the handler modules looked dependent-less.
+    const http = path.join(tempDir, 'src/http');
+    fs.mkdirSync(http, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/lib.rs'), `pub mod http;\n`);
+    fs.writeFileSync(
+      path.join(http, 'mod.rs'),
+      `mod users;\nmod profiles;\npub fn api_router() {\n    users::router();\n    profiles::router();\n}\n`
+    );
+    fs.writeFileSync(path.join(http, 'users.rs'), `pub fn router() -> i32 { 1 }\n`);
+    fs.writeFileSync(path.join(http, 'profiles.rs'), `pub fn router() -> i32 { 2 }\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // Each submodule's same-named `router` fn must get mod.rs as a dependent —
+    // proving the bare prefix resolved self-relative AND disambiguated the
+    // colliding `router` name to the correct file (not an arbitrary one).
+    const routers = cg.getNodesByKind('function').filter((n) => n.name === 'router');
+    const usersRouter = routers.find((n) => n.filePath.endsWith('http/users.rs'));
+    const profilesRouter = routers.find((n) => n.filePath.endsWith('http/profiles.rs'));
+    expect(usersRouter, 'users.rs router fn').toBeDefined();
+    expect(profilesRouter, 'profiles.rs router fn').toBeDefined();
+    const usersDeps = [...cg.getImpactRadius(usersRouter!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    const profilesDeps = [...cg.getImpactRadius(profilesRouter!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(usersDeps.some((p) => p.endsWith('http/mod.rs')), 'users::router() lands on users.rs').toBe(true);
+    expect(profilesDeps.some((p) => p.endsWith('http/mod.rs')), 'profiles::router() lands on profiles.rs').toBe(true);
+  });
+
+  it('a 3-segment module-path call (`database::profiles::find()`) resolves to the leaf fn', async () => {
+    // A 2-level module path — the common `db.run(move |c| database::profiles::find(c))`
+    // / `crate::a::b::func()` shape. The reference-resolver pre-filter used to drop any
+    // `a::b::c` whose leaf it never checked (it tested only the first segment and the
+    // `b::c` remainder, neither of which names a symbol), so the call never reached the
+    // Rust path resolver and the leaf module looked dependent-less.
+    const routes = path.join(tempDir, 'src/routes');
+    const database = path.join(tempDir, 'src/database');
+    fs.mkdirSync(routes, { recursive: true });
+    fs.mkdirSync(database, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/lib.rs'), `pub mod routes;\npub mod database;\n`);
+    fs.writeFileSync(path.join(database, 'mod.rs'), `pub mod profiles;\n`);
+    fs.writeFileSync(path.join(database, 'profiles.rs'), `pub fn find(id: i32) -> i32 { id }\n`);
+    fs.writeFileSync(
+      path.join(routes, 'mod.rs'),
+      `use crate::database;\npub fn get_profile(id: i32) -> i32 {\n    database::profiles::find(id)\n}\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const find = cg
+      .getNodesByKind('function')
+      .find((n) => n.name === 'find' && n.filePath.endsWith('database/profiles.rs'));
+    expect(find, 'database/profiles.rs find fn').toBeDefined();
+    const deps = [...cg.getImpactRadius(find!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('routes/mod.rs')), 'database::profiles::find() resolves to the leaf fn').toBe(true);
+  });
+
+  it('Rocket `routes![…]` / `catchers![…]` macros link the mount to the handler fns', async () => {
+    // Tree-sitter leaves the macro body as a raw token tree, so the handler
+    // paths inside `routes![a::b::handler, …]` are invisible to the call walker
+    // and the handlers — mounted by Rocket at runtime, not called in-repo — look
+    // like they have no caller. The route-macro extractor reconstructs each path
+    // and emits a reference, which the Rust path resolver links to the handler.
+    const routes = path.join(tempDir, 'src/routes');
+    fs.mkdirSync(routes, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src/lib.rs'),
+      `mod routes;\nfn not_found() {}\npub fn rocket() {\n` +
+      `    rocket::build()\n` +
+      `        .mount("/api", routes![routes::users::post_users, routes::users::get_user])\n` +
+      `        .register("/", catchers![not_found]);\n}\n`);
+    fs.writeFileSync(path.join(routes, 'mod.rs'), `pub mod users;\n`);
+    fs.writeFileSync(path.join(routes, 'users.rs'), `pub fn post_users() {}\npub fn get_user() {}\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const handlers = cg.getNodesByKind('function').filter((n) => n.filePath.endsWith('routes/users.rs'));
+    expect(handlers.length, 'both handler fns indexed').toBe(2);
+    for (const h of handlers) {
+      const deps = [...cg.getImpactRadius(h.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+      expect(deps.some((p) => p.endsWith('lib.rs')), `routes![] links ${h.name} to its mount in lib.rs`).toBe(true);
+    }
+  });
+});
+
+describe('SvelteKit load → page synthesizer', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a +page.svelte to its OWN directory\'s +page.server.js load, not another route\'s', async () => {
+    // SvelteKit wires +page.server.js's `load` to +page.svelte's `data` BY FILE
+    // PATH — there is no static import — so editing a loader showed no impact on
+    // the page it feeds. The synthesizer links each page component to the `load`
+    // in its OWN directory (path-deterministic, so it never crosses routes).
+    const login = path.join(tempDir, 'src/routes/login');
+    const register = path.join(tempDir, 'src/routes/register');
+    fs.mkdirSync(login, { recursive: true });
+    fs.mkdirSync(register, { recursive: true });
+    fs.writeFileSync(path.join(login, '+page.svelte'), `<script>export let data;</script>\n<h1>Login {data.x}</h1>\n`);
+    fs.writeFileSync(path.join(login, '+page.server.js'), `export function load() { return { x: 1 }; }\n`);
+    fs.writeFileSync(path.join(register, '+page.svelte'), `<script>export let data;</script>\n<h1>Register</h1>\n`);
+    fs.writeFileSync(path.join(register, '+page.server.js'), `export function load() { return { y: 2 }; }\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const loginLoad = cg
+      .getNodesByKind('function')
+      .find((n) => n.name === 'load' && n.filePath.endsWith('login/+page.server.js'));
+    expect(loginLoad, 'login load fn').toBeDefined();
+    const impacted = [...cg.getImpactRadius(loginLoad!.id, 3).nodes.values()].map((n) => n.filePath ?? '');
+    // editing login's load surfaces login's page (the framework-wired data flow)…
+    expect(impacted.some((p) => p.endsWith('login/+page.svelte')), 'load links to its own page').toBe(true);
+    // …but never register's page (same-directory only).
+    expect(impacted.some((p) => p.endsWith('register/+page.svelte')), 'does not cross routes').toBe(false);
+  });
+});
+
+describe('Nuxt nested auto-imported component resolution', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('links a `<MediaCard/>` usage to components/media/Card.vue (Nuxt dir-prefixed auto-import)', async () => {
+    // Nuxt auto-imports a nested component by a DIRECTORY-PREFIXED name —
+    // components/media/Card.vue is used as <MediaCard/>, not <Card/> — but the
+    // component node is named by basename (`Card`), so the PascalCase usage
+    // didn't resolve and the nested component looked unused.
+    const media = path.join(tempDir, 'components/media');
+    fs.mkdirSync(media, { recursive: true });
+    fs.writeFileSync(path.join(media, 'Card.vue'), `<template><div>card</div></template>\n<script setup>defineProps(['item'])</script>\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'components/Grid.vue'),
+      `<template>\n  <div><MediaCard :item="i" /></div>\n</template>\n<script setup>const i = {}</script>\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const card = cg.getNodesByKind('component').find((n) => n.filePath.endsWith('media/Card.vue'));
+    expect(card, 'media/Card.vue component').toBeDefined();
+    const deps = [...cg.getImpactRadius(card!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('components/Grid.vue')), '<MediaCard> links Grid to media/Card.vue').toBe(true);
+  });
+});
+
+describe('Swift property-wrapper attribute type references', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('a Fluent `@Siblings(through: Pivot.self)` links the model to the pivot type', async () => {
+    // A many-to-many pivot/join model is referenced ONLY through the relationship
+    // property wrapper's metatype argument (`Pivot.self`), never by a controller
+    // query. The wrapper type was captured but the argument expression wasn't
+    // walked, so the pivot model looked like nothing depended on it.
+    fs.writeFileSync(path.join(tempDir, 'Pivot.swift'),
+      `import Fluent\nfinal class AcronymCategoryPivot: Model {\n  static let schema = "acronym-category"\n}\n`);
+    fs.writeFileSync(path.join(tempDir, 'Acronym.swift'),
+      `import Fluent\nfinal class Acronym: Model {\n` +
+      `  @Siblings(through: AcronymCategoryPivot.self, from: \\.$acronym, to: \\.$category)\n` +
+      `  var categories: [Category]\n}\n`);
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const pivot = cg.getNodesByKind('class').find((n) => n.name === 'AcronymCategoryPivot');
+    expect(pivot, 'pivot model class').toBeDefined();
+    const deps = [...cg.getImpactRadius(pivot!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('Acronym.swift')), '@Siblings metatype arg links Acronym to the pivot').toBe(true);
+  });
+});
+
+describe('Objective-C messages, class receivers, and #import', () => {
+  let tempDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    if (cg) cg.close();
+    if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('resolves single-arg selectors, class-message receivers, and #import headers', async () => {
+    fs.writeFileSync(
+      path.join(tempDir, 'SDImageCache.h'),
+      `#import <Foundation/Foundation.h>
+@interface SDImageCache : NSObject
++ (instancetype)sharedCache;
++ (void)storeImage:(NSString *)key;
+@end
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'SDImageCache.m'),
+      `#import "SDImageCache.h"
+@implementation SDImageCache
++ (instancetype)sharedCache { return nil; }
++ (void)storeImage:(NSString *)key { }
+@end
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'SDManager.m'),
+      `#import "SDImageCache.h"
+@interface SDManager : NSObject
+@end
+@implementation SDManager
+- (void)run {
+  [SDImageCache sharedCache];
+  [SDImageCache storeImage:@"k"];
+}
+@end
+`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    // 1. The single-argument selector `[SDImageCache storeImage:@"k"]` resolves
+    //    to the `storeImage:` method — named WITH its colon both at the call site
+    //    and the definition (before the fix the call site dropped the colon).
+    const storeImage = cg.getNodesByKind('method').find((n) => n.name === 'storeImage:');
+    expect(storeImage, 'storeImage: method').toBeDefined();
+    const storeCallers = [...cg.getImpactRadius(storeImage!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(storeCallers.some((p) => p.endsWith('SDManager.m'))).toBe(true);
+
+    // 2. The class-message receiver `[SDImageCache sharedCache]` references the
+    //    SDImageCache class (whose @interface lives in the header).
+    const cache = cg.getNodesByKind('class').find((n) => n.name === 'SDImageCache');
+    expect(cache, 'SDImageCache class').toBeDefined();
+    const classDeps = [...cg.getImpactRadius(cache!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(classDeps.some((p) => p.endsWith('SDManager.m'))).toBe(true);
+
+    // 3. `#import "SDImageCache.h"` resolves to the header FILE — editing it
+    //    surfaces both importers.
+    const header = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('SDImageCache.h'));
+    expect(header, 'SDImageCache.h indexed').toBeDefined();
+    const importers = [...cg.getImpactRadius(header!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(importers.some((p) => p.endsWith('SDManager.m'))).toBe(true);
   });
 });
 
@@ -3273,6 +8483,54 @@ export function multiply(a: number, b: number): number {
     cg.close();
   });
 
+  it('should resolve an ES import from a .xsjs file to a .xsjslib file (#556)', async () => {
+    // Exercises the JS import-path resolution list: `./helpers` must resolve to
+    // `helpers.xsjslib`. `decoy.js` exports the same symbol name and is never
+    // imported — without .xsjs/.xsjslib in the list the import resolves to
+    // nothing and the call falls back to same-name matching, which binds the
+    // edge to the decoy. The decoy is what makes this test fail on a regression:
+    // with a lone helpers.xsjslib the fallback happens to pick the right file.
+    fs.writeFileSync(
+      path.join(tempDir, 'helpers.xsjslib'),
+      'export function buildQuery(table) {\n  return "SELECT * FROM " + table;\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'decoy.js'),
+      'export function buildQuery(table) {\n  return "DECOY " + table;\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'service.xsjs'),
+      'import { buildQuery } from "./helpers";\n\nfunction run() {\n  return buildQuery("users");\n}\n'
+    );
+
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+
+    const run = cg.getNodesInFile('service.xsjs').find((n) => n.name === 'run');
+    const buildQuery = cg.getNodesInFile('helpers.xsjslib').find((n) => n.name === 'buildQuery');
+    const decoy = cg.getNodesInFile('decoy.js').find((n) => n.name === 'buildQuery');
+    expect(run).toBeDefined();
+    expect(buildQuery).toBeDefined();
+    expect(decoy).toBeDefined();
+
+    expect(
+      cg.getFileDependencies('service.xsjs'),
+      "'./helpers' should resolve to helpers.xsjslib, not the same-named decoy"
+    ).toEqual(['helpers.xsjslib']);
+
+    const outgoing = cg.getOutgoingEdges(run!.id);
+    expect(
+      outgoing.find((e) => e.target === buildQuery!.id),
+      'run() should resolve buildQuery across the .xsjs -> .xsjslib import'
+    ).toBeDefined();
+    expect(
+      outgoing.find((e) => e.target === decoy!.id),
+      'run() must not bind to the unrelated same-named export in decoy.js'
+    ).toBeUndefined();
+
+    cg.close();
+  });
+
   it('should count the full file-level tracked class (yaml/twig/properties) in indexFiles()', async () => {
     fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
     fs.writeFileSync(path.join(tempDir, 'view.twig'), '{{ title }}\n');
@@ -3395,6 +8653,105 @@ describe('Directory Exclusion', () => {
   });
 });
 
+
+describe('Nested .gitignore node_modules exclusion (#1567)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  function plantNodeModules(subproject: string, packages = 80): void {
+    const base = path.join(tempDir, subproject, 'node_modules');
+    for (let i = 0; i < packages; i++) {
+      const pkg = path.join(base, `pkg${i}`);
+      fs.mkdirSync(pkg, { recursive: true });
+      fs.writeFileSync(path.join(pkg, 'index.js'), `module.exports = ${i};`);
+      fs.writeFileSync(path.join(pkg, 'index.d.ts'), 'export const n: number;');
+      if (i % 4 === 0) fs.writeFileSync(path.join(pkg, '.gitignore'), '*.map\n');
+      const nested = path.join(pkg, 'node_modules', `nested${i}`);
+      fs.mkdirSync(nested, { recursive: true });
+      fs.writeFileSync(path.join(nested, 'lib.ts'), 'export const x = 1;');
+    }
+  }
+
+  function initGitRepo(): void {
+    const { execFileSync } = require('child_process') as typeof import('child_process');
+    execFileSync('git', ['init'], { cwd: tempDir, stdio: 'ignore' });
+    execFileSync('git', ['add', '-A'], { cwd: tempDir, stdio: 'ignore' });
+    execFileSync(
+      'git',
+      ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-m', 'init'],
+      { cwd: tempDir, stdio: 'ignore' },
+    );
+  }
+
+  it('excludes node_modules ignored only by a nested .gitignore (git path)', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), '*.log\n');
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend');
+    plantNodeModules('extension');
+    initGitRepo();
+
+    const files = scanDirectory(tempDir);
+    expect(files.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+    expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
+  });
+
+  it('excludes nested-gitignore node_modules on the filesystem-walk fallback too', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), '*.log\n');
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend', 60);
+    plantNodeModules('extension', 60);
+
+    const files = scanDirectory(tempDir);
+    expect(files.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+    expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
+  });
+
+  it('still excludes when root only lists one subproject node_modules (Boba-like)', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(
+      path.join(tempDir, '.gitignore'),
+      ['*.log', 'frontend/node_modules/', 'frontend/.angular/', ''].join('\n'),
+    );
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend', 40);
+    plantNodeModules('extension', 40);
+
+    const fsFiles = scanDirectory(tempDir);
+    expect(fsFiles.every((f) => !f.includes('node_modules'))).toBe(true);
+    expect(fsFiles.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+
+    initGitRepo();
+    const gitFiles = scanDirectory(tempDir);
+    expect(gitFiles.every((f) => !f.includes('node_modules'))).toBe(true);
+    expect(gitFiles.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+  });
+});
+
+
 describe('Git Submodules', () => {
   let tempDir: string;
 
@@ -3443,6 +8800,182 @@ describe('Git Submodules', () => {
 
     expect(files).toContain('app.ts');
     expect(files).toContain('libs/lib/lib.ts');
+  });
+});
+
+describe('Nested gitlink repos (#1031, #1033)', () => {
+  let tempDir: string;
+  // Helper: make a self-contained git repo at `dir` with one committed TS file.
+  const makeRepo = async (dir: string, base: string) => {
+    const { execFileSync } = await import('child_process');
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
+    fs.mkdirSync(dir, { recursive: true });
+    git('init', '-q');
+    git('config', 'user.email', 'test@test.com');
+    git('config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(dir, `${base}.ts`), `export const ${base} = 1;`);
+    git('add', '-A');
+    git('commit', '-q', '-m', `${base} init`);
+  };
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  // The #1031 case: a nested repo `git add`ed inside the super-repo becomes a
+  // gitlink (mode 160000) with NO `.gitmodules`. It is tracked (so it never shows
+  // in the untracked `-o` listing) yet not an active submodule (so
+  // `--recurse-submodules` won't expand it) — it used to fall through both passes
+  // and only the super-repo's own files got indexed.
+  it('indexes a bare gitlink (git add\'ed embedded repo, no .gitmodules), recursively', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+
+    // An embedded clone, itself holding a further nested clone (untracked inside it).
+    await makeRepo(path.join(root, 'embedded'), 'inner');
+    await makeRepo(path.join(root, 'embedded', 'deep'), 'deep');
+
+    // `git add embedded` records it as a 160000 gitlink (no fetch, no .gitmodules).
+    git(root, 'add', 'embedded');
+    git(root, 'commit', '-q', '-m', 'add embedded as gitlink');
+    expect(fs.existsSync(path.join(root, '.gitmodules'))).toBe(false);
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('app.ts');
+    expect(files).toContain('embedded/inner.ts'); // the gitlink's own source
+    expect(files).toContain('embedded/deep/deep.ts'); // recursion continues into its nested repo
+  });
+
+  // The -c → -s switch must not regress active submodules (#147): a repo can hold
+  // BOTH an active submodule (expanded by --recurse-submodules) and a bare gitlink
+  // (handled by the new pass), and the mixed 160000/100644 modes must parse right.
+  it('indexes a gitlink alongside an active submodule', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const lib = path.join(tempDir, '_lib');
+    await makeRepo(lib, 'lib');
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+
+    // A proper, active submodule.
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'libs/lib'], { cwd: root, stdio: 'pipe' });
+    git(root, 'commit', '-q', '-m', 'add submodule');
+
+    // A bare gitlink in the same repo (under a non-ignored dir name).
+    await makeRepo(path.join(root, 'external', 'tool'), 'tool');
+    git(root, 'add', 'external/tool');
+    git(root, 'commit', '-q', '-m', 'add gitlink');
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('app.ts');
+    expect(files).toContain('libs/lib/lib.ts'); // active submodule still expands (#147)
+    expect(files).toContain('external/tool/tool.ts'); // bare gitlink now indexed
+  });
+
+  // A gitlink under a built-in default-ignored directory (vendor/, node_modules/,
+  // …) stays excluded — a committed dependency doesn't become project code just
+  // because it's a nested repo. Mirrors how the untracked-embedded path treats
+  // the same dirs (#407), so the two passes agree.
+  it('does not index a gitlink under a default-ignored directory (e.g. vendor/)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+    await makeRepo(path.join(root, 'vendor', 'pkg'), 'dep');
+    git(root, 'add', 'vendor/pkg');
+    git(root, 'commit', '-q', '-m', 'add vendored gitlink');
+
+    const files = scanDirectory(root);
+
+    expect(files).toContain('app.ts');
+    expect(files).not.toContain('vendor/pkg/dep.ts');
+  });
+
+  // A gitlink with NO working tree on disk (the common "cloned without
+  // --recurse-submodules" state) has nothing to index — we must leave it alone,
+  // not fabricate entries, and must not break the rest of the scan.
+  it('leaves an uninitialized submodule (no checkout on disk) alone', async () => {
+    const { execFileSync } = await import('child_process');
+
+    const lib = path.join(tempDir, '_lib');
+    await makeRepo(lib, 'lib');
+
+    const sup = path.join(tempDir, 'super');
+    await makeRepo(sup, 'app');
+    execFileSync('git', ['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', lib, 'libs/lib'], { cwd: sup, stdio: 'pipe' });
+    execFileSync('git', ['commit', '-q', '-m', 'add submodule'], { cwd: sup, stdio: 'pipe' });
+
+    // Clone the super-repo WITHOUT --recurse-submodules → libs/lib is an empty
+    // gitlink dir (mode 160000, no `.git` inside, no files).
+    const clone = path.join(tempDir, 'clone');
+    execFileSync('git', ['clone', '-q', sup, clone], { stdio: 'pipe' });
+    expect(fs.readdirSync(path.join(clone, 'libs', 'lib'))).toHaveLength(0);
+
+    const files = scanDirectory(clone);
+
+    expect(files).toContain('app.ts');
+    expect(files).not.toContain('libs/lib/lib.ts'); // not on disk → correctly absent
+  });
+
+  // #1065: a gitlink under a path the super-repo's OWN `.gitignore` covers is the
+  // tracked-gitlink twin of the untracked-ignored embedded repo (#514, #970). The
+  // gitlink-discovery pass must honor that `.gitignore` the same way — otherwise a
+  // gitignored reference/benchmark corpus full of `git add`ed clones gets pulled
+  // into the index (the 138k-file blow-up the reporter hit). Respect it by default;
+  // re-include only via `codegraph.json` `includeIgnored`.
+  it('does not index a gitlink under a gitignored directory by default (#1065)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+    // An embedded clone under a path the super-repo gitignores (a benchmark corpus).
+    await makeRepo(path.join(root, 'benchmark', 'repos', 'ref'), 'ref');
+    git(root, 'add', 'benchmark/repos/ref'); // tracked as a 160000 gitlink
+    fs.writeFileSync(path.join(root, '.gitignore'), 'benchmark/repos/\n');
+    git(root, 'add', '.gitignore');
+    git(root, 'commit', '-q', '-m', 'add gitignored gitlink + ignore rule');
+
+    const files = scanDirectory(root);
+    expect(files).toContain('app.ts');
+    expect(files).not.toContain('benchmark/repos/ref/ref.ts'); // gitignored → excluded
+
+    // The watcher path agrees: the ignored root is never discovered, and the dir is
+    // pruned (the reporter's exact clue — `ignores('benchmark/repos/')` was false).
+    expect(discoverEmbeddedRepoRoots(root)).toEqual([]);
+    expect(buildScopeIgnore(root).ignores('benchmark/repos/')).toBe(true);
+    expect(buildScopeIgnore(root).ignores('benchmark/repos/ref/ref.ts')).toBe(true);
+  });
+
+  it('re-includes a gitignored gitlink when codegraph.json includeIgnored opts in (#1065)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'root');
+    await makeRepo(root, 'app');
+    await makeRepo(path.join(root, 'benchmark', 'repos', 'ref'), 'ref');
+    git(root, 'add', 'benchmark/repos/ref');
+    fs.writeFileSync(path.join(root, '.gitignore'), 'benchmark/repos/\n');
+    fs.writeFileSync(path.join(root, 'codegraph.json'), JSON.stringify({ includeIgnored: ['benchmark/repos/'] }));
+    git(root, 'add', '.gitignore', 'codegraph.json');
+    git(root, 'commit', '-q', '-m', 'opt the gitignored gitlink back in');
+
+    const files = scanDirectory(root);
+    expect(files).toContain('app.ts');
+    expect(files).toContain('benchmark/repos/ref/ref.ts'); // opted in → indexed
+    expect(discoverEmbeddedRepoRoots(root)).toContain('benchmark/repos/ref/');
   });
 });
 
@@ -3515,6 +9048,264 @@ describe('Nested non-submodule git repos', () => {
     expect(files).toContain('sub_repo/src/real.ts');
     expect(files).not.toContain('sub_repo/src/generated.ts');
   });
+
+  // A .gitignore the `ignore` library can't compile to a regex must not abort
+  // the whole scan — the bad pattern is dropped, valid ones still apply (#682).
+  it('does not crash on a .gitignore with an uncompilable pattern (#682)', () => {
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'build'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'real.ts'), 'export const x = 1;');
+    fs.writeFileSync(path.join(tempDir, 'build', 'out.ts'), 'export const y = 2;');
+    // `\\[` makes the matcher build an unterminated character class — the throw
+    // is lazy (at match time), which is what escaped and killed sync.
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'build/\n\\\\[\n');
+
+    let files: string[] = [];
+    expect(() => {
+      files = scanDirectory(tempDir);
+    }).not.toThrow();
+    expect(files).toContain('src/real.ts');
+    // The still-valid `build/` rule is honored; only the bad line was dropped.
+    expect(files.some((f) => f.startsWith('build/'))).toBe(false);
+  });
+
+  // A .gitignore that isn't valid UTF-8 — e.g. encrypted in place by corporate
+  // DLP / endpoint software (UTF-16 header + ciphertext) — is skipped whole,
+  // not fed to the matcher as garbage patterns (#682).
+  it('does not crash on a non-UTF-8 (DLP-encrypted) .gitignore (#682)', () => {
+    fs.mkdirSync(path.join(tempDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'src', 'real.ts'), 'export const x = 1;');
+    const header = Buffer.concat([
+      Buffer.from([0x00, 0x00]),
+      Buffer.from('[notice][user]', 'utf16le'),
+    ]);
+    const junk = Buffer.from([0x5b, 0x99, 0xc3, 0x28, 0x5c, 0x5b, 0xff, 0xfd]);
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), Buffer.concat([header, junk]));
+
+    let files: string[] = [];
+    expect(() => {
+      files = scanDirectory(tempDir);
+    }).not.toThrow();
+    expect(files).toContain('src/real.ts');
+  });
+
+  it('buildDefaultIgnore survives a bad .gitignore and still applies valid rules (#682)', () => {
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'dist/\n\\\\[\n');
+    const ig = buildDefaultIgnore(tempDir);
+    expect(() => ig.ignores('src/app.ts')).not.toThrow();
+    expect(ig.ignores('dist/')).toBe(true); // valid rule survives
+    expect(ig.ignores('src/app.ts')).toBe(false);
+  });
+
+  it('buildDefaultIgnore honors .git/info/exclude (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'exclude-root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    fs.writeFileSync(path.join(root, 'src.ts'), 'export const x = 1;\n');
+    fs.mkdirSync(path.join(root, '.claude', 'worktrees', 'agent-1'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.claude', 'worktrees', 'agent-1', 'src.ts'),
+      'export const w = 1;\n',
+    );
+    // Not in .gitignore — only in info/exclude (the reporter's exact shape).
+    fs.writeFileSync(
+      path.join(root, '.git', 'info', 'exclude'),
+      '**/.claude/worktrees/\n',
+    );
+
+    const ig = buildDefaultIgnore(root);
+    expect(ig.ignores('src.ts')).toBe(false);
+    expect(ig.ignores('.claude/worktrees/agent-1/src.ts')).toBe(true);
+    expect(ig.ignores('.claude/worktrees/')).toBe(true);
+
+    // ScopeIgnore (watcher path) agrees, including via git ignored-dir seeding.
+    const scope = buildScopeIgnore(root);
+    expect(scope.ignores('src.ts')).toBe(false);
+    expect(scope.ignores('.claude/worktrees/agent-1/')).toBe(true);
+    expect(scope.ignores('.claude/worktrees/agent-1/src.ts')).toBe(true);
+  });
+
+  it('buildDefaultIgnore honors core.excludesFile (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'excludesfile-root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    const globalExcludes = path.join(tempDir, 'global-excludes');
+    fs.writeFileSync(globalExcludes, 'scratch/\n');
+    git(root, 'config', 'core.excludesFile', globalExcludes);
+    fs.mkdirSync(path.join(root, 'scratch'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'scratch', 'tmp.ts'), 'export const t = 1;\n');
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export const a = 1;\n');
+
+    const ig = buildDefaultIgnore(root);
+    expect(ig.ignores('app.ts')).toBe(false);
+    expect(ig.ignores('scratch/')).toBe(true);
+    expect(ig.ignores('scratch/tmp.ts')).toBe(true);
+  });
+
+  it('filesystem fallback retains git info/exclude and core.excludesFile when ls-files fails (#1959)', async () => {
+    const { execFileSync } = await import('child_process');
+    const root = path.join(tempDir, 'fallback-excludes-root');
+    fs.mkdirSync(root, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: root, stdio: 'pipe' });
+    const globalExcludes = path.join(tempDir, 'fallback-global-excludes');
+    fs.writeFileSync(globalExcludes, 'scratch/\n');
+    execFileSync('git', ['config', 'core.excludesFile', globalExcludes], { cwd: root, stdio: 'pipe' });
+    fs.writeFileSync(path.join(root, '.git', 'info', 'exclude'), 'worktrees/\n');
+    fs.mkdirSync(path.join(root, 'scratch'));
+    fs.mkdirSync(path.join(root, 'worktrees'));
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export const app = 1;\n');
+    fs.writeFileSync(path.join(root, 'scratch', 'hidden.ts'), 'export const hidden = 1;\n');
+    fs.writeFileSync(path.join(root, 'worktrees', 'hidden.ts'), 'export const hidden = 2;\n');
+
+    // rev-parse/config still work, but both ls-files and status fail as they
+    // would under a Git timeout. This exercises the real filesystem walk.
+    fs.writeFileSync(path.join(root, '.git', 'index'), 'not a git index');
+    expect(() => execFileSync('git', ['ls-files'], { cwd: root, stdio: 'pipe' })).toThrow();
+    expect(scanDirectory(root)).toEqual(['app.ts']);
+    expect(await scanDirectoryAsync(root)).toEqual(['app.ts']);
+  });
+
+  it('buildScopeIgnore prunes dirs ignored only by a nested .gitignore (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'nested-gi-root');
+    fs.mkdirSync(path.join(root, 'pkg', 'build'), { recursive: true });
+    git(root, 'init', '-q');
+    git(root, 'config', 'user.email', 'test@test.com');
+    git(root, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(root, 'pkg', 'app.ts'), 'export const a = 1;\n');
+    fs.writeFileSync(path.join(root, 'pkg', 'build', 'out.ts'), 'export const o = 1;\n');
+    fs.writeFileSync(path.join(root, 'pkg', '.gitignore'), 'build/\n');
+    // Commit only the non-ignored file so git still reports build/ as ignored-other.
+    git(root, 'add', 'pkg/app.ts', 'pkg/.gitignore');
+    git(root, 'commit', '-q', '-m', 'init');
+
+    const scope = buildScopeIgnore(root);
+    expect(scope.ignores('pkg/app.ts')).toBe(false);
+    expect(scope.ignores('pkg/build/')).toBe(true);
+    expect(scope.ignores('pkg/build/out.ts')).toBe(true);
+  });
+
+  it.each(['filesystem', 'untracked', 'tracked'])(
+    'keeps Java packages named build while excluding build output (%s, #1642)',
+    async (mode) => {
+      const sources = ['', 'module/'].flatMap((prefix) => ['main', 'test'].flatMap((sourceSet) => [
+        `${prefix}src/${sourceSet}/java/com/acme/build/RealtimePlusService.java`,
+        `${prefix}src/${sourceSet}/java/build/nested/build/Example.java`,
+      ]).concat([
+        `${prefix}src/androidTest/java/com/acme/build/DeviceProbe.java`,
+        `${prefix}src/main/kotlin/com/acme/build/KotlinProbe.kt`,
+        `${prefix}src/test/scala/com/acme/build/ScalaProbe.scala`,
+      ]));
+      const ignored = [
+        'build/generated/Generated.java',
+        'module/build/generated/Generated.java',
+        'build/src/main/java/com/build/Generated.java',
+        'module/build/src/test/java/build/Generated.java',
+        'src/main/resources/build/Generated.java',
+        'node_modules/pkg/src/main/java/com/build/Generated.java',
+        'target/src/test/java/com/build/Generated.java',
+        ...['src/main/java/com/build/', 'module/src/test/java/build/'].flatMap((prefix) => [
+          `${prefix}node_modules/pkg/a.js`,
+          `${prefix}target/A.java`,
+          `${prefix}target/build/A.java`,
+          `${prefix}dist/A.java`,
+          `${prefix}vendor/A.java`,
+          `${prefix}cmake-build-debug/A.java`,
+          `${prefix}res/layout/A.xml`,
+        ]),
+      ];
+      for (const rel of [...sources, ...ignored]) {
+        const abs = path.join(tempDir, rel);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, 'class Example {}\n');
+      }
+      if (mode !== 'filesystem') {
+        execFileSync('git', ['init', '-q'], { cwd: tempDir });
+        if (mode === 'tracked') execFileSync('git', ['add', '-f', '.'], { cwd: tempDir });
+      }
+
+      const defaults = buildDefaultIgnore(tempDir);
+      const scope = buildScopeIgnore(tempDir);
+      const files = scanDirectory(tempDir);
+      expect(await scanDirectoryAsync(tempDir)).toEqual(files);
+      for (const rel of sources) {
+        expect(defaults.ignores(rel), rel).toBe(false);
+        expect(scope.ignores(rel), rel).toBe(false);
+        // The watcher and filesystem walker must be able to reach each file.
+        const parts = rel.split('/');
+        for (let i = 1; i < parts.length; i++) {
+          expect(scope.ignores(parts.slice(0, i).join('/') + '/'), rel).toBe(false);
+        }
+        expect(files).toContain(rel);
+      }
+      for (const rel of ignored) {
+        expect(defaults.ignores(rel), rel).toBe(true);
+        expect(scope.ignores(rel), rel).toBe(true);
+        expect(files).not.toContain(rel);
+      }
+    },
+  );
+
+  it.each(['.gitignore', 'codegraph.json', 'src/main/java/.gitignore'])(
+    'lets explicit %s rules exclude a Java package named build (#1642)',
+    (ignoreFile) => {
+      const sourceFile = 'src/main/java/com/acme/build/Hidden.java';
+      const abs = path.join(tempDir, sourceFile);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, 'class Hidden {}\n');
+      execFileSync('git', ['init', '-q'], { cwd: tempDir });
+      fs.writeFileSync(path.join(tempDir, ignoreFile), ignoreFile === 'codegraph.json'
+        ? JSON.stringify({ exclude: ['src/main/java/**/build/'] })
+        : 'build/\n');
+
+      expect(buildScopeIgnore(tempDir).ignores(sourceFile)).toBe(true);
+      expect(scanDirectory(tempDir)).not.toContain(sourceFile);
+    },
+  );
+
+  it('retrieves and syncs indexed Java packages named build (#1642)', async () => {
+    const { ToolHandler } = await import('../src/mcp/tools');
+    const sourceFile = 'src/main/java/com/ctrip/panda/es/build/RealtimePlusService.java';
+    const ignoredFile = 'src/main/java/com/ctrip/panda/es/build/target/Generated.java';
+    for (const rel of [sourceFile, ignoredFile]) {
+      fs.mkdirSync(path.dirname(path.join(tempDir, rel)), { recursive: true });
+    }
+    const source = 'package com.ctrip.panda.es.build;\npublic class RealtimePlusService { public int run() { return 1; } }\n';
+    fs.writeFileSync(path.join(tempDir, sourceFile), source);
+    fs.writeFileSync(path.join(tempDir, ignoredFile), 'public class Generated {}\n');
+    const cg = CodeGraph.initSync(tempDir);
+    try {
+      expect((await cg.indexAll()).filesIndexed).toBe(1);
+      expect(cg.getNodesInFile(sourceFile).some((node) => node.name === 'RealtimePlusService')).toBe(true);
+      const result = await new ToolHandler(cg).execute('codegraph_explore', { query: 'RealtimePlusService' });
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0]!.text).toContain('public class RealtimePlusService');
+
+      fs.writeFileSync(path.join(tempDir, sourceFile), source.replace('run()', 'updatedRun()'));
+      await cg.sync({ paths: [sourceFile, ignoredFile] });
+      expect(cg.getNodesInFile(sourceFile).some((node) => node.name === 'updatedRun')).toBe(true);
+      expect(cg.getNodesInFile(ignoredFile)).toEqual([]);
+
+      const addedFile = 'src/test/java/com/build/ServiceTest.java';
+      fs.mkdirSync(path.dirname(path.join(tempDir, addedFile)), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, addedFile), 'package com.build; public class ServiceTest {}\n');
+      expect((await cg.sync()).filesAdded).toBe(1);
+      expect(cg.getNodesInFile(addedFile).some((node) => node.name === 'ServiceTest')).toBe(true);
+    } finally {
+      cg.close();
+    }
+  });
 });
 
 // =============================================================================
@@ -3548,15 +9339,27 @@ class UserService(private val repo: UserRepository) {
       expect(cls?.language).toBe('scala');
     });
 
-    it('should extract object definitions as class kind', () => {
-      const code = `
-object DatabaseConfig {
-  val url = "jdbc:postgresql://localhost/mydb"
-}
-`;
+    it.each(['\n', '\r\n'])('extracts objects as modules with method ownership (%j)', (eol) => {
+      const code = [
+        'object DatabaseConfig {',
+        '  val url = "jdbc:postgresql://localhost/mydb"',
+        '  def connect(): String = url',
+        '}',
+        'def scope(): Int = {',
+        '  object Local { def value(): Int = 1 }',
+        '  Local.value()',
+        '}',
+        'case object Empty',
+      ].join(eol);
       const result = extractFromSource('Config.scala', code);
-      const obj = result.nodes.find((n) => n.kind === 'class' && n.name === 'DatabaseConfig');
-      expect(obj).toBeDefined();
+      for (const [name, method] of [['DatabaseConfig', 'connect'], ['Local', 'value']]) {
+        const obj = result.nodes.find((n) => n.kind === 'module' && n.name === name)!;
+        const member = result.nodes.find((n) => n.kind === 'method' && n.name === method)!;
+        expect(obj).toBeDefined();
+        expect(member).toBeDefined();
+        expect(result.edges.some((e) => e.kind === 'contains' && e.source === obj.id && e.target === member.id)).toBe(true);
+      }
+      expect(result.nodes.some((n) => n.kind === 'module' && n.name === 'Empty')).toBe(true);
     });
 
     it('should extract trait definitions as trait kind', () => {
@@ -3784,6 +9587,35 @@ def processData(): Unit = {
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
       expect(calls.length).toBeGreaterThan(0);
     });
+
+    it('walks a val/var initializer scoped to the declared symbol (#693 for Scala)', () => {
+      // The val/var hook minted the node and returned true, so the dispatcher
+      // only scanned the subtree for function-as-value candidates — every call
+      // in an initializer was dropped, which on a `val`-heavy codebase
+      // (SpinalHDL, Akka wiring) is most of the wiring.
+      const code = `
+class C {
+  val fieldLambda: () => Unit = () => target()
+  val direct = target()
+  lazy val lazily = target()
+  private def target(): Unit = {}
+}
+
+object O {
+  val topLambda = () => hit()
+  def hit(): Unit = {}
+}
+`;
+      const result = extractFromSource('C.scala', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const callersOf = (name: string) =>
+        result.unresolvedReferences
+          .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+          .map((u) => byId.get(u.fromNodeId)?.name)
+          .sort();
+      expect(callersOf('target')).toEqual(['direct', 'fieldLambda', 'lazily']);
+      expect(callersOf('hit')).toEqual(['topLambda']);
+    });
   });
 });
 
@@ -3890,6 +9722,33 @@ const token = getTokenMp();
     expect(call).toBeDefined();
   });
 
+  it.each(['LF', 'CRLF'])('should attribute calls in <script setup> destructuring and in the template to the component (%s, #2340)', (ending) => {
+    const lf = `<template>
+  <NuxtLink :to="useBar(link.location)">{{ useBar(link) }}</NuxtLink>
+  <li v-for="item in items" @click="item.open()">{{ label(item) }}</li>
+</template>
+
+<script setup lang="ts">
+const { a } = useFoo(1)
+const [b] = useFoo(2)
+</script>
+`;
+    const code = ending === 'CRLF' ? lf.replace(/\n/g, '\r\n') : lf;
+    const result = extractFromSource('Card.vue', code);
+    const component = result.nodes.find((n) => n.kind === 'component')!;
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => `${r.fromNodeId === component.id ? 'component' : r.fromNodeId}:${r.referenceName}@${r.line}`)
+      .sort();
+    expect(calls).toEqual([
+      'component:label@3',
+      'component:useBar@2',
+      'component:useBar@2',
+      'component:useFoo@7',
+      'component:useFoo@8',
+    ]);
+  });
+
   it('should extract calls from Vue Options API object methods', () => {
     const code = `<template>
   <button @click="save">Save</button>
@@ -3984,8 +9843,10 @@ function greet() {
     expect(componentNode?.name).toBe('Static');
     expect(componentNode?.language).toBe('vue');
 
-    // Only the component node should exist (no script nodes)
-    expect(result.nodes.length).toBe(1);
+    // The file and the component it is — no script nodes. (A file with no
+    // script used to have no file node at all.)
+    expect(result.nodes.map((n) => n.kind).sort()).toEqual(['component', 'file']);
+    expect(result.edges).toContainEqual(expect.objectContaining({ source: 'file:Static.vue', target: componentNode!.id, kind: 'contains' }));
   });
 
   it('should create containment edges from component to script nodes', () => {
@@ -4003,6 +9864,218 @@ const value = 42;
     expect(componentNode).toBeDefined();
 
     // Should have containment edges from component to child nodes
+    const containEdges = result.edges.filter(
+      (e) => e.source === componentNode!.id && e.kind === 'contains'
+    );
+    expect(containEdges.length).toBeGreaterThan(0);
+  });
+});
+
+describe('Astro Extraction', () => {
+  it('should detect Astro files', () => {
+    expect(detectLanguage('src/pages/index.astro')).toBe('astro');
+    expect(detectLanguage('Layout.astro')).toBe('astro');
+    expect(isLanguageSupported('astro')).toBe(true);
+  });
+
+  it('should extract component node from an .astro file', () => {
+    const code = `---
+const title = 'Hello';
+---
+<h1>{title}</h1>
+`;
+    const result = extractFromSource('Card.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Card');
+    expect(componentNode?.language).toBe('astro');
+    expect(componentNode?.isExported).toBe(true);
+  });
+
+  it('should extract frontmatter symbols with correct line numbers (#768)', () => {
+    const code = `---
+import { formatDate } from '../utils/format';
+
+function getIconNode(name: string): string {
+  return name;
+}
+
+const { title } = Astro.props;
+---
+<span>{title}</span>
+`;
+    const result = extractFromSource('navs.astro', code);
+
+    // The #768 repro: a function defined in frontmatter must be found
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'getIconNode');
+    expect(fn).toBeDefined();
+    expect(fn?.language).toBe('astro');
+    expect(fn?.startLine).toBe(4);
+
+    const imp = result.nodes.find((n) => n.kind === 'import');
+    expect(imp).toBeDefined();
+    expect(imp?.startLine).toBe(2);
+  });
+
+  it('should extract exported getStaticPaths from frontmatter', () => {
+    const code = `---
+export async function getStaticPaths() {
+  return [];
+}
+const { slug } = Astro.params;
+---
+<p>{slug}</p>
+`;
+    const result = extractFromSource('[slug].astro', code);
+
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'getStaticPaths');
+    expect(fn).toBeDefined();
+    expect(fn?.isExported).toBe(true);
+  });
+
+  it('should extract calls from template expressions', () => {
+    const code = `---
+import { formatDate } from '../utils/format';
+const date = new Date();
+---
+<time>{formatDate(date)}</time>
+`;
+    const result = extractFromSource('Stamp.astro', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'formatDate' && ref.line === 5
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('should extract calls from a multiline expression opening line', () => {
+    const code = `---
+const posts = [];
+---
+<ul>
+  {posts.map((post) => (
+    <li>{render(post)}</li>
+  ))}
+</ul>
+`;
+    const result = extractFromSource('List.astro', code);
+
+    const mapCall = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'posts.map'
+    );
+    expect(mapCall).toBeDefined();
+    const innerCall = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'render'
+    );
+    expect(innerCall).toBeDefined();
+  });
+
+  it('should extract PascalCase component usages from the template', () => {
+    const code = `---
+import Layout from '../layouts/Layout.astro';
+import PostCard from '../components/PostCard.astro';
+---
+<Layout title="Home">
+  <PostCard />
+  <Fragment slot="head" />
+  <div class="plain-html" />
+</Layout>
+`;
+    const result = extractFromSource('index.astro', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    const names = refs.map((r) => r.referenceName);
+    expect(names).toContain('Layout');
+    expect(names).toContain('PostCard');
+    // Astro built-ins and lowercase HTML are not component references
+    expect(names).not.toContain('Fragment');
+    expect(names).not.toContain('div');
+  });
+
+  it('should not extract template patterns from frontmatter, script, or style content', () => {
+    const code = `---
+// <FakeComponent /> inside frontmatter comment
+const x = { y: maybeCall(1) };
+---
+<div>real</div>
+<script>
+  const z = { w: scriptCall(2) };
+</script>
+<style>
+  .a { color: red; }
+</style>
+`;
+    const result = extractFromSource('Guard.astro', code);
+
+    const templateRefs = result.unresolvedReferences.filter(
+      (r) => r.referenceKind === 'references' && r.referenceName === 'FakeComponent'
+    );
+    expect(templateRefs).toHaveLength(0);
+
+    // maybeCall/scriptCall come from the delegated TS extraction (once),
+    // not double-counted by the template scanner
+    const maybeCalls = result.unresolvedReferences.filter(
+      (r) => r.referenceName === 'maybeCall' && r.referenceKind === 'calls'
+    );
+    expect(maybeCalls.length).toBeLessThanOrEqual(1);
+  });
+
+  it('should extract <script> block symbols with correct line numbers', () => {
+    const code = `---
+const a = 1;
+---
+<div>hi</div>
+<script>
+function trackView(page: string) {
+  console.log(page);
+}
+</script>
+`;
+    const result = extractFromSource('Tracker.astro', code);
+
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'trackView');
+    expect(fn).toBeDefined();
+    expect(fn?.startLine).toBe(6);
+    expect(fn?.language).toBe('astro');
+  });
+
+  it('should create component node for a frontmatter-less template-only file', () => {
+    const code = `<div>Static content</div>
+`;
+    const result = extractFromSource('Static.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Static');
+    expect(componentNode?.language).toBe('astro');
+  });
+
+  it('should treat an unclosed frontmatter fence as no frontmatter', () => {
+    const code = `---
+const broken = true;
+<div>never closed</div>
+`;
+    const result = extractFromSource('Broken.astro', code);
+
+    // No TS delegation happened (the fence never closes), but the component
+    // node still exists and nothing throws.
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(result.nodes.find((n) => n.name === 'broken')).toBeUndefined();
+  });
+
+  it('should create containment edges from component to frontmatter nodes', () => {
+    const code = `---
+const value = 42;
+---
+<div>{value}</div>
+`;
+    const result = extractFromSource('Contained.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+
     const containEdges = result.edges.filter(
       (e) => e.source === componentNode!.id && e.kind === 'contains'
     );
@@ -4151,6 +10224,58 @@ function M:send(data) return self end
       expect(connect?.qualifiedName).toBe('M::connect');
       const send = methods.find((m) => m.name === 'send');
       expect(send?.qualifiedName).toBe('M::send');
+    });
+
+    it('should name function expressions from local, member, and table-field bindings', () => {
+      const code = `
+local function helper() return 1 end
+local localFn = function() return helper() end
+local M = {
+  callbacks = {
+    onStart = function() return helper() end,
+    ["onStop"] = function() return helper() end,
+    [DYNAMIC] = function() return helper() end,
+  },
+}
+M.assignedFn = function() return helper() end
+M["bracketFn"] = function() return helper() end
+localFn()
+`;
+      const result = extractFromSource('handlers.lua', code);
+      const localFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'localFn');
+      const assignedFn = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M::assignedFn'
+      );
+      const onStart = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M.callbacks::onStart'
+      );
+      const onStop = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M.callbacks::onStop'
+      );
+      const bracketFn = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M::bracketFn'
+      );
+
+      expect(localFn).toBeDefined();
+      expect(assignedFn).toBeDefined();
+      expect(onStart).toBeDefined();
+      expect(onStop).toBeDefined();
+      expect(bracketFn).toBeDefined();
+      expect(result.nodes.some((n) => n.name === 'DYNAMIC')).toBe(false);
+      expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'localFn')).toBe(false);
+
+      for (const callable of [localFn, assignedFn, onStart, onStop, bracketFn]) {
+        expect(
+          result.unresolvedReferences.some(
+            (r) => r.fromNodeId === callable!.id && r.referenceKind === 'calls' && r.referenceName === 'helper'
+          )
+        ).toBe(true);
+      }
+      expect(
+        result.unresolvedReferences.some(
+          (r) => r.referenceKind === 'calls' && r.referenceName === 'localFn'
+        )
+      ).toBe(true);
     });
   });
 
@@ -4347,6 +10472,22 @@ void helperFunction(int count) {
     expect(imports).toContain('MyClass.h');
   });
 
+  it('extracts union declarations as first-class union nodes', () => {
+    const code = `
+typedef union {
+  unsigned int raw;
+  float value;
+} NumberBits;
+
+union opaque_bits;
+`;
+    const result = extractFromSource('NumberBits.m', code);
+
+    const numberBits = result.nodes.find((n) => n.name === 'NumberBits');
+    expect(numberBits?.kind).toBe('union');
+    expect(result.nodes.some((n) => n.name === 'opaque_bits')).toBe(false);
+  });
+
   it('should record inheritance and protocol conformance', () => {
     const result = extractFromSource('App.m', sample);
     const extendsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
@@ -4414,6 +10555,211 @@ void helperFunction(int count) {
   });
 });
 
+describe('Solidity Extraction', () => {
+  const code = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+interface IVault {
+    function deposit(uint256 amount) external returns (bool);
+    event Deposited(address indexed user, uint256 amount);
+}
+
+library SafeMath {
+    function add(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a + b;
+    }
+}
+
+contract Vault is IVault {
+    using SafeMath for uint256;
+
+    enum Status { Active, Frozen, Closed }
+
+    struct UserInfo {
+        uint256 balance;
+        uint256 lastDeposit;
+    }
+
+    IERC20 public immutable token;
+    mapping(address => UserInfo) public users;
+    address public owner;
+
+    event Withdrawn(address indexed user, uint256 amount);
+    error NotOwner();
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    constructor(address _token) {
+        token = IERC20(_token);
+        owner = msg.sender;
+    }
+
+    function deposit(uint256 amount) external override returns (bool) {
+        users[msg.sender].balance = users[msg.sender].balance.add(amount);
+        emit Deposited(msg.sender, amount);
+        return true;
+    }
+
+    function withdraw(uint256 amount) external onlyOwner {
+        emit Withdrawn(msg.sender, amount);
+    }
+}
+`;
+
+  describe('Language detection', () => {
+    it('should detect Solidity files', () => {
+      expect(detectLanguage('contracts/Vault.sol')).toBe('solidity');
+    });
+
+    it('should report Solidity as supported', () => {
+      expect(isLanguageSupported('solidity')).toBe(true);
+      expect(getSupportedLanguages()).toContain('solidity');
+    });
+  });
+
+  describe('Container extraction', () => {
+    it('should extract contract / interface / library as class-likes', () => {
+      const result = extractFromSource('Vault.sol', code);
+      // interface_declaration → interface
+      const iface = result.nodes.find((n) => n.kind === 'interface' && n.name === 'IVault');
+      expect(iface).toBeDefined();
+      expect(iface?.language).toBe('solidity');
+      // contract and library both map to 'class' (library has no special semantics
+      // a class node doesn't already cover — they share methodTypes/inheritance).
+      expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'Vault')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'SafeMath')).toBeDefined();
+    });
+
+    it('should emit extends references for `is X, Y` inheritance', () => {
+      // `Vault is IVault` — Solidity uses one keyword (`is`) for both class
+      // extension and interface implementation, so the extractor emits `extends`
+      // and the resolver's interface-impl synthesizer reclassifies to
+      // `implements` based on the target node kind.
+      const result = extractFromSource('Vault.sol', code);
+      const extendsRefs = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'extends' && r.referenceName === 'IVault'
+      );
+      expect(extendsRefs).toHaveLength(1);
+      const vaultNode = result.nodes.find((n) => n.kind === 'class' && n.name === 'Vault');
+      expect(extendsRefs[0]?.fromNodeId).toBe(vaultNode?.id);
+    });
+  });
+
+  describe('Method extraction', () => {
+    it('should extract methods, modifiers, and constructor with signatures', () => {
+      const result = extractFromSource('Vault.sol', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const names = methods.map((n) => n.name);
+      expect(names).toContain('deposit');
+      expect(names).toContain('withdraw');
+      expect(names).toContain('add');
+      expect(names).toContain('onlyOwner');     // modifier_definition
+      expect(names).toContain('constructor');   // constructor_definition (synthetic name)
+
+      // Signature should capture parameters + visibility + state mutability + return type.
+      const add = methods.find((m) => m.name === 'add');
+      expect(add?.signature).toContain('uint256 a');
+      expect(add?.signature).toContain('internal');
+      expect(add?.signature).toContain('pure');
+      expect(add?.signature).toContain('returns (uint256)');
+
+      // `external` visibility should map to 'public' (callable from outside the contract).
+      const deposit = methods.find((m) => m.name === 'deposit');
+      expect(deposit?.visibility).toBe('public');
+    });
+  });
+
+  describe('Struct, enum, and field extraction', () => {
+    it('should extract struct, enum, and enum members', () => {
+      const result = extractFromSource('Vault.sol', code);
+      expect(result.nodes.find((n) => n.kind === 'struct' && n.name === 'UserInfo')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'Status')).toBeDefined();
+      const enumMembers = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+      expect(enumMembers).toEqual(expect.arrayContaining(['Active', 'Frozen', 'Closed']));
+    });
+
+    it('should extract state variables, struct members, events, errors as fields', () => {
+      const result = extractFromSource('Vault.sol', code);
+      const fieldNames = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      // state variables
+      expect(fieldNames).toEqual(expect.arrayContaining(['token', 'users', 'owner']));
+      // struct members
+      expect(fieldNames).toEqual(expect.arrayContaining(['balance', 'lastDeposit']));
+      // event + error
+      expect(fieldNames).toEqual(expect.arrayContaining(['Deposited', 'Withdrawn', 'NotOwner']));
+    });
+
+    it('should treat `constant_variable_declaration` as a constant, not a variable', () => {
+      const constCode = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+uint256 constant FILE_CONST = 42;
+`;
+      const result = extractFromSource('consts.sol', constCode);
+      const node = result.nodes.find((n) => n.name === 'FILE_CONST');
+      expect(node?.kind).toBe('constant');
+    });
+  });
+
+  describe('Import and call extraction', () => {
+    it('should extract import directives with the source path as the module name', () => {
+      const result = extractFromSource('Vault.sol', code);
+      const imp = result.nodes.find((n) => n.kind === 'import');
+      expect(imp).toBeDefined();
+      expect(imp?.name).toBe('@openzeppelin/contracts/token/ERC20/IERC20.sol');
+    });
+
+    it('should produce calls refs for emit, revert, and library/method calls', () => {
+      const result = extractFromSource('Vault.sol', code);
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      // emit Deposited(...)
+      expect(calls).toContain('Deposited');
+      // revert NotOwner()
+      expect(calls).toContain('NotOwner');
+      // library call: balance.add(amount) — receiver-qualified
+      expect(calls.some((c) => c === 'add' || c === 'balance.add')).toBe(true);
+    });
+
+    it('should produce calls refs for modifier invocations and base-constructor invocations', () => {
+      // `withdraw(...) external onlyOwner` — the modifier sits in the function
+      // header, outside the body: field the call walker descends, so it goes
+      // through the decorator-position walk. It must emit `calls` (not
+      // `decorates`) so flow traversal rides the withdraw → onlyOwner →
+      // NotOwner audit path.
+      const result = extractFromSource('Vault.sol', code);
+      const withdrawNode = result.nodes.find((n) => n.kind === 'method' && n.name === 'withdraw');
+      const modifierCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'onlyOwner'
+      );
+      expect(modifierCall).toBeDefined();
+      expect(modifierCall?.fromNodeId).toBe(withdrawNode?.id);
+
+      // Base-constructor invocation parses as the same modifier_invocation
+      // node: `constructor(address o) ERC20("T", "TOK") Ownable(o)` — the
+      // constructor-chain hop.
+      const ctorCode = `pragma solidity ^0.8.20;
+contract MyToken is ERC20, Ownable {
+    constructor(address o) ERC20("Tok", "TOK") Ownable(o) {}
+    function grab(bytes32 r) external onlyRole(ADMIN_ROLE) returns (uint256) { return 1; }
+}
+`;
+      const ctorResult = extractFromSource('MyToken.sol', ctorCode);
+      const ctorCalls = ctorResult.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(ctorCalls).toEqual(expect.arrayContaining(['ERC20', 'Ownable']));
+      // modifier WITH arguments still resolves to the bare modifier name
+      expect(ctorCalls).toContain('onlyRole');
+    });
+  });
+});
+
 describe('Regression: issue-specific extraction fixes', () => {
   it('indexes inner functions of an anonymous AMD/CommonJS module wrapper (#528)', () => {
     const code = `
@@ -4460,8 +10806,7 @@ func (s Stack[T]) Len() int { return len(s.items) }
   });
 });
 
-// =============================================================================
-// Groovy
+// ======================================================================// Groovy
 // =============================================================================
 
 describe('Groovy Extraction', () => {
@@ -4611,5 +10956,3375 @@ def greet(String name) {
   it('should report Groovy as supported', () => {
     expect(isLanguageSupported('groovy')).toBe(true);
     expect(getSupportedLanguages()).toContain('groovy');
+  });
+});
+
+describe('Import / re-export dependency linking (blast-radius recall)', () => {
+  // An import IS a dependency, but extraction only emits references for calls,
+  // instantiations, type annotations, and inheritance — so a symbol imported and
+  // then merely re-exported, placed in a registry array, passed as an argument,
+  // or used in JSX produced no cross-file edge, leaving the providing file with a
+  // false "0 dependents". These tests pin the import/re-export binding linking.
+  it('emits an imports reference per named, aliased, and default import binding', () => {
+    const code = `
+import { widget, helper as h } from './foo';
+import Thing from './thing';
+import * as NS from './ns';
+export const registry = [widget];
+`;
+    const result = extractFromSource('bar.ts', code);
+    const names = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    expect(names).toContain('widget');   // named import → local name
+    expect(names).toContain('h');        // aliased import → local alias
+    expect(names).toContain('Thing');    // default import
+    expect(names).toContain('NS');       // namespace import → linked to the module file as a dependency
+  });
+
+  it('emits an imports reference per re-exported binding', () => {
+    const result = extractFromSource('barrel.ts', `export { alpha, beta as b } from './source';`);
+    const names = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    // Re-export links the SOURCE-side name, not the local alias.
+    expect(names).toContain('alpha');
+    expect(names).toContain('beta');
+  });
+
+  it('a re-export imports its source module, as an import statement does', () => {
+    const result = extractFromSource(
+      'barrel.ts',
+      `export * from './star';\nexport { alpha } from './named';\nexport * as ns from './space';\n`
+    );
+    const modules = ['./star', './named', './space'];
+    expect(result.nodes.filter((n) => n.kind === 'import').map((n) => n.name)).toEqual(modules);
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+    for (const module of modules) expect(refs).toContain(module);
+    expect(refs).toContain('alpha');
+  });
+
+  it('a barrel that only re-exports everything is a dependent of the module', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'foo.ts'), `export function helper(): void {}\n`);
+      fs.writeFileSync(path.join(dir, 'src', 'index.ts'), `export * from './foo';\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.ts'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('src/foo.ts')).toContain('src/index.ts');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('a value imported/re-exported but never called still makes the importer a dependent', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'src', 'foo.ts'),
+        `export const widget = { n: 1 };\nexport function helper(): void {}\n`
+      );
+      // bar uses widget ONLY in an array and re-exports helper — neither is
+      // called/typed, so before import-linking bar had no edge to foo at all.
+      fs.writeFileSync(
+        path.join(dir, 'src', 'bar.ts'),
+        `import { widget } from './foo';\nexport { helper } from './foo';\nexport const registry = [widget];\n`
+      );
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.ts'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('src/foo.ts')).toContain('src/bar.ts');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('a namespace import touched only via a value-member read still links the module file', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'foo.ts'), `export const SOME_CONST = 42;\n`);
+      // `foo` is imported as a namespace and used ONLY via a value-member read
+      // (no call, no type) — `foo.helper()` would link on its own, but a bare
+      // `foo.SOME_CONST` would not, so the module-import backstop must link it.
+      fs.writeFileSync(path.join(dir, 'src', 'bar.ts'), `import * as foo from './foo';\nexport const x = foo.SOME_CONST;\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.ts'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('src/foo.ts')).toContain('src/bar.ts');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('Python import dependency linking (blast-radius recall)', () => {
+  // Same recall gap as TS: Python only linked called/instantiated imports, so a
+  // name brought in with `from module import X` and then merely stored, used as
+  // a decorator/argument, or re-exported through an `__init__.py` produced no
+  // cross-file edge — the providing module showed a false "0 dependents".
+  it('emits an imports reference per name in a `from module import ...` (incl. value/aliased)', () => {
+    const code = [
+      'from foo import helper, widget',
+      'from foo import Thing as T',
+      'from . import sibling',
+      'from bar import *',
+    ].join('\n');
+    const names = extractFromSource('mod.py', code)
+      .unresolvedReferences.filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    expect(names).toContain('helper');
+    expect(names).toContain('widget');   // value import
+    expect(names).toContain('T');        // aliased import → local name
+    expect(names).toContain('sibling');  // `from . import <name>`
+    expect(names).not.toContain('*');    // wildcard import has no names
+  });
+
+  it('a Python value imported but never called still makes the importer a dependent', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'pkg'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'pkg', 'foo.py'), `widget = {"n": 1}\ndef helper():\n    return 1\n`);
+      // bar imports widget+helper but only stores widget in a list — nothing is
+      // called, so before import-linking bar had no edge to foo.
+      fs.writeFileSync(path.join(dir, 'pkg', 'bar.py'), `from foo import widget, helper\nregistry = [widget]\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['pkg/**/*.py'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('pkg/foo.py')).toContain('pkg/bar.py');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('resolves `from . import submodule` + `submodule.func()` to the submodule', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'pkg'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'pkg', '__init__.py'), '');
+      fs.writeFileSync(path.join(dir, 'pkg', 'certs.py'), `def where():\n    return "/ca.pem"\n`);
+      // certs is an imported MODULE (a file), and certs.where() is a qualified
+      // call through it — the receiver isn't a symbol, so plain name-matching
+      // can't link it. Also exercises the Python relative-dot path fix (`.certs`).
+      fs.writeFileSync(path.join(dir, 'pkg', 'utils.py'), `from . import certs\ndef go():\n    return certs.where()\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['pkg/**/*.py'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('pkg/certs.py')).toContain('pkg/utils.py');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('a module import is a dependency even when the used member is re-exported elsewhere', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'pkg'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'pkg', '__init__.py'), '');
+      // `where` is NOT defined in certs.py (re-exported from a 3rd-party pkg), so
+      // member resolution can't find it — the module-import backstop must still
+      // record utils -> certs. (Mirrors requests' real `certs.where`.)
+      fs.writeFileSync(path.join(dir, 'pkg', 'certs.py'), `from external_ca import where\n`);
+      fs.writeFileSync(path.join(dir, 'pkg', 'utils.py'), `from . import certs\nCA = certs.where()\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['pkg/**/*.py'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('pkg/certs.py')).toContain('pkg/utils.py');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('Go cross-package composite literals (blast-radius recall)', () => {
+  // Go function calls and type references across packages already resolved, but
+  // struct composite literals — `render.XML{...}` / `pkga.Widget{...}` — were not
+  // extracted at all, so a package whose types are only INSTANTIATED elsewhere
+  // (gin's render/binding implementations) showed 0 dependents.
+  it('links a cross-package struct composite literal to the defining package', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      fs.mkdirSync(path.join(dir, 'render'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'render', 'xml.go'), `package render\n\ntype XML struct { Data any }\n`);
+      fs.writeFileSync(path.join(dir, 'app.go'), `package main\n\nimport "example.com/proj/render"\n\nfunc handle() any { return render.XML{} }\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('render/xml.go')).toContain('app.go');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('links a composite literal in a package-level var registry', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      fs.mkdirSync(path.join(dir, 'render'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'render', 'xml.go'), `package render\n\ntype XML struct {}\nfunc (XML) Render() {}\n`);
+      // The implementation is registered only in a top-level `var registry = {...}`
+      // map literal — the body walker doesn't cover top-level declarations, so this
+      // exercises the var-initializer walking added for Go.
+      fs.writeFileSync(path.join(dir, 'reg.go'), `package main\n\nimport "example.com/proj/render"\n\ntype R interface { Render() }\n\nvar registry = map[string]R{ "xml": render.XML{} }\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('render/xml.go')).toContain('reg.go');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('attributes a call inside a top-level closure (cobra RunE) to the var, not the file (#693)', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      // Wire is called ONLY from the anonymous RunE closure inside a top-level
+      // `var rootCmd = &Cmd{...}` — previously the call leaked to the file node,
+      // so `callers(Wire)` surfaced a file (or read as "no caller"). It must now
+      // attribute to the enclosing var.
+      fs.writeFileSync(path.join(dir, 'factory.go'), `package main\n\nfunc Wire() error { return nil }\n`);
+      fs.writeFileSync(
+        path.join(dir, 'root.go'),
+        `package main\n\ntype Cmd struct{ RunE func() error }\n\nvar rootCmd = &Cmd{\n\tRunE: func() error { return Wire() },\n}\n`
+      );
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      const wire = cg.getNodesByName('Wire').find((n) => n.kind === 'function');
+      expect(wire).toBeDefined();
+      const callers = cg.getCallers(wire!.id).map((c) => c.node);
+      expect(callers.some((n) => n.kind === 'variable' && n.name === 'rootCmd')).toBe(true);
+      expect(callers.some((n) => n.kind === 'file')).toBe(false);
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('links a parenthesized pointer type conversion `(*T)(x)` to the type', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      fs.writeFileSync(path.join(dir, 'types.go'), `package main\n\ntype Wrapped struct { N int }\n`);
+      // `(*Wrapped)(x)` parses as a call whose callee is the parenthesized type
+      // `(*Wrapped)` — without normalization it dropped on the floor.
+      fs.writeFileSync(path.join(dir, 'use.go'), `package main\n\nfunc run(x *int) { _ = (*Wrapped)(x) }\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('types.go')).toContain('use.go');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('links an implementation reached only through a Go interface (implicit satisfaction, #584)', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/proj\n\ngo 1.21\n');
+      fs.mkdirSync(path.join(dir, 'codec'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'codec', 'api.go'), `package codec\n\ntype Core interface {\n\tMarshal(v any) ([]byte, error)\n}\n\nvar API Core\n`);
+      // jsonApi satisfies Core structurally (no `implements` keyword) and is
+      // reached ONLY through the interface (API.Marshal). Without implicit
+      // interface satisfaction + dispatch, json.go shows 0 dependents.
+      fs.writeFileSync(path.join(dir, 'codec', 'json.go'), `package codec\n\ntype jsonApi struct{}\n\nfunc (j jsonApi) Marshal(v any) ([]byte, error) { return nil, nil }\n\nfunc init() { API = jsonApi{} }\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.go'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('codec/json.go')).toContain('codec/api.go');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('C# records (blast-radius recall)', () => {
+  // Records are ubiquitous in modern C# (DTOs, value objects, CQRS messages),
+  // but `record` / `record struct` declarations weren't extracted as types — so
+  // every reference, generic-type-argument, and `new` of a record dropped on the
+  // floor and the defining file showed 0 dependents. (#237)
+  it('extracts a record as a graph node (record class + record struct)', () => {
+    const r = extractFromSource('r.cs', `namespace P;\npublic record Box(int N);\npublic record struct Pt(int X);\n`);
+    expect(r.nodes.find((n) => n.name === 'Box' && (n.kind === 'class' || n.kind === 'struct'))).toBeDefined();
+    expect(r.nodes.find((n) => n.name === 'Pt' && (n.kind === 'class' || n.kind === 'struct'))).toBeDefined();
+  });
+
+  it('resolves references / instantiations of a record across files', async () => {
+    const dir = createTempDir();
+    try {
+      fs.writeFileSync(path.join(dir, 'types.cs'), `namespace P;\npublic record Box(int N);\n`);
+      // Box is used as a generic type argument and instantiated — both require
+      // Box to be a node to resolve.
+      fs.writeFileSync(
+        path.join(dir, 'use.cs'),
+        `using System.Collections.Generic;\nnamespace P;\npublic class User {\n    public IEnumerable<Box> Boxes { get; }\n    public Box Make() => new Box(1);\n}\n`
+      );
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.cs'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('types.cs')).toContain('use.cs');
+      cg.destroy();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('Rust cross-module recall', () => {
+  function rustProject(files: Record<string, string>): string {
+    const dir = createTempDir();
+    fs.writeFileSync(path.join(dir, 'Cargo.toml'), '[package]\nname = "proj"\nversion = "0.1.0"\nedition = "2021"\n');
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    for (const [rel, content] of Object.entries(files)) {
+      const full = path.join(dir, 'src', rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, content);
+    }
+    return dir;
+  }
+
+  it('extracts a struct literal `Foo { .. }` as an instantiation across modules', async () => {
+    const dir = rustProject({
+      'lib.rs': 'pub mod types;\npub mod consumer;\n',
+      'types.rs': 'pub struct Widget { pub n: i32 }\n',
+      'consumer.rs': 'use crate::types::Widget;\npub fn build() -> Widget { Widget { n: 1 } }\n',
+    });
+    try {
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.rs'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('src/types.rs')).toContain('src/consumer.rs');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+
+  it('extracts trait method declarations and bridges trait dispatch to the impl', async () => {
+    const dir = rustProject({
+      'lib.rs': 'pub mod types;\npub mod consumer;\n',
+      'types.rs': 'pub trait Render { fn render(&self) -> i32; }\n',
+      // Mine implements Render structurally; reached via &dyn Render dispatch.
+      'consumer.rs': 'use crate::types::Render;\npub struct Mine { pub x: i32 }\nimpl Render for Mine { fn render(&self) -> i32 { self.x } }\n',
+    });
+    try {
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.rs'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      // implements edge (Mine -> Render) makes types.rs a dependent of consumer.rs's struct.
+      expect(cg.getFileDependents('src/types.rs')).toContain('src/consumer.rs');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+
+  it('links `pub use` re-export hubs to the modules they re-export', async () => {
+    const dir = rustProject({
+      'lib.rs': 'pub mod api;\n',
+      'api/mod.rs': 'mod widget;\npub use self::widget::Widget;\n',
+      'api/widget.rs': 'pub struct Widget { pub n: i32 }\n',
+    });
+    try {
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.rs'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      // The re-export hub depends on the module it re-exports from.
+      expect(cg.getFileDependents('src/api/widget.rs')).toContain('src/api/mod.rs');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+
+  it('resolves a qualified path to the correct module when the leaf name collides', async () => {
+    const dir = rustProject({
+      'lib.rs': 'pub mod fast;\npub mod slow;\npub mod hub;\n',
+      'fast.rs': 'pub fn read() -> i32 { 1 }\n',
+      'slow.rs': 'pub fn read() -> i32 { 2 }\n',
+      // `read` exists in BOTH fast.rs and slow.rs — module-path resolution must
+      // send this re-export to fast.rs specifically, not name-match either.
+      'hub.rs': 'pub use crate::fast::read;\n',
+    });
+    try {
+      const cg = CodeGraph.initSync(dir, { config: { include: ['src/**/*.rs'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('src/fast.rs')).toContain('src/hub.rs');
+      expect(cg.getFileDependents('src/slow.rs')).not.toContain('src/hub.rs');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('Java annotations (blast-radius recall)', () => {
+  it('indexes @interface definitions and links @Annotation usages to them', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'p'), { recursive: true });
+      // The annotation DEFINITION must be a node, and the @MyAnno usages (which
+      // live inside a `modifiers` node on the class/field/method) must extract.
+      fs.writeFileSync(path.join(dir, 'p', 'MyAnno.java'), `package p;\npublic @interface MyAnno { String value() default ""; }\n`);
+      fs.writeFileSync(
+        path.join(dir, 'p', 'User.java'),
+        `package p;\n@MyAnno("c")\npublic class User {\n  @MyAnno("f") int field;\n  @MyAnno("m") void go() {}\n}\n`
+      );
+      const cg = CodeGraph.initSync(dir, { config: { include: ['**/*.java'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('p/MyAnno.java')).toContain('p/User.java');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('Swift property wrappers / attributes (blast-radius recall)', () => {
+  it('links a @propertyWrapper usage to the wrapper type', async () => {
+    const dir = createTempDir();
+    try {
+      fs.mkdirSync(path.join(dir, 'Sources', 'M'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'Sources', 'M', 'Wrap.swift'), `@propertyWrapper\npublic struct Argument<T> { public var wrappedValue: T }\n`);
+      // `@Argument` is a Swift attribute on a stored property — it lives in the
+      // property's `modifiers` and Swift doesn't extract instance properties as
+      // their own nodes, so without the fix the wrapper type has no users.
+      fs.writeFileSync(path.join(dir, 'Sources', 'M', 'Cmd.swift'), `public struct MyCommand {\n  @Argument var name: String\n  @Argument var count: Int\n}\n`);
+      const cg = CodeGraph.initSync(dir, { config: { include: ['Sources/**/*.swift'], exclude: [] } });
+      await cg.indexAll();
+      cg.resolveReferences();
+      expect(cg.getFileDependents('Sources/M/Wrap.swift')).toContain('Sources/M/Cmd.swift');
+      cg.destroy();
+    } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('R Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect R files (both extension cases)', () => {
+      expect(detectLanguage('analysis.R')).toBe('r');
+      expect(detectLanguage('scripts/clean.r')).toBe('r');
+    });
+
+    it('should report R as supported', () => {
+      expect(isLanguageSupported('r')).toBe(true);
+      expect(getSupportedLanguages()).toContain('r');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('extracts every assignment form, lambdas, and nested functions', () => {
+      const code = `
+clean_data <- function(df, threshold = 0.5) {
+  helper <- function(d) scale(d)
+  helper(df)
+}
+normalize = function(v) (v - mean(v)) / sd(v)
+double_it <- \\(x) x * 2
+`;
+      const result = extractFromSource('analysis.R', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('clean_data');
+      expect(funcs).toContain('normalize');
+      expect(funcs).toContain('double_it');
+      expect(funcs).toContain('helper'); // nested, inside clean_data's scope
+      const cleanData = result.nodes.find((n) => n.name === 'clean_data');
+      expect(cleanData?.language).toBe('r');
+      expect(cleanData?.signature).toBe('(df, threshold = 0.5)');
+    });
+
+    it('attributes body calls to the enclosing function', () => {
+      const code = `
+prep <- function(d) scale(d)
+fit_model <- function(data) {
+  lm(y ~ x, data = prep(data))
+}
+`;
+      const result = extractFromSource('models.R', code);
+      const prepCall = result.unresolvedReferences.find(
+        (r) => r.referenceName === 'prep' && r.referenceKind === 'calls'
+      );
+      expect(prepCall).toBeDefined();
+      const fitModel = result.nodes.find((n) => n.name === 'fit_model');
+      expect(prepCall?.fromNodeId).toBe(fitModel?.id);
+    });
+  });
+
+  describe('Imports', () => {
+    it('extracts library/require/source as imports, not calls', () => {
+      const code = `
+library(dplyr)
+require(stats)
+requireNamespace("jsonlite")
+source("helpers.R")
+`;
+      const result = extractFromSource('main.R', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('dplyr');
+      expect(imports).toContain('stats');
+      expect(imports).toContain('jsonlite');
+      expect(imports).toContain('helpers.R');
+      // Claimed by the hook — no call references to the import machinery.
+      const libCalls = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && (r.referenceName === 'library' || r.referenceName === 'source')
+      );
+      expect(libCalls).toHaveLength(0);
+    });
+  });
+
+  describe('Variables and constants', () => {
+    it('extracts top-level assignments; ALL_CAPS as constants; right-assign too', () => {
+      const code = `
+ALPHA <- 0.05
+max_iter = 100
+compute_stats(df) -> stats_result
+inner <- function() {
+  local_var <- 1
+}
+`;
+      const result = extractFromSource('config.R', code);
+      const constant = result.nodes.find((n) => n.name === 'ALPHA');
+      expect(constant?.kind).toBe('constant');
+      const variable = result.nodes.find((n) => n.name === 'max_iter');
+      expect(variable?.kind).toBe('variable');
+      const rightAssigned = result.nodes.find((n) => n.name === 'stats_result');
+      expect(rightAssigned?.kind).toBe('variable');
+      // Locals inside functions are deliberately NOT extracted.
+      expect(result.nodes.find((n) => n.name === 'local_var')).toBeUndefined();
+    });
+  });
+
+  describe('Classes', () => {
+    it('extracts S4/R5/R6 class calls as classes with their list methods', () => {
+      const code = `
+setClass("Patient", representation(id = "character"))
+Account <- setRefClass("Account",
+  fields = list(balance = "numeric"),
+  methods = list(deposit = function(x) { balance <<- balance + x })
+)
+Stack <- R6Class("Stack",
+  public = list(push = function(v) invisible(v))
+)
+setGeneric("describe", function(obj) standardGeneric("describe"))
+setMethod("describe", "Patient", function(obj) paste(obj@id))
+`;
+      const result = extractFromSource('classes.R', code);
+      const classes = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+      expect(classes).toContain('Patient');
+      expect(classes).toContain('Account');
+      expect(classes).toContain('Stack');
+      const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+      expect(methods).toContain('deposit');
+      expect(methods).toContain('push');
+      // setGeneric/setMethod produce functions named by their string argument.
+      const describes = result.nodes.filter((n) => n.name === 'describe' && n.kind === 'function');
+      expect(describes.length).toBeGreaterThanOrEqual(2);
+      // The class-assignment idiom must not ALSO produce a variable node.
+      expect(result.nodes.find((n) => n.name === 'Account' && n.kind === 'variable')).toBeUndefined();
+    });
+
+    it('extracts ggproto classes with direct-arg methods and the parent as extends', () => {
+      // ggplot2's OO system — every Geom/Stat/Scale in the ecosystem uses it.
+      const code = `
+GeomPoint <- ggproto("GeomPoint", Geom,
+  required_aes = c("x", "y"),
+  draw_panel = function(data, panel_params, coord) {
+    coords <- coord$transform(data, panel_params)
+    grid::pointsGrob(coords$x, coords$y)
+  },
+  draw_key = draw_key_point
+)
+`;
+      const result = extractFromSource('geom-point.R', code);
+      const cls = result.nodes.find((n) => n.name === 'GeomPoint' && n.kind === 'class');
+      expect(cls).toBeDefined();
+      const method = result.nodes.find((n) => n.name === 'draw_panel' && n.kind === 'method');
+      expect(method).toBeDefined();
+      const ext = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'extends' && r.referenceName === 'Geom'
+      );
+      expect(ext?.fromNodeId).toBe(cls?.id);
+      // No twin variable for the assignment.
+      expect(result.nodes.find((n) => n.name === 'GeomPoint' && n.kind === 'variable')).toBeUndefined();
+    });
+  });
+});
+
+// =============================================================================
+// CFML (ColdFusion Markup Language — .cfc/.cfm tag-based and bare-script, .cfs)
+// =============================================================================
+
+describe('CFML Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect .cfc/.cfm as cfml and .cfs as cfscript', () => {
+      expect(detectLanguage('Service.cfc')).toBe('cfml');
+      expect(detectLanguage('index.cfm')).toBe('cfml');
+      expect(detectLanguage('Helper.cfs')).toBe('cfscript');
+    });
+
+    it('should report cfml and cfscript as supported', () => {
+      expect(isLanguageSupported('cfml')).toBe(true);
+      expect(isLanguageSupported('cfscript')).toBe(true);
+      expect(getSupportedLanguages()).toContain('cfml');
+      expect(getSupportedLanguages()).toContain('cfscript');
+    });
+  });
+
+  describe('Bare-script .cfc (component { ... })', () => {
+    const code = `
+component extends="BaseService" implements="IService" {
+
+    property name="name" type="string";
+
+    function init(required string name) {
+        variables.name = arguments.name;
+        return this;
+    }
+
+    public string function getName() {
+        return variables.name;
+    }
+
+    private void function logSomething(required string msg) {
+        writeLog(text=msg);
+    }
+}
+`;
+
+    it('should name the component from the file name (the grammar has no name field)', () => {
+      const result = extractFromSource('SampleService.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls).toBeDefined();
+      expect(cls?.name).toBe('SampleService');
+      expect(cls?.language).toBe('cfml');
+    });
+
+    it('should extract methods with visibility and contains edges to the class', () => {
+      const result = extractFromSource('SampleService.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.map((m) => m.name)).toEqual(
+        expect.arrayContaining(['init', 'getName', 'logSomething'])
+      );
+      const logSomething = methods.find((m) => m.name === 'logSomething');
+      expect(logSomething?.visibility).toBe('private');
+      const containsLog = result.edges.find(
+        (e) => e.source === cls?.id && e.target === logSomething?.id && e.kind === 'contains'
+      );
+      expect(containsLog).toBeDefined();
+    });
+
+    it('should extract extends/implements as unresolved references from the class', () => {
+      const result = extractFromSource('SampleService.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const extendsRef = result.unresolvedReferences.find((r) => r.referenceKind === 'extends');
+      expect(extendsRef?.referenceName).toBe('BaseService');
+      expect(extendsRef?.fromNodeId).toBe(cls?.id);
+      const implRef = result.unresolvedReferences.find((r) => r.referenceKind === 'implements');
+      expect(implRef?.referenceName).toBe('IService');
+      expect(implRef?.fromNodeId).toBe(cls?.id);
+    });
+  });
+
+  describe('Standalone .cfs (pure CFScript)', () => {
+    it('should also name an anonymous component from the file name', () => {
+      const code = `
+component {
+    function ping() {
+        return "pong";
+    }
+}
+`;
+      const result = extractFromSource('Sample.cfs', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls).toBeDefined();
+      expect(cls?.name).toBe('Sample');
+      expect(cls?.language).toBe('cfscript');
+    });
+
+    it('should extract top-level imports with no enclosing component', () => {
+      const code = `
+import com.foo.Bar;
+import foo.cfm;
+`;
+      const result = extractFromSource('Includes.cfs', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('com.foo.Bar');
+      expect(imports).toContain('foo.cfm');
+    });
+  });
+
+  describe('Tag-based .cfc (<cfcomponent>/<cffunction>)', () => {
+    const code = `<cfcomponent extends="Base" implements="IFoo,IBar" output="false">
+\t<cffunction name="getName" access="public" returntype="string">
+\t\t<cfreturn this.name>
+\t</cffunction>
+\t<cffunction name="doWork" access="private" returntype="void">
+\t\t<cfscript>
+\t\t\tvar x = helper();
+\t\t\tanotherCall(x);
+\t\t</cfscript>
+\t</cffunction>
+</cfcomponent>
+`;
+
+    it('should name the component from the file name when the tag has no name attribute', () => {
+      const result = extractFromSource('TagStyle.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls?.name).toBe('TagStyle');
+      expect(cls?.language).toBe('cfml');
+    });
+
+    it('should prefer an explicit name attribute on the cfcomponent tag', () => {
+      const named = `<cfcomponent name="ExplicitName">\n<cffunction name="a"><cfreturn 1></cffunction>\n</cfcomponent>`;
+      const result = extractFromSource('File.cfc', named);
+      expect(result.nodes.find((n) => n.kind === 'class')?.name).toBe('ExplicitName');
+    });
+
+    it('should extract cffunction tags as methods with access-derived visibility', () => {
+      const result = extractFromSource('TagStyle.cfc', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.map((m) => m.name)).toEqual(expect.arrayContaining(['getName', 'doWork']));
+      const getName = methods.find((m) => m.name === 'getName');
+      expect(getName?.visibility).toBe('public');
+      expect(getName?.returnType).toBe('string');
+      const doWork = methods.find((m) => m.name === 'doWork');
+      expect(doWork?.visibility).toBe('private');
+    });
+
+    it('should not double-extract symbols from the component body (implicit-end-tag walk)', () => {
+      const result = extractFromSource('TagStyle.cfc', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method' && n.name === 'getName');
+      expect(methods).toHaveLength(1);
+      const doWorkMethods = result.nodes.filter((n) => n.kind === 'method' && n.name === 'doWork');
+      expect(doWorkMethods).toHaveLength(1);
+    });
+
+    it('should delegate <cfscript> tag bodies to the cfscript grammar and attribute calls to the enclosing method', () => {
+      const result = extractFromSource('TagStyle.cfc', code);
+      const doWork = result.nodes.find((n) => n.kind === 'method' && n.name === 'doWork');
+      const helperCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'helper'
+      );
+      expect(helperCall?.fromNodeId).toBe(doWork?.id);
+    });
+
+    it('should produce exactly one correctly-ranged file node, not a leaked snippet-scoped one', () => {
+      const result = extractFromSource('TagStyle.cfc', code);
+      const fileNodes = result.nodes.filter((n) => n.kind === 'file');
+      expect(fileNodes).toHaveLength(1);
+      expect(fileNodes[0].startLine).toBe(1);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const containsClass = result.edges.find(
+        (e) => e.source === fileNodes[0].id && e.target === cls?.id && e.kind === 'contains'
+      );
+      expect(containsClass).toBeDefined();
+    });
+  });
+
+  describe('Top-level cffunction with no enclosing cfcomponent (.cfm template)', () => {
+    it('should extract as a top-level function contained by the file', () => {
+      const code = `<cffunction name="helper" access="public" returntype="string">
+\t<cfreturn "hi">
+</cffunction>
+`;
+      const result = extractFromSource('helper.cfm', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'helper');
+      expect(fn).toBeDefined();
+      const fileNode = result.nodes.find((n) => n.kind === 'file');
+      const containsFn = result.edges.find(
+        (e) => e.source === fileNode?.id && e.target === fn?.id && e.kind === 'contains'
+      );
+      expect(containsFn).toBeDefined();
+    });
+  });
+
+  describe('<cfscript> nested inside control-flow tags (<cfif>/<cfloop>/<cftry>)', () => {
+    it('should delegate a <cfscript> body nested inside <cfif> within a <cffunction>', () => {
+      const code = `<cfcomponent>
+<cffunction name="doStuff">
+  <cfif true>
+    <cfscript>
+      helper();
+    </cfscript>
+  </cfif>
+</cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('Nested.cfc', code);
+      const doStuff = result.nodes.find((n) => n.kind === 'method' && n.name === 'doStuff');
+      expect(doStuff).toBeDefined();
+      const helperCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'helper'
+      );
+      expect(helperCall?.fromNodeId).toBe(doStuff?.id);
+    });
+
+    it('should delegate a <cfscript> body nested inside <cfif> at top-level component scope', () => {
+      const code = `<cfcomponent>
+<cfif true>
+  <cfscript>
+    topLevelHelper();
+  </cfscript>
+</cfif>
+</cfcomponent>
+`;
+      const result = extractFromSource('Nested2.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls).toBeDefined();
+      const helperCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'topLevelHelper'
+      );
+      expect(helperCall?.fromNodeId).toBe(cls?.id);
+    });
+  });
+
+  describe('<cfquery> SQL bodies (cfquery grammar)', () => {
+    it('should extract a call expression embedded in a #hash# inside the SQL body', () => {
+      const code = `<cfcomponent>
+<cffunction name="getUsers">
+  <cfquery name="qUsers" datasource="#variables.dsn#">
+    SELECT id, name FROM users WHERE owner = #getCurrentUser().getId()#
+  </cfquery>
+  <cfreturn qUsers>
+</cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('Query.cfc', code);
+      const getUsers = result.nodes.find((n) => n.kind === 'method' && n.name === 'getUsers');
+      expect(getUsers).toBeDefined();
+      const getCurrentUserCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'getCurrentUser'
+      );
+      expect(getCurrentUserCall?.fromNodeId).toBe(getUsers?.id);
+      const getIdCall = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'getId'
+      );
+      expect(getIdCall?.fromNodeId).toBe(getUsers?.id);
+    });
+  });
+
+  describe('UTF-8 BOM handling (common in CFML saved by Windows editors)', () => {
+    it('should route a BOM-prefixed tag-based .cfc to the tag grammar, not the script grammar', () => {
+      const code = `\uFEFF<cfcomponent output="false">\n<cffunction name="configure" access="public">\n<cfreturn 1>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('ModuleConfig.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls?.name).toBe('ModuleConfig');
+      const configure = result.nodes.find((n) => n.kind === 'method' && n.name === 'configure');
+      expect(configure).toBeDefined();
+    });
+
+    it('should still treat a BOM-prefixed bare-script .cfc as script', () => {
+      const code = `\uFEFFcomponent {\n  function ping() { return "pong"; }\n}\n`;
+      const result = extractFromSource('Ping.cfc', code);
+      expect(result.nodes.find((n) => n.kind === 'class')?.name).toBe('Ping');
+      expect(result.nodes.find((n) => n.kind === 'method')?.name).toBe('ping');
+    });
+  });
+
+  describe('Unquoted tag attribute values (legal in older CFML)', () => {
+    it('should extract functions and inheritance from unquoted attributes', () => {
+      const code = `<cfcomponent extends=Base>\n<cffunction name=doThing access=private>\n<cfreturn 1>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Unquoted.cfc', code);
+      const doThing = result.nodes.find((n) => n.kind === 'method' && n.name === 'doThing');
+      expect(doThing).toBeDefined();
+      expect(doThing?.visibility).toBe('private');
+      const extendsRef = result.unresolvedReferences.find((r) => r.referenceKind === 'extends');
+      expect(extendsRef?.referenceName).toBe('Base');
+    });
+  });
+
+  describe('Functions in a component-level <cfscript> block', () => {
+    it('should classify them as methods of the component (ColdBox ModuleConfig shape)', () => {
+      const code = `<cfcomponent output="false">\n<cfscript>\nfunction configure() {\n  return settings();\n}\nfunction onLoad() {\n  return 1;\n}\n</cfscript>\n</cfcomponent>\n`;
+      const result = extractFromSource('ModuleConfig.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+      expect(methods).toEqual(expect.arrayContaining(['configure', 'onLoad']));
+      expect(result.nodes.filter((n) => n.kind === 'function')).toHaveLength(0);
+      const configure = result.nodes.find((n) => n.kind === 'method' && n.name === 'configure');
+      const containsEdge = result.edges.find(
+        (e) => e.source === cls?.id && e.target === configure?.id && e.kind === 'contains'
+      );
+      expect(containsEdge).toBeDefined();
+    });
+
+    it('should keep kind function for a <cfscript> inside a cffunction body', () => {
+      const code = `<cfcomponent>\n<cffunction name="outer">\n<cfscript>\nfunction innerHelper() { return 1; }\n</cfscript>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Outer.cfc', code);
+      expect(result.nodes.find((n) => n.name === 'outer')?.kind).toBe('method');
+      expect(result.nodes.find((n) => n.name === 'innerHelper')?.kind).toBe('function');
+    });
+  });
+
+  describe('Calls in tag expressions outside <cfscript>/<cfquery> (#2091)', () => {
+    const callsFrom = (result: ReturnType<typeof extractFromSource>, fromId: string | undefined) =>
+      result.unresolvedReferences
+        .filter((r) => r.fromNodeId === fromId && (r.referenceKind === 'calls' || r.referenceKind === 'instantiates'))
+        .map((r) => `${r.referenceKind === 'instantiates' ? 'new ' : ''}${r.referenceName}@${r.line}`)
+        .sort();
+
+    it('should extract calls in <cfset>, <cfif>, <cfelseif> and <cfreturn>, attributed to the enclosing method', () => {
+      const code = `<cfcomponent>
+\t<cffunction name="a">
+\t\t<cfset x = b(1)>
+\t\t<cfif c(2)>
+\t\t<cfelseif e(3)>
+\t\t</cfif>
+\t\t<cfreturn d()>
+\t</cffunction>
+\t<cffunction name="b"></cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('Svc.cfc', code);
+      const a = result.nodes.find((n) => n.kind === 'method' && n.name === 'a');
+      expect(a).toBeDefined();
+      expect(callsFrom(result, a?.id)).toEqual(['b@3', 'c@4', 'd@7', 'e@5']);
+    });
+
+    it('should extract #hash# expressions in output, strings and tag attributes — once each, alongside <cfquery> bodies', () => {
+      const code = `<cfcomponent>
+<cffunction name="render">
+  <cfset var y = svc.load(1)>
+  <cfset local.msg = "Hi #userName()#">
+  <cfoutput>#fmt(y)# and #variables.mailer.send()#</cfoutput>
+  <cfloop array="#getItems()#" index="i"></cfloop>
+  <cfquery name="q" datasource="#dsn()#">SELECT #col()# FROM t</cfquery>
+  <cfset obj = new Widget()>
+</cffunction>
+</cfcomponent>
+`;
+      const result = extractFromSource('View.cfc', code);
+      const render = result.nodes.find((n) => n.kind === 'method' && n.name === 'render');
+      expect(callsFrom(result, render?.id)).toEqual([
+        'col@7',
+        'dsn@7',
+        'fmt@5',
+        'getItems@6',
+        'new Widget@8',
+        'svc.load@3',
+        'userName@4',
+        'variables.mailer.send@5',
+      ]);
+      // `<cfset var y = …>` is a function local — no variable node for it.
+      expect(result.nodes.find((n) => n.name === 'y')).toBeUndefined();
+    });
+
+    it('should attribute component-scope and template-scope calls to the component and the file', () => {
+      const component = `<cfcomponent>\n<cfset setup()>\n<cffunction name="m"></cffunction>\n</cfcomponent>\n`;
+      const cfc = extractFromSource('Pseudo.cfc', component);
+      const cls = cfc.nodes.find((n) => n.kind === 'class');
+      expect(callsFrom(cfc, cls?.id)).toEqual(['setup@2']);
+
+      const template = `<cfset items = loadItems()>\n<cfoutput>#renderList(items)#</cfoutput>\n`;
+      const cfm = extractFromSource('index.cfm', template);
+      const file = cfm.nodes.find((n) => n.kind === 'file');
+      expect(callsFrom(cfm, file?.id)).toEqual(['loadItems@1', 'renderList@2']);
+    });
+
+    it("should keep each call's own line and column (several per line, and across lines)", () => {
+      const code = `<cfcomponent>
+<cffunction name="m"><cfset a()><cfif   b.c()><cfset d(e())></cfif>
+  <cfset total = sum(
+      count(), other.fetch())><cfoutput>#last()#</cfoutput>
+</cffunction>
+</cfcomponent>
+`;
+      const lines = code.split('\n');
+      const result = extractFromSource('Pos.cfc', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.map((r) => r.referenceName).sort()).toEqual(['a', 'b.c', 'count', 'd', 'e', 'last', 'other.fetch', 'sum']);
+      for (const r of calls) {
+        expect(lines[r.line - 1]!.slice(r.column).startsWith(r.referenceName)).toBe(true);
+      }
+    });
+
+    it('should read a <cfloop condition="…"> attribute as an expression', () => {
+      const code = `<cfcomponent>\n<cffunction name="drain">\n<cfloop condition="hasNext()">\n</cfloop>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Queue.cfc', code);
+      const drain = result.nodes.find((n) => n.kind === 'method' && n.name === 'drain');
+      expect(callsFrom(result, drain?.id)).toEqual(['hasNext@3']);
+    });
+
+    it('should not read HTML <script> bodies or plain text as CFML calls', () => {
+      const code = `<cfcomponent>\n<cffunction name="page">\n<script>notACall();</script>\n<p>also(not)</p>\n</cffunction>\n</cfcomponent>\n`;
+      const result = extractFromSource('Page.cfc', code);
+      expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls')).toEqual([]);
+    });
+  });
+
+  describe('<cffunction> inside a generic container tag (#2091)', () => {
+    it('should extract a method nested in <cfprocessingdirective> (the Application.cfc shape)', () => {
+      const code = `<cfcomponent>
+\t<cfprocessingdirective suppresswhitespace="true">
+\t\t<cffunction name="onRequestStart">
+\t\t\t<cfset loadConfig()>
+\t\t</cffunction>
+\t</cfprocessingdirective>
+</cfcomponent>
+`;
+      const result = extractFromSource('Application.cfc', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      const method = result.nodes.find((n) => n.kind === 'method' && n.name === 'onRequestStart');
+      expect(method).toBeDefined();
+      expect(method?.qualifiedName).toBe('Application::onRequestStart');
+      expect(result.edges.some((e) => e.kind === 'contains' && e.source === cls?.id && e.target === method?.id)).toBe(true);
+      const call = result.unresolvedReferences.find((r) => r.referenceName === 'loadConfig');
+      expect(call?.fromNodeId).toBe(method?.id);
+    });
+
+    it('should extract a top-level function nested in <cfsilent> in a template', () => {
+      const code = `<cfsilent>\n<cffunction name="helper"><cfreturn 1></cffunction>\n</cfsilent>\n`;
+      const result = extractFromSource('lib.cfm', code);
+      expect(result.nodes.find((n) => n.name === 'helper')?.kind).toBe('function');
+    });
+  });
+
+  describe('<cfinterface> (#2091)', () => {
+    const code = `<cfinterface extends="IBase, IOther">
+\t<cffunction name="search" access="public" returntype="any">
+\t\t<cfargument name="q" type="string">
+\t</cffunction>
+\t<cffunction name="count"></cffunction>
+</cfinterface>
+`;
+
+    it('should extract an interface node named from the file, with its functions as methods', () => {
+      const result = extractFromSource('ISearchable.cfc', code);
+      const iface = result.nodes.find((n) => n.kind === 'interface');
+      expect(iface?.name).toBe('ISearchable');
+      expect(iface?.startLine).toBe(1);
+      expect(iface?.endLine).toBe(6);
+      expect(result.nodes.filter((n) => n.kind === 'class')).toHaveLength(0);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.map((m) => m.qualifiedName).sort()).toEqual(['ISearchable::count', 'ISearchable::search']);
+      for (const m of methods) {
+        expect(result.edges.some((e) => e.kind === 'contains' && e.source === iface?.id && e.target === m.id)).toBe(true);
+      }
+      expect(methods.find((m) => m.name === 'search')?.returnType).toBe('any');
+    });
+
+    it('should extract each interface it extends', () => {
+      const result = extractFromSource('ISearchable.cfc', code);
+      const iface = result.nodes.find((n) => n.kind === 'interface');
+      const ext = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+      expect(ext.map((r) => r.referenceName)).toEqual(['IBase', 'IOther']);
+      expect(ext.every((r) => r.fromNodeId === iface?.id)).toBe(true);
+    });
+  });
+});
+
+describe('COBOL Extraction', () => {
+  it('should detect .cbl/.cob/.cpy as cobol (case-insensitive)', () => {
+    expect(detectLanguage('app/cbl/CBACT01C.cbl')).toBe('cobol');
+    expect(detectLanguage('app/cbl/CBSTM03A.CBL')).toBe('cobol');
+    expect(detectLanguage('prog.cob')).toBe('cobol');
+    expect(detectLanguage('app/cpy/CVACT01Y.cpy')).toBe('cobol');
+    expect(isSourceFile('CBACT01C.cbl')).toBe(true);
+  });
+
+  const FIXED = (body: string) =>
+    body
+      .split('\n')
+      .map((l) => (l.length > 0 ? '       ' + l : l))
+      .join('\n');
+
+  const PROGRAM = FIXED(`IDENTIFICATION DIVISION.
+PROGRAM-ID. TESTPROG.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-TOTALS.
+    05  WS-COUNT            PIC 9(4) VALUE ZERO.
+    88  WS-DONE             VALUE 'Y'.
+77  WS-FLAG                 PIC X.
+COPY CVACT01Y.
+PROCEDURE DIVISION.
+MAIN-SECTION SECTION.
+0000-MAIN.
+    PERFORM 1000-INIT
+    PERFORM 2000-PROCESS THRU 2000-EXIT
+    CALL 'CBACT01C' USING WS-TOTALS
+    CALL WS-FLAG
+    GO TO 9999-END
+    .
+1000-INIT.
+    MOVE ZERO TO WS-COUNT.
+2000-PROCESS.
+    EXEC CICS LINK PROGRAM('COCOM01C') COMMAREA(WS-TOTALS)
+    END-EXEC.
+2000-EXIT.
+    EXIT.
+9999-END.
+    GOBACK.
+`);
+
+  it('should extract the program as a module node', () => {
+    const result = extractFromSource('TESTPROG.cbl', PROGRAM);
+    const moduleNode = result.nodes.find((n) => n.kind === 'module');
+    expect(moduleNode).toBeDefined();
+    expect(moduleNode?.name).toBe('TESTPROG');
+  });
+
+  it('should extract sections and paragraphs as functions with reconstructed extents', () => {
+    const result = extractFromSource('TESTPROG.cbl', PROGRAM);
+    const fns = result.nodes.filter((n) => n.kind === 'function');
+    const names = fns.map((f) => f.name);
+    expect(names).toContain('MAIN-SECTION');
+    expect(names).toContain('0000-MAIN');
+    expect(names).toContain('2000-PROCESS');
+    // A paragraph spans from its header to the next header, not just one line.
+    const main = fns.find((f) => f.name === '0000-MAIN');
+    expect(main).toBeDefined();
+    expect(main!.endLine).toBeGreaterThan(main!.startLine + 3);
+    // Paragraphs are contained in their section (qualified name includes it).
+    expect(main!.qualifiedName).toContain('MAIN-SECTION');
+  });
+
+  it('should extract PERFORM, PERFORM THRU, GO TO, and CALL literal as calls references', () => {
+    const result = extractFromSource('TESTPROG.cbl', PROGRAM);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const targets = calls.map((c) => c.referenceName);
+    expect(targets).toContain('1000-INIT');
+    expect(targets).toContain('2000-PROCESS'); // PERFORM ... THRU start
+    expect(targets).toContain('2000-EXIT'); // PERFORM ... THRU end
+    expect(targets).toContain('9999-END'); // GO TO
+    expect(targets).toContain('CBACT01C'); // CALL 'literal'
+    expect(targets).toContain('COCOM01C'); // EXEC CICS LINK PROGRAM('...')
+    // Dynamic CALL through a data name is skipped — announce, don't guess.
+    expect(targets).not.toContain('WS-FLAG');
+  });
+
+  it('should extract COPY as an import node and imports reference', () => {
+    const result = extractFromSource('TESTPROG.cbl', PROGRAM);
+    const importNode = result.nodes.find((n) => n.kind === 'import');
+    expect(importNode).toBeDefined();
+    expect(importNode?.name).toBe('CVACT01Y');
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports');
+    expect(importRefs.map((r) => r.referenceName)).toContain('CVACT01Y');
+  });
+
+  it('should extract data items as variables, fields, and 88-level constants', () => {
+    const result = extractFromSource('TESTPROG.cbl', PROGRAM);
+    const group = result.nodes.find((n) => n.name === 'WS-TOTALS');
+    expect(group?.kind).toBe('variable');
+    const nested = result.nodes.find((n) => n.name === 'WS-COUNT');
+    expect(nested?.kind).toBe('field');
+    expect(nested?.qualifiedName).toContain('WS-TOTALS');
+    const condition = result.nodes.find((n) => n.name === 'WS-DONE');
+    expect(condition?.kind).toBe('constant');
+    const standalone = result.nodes.find((n) => n.name === 'WS-FLAG');
+    expect(standalone?.kind).toBe('variable');
+  });
+
+  it('should extract EXEC SQL INCLUDE as an import', () => {
+    const code = FIXED(`IDENTIFICATION DIVISION.
+PROGRAM-ID. SQLPROG.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+EXEC SQL INCLUDE SQLCA END-EXEC.
+01  WS-X                    PIC X.
+PROCEDURE DIVISION.
+P1.
+    GOBACK.
+`);
+    const result = extractFromSource('SQLPROG.cbl', code);
+    const importNode = result.nodes.find((n) => n.kind === 'import' && n.name === 'SQLCA');
+    expect(importNode).toBeDefined();
+    // The EXEC block must not break the rest of the file.
+    expect(result.nodes.find((n) => n.name === 'WS-X')).toBeDefined();
+  });
+
+  it('should extract a standalone data copybook (.cpy fragment)', () => {
+    const code = FIXED(`01  ACCOUNT-RECORD.
+    05  ACCT-ID             PIC 9(11).
+    05  ACCT-CURR-BAL       PIC S9(10)V99.
+`);
+    const result = extractFromSource('CVACT01Y.cpy', code);
+    const record = result.nodes.find((n) => n.name === 'ACCOUNT-RECORD');
+    expect(record?.kind).toBe('variable');
+    const field = result.nodes.find((n) => n.name === 'ACCT-ID');
+    expect(field?.kind).toBe('field');
+  });
+
+  it('should extract a procedure copybook (.cpy fragment with paragraphs)', () => {
+    const code = FIXED(`EDIT-DATE.
+    MOVE 1 TO WS-X
+    PERFORM VALIDATE-YEAR.
+VALIDATE-YEAR.
+    CONTINUE.
+`);
+    const result = extractFromSource('CSUTLDPY.cpy', code);
+    const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+    expect(fns).toContain('EDIT-DATE');
+    expect(fns).toContain('VALIDATE-YEAR');
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    expect(calls.map((c) => c.referenceName)).toContain('VALIDATE-YEAR');
+  });
+
+  it('should emit write-site references for MOVE/ADD/COMPUTE targets', () => {
+    const code = FIXED(`IDENTIFICATION DIVISION.
+PROGRAM-ID. WRITEREF.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-TOTAL                 PIC S9(7)V99.
+01  WS-COUNT                 PIC 9(4).
+PROCEDURE DIVISION.
+P1.
+    MOVE ZERO TO WS-TOTAL
+    ADD 1 TO WS-COUNT
+    COMPUTE WS-TOTAL = WS-TOTAL + 1
+    SUBTRACT 1 FROM WS-COUNT
+    MOVE 1 TO RETURN-CODE.
+`);
+    const result = extractFromSource('WRITEREF.cbl', code);
+    const writes = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    const names = writes.map((w) => w.referenceName);
+    expect(names.filter((n) => n === 'WS-TOTAL').length).toBeGreaterThanOrEqual(2); // MOVE + COMPUTE
+    expect(names).toContain('WS-COUNT'); // ADD and SUBTRACT targets
+    // Special registers carry no declaration — never referenced.
+    expect(names).not.toContain('RETURN-CODE');
+  });
+
+  it('should emit cics-transid references for RETURN TRANSID, literal and via same-file VALUE', () => {
+    const code = FIXED(`IDENTIFICATION DIVISION.
+PROGRAM-ID. TXPROG.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01  WS-TRANID                PIC X(04) VALUE 'CB00'.
+PROCEDURE DIVISION.
+P1.
+    EXEC CICS RETURN TRANSID('CC00') COMMAREA(WS-X) END-EXEC
+    .
+P2.
+    EXEC CICS RETURN TRANSID(WS-TRANID) END-EXEC
+    .
+P3.
+    EXEC CICS XCTL PROGRAM(WS-UNKNOWN-VAR) END-EXEC
+    .
+`);
+    const result = extractFromSource('TXPROG.cbl', code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+    const names = calls.map((c) => c.referenceName);
+    expect(names).toContain('cics-transid:CC00'); // literal
+    expect(names).toContain('cics-transid:CB00'); // dereferenced through WS-TRANID
+    // Un-derefable program variable: dynamic dispatch, no guessed edge.
+    expect(names.filter((n) => n.startsWith('cics-transid:')).length).toBe(2);
+  });
+
+  it('should shift free-format source so it still extracts (preParse)', () => {
+    const code = `IDENTIFICATION DIVISION.
+PROGRAM-ID. FREEPROG.
+PROCEDURE DIVISION.
+DO-WORK.
+    DISPLAY 'HI'.
+`;
+    const result = extractFromSource('freeprog.cbl', code);
+    expect(result.nodes.find((n) => n.kind === 'module')?.name).toBe('FREEPROG');
+    expect(result.nodes.find((n) => n.kind === 'function')?.name).toBe('DO-WORK');
+  });
+});
+
+// =============================================================================
+// VB.NET (.vb) — vendored patched govindbanura/tree-sitter-vbnet grammar
+// =============================================================================
+
+describe('VB.NET Extraction', () => {
+  it('should detect .vb as vbnet', () => {
+    expect(detectLanguage('Service.vb')).toBe('vbnet');
+    expect(detectLanguage('app/Forms/MainForm.vb')).toBe('vbnet');
+    expect(isSourceFile('Service.vb')).toBe(true);
+  });
+
+  const SAMPLE = `Imports System
+Imports System.Collections.Generic
+
+Namespace Acme.Billing
+
+    Public Interface IRepository
+        Function GetById(ByVal id As Integer) As Invoice
+    End Interface
+
+    Public Enum InvoiceState
+        Draft = 0
+        Sent
+        Paid
+    End Enum
+
+    Public Structure Money
+        Public Amount As Decimal
+    End Structure
+
+    Public MustInherit Class EntityBase
+        Public Property Id As Integer
+    End Class
+
+    Public Class Invoice
+        Inherits EntityBase
+        Implements IRepository
+
+        Private ReadOnly _lines As New List(Of String)
+        Public Const MaxLines As Integer = 100
+        Public Event Paid(ByVal amount As Decimal)
+
+        Public Property State As InvoiceState
+
+        Public Sub New(ByVal id As Integer)
+            Me.Id = id
+        End Sub
+
+        Public Function GetById(ByVal id As Integer) As Invoice Implements IRepository.GetById
+            Return New Invoice(id)
+        End Function
+
+        Public Sub AddLine(ByVal description As String)
+            _lines.Add(description)
+            Validate(description)
+        End Sub
+
+        Private Sub Validate(ByVal text As String)
+            If text.Length > MaxLines Then Throw New ArgumentException("too long")
+        End Sub
+    End Class
+
+    ' lowercase keywords: VB is case-insensitive
+    public module Helpers
+        public function Twice(byval n as integer) as integer
+            return n * 2
+        end function
+
+        Public Sub Run()
+            Dim inv = New Invoice(1)
+            inv.AddLine("widget")
+            Dim d As New Dictionary(Of String, Integer)
+            Helpers.Twice(21)
+        End Sub
+    end module
+End Namespace
+`;
+
+  it('should extract classes, modules, interfaces, structures, and enums', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const kinds = (kind: string) => result.nodes.filter((n) => n.kind === kind).map((n) => n.name);
+    expect(kinds('class')).toEqual(expect.arrayContaining(['EntityBase', 'Invoice', 'Helpers']));
+    expect(kinds('interface')).toContain('IRepository');
+    expect(kinds('struct')).toContain('Money');
+    expect(kinds('enum')).toContain('InvoiceState');
+    expect(kinds('enum_member')).toEqual(expect.arrayContaining(['Draft', 'Sent', 'Paid']));
+  });
+
+  it('should extract methods, constructors, properties, fields, and events (case-insensitive keywords)', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toEqual(expect.arrayContaining(['GetById', 'AddLine', 'Validate', 'Twice', 'Run']));
+    const props = result.nodes.filter((n) => n.kind === 'property').map((n) => n.name);
+    expect(props).toEqual(expect.arrayContaining(['Id', 'State']));
+    const fields = result.nodes.filter((n) => n.kind === 'field' || n.kind === 'constant').map((n) => n.name);
+    expect(fields).toEqual(expect.arrayContaining(['_lines', 'MaxLines']));
+    // Event declarations index as findable members
+    expect(fields).toContain('Paid');
+  });
+
+  it('should qualify types with their namespace', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const invoice = result.nodes.find((n) => n.kind === 'class' && n.name === 'Invoice');
+    expect(invoice?.qualifiedName).toContain('Acme.Billing');
+  });
+
+  it('should emit Inherits as extends and Implements as implements references', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const extendsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+    expect(extendsRefs.map((r) => r.referenceName)).toContain('EntityBase');
+    const implementsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
+    expect(implementsRefs.map((r) => r.referenceName)).toContain('IRepository');
+  });
+
+  it('should extract calls through both invocation and index-shaped parens', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    // `_lines.Add(description)` parses as array_access (non-empty parens) — still a call site
+    expect(calls).toContain('_lines.Add');
+    // bare call with args
+    expect(calls).toContain('Validate');
+    // qualified module call
+    expect(calls).toContain('Helpers.Twice');
+  });
+
+  it('should emit instantiates for New, with VB generic syntax stripped', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const insts = result.unresolvedReferences.filter((r) => r.referenceKind === 'instantiates').map((r) => r.referenceName);
+    expect(insts).toContain('Invoice');
+    // `As New Dictionary(Of String, Integer)` → bare type name, not `Dictionary(Of ...)`
+    expect(insts.some((n) => n.includes('(') || /\bOf\b/.test(n))).toBe(false);
+  });
+
+  it('should extract Imports as import nodes', () => {
+    const result = extractFromSource('Invoice.vb', SAMPLE);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toEqual(expect.arrayContaining(['System', 'System.Collections.Generic']));
+  });
+
+  it('should parse a file without a trailing newline (preParse guard)', () => {
+    const code = 'Class Tail\n    Sub Go()\n        Log("x")\n    End Sub\nEnd Class';
+    const result = extractFromSource('Tail.vb', code);
+    expect(result.nodes.find((n) => n.kind === 'class')?.name).toBe('Tail');
+    expect(result.nodes.find((n) => n.kind === 'method')?.name).toBe('Go');
+  });
+});
+
+describe('VB.NET Extraction — scanner-backed constructs', () => {
+  it('should parse XML literals as opaque literals without breaking siblings', () => {
+    const code = `Class Muxer
+    Function WriteTags() As Object
+        Dim xml = <Tags>
+                      <%= From tag In Tags Select <Tag><Name><%= tag.Name %></Name></Tag> %>
+                  </Tags>
+        Return xml
+    End Function
+
+    Sub After()
+        Log("still extracted")
+    End Sub
+End Class
+`;
+    const result = extractFromSource('Muxer.vb', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toEqual(expect.arrayContaining(['WriteTags', 'After']));
+  });
+
+  it('should parse multi-line LINQ query clauses', () => {
+    const code = `Class T
+    Function Big() As Integer
+        Dim big = From l In _lines
+                  Where l.Length > 3
+                  Select l.Length
+        Return big.Sum()
+    End Function
+End Class
+`;
+    const result = extractFromSource('Linq.vb', code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('big.Sum');
+    expect(result.nodes.find((n) => n.kind === 'method')?.name).toBe('Big');
+  });
+
+  it('should extract MustOverride members without derailing following members', () => {
+    const code = `MustInherit Class VideoEncoder
+    MustOverride ReadOnly Property OutputExt As String
+
+    Public MustOverride Sub ShowConfigDialog(Optional param As Object = Nothing)
+
+    MustOverride Function GetError() As String
+
+    Sub New()
+        CanEdit = True
+    End Sub
+End Class
+`;
+    const result = extractFromSource('VideoEncoder.vb', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toEqual(expect.arrayContaining(['ShowConfigDialog', 'GetError', 'New']));
+    const props = result.nodes.filter((n) => n.kind === 'property').map((n) => n.name);
+    expect(props).toContain('OutputExt');
+  });
+
+  it('should parse nullable declarator shorthand (Dim x? = expr)', () => {
+    const code = `Class T
+    Sub M(folderInfo As Object)
+        Dim SteamFolderData? = Parser.GetSteamNameAndID(folderInfo)
+        Use(SteamFolderData)
+    End Sub
+End Class
+`;
+    const result = extractFromSource('Factory.vb', code);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('Parser.GetSteamNameAndID');
+  });
+});
+
+// =============================================================================
+// Erlang (vendored WhatsApp/tree-sitter-erlang grammar — the ELP grammar)
+// =============================================================================
+
+describe('Erlang Extraction', () => {
+  describe('Language detection', () => {
+    it('should report Erlang as supported', () => {
+      expect(isLanguageSupported('erlang')).toBe(true);
+      expect(getSupportedLanguages()).toContain('erlang');
+      expect(isSourceFile('apps/app/src/foo.erl')).toBe(true);
+      expect(isSourceFile('include/foo.hrl')).toBe(true);
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should merge multi-clause functions into one node spanning all clauses', () => {
+      const code = `-module(m).
+-export([classify/1]).
+
+classify(X) when is_atom(X) ->
+    atom;
+classify(X) when is_binary(X) ->
+    binary;
+classify(_X) ->
+    other.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function' && n.name === 'classify');
+      expect(fns).toHaveLength(1);
+      expect(fns[0]!.startLine).toBe(4);
+      expect(fns[0]!.endLine).toBe(9);
+      expect(fns[0]!.language).toBe('erlang');
+    });
+
+    it('should qualify functions with the module namespace', () => {
+      const code = `-module(my_server).
+-export([start/0]).
+
+start() -> ok.
+helper() -> ok.
+`;
+      const result = extractFromSource('src/my_server.erl', code);
+      const ns = result.nodes.find((n) => n.kind === 'namespace');
+      expect(ns?.name).toBe('my_server');
+      const start = result.nodes.find((n) => n.kind === 'function' && n.name === 'start');
+      // Arity is part of an Erlang function's identity — qualifiedName carries it (#1610).
+      expect(start?.qualifiedName).toBe('my_server::start/0');
+    });
+
+    it('should give same-name different-arity functions separate arity-qualified nodes (#1610)', () => {
+      const code = `-module(gap).
+-export([f/1, f/2]).
+
+f(X)    -> X + 1.
+f(X, Y) -> X + Y.
+`;
+      const result = extractFromSource('src/gap.erl', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function' && n.name === 'f');
+      expect(fns).toHaveLength(2);
+      expect(fns.map((n) => n.qualifiedName).sort()).toEqual(['gap::f/1', 'gap::f/2']);
+      const f1 = fns.find((n) => n.qualifiedName === 'gap::f/1')!;
+      const f2 = fns.find((n) => n.qualifiedName === 'gap::f/2')!;
+      expect([f1.startLine, f1.endLine]).toEqual([4, 4]);
+      expect([f2.startLine, f2.endLine]).toEqual([5, 5]);
+      expect(f1.signature).toBe('f(X)');
+      expect(f2.signature).toBe('f(X, Y)');
+    });
+
+    it('should split interleaved same-name defs by arity with distinct qualified names', () => {
+      const code = `-module(inter).
+
+f(X)    -> X + 1;
+f(Y)    -> Y.
+g()     -> ok.
+f(X, Y) -> X + Y.
+`;
+      const result = extractFromSource('src/inter.erl', code);
+      const fs = result.nodes.filter((n) => n.kind === 'function' && n.name === 'f');
+      expect(fs).toHaveLength(2);
+      expect(fs.map((n) => n.qualifiedName).sort()).toEqual(['inter::f/1', 'inter::f/2']);
+      // Clauses of the same arity still merge into one span.
+      const f1 = fs.find((n) => n.qualifiedName === 'inter::f/1')!;
+      expect([f1.startLine, f1.endLine]).toEqual([3, 4]);
+    });
+
+    it('should flag exported per arity (#1610)', () => {
+      const code = `-module(m).
+-export([f/1]).
+
+f(X) -> X.
+f(X, Y) -> {X, Y}.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      expect(result.nodes.find((n) => n.qualifiedName === 'm::f/1')?.isExported).toBe(true);
+      expect(result.nodes.find((n) => n.qualifiedName === 'm::f/2')?.isExported).toBe(false);
+    });
+
+    it('should attach a -spec sitting between two arities to the arity it names (#1610)', () => {
+      const code = `-module(deleg).
+-export([header/2, header/3]).
+
+header(Name, Req) ->
+    header(Name, Req, undefined).
+
+-spec header(binary(), map(), any()) -> any().
+header(Name, Headers, Default) ->
+    maps:get(Name, Headers, Default).
+`;
+      const result = extractFromSource('src/deleg.erl', code);
+      const h2 = result.nodes.find((n) => n.qualifiedName === 'deleg::header/2')!;
+      const h3 = result.nodes.find((n) => n.qualifiedName === 'deleg::header/3')!;
+      expect(h2.signature).toBe('header(Name, Req)');
+      expect(h3.signature).toBe('-spec header(binary(), map(), any()) -> any().');
+      expect([h2.startLine, h2.endLine]).toEqual([4, 5]);
+      expect(h3.startLine).toBe(8);
+      // The delegation call carries the callee's arity — no more self-loop.
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('header/3');
+    });
+
+    it('should flag exported functions and honor -compile(export_all)', () => {
+      const code = `-module(m).
+-export([api/0]).
+
+api() -> internal().
+internal() -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const api = result.nodes.find((n) => n.name === 'api');
+      const internal = result.nodes.find((n) => n.name === 'internal');
+      expect(api?.isExported).toBe(true);
+      expect(internal?.isExported).toBe(false);
+
+      const all = extractFromSource('src/all.erl', `-module(all).
+-compile(export_all).
+
+anything() -> ok.
+`);
+      expect(all.nodes.find((n) => n.name === 'anything')?.isExported).toBe(true);
+    });
+
+    it('should use the preceding -spec as the signature and capture doc comments', () => {
+      const code = `-module(m).
+
+%% Fetches a value by key.
+-spec fetch(binary()) -> {ok, term()} | not_found.
+fetch(Key) ->
+    lookup(Key).
+
+lookup(_K) -> not_found.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const fetch = result.nodes.find((n) => n.name === 'fetch');
+      expect(fetch?.signature).toBe('-spec fetch(binary()) -> {ok, term()} | not_found.');
+      expect(fetch?.docstring).toBe('Fetches a value by key.');
+    });
+
+    it('should fall back to the clause header as the signature', () => {
+      const code = `-module(m).
+
+resize(W, H) when W > 0, H > 0 ->
+    {W, H}.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const resize = result.nodes.find((n) => n.name === 'resize');
+      expect(resize?.signature).toBe('resize(W, H) when W > 0, H > 0');
+    });
+  });
+
+  describe('Record and type extraction', () => {
+    it('should extract records as structs with fields', () => {
+      const code = `-module(m).
+
+-record(state, {
+    store = #{} :: map(),
+    counter = 0 :: non_neg_integer()
+}).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const rec = result.nodes.find((n) => n.kind === 'struct');
+      expect(rec?.name).toBe('state');
+      const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fields).toContain('store');
+      expect(fields).toContain('counter');
+    });
+
+    it('should extract -type and -opaque as type aliases, without bogus type-call refs', () => {
+      const code = `-module(m).
+
+-type key() :: atom() | binary().
+-opaque handle() :: reference().
+-spec noop(key()) -> ok.
+noop(_K) -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const aliases = result.nodes.filter((n) => n.kind === 'type_alias').map((n) => n.name);
+      expect(aliases).toContain('key');
+      expect(aliases).toContain('handle');
+      // Type-position expressions parse as `call` nodes — the spec/type subtrees
+      // must not leak `calls` refs to type names like atom()/binary().
+      const bogus = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && ['atom', 'binary', 'reference', 'key'].includes(r.referenceName)
+      );
+      expect(bogus).toHaveLength(0);
+    });
+
+    it('should extract -define macros as constants', () => {
+      const code = `-module(m).
+
+-define(TIMEOUT, 5000).
+-define(WRAP(X), {ok, X}).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const consts = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name);
+      expect(consts).toContain('TIMEOUT');
+      expect(consts).toContain('WRAP');
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('should extract -include/-include_lib and -import', () => {
+      const code = `-module(m).
+
+-include("records.hrl").
+-include_lib("kernel/include/logger.hrl").
+-import(lists, [map/2]).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('records.hrl');
+      expect(imports).toContain('kernel/include/logger.hrl');
+      expect(imports).toContain('lists');
+      const ref = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'imports' && r.referenceName === 'records.hrl'
+      );
+      expect(ref).toBeDefined();
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should record local calls bare and remote calls module-qualified', () => {
+      const code = `-module(m).
+-export([run/1]).
+
+run(X) ->
+    Y = prepare(X),
+    other_mod:process(Y).
+
+prepare(X) -> X.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('prepare/1');
+      // `mod:fn(...)` is emitted as `mod::fn/arity` — the same shape the
+      // module namespace + arity suffix gives every function's qualifiedName,
+      // so it resolves via the qualified-name matcher (#1610).
+      expect(calls).toContain('other_mod::process/1');
+    });
+
+    it('should carry written arity on fun references and static MFA lists (#1610)', () => {
+      const code = `-module(m).
+-export([go/0]).
+
+go() ->
+    lists:map(fun bump/1, [1]),
+    Prod = fun other_mod:produce/2,
+    proc_lib:spawn_link(?MODULE, work, [a, b]),
+    Prod.
+
+bump(X) -> X + 1.
+work(_A, _B) -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences;
+      expect(refs.some((r) => r.referenceKind === 'references' && r.referenceName === 'bump/1')).toBe(true);
+      expect(refs.some((r) => r.referenceKind === 'references' && r.referenceName === 'other_mod::produce/2')).toBe(true);
+      expect(refs.some((r) => r.referenceKind === 'calls' && r.referenceName === 'work/2')).toBe(true);
+    });
+
+    it('should not emit calls for dynamic dispatch (var module / var fun)', () => {
+      const code = `-module(m).
+-export([run/2]).
+
+run(Mod, F) ->
+    Mod:handle(x),
+    F(y).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls.some((c) => c.startsWith('handle'))).toBe(false);
+      expect(calls.some((c) => c.startsWith('Mod::'))).toBe(false);
+      expect(calls.some((c) => c === 'F' || c.startsWith('F/'))).toBe(false);
+    });
+
+    it('should connect gen_server self-calls to the module handlers', () => {
+      const code = `-module(kv_store).
+-behaviour(gen_server).
+-export([get/1, put/2, drop/1]).
+-export([init/1, handle_call/3, handle_cast/2]).
+
+-define(SERVER, ?MODULE).
+
+get(Key) ->
+    gen_server:call(?SERVER, {get, Key}).
+
+put(Key, Value) ->
+    gen_server:cast(?MODULE, {put, Key, Value}).
+
+drop(Key) ->
+    gen_server:call(kv_store, {drop, Key}).
+
+init(_) -> {ok, #{}}.
+handle_call({get, K}, _From, S) -> {reply, maps:find(K, S), S};
+handle_call({drop, K}, _From, S) -> {reply, ok, maps:remove(K, S)}.
+handle_cast({put, K, V}, S) -> {noreply, maps:put(K, V, S)}.
+`;
+      const result = extractFromSource('src/kv_store.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      // ?SERVER (defined as ?MODULE), ?MODULE, and the module's own atom all
+      // count as self — public API wrappers connect to their handlers, at
+      // OTP's fixed handler arities (#1610).
+      expect(calls.filter((c) => c === 'kv_store::handle_call/3')).toHaveLength(2);
+      expect(calls).toContain('kv_store::handle_cast/2');
+    });
+
+    it('should connect gen_server calls to a registered-name module, directly or via an atom macro', () => {
+      const code = `-module(kv_client).
+-export([fetch/1, evict/1]).
+
+-define(STORE, kv_store).
+
+fetch(Key) ->
+    gen_server:call(kv_store, {get, Key}).
+
+evict(Key) ->
+    gen_server:cast(?STORE, {evict, Key}).
+`;
+      const result = extractFromSource('src/kv_client.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      // OTP's {local, ?MODULE} convention names a server after its module —
+      // a cross-module registered name targets that module's handlers. A name
+      // matching no module simply never resolves downstream.
+      expect(calls).toContain('kv_store::handle_call/3');
+      expect(calls).toContain('kv_store::handle_cast/2');
+    });
+
+    it('should not connect gen_server calls with dynamic targets', () => {
+      const code = `-module(m).
+-export([go/2]).
+
+go(Pid, Msg) ->
+    gen_server:call(Pid, Msg),
+    gen_server:cast({global, some_name}, Msg),
+    gen_server:call({some_name, node()}, Msg).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls.filter((c) => c.includes('handle_call') || c.includes('handle_cast'))).toHaveLength(0);
+    });
+
+    it('should lift static MFA arguments of the spawn/apply family into call refs', () => {
+      const code = `-module(m).
+-export([boot/2]).
+
+boot(Req, Env) ->
+    Pid = proc_lib:spawn_link(?MODULE, request_process, [Req, Env]),
+    spawn(?MODULE, monitor_loop, [Pid]),
+    apply(other_mod, handle, [Req]),
+    timer:apply_after(500, other_mod, tick, []),
+    Pid.
+
+request_process(_R, _E) -> ok.
+monitor_loop(_P) -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('request_process/2'); // ?MODULE → bare-with-arity, same-file resolution
+      expect(calls).toContain('monitor_loop/1');
+      expect(calls).toContain('other_mod::handle/1');
+      expect(calls).toContain('other_mod::tick/0');
+    });
+
+    it('should stay silent on dynamic spawn/apply (var module, fun value, or plain fun)', () => {
+      const code = `-module(m).
+-export([go/3]).
+
+go(M, F, A) ->
+    spawn(M, F, A),
+    spawn(fun() -> helper() end),
+    apply(M, F, A).
+
+helper() -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      // The fun body's call is still walked; no phantom MFA targets appear.
+      expect(calls).toContain('helper/0');
+      expect(calls.filter((c) => !['spawn/3', 'spawn/1', 'apply/3', 'helper/0'].includes(c))).toHaveLength(0);
+    });
+
+    it('should treat ?MODULE:fn calls as local calls', () => {
+      const code = `-module(m).
+-export([kick/0]).
+
+kick() ->
+    ?MODULE:work().
+
+work() -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('work/0');
+    });
+
+    it('should capture fun name/arity values as function references', () => {
+      const code = `-module(m).
+-export([wire/1]).
+
+wire(Pids) ->
+    lists:foreach(fun notify/1, Pids),
+    lists:map(fun m:notify/1, Pids).
+
+notify(_P) -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references').map((r) => r.referenceName);
+      expect(refs).toContain('notify/1');
+      expect(refs).toContain('m::notify/1');
+    });
+
+    it('should reference records used in bodies and argument patterns', () => {
+      const code = `-module(m).
+-export([mk/1, get_id/1]).
+
+-record(req, {id, payload}).
+
+mk(Id) -> #req{id = Id}.
+get_id(#req{id = Id}) -> Id.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'references' && r.referenceName === 'req'
+      );
+      expect(refs.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('should attribute calls from every clause of a multi-clause function', () => {
+      const code = `-module(m).
+-export([handle/1]).
+
+handle({a, X}) ->
+    first(X);
+handle({b, X}) ->
+    second(X).
+
+first(X) -> X.
+second(X) -> X.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const handle = result.nodes.find((n) => n.kind === 'function' && n.name === 'handle');
+      const calls = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && r.fromNodeId === handle?.id
+      ).map((r) => r.referenceName);
+      expect(calls).toContain('first/1');
+      expect(calls).toContain('second/1');
+    });
+  });
+
+  describe('escript and app resource files', () => {
+    it('should extract functions and calls from an escript behind a shebang', () => {
+      const code = `#!/usr/bin/env escript
+%%! -smp enable
+
+main([Path]) ->
+    Result = analyze(Path),
+    io:format("~p~n", [Result]).
+
+analyze(Path) ->
+    {ok, Bin} = file:read_file(Path),
+    byte_size(Bin).
+`;
+      const result = extractFromSource('bin/tool.escript', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toContain('main');
+      expect(fns).toContain('analyze');
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('analyze/1');
+      expect(calls).toContain('io::format/2');
+    });
+
+    it('should link an app resource file to its callback module and dependency apps', () => {
+      const code = `{application, sample, [
+    {description, "Sample application"},
+    {vsn, "1.0.0"},
+    {registered, [sample_server]},
+    {mod, {sample_app, []}},
+    {applications, [kernel, stdlib, sample_core]},
+    {included_applications, [sample_extra]},
+    {env, [{limit, 100}]},
+    {modules, []}
+]}.
+`;
+      const result = extractFromSource('src/sample.app.src', code);
+      const refs = result.unresolvedReferences.map((r) => `${r.referenceKind}:${r.referenceName}`);
+      // The application-callback module is the app's entry point.
+      expect(refs).toContain('references:sample_app');
+      // Dependencies resolve to umbrella siblings; kernel/stdlib just drop.
+      expect(refs).toContain('imports:kernel');
+      expect(refs).toContain('imports:sample_core');
+      expect(refs).toContain('imports:sample_extra');
+      // Registered names, env values, and the like carry no graph structure.
+      expect(refs.filter((r) => r.endsWith(':sample_server'))).toHaveLength(0);
+      expect(refs.filter((r) => r.endsWith(':limit'))).toHaveLength(0);
+    });
+  });
+
+  describe('Macro linkage', () => {
+    it('should attribute macro-body calls to the macro and link function-like uses into the chain', () => {
+      const code = `-module(m).
+-export([do_thing/1]).
+
+-define(LOG_AUDIT(Event), audit_logger:log(Event, ?MODULE)).
+
+do_thing(X) ->
+    ?LOG_AUDIT({thing, X}),
+    ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const macro = result.nodes.find((n) => n.kind === 'constant' && n.name === 'LOG_AUDIT');
+      const doThing = result.nodes.find((n) => n.kind === 'function' && n.name === 'do_thing');
+      const refsFrom = (id?: string) =>
+        result.unresolvedReferences.filter((r) => r.fromNodeId === id).map((r) => `${r.referenceKind}:${r.referenceName}`);
+      // The body's remote call belongs to the macro node — true exactly once.
+      expect(refsFrom(macro?.id)).toContain('calls:audit_logger::log/2');
+      // The use site joins the call chain: do_thing -calls→ LOG_AUDIT.
+      expect(refsFrom(doThing?.id)).toContain('calls:LOG_AUDIT');
+    });
+
+    it('should reference bare macro reads without polluting call chains', () => {
+      const code = `-module(m).
+-export([wait/0]).
+
+-define(TIMEOUT, 5000).
+
+wait() ->
+    receive after ?TIMEOUT -> ok end.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences.map((r) => `${r.referenceKind}:${r.referenceName}`);
+      expect(refs).toContain('references:TIMEOUT');
+      expect(refs).not.toContain('calls:TIMEOUT');
+    });
+
+    it('should skip compiler-predefined macros and keep walking macro-use arguments', () => {
+      const code = `-module(m).
+-export([check/0]).
+
+check() ->
+    ?assertEqual(ok, prepare()),
+    {?MODULE, ?LINE, ?FUNCTION_NAME}.
+
+prepare() -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      // The nested call inside the macro's arguments still attributes to check/0.
+      expect(refs).toContain('prepare/0');
+      // ?assertEqual (an OTP header macro) is emitted and simply never resolves…
+      expect(refs).toContain('assertEqual');
+      // …but predefined macros have no definition to link.
+      expect(refs).not.toContain('MODULE');
+      expect(refs).not.toContain('LINE');
+      expect(refs).not.toContain('FUNCTION_NAME');
+    });
+
+    it('should chain macro-to-macro uses', () => {
+      const code = `-module(m).
+
+-define(TARGET, target_fn()).
+-define(ALIAS, ?TARGET).
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const target = result.nodes.find((n) => n.kind === 'constant' && n.name === 'TARGET');
+      const alias = result.nodes.find((n) => n.kind === 'constant' && n.name === 'ALIAS');
+      const refsFrom = (id?: string) =>
+        result.unresolvedReferences.filter((r) => r.fromNodeId === id).map((r) => `${r.referenceKind}:${r.referenceName}`);
+      expect(refsFrom(target?.id)).toContain('calls:target_fn/0');
+      expect(refsFrom(alias?.id)).toContain('references:TARGET');
+    });
+  });
+
+  describe('Behaviour extraction', () => {
+    it('should emit an implements reference for -behaviour', () => {
+      const code = `-module(m).
+-behaviour(gen_server).
+
+init(_) -> {ok, #{}}.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const impl = result.unresolvedReferences.find((r) => r.referenceKind === 'implements');
+      expect(impl?.referenceName).toBe('gen_server');
+    });
+
+    it('should not create symbols from -callback declarations', () => {
+      const code = `-module(b).
+
+-callback handle_thing(term()) -> ok.
+-callback init(list()) -> {ok, term()}.
+`;
+      const result = extractFromSource('src/b.erl', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function');
+      expect(fns).toHaveLength(0);
+    });
+  });
+});
+
+describe('Terraform Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Terraform files', () => {
+      expect(detectLanguage('main.tf')).toBe('terraform');
+      expect(detectLanguage('terraform.tfvars')).toBe('terraform');
+      expect(detectLanguage('versions.tofu')).toBe('terraform');
+    });
+
+    it('should report Terraform as supported', () => {
+      expect(isLanguageSupported('terraform')).toBe(true);
+      expect(getSupportedLanguages()).toContain('terraform');
+    });
+  });
+
+  describe('Block extraction', () => {
+    it('should extract a resource block as a class with qualified type.name', () => {
+      const code = `
+resource "aws_s3_bucket" "my_bucket" {
+  bucket = "example"
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const res = result.nodes.find((n) => n.name === 'aws_s3_bucket.my_bucket');
+      expect(res).toBeDefined();
+      expect(res?.kind).toBe('class');
+      expect(res?.qualifiedName).toBe('aws_s3_bucket.my_bucket');
+      expect(res?.signature).toBe('resource "aws_s3_bucket" "my_bucket"');
+      expect(res?.language).toBe('terraform');
+    });
+
+    it('should extract a data block under the data.* qualified name', () => {
+      const code = `
+data "aws_caller_identity" "current" {}
+`;
+      const result = extractFromSource('main.tf', code);
+      const node = result.nodes.find((n) => n.qualifiedName === 'data.aws_caller_identity.current');
+      expect(node).toBeDefined();
+      expect(node?.kind).toBe('class');
+    });
+
+    it('should extract a variable block as variable with qualified name var.X', () => {
+      const code = `
+variable "region" {
+  type    = string
+  default = "us-east-1"
+}
+`;
+      const result = extractFromSource('variables.tf', code);
+      const v = result.nodes.find((n) => n.qualifiedName === 'var.region');
+      expect(v).toBeDefined();
+      expect(v?.kind).toBe('variable');
+      expect(v?.name).toBe('region');
+    });
+
+    it('should extract an output block as variable with qualified name output.X', () => {
+      const code = `
+output "bucket_arn" {
+  value = aws_s3_bucket.my_bucket.arn
+}
+`;
+      const result = extractFromSource('outputs.tf', code);
+      const out = result.nodes.find((n) => n.qualifiedName === 'output.bucket_arn');
+      expect(out).toBeDefined();
+      expect(out?.kind).toBe('variable');
+    });
+
+    it('should extract a module block as module with qualified name module.X', () => {
+      const code = `
+module "vpc" {
+  source = "./modules/vpc"
+  cidr   = var.vpc_cidr
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const m = result.nodes.find((n) => n.qualifiedName === 'module.vpc');
+      expect(m).toBeDefined();
+      expect(m?.kind).toBe('module');
+    });
+
+    it('should extract a provider block as namespace', () => {
+      const code = `
+provider "aws" {
+  region = "us-east-1"
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const p = result.nodes.find((n) => n.qualifiedName === 'provider.aws');
+      expect(p).toBeDefined();
+      expect(p?.kind).toBe('namespace');
+    });
+
+    it('should extract every locals attribute as its own constant with local.K qualified name', () => {
+      const code = `
+locals {
+  prefix      = "prod"
+  full_name   = "\${local.prefix}-app"
+  max_retries = 3
+}
+`;
+      const result = extractFromSource('locals.tf', code);
+      const names = result.nodes
+        .filter((n) => n.kind === 'constant')
+        .map((n) => n.qualifiedName)
+        .sort();
+      expect(names).toEqual(['local.full_name', 'local.max_retries', 'local.prefix']);
+    });
+
+    it('should ignore a terraform settings block', () => {
+      const code = `
+terraform {
+  required_version = ">= 1.5"
+}
+`;
+      const result = extractFromSource('versions.tf', code);
+      const symbols = result.nodes.filter((n) => n.kind !== 'file');
+      expect(symbols).toHaveLength(0);
+    });
+
+    it('should index .tfvars top-level attributes via the same parser path', () => {
+      // .tfvars files have no blocks — just bare attributes, each of which
+      // SETS the root module variable of that name. No symbols are declared,
+      // but every top-level assignment references its variable so "what sets
+      // var.region" is answerable.
+      const code = `
+region      = "us-east-1"
+environment = "prod"
+`;
+      const result = extractFromSource('terraform.tfvars', code);
+      expect(result.errors.filter((e) => e.severity === 'error')).toHaveLength(0);
+      const symbols = result.nodes.filter((n) => n.kind !== 'file');
+      expect(symbols).toHaveLength(0);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('var.region');
+      expect(refs).toContain('var.environment');
+    });
+  });
+
+  describe('Reference extraction', () => {
+    it('should emit a reference for var.X used inside a resource', () => {
+      const code = `
+variable "region" {}
+resource "aws_s3_bucket" "b" {
+  bucket = var.region
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('var.region');
+    });
+
+    it('should emit a reference for module.M.<output> as module.M', () => {
+      const code = `
+output "vpc_id" {
+  value = module.vpc.vpc_id
+}
+`;
+      const result = extractFromSource('outputs.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('module.vpc');
+    });
+
+    it('should emit a scoped module.M:output.X ref alongside module.M for output chains', () => {
+      const code = `
+output "vpc_id" {
+  value = module.vpc.vpc_id
+}
+`;
+      const result = extractFromSource('outputs.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('module.vpc:output.vpc_id');
+      // A bare module.M use (no output segment) stays a single ref.
+      const bare = extractFromSource('main.tf', 'output "m" {\n  value = module.vpc\n}\n');
+      const bareRefs = bare.unresolvedReferences.map((r) => r.referenceName);
+      expect(bareRefs).toContain('module.vpc');
+      expect(bareRefs.some((r) => r.includes(':output.'))).toBe(false);
+    });
+
+    it('should wire module blocks: scoped input refs, meta-args skipped, local source imported', () => {
+      const code = `
+module "vpc" {
+  source     = "./modules/vpc"
+  version    = "1.0.0"
+  count      = 2
+  depends_on = [aws_iam_role.net]
+  cidr       = var.vpc_cidr
+  name       = "prod"
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      // Input attributes wire to the child module's variables (scoped spelling).
+      expect(refs).toContain('module.vpc:var.cidr');
+      expect(refs).toContain('module.vpc:var.name');
+      // Meta-arguments configure the call, not child variables.
+      expect(refs).not.toContain('module.vpc:var.source');
+      expect(refs).not.toContain('module.vpc:var.version');
+      expect(refs).not.toContain('module.vpc:var.count');
+      expect(refs).not.toContain('module.vpc:var.depends_on');
+      // A local ./ source emits the module→file imports ref.
+      const fileRef = result.unresolvedReferences.find((r) => r.referenceName === 'module.vpc:file');
+      expect(fileRef).toBeDefined();
+      expect(fileRef?.referenceKind).toBe('imports');
+      // Attribute VALUES still reference the parent scope as before.
+      expect(refs).toContain('var.vpc_cidr');
+      expect(refs).toContain('aws_iam_role.net');
+    });
+
+    it('should not emit a module.M:file ref for registry or git sources', () => {
+      const code = `
+module "s3" {
+  source  = "terraform-aws-modules/s3-bucket/aws"
+  version = "4.0.0"
+  bucket  = "x"
+}
+module "net" {
+  source = "git::https://example.com/net.git"
+  cidr   = "10.0.0.0/16"
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs.some((r) => r.endsWith(':file'))).toBe(false);
+      // Input wiring is still emitted — the resolver drops it when the
+      // source turns out to be out-of-repo.
+      expect(refs).toContain('module.s3:var.bucket');
+    });
+
+    it('should emit a remote-output candidate for module.M.outputs.X chains', () => {
+      const code = `
+resource "aws_eks_cluster" "this" {
+  vpc_id = module.vpc.outputs.vpc_id
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('module.vpc');
+      expect(refs).toContain('module.vpc:remote-output.vpc_id');
+      // A plain two-segment chain must NOT produce a remote-output candidate.
+      const plain = extractFromSource('o.tf', 'output "x" {\n  value = module.vpc.vpc_id\n}\n');
+      const plainRefs = plain.unresolvedReferences.map((r) => r.referenceName);
+      expect(plainRefs.some((r) => r.includes(':remote-output.'))).toBe(false);
+    });
+
+    it('should reference resource addresses from moved/import/removed blocks, anchored to the file', () => {
+      const code = `
+resource "aws_instance" "new" {}
+moved {
+  from = aws_instance.old
+  to   = aws_instance.new
+}
+import {
+  to = aws_s3_bucket.b
+  id = "bucket-name"
+}
+removed {
+  from = module.legacy.aws_iam_role.r
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences;
+      const names = refs.map((r) => r.referenceName);
+      expect(names).toContain('aws_instance.old');
+      expect(names).toContain('aws_instance.new');
+      expect(names).toContain('aws_s3_bucket.b');
+      expect(names).toContain('module.legacy');
+      // Scoped module refs are suppressed here: module.legacy.aws_iam_role.r
+      // names a resource inside a module instance, never a module output.
+      expect(names.some((n) => n.includes(':'))).toBe(false);
+      // Anchored to the file node, and no phantom symbols were declared.
+      const fileNode = result.nodes.find((n) => n.kind === 'file');
+      for (const r of refs.filter((x) => x.referenceName === 'aws_instance.old')) {
+        expect(r.fromNodeId).toBe(fileNode?.id);
+      }
+      expect(result.nodes.filter((n) => n.kind !== 'file')).toHaveLength(1); // just aws_instance.new
+    });
+
+    it('should collect check-assert condition references and still index check-scoped data blocks', () => {
+      const code = `
+check "health" {
+  data "http" "ping" {
+    url = var.endpoint
+  }
+  assert {
+    condition     = data.http.ping.status_code == 200 && var.strict
+    error_message = "unhealthy"
+  }
+}
+`;
+      const result = extractFromSource('checks.tf', code);
+      const names = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(names).toContain('data.http.ping');
+      expect(names).toContain('var.strict');
+      expect(names).toContain('var.endpoint');
+      // The scoped data source inside the check is a real symbol.
+      expect(result.nodes.find((n) => n.qualifiedName === 'data.http.ping')).toBeDefined();
+    });
+
+    it('should qualify aliased provider blocks and reference provider selections', () => {
+      const code = `
+provider "aws" {
+  region = "us-east-1"
+}
+provider "aws" {
+  alias  = "east"
+  region = "us-east-2"
+}
+resource "aws_s3_bucket" "b" {
+  provider = aws.east
+  bucket   = "x"
+}
+resource "google_service_account" "sa" {
+  provider = google-beta
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const providers = result.nodes.filter((n) => n.kind === 'namespace').map((n) => n.qualifiedName).sort();
+      expect(providers).toEqual(['provider.aws', 'provider.aws.east']);
+      const names = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(names).toContain('provider.aws.east');
+      expect(names).toContain('provider.google-beta');
+      // The selection must not be misread as a resource reference.
+      expect(names).not.toContain('aws.east');
+    });
+
+    it('should reference the values (not keys) of a module providers map', () => {
+      const code = `
+module "vpc" {
+  source    = "./modules/vpc"
+  providers = {
+    aws = aws.east
+  }
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const names = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(names).toContain('provider.aws.east');
+      expect(names).not.toContain('provider.aws');
+      expect(names).not.toContain('aws.east');
+      // providers is a meta-argument — no input wiring for it.
+      expect(names).not.toContain('module.vpc:var.providers');
+    });
+
+    it('should emit data.T.N references stripped of the trailing attribute', () => {
+      const code = `
+output "account" {
+  value = data.aws_caller_identity.current.account_id
+}
+`;
+      const result = extractFromSource('outputs.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('data.aws_caller_identity.current');
+    });
+
+    it('should emit T.N references for managed-resource attribute access', () => {
+      const code = `
+resource "aws_iam_policy" "p" {
+  policy = aws_s3_bucket.my.arn
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('aws_s3_bucket.my');
+    });
+
+    it('should emit local.K references from locals attribute expressions', () => {
+      const code = `
+locals {
+  prefix = "prod"
+  name   = "\${local.prefix}-app"
+}
+`;
+      const result = extractFromSource('locals.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(refs).toContain('local.prefix');
+    });
+
+    it('should skip built-in heads (each, count, self, path, terraform.workspace)', () => {
+      const code = `
+resource "aws_instance" "x" {
+  count       = each.value
+  name        = path.module
+  workspace   = terraform.workspace
+  self_ref    = self.id
+  index_value = count.index
+}
+`;
+      const result = extractFromSource('main.tf', code);
+      const refs = result.unresolvedReferences.map((r) => r.referenceName);
+      // None of the built-ins should produce project references.
+      expect(refs.some((r) => r.startsWith('each.'))).toBe(false);
+      expect(refs.some((r) => r.startsWith('count.'))).toBe(false);
+      expect(refs.some((r) => r.startsWith('self.'))).toBe(false);
+      expect(refs.some((r) => r.startsWith('path.'))).toBe(false);
+      expect(refs.some((r) => r.startsWith('terraform.'))).toBe(false);
+    });
+  });
+});
+
+// =============================================================================
+// ArkTS (HarmonyOS / OpenHarmony declarative UI — `.ets`)
+// =============================================================================
+
+describe('ArkTS Extraction', () => {
+  it('reports ArkTS as supported', () => {
+    expect(isLanguageSupported('arkts')).toBe(true);
+    expect(getSupportedLanguages()).toContain('arkts');
+  });
+
+  describe('@Component struct extraction', () => {
+    const code = `
+import { TodoItem } from '../model/TodoItem';
+
+@Entry
+@Component
+struct Index {
+  @State message: string = 'Hello';
+  @Prop count: number = 0;
+  @StorageLink('theme') theme: string = 'light';
+  private service: TodoService = new TodoService();
+
+  aboutToAppear(): void {
+    this.load();
+  }
+
+  load(): void {
+    this.message = 'loaded';
+  }
+
+  build() {
+    Column() {
+      Text(this.message).fontSize(50)
+    }
+    .height('100%')
+  }
+}
+`;
+
+    it('extracts the struct with its ArkUI decorators', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const comp = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Index');
+      expect(comp).toBeDefined();
+      expect(comp?.language).toBe('arkts');
+      expect(comp?.decorators).toEqual(expect.arrayContaining(['Entry', 'Component']));
+    });
+
+    it('extracts an EXPORTED struct whose decorators sit on the export statement', () => {
+      const result = extractFromSource(
+        'components/Card.ets',
+        `@Component\nexport struct Card {\n  build() {\n    Row() {}\n  }\n}\n`
+      );
+      const card = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Card');
+      expect(card).toBeDefined();
+      expect(card?.isExported).toBe(true);
+      expect(card?.decorators).toContain('Component');
+    });
+
+    it('extracts struct members: build(), lifecycle + regular methods with qualified names', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.find((m) => m.qualifiedName === 'Index::build')).toBeDefined();
+      expect(methods.find((m) => m.qualifiedName === 'Index::aboutToAppear')).toBeDefined();
+      expect(methods.find((m) => m.qualifiedName === 'Index::load')).toBeDefined();
+    });
+
+    it('extracts @State/@Prop/@StorageLink members as properties with their decorators', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const message = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::message');
+      expect(message).toBeDefined();
+      expect(message?.decorators).toContain('State');
+      const count = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::count');
+      expect(count?.decorators).toContain('Prop');
+      // Decorator-with-args: the decorator NAME is captured, not its argument.
+      const theme = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::theme');
+      expect(theme?.decorators).toContain('StorageLink');
+    });
+
+    it('emits intra-struct method call refs (this.load())', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'load'
+      );
+      expect(call).toBeDefined();
+    });
+  });
+
+  describe('build() DSL call surface', () => {
+    const code = `
+@Extend(Text) function titleStyle(size: number) {
+  .fontSize(size)
+}
+
+@Component
+struct Page {
+  count: number = 0;
+
+  handleTap(): void {
+    this.count += 1;
+  }
+
+  @Builder
+  headerBar(title: string) {
+    Row() {
+      Text(title).titleStyle(24)
+      Button('Go').onClick(this.handleTap)
+    }
+  }
+
+  build() {
+    Column({ space: 8 }) {
+      this.headerBar('Home')
+      ChildCard({ label: 'hi' })
+    }
+    .height('100%')
+  }
+}
+`;
+
+    function callRefsFrom(result: ReturnType<typeof extractFromSource>, methodName: string): string[] {
+      const from = result.nodes.find((n) => n.kind === 'method' && n.name === methodName);
+      return result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls' && r.fromNodeId === from?.id)
+        .map((r) => r.referenceName);
+    }
+
+    it('emits a call ref for a custom component instantiation inside build()', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      expect(callRefsFrom(result, 'build')).toContain('ChildCard');
+    });
+
+    it('emits dot-prefixed call refs for chained attributes (@Extend/@Styles-only resolution)', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      // `.titleStyle(24)` chains on the Text component — one node, repeated
+      // property/arguments field pairs, NOT nested call_expressions. The
+      // leading dot routes the ref to the decorator-gated matcher strategy so
+      // framework attributes (`.height` below) can never hit an arbitrary
+      // same-named symbol.
+      expect(callRefsFrom(result, 'headerBar')).toContain('.titleStyle');
+      expect(callRefsFrom(result, 'build')).toContain('.height');
+      expect(callRefsFrom(result, 'build')).not.toContain('height');
+    });
+
+    it('recovers the detached-chain shape (chain on the line after a nested component)', () => {
+      // Inside arkui_children, a chain starting after the closing `}` is
+      // detached by the grammar into sibling leading_dot_expression +
+      // parenthesized_expression statements — the close-button idiom.
+      const detached = `
+@Component
+struct Panel {
+  close(): void {}
+
+  build() {
+    Column() {
+      Row() {
+        Text('x')
+      }
+      .width(10)
+      .onClick(this.close)
+      .id('close_button')
+    }
+  }
+}
+`;
+      const result = extractFromSource('components/Panel.ets', detached);
+      const refs = callRefsFrom(result, 'build');
+      expect(refs).toContain('close');
+      expect(refs).toContain('.width');
+      expect(refs).not.toContain('width');
+    });
+
+    it('dot-prefixes the innermost call of a proper-form detached chain', () => {
+      // `.alignItems(x).layoutWeight(1)` under a leading_dot_expression: the
+      // wrapper consumes the dot, so the innermost call has a bare identifier
+      // function and would otherwise emit as a plain `alignItems(...)` call.
+      const chained = `
+@Component
+struct Card {
+  build() {
+    Column() {
+      List() {
+        Text('x')
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .height('100%')
+    }
+  }
+}
+`;
+      const result = extractFromSource('components/Card.ets', chained);
+      const refs = callRefsFrom(result, 'build');
+      expect(refs).toContain('.alignItems');
+      expect(refs).not.toContain('alignItems');
+      expect(refs).toContain('.layoutWeight');
+      expect(refs).not.toContain('layoutWeight');
+    });
+
+    it('emits a call ref for an .onClick(this.handler) method-reference binding', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      expect(callRefsFrom(result, 'headerBar')).toContain('handleTap');
+    });
+
+    it('emits a call ref for a @Builder method invoked as this.headerBar()', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      expect(callRefsFrom(result, 'build')).toContain('headerBar');
+    });
+
+    it('extracts a global @Extend function with its decorator', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'titleStyle');
+      expect(fn).toBeDefined();
+      expect(fn?.decorators).toContain('Extend');
+    });
+  });
+
+  describe('Global @Builder functions', () => {
+    it('extracts a decorated global @Builder function with signature and decorator', () => {
+      const result = extractFromSource(
+        'common/builders.ets',
+        `@Builder\nfunction EmptyHint(message: string) {\n  Column() {\n    Text(message).fontSize(16)\n  }\n}\n`
+      );
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'EmptyHint');
+      expect(fn).toBeDefined();
+      expect(fn?.signature).toBe('(message: string)');
+      expect(fn?.decorators).toContain('Builder');
+    });
+  });
+
+  describe('Standard TypeScript constructs in .ets', () => {
+    it('extracts classes, interfaces, enums, type aliases and their members', () => {
+      const code = `
+export enum Priority { Low, Medium = 2, High }
+
+export interface Shape {
+  area(): number;
+}
+
+export type Handler = (e: string) => void;
+
+export class Service {
+  private count: number = 0;
+  doWork(x: number): number {
+    return this.helper(x);
+  }
+  helper(n: number): number { return n * 2; }
+}
+`;
+      const result = extractFromSource('common/service.ets', code);
+      expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'Service')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'Priority')).toBeDefined();
+      const members = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.qualifiedName);
+      expect(members).toEqual(expect.arrayContaining(['Priority::Low', 'Priority::Medium', 'Priority::High']));
+      expect(result.nodes.find((n) => n.kind === 'interface' && n.name === 'Shape')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Handler')).toBeDefined();
+      const doWork = result.nodes.find((n) => n.qualifiedName === 'Service::doWork');
+      expect(doWork?.kind).toBe('method');
+      expect(doWork?.signature).toBe('(x: number): number');
+      expect(
+        result.unresolvedReferences.find((r) => r.referenceKind === 'calls' && r.referenceName === 'helper')
+      ).toBeDefined();
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('extracts relative, SDK (@ohos/@kit) and default imports', () => {
+      const code = `
+import router from '@ohos.router';
+import { promptAction } from '@kit.ArkUI';
+import { TodoItem } from '../model/TodoItem';
+import DataStore from '../data/DataStore';
+`;
+      const result = extractFromSource('pages/imports.ets', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('@ohos.router');
+      expect(imports).toContain('@kit.ArkUI');
+      expect(imports).toContain('../model/TodoItem');
+      expect(imports).toContain('../data/DataStore');
+    });
+  });
+});
+
+// R7a preParse additions — the blanking passes added so macro-heavy C/C++
+// parses clean enough for the kernel route (each also improves the wasm
+// path's own graphs). Offset preservation is load-bearing everywhere.
+describe('C/C++ kernel-port preParse blanks (R7a)', () => {
+  it('blankCCplusplusGuardBodies blanks extern-C guard bodies, keeps directives', async () => {
+    const { blankCCplusplusGuardBodies } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      '#ifdef __cplusplus',
+      'extern "C" {',
+      '#endif',
+      'int real_decl(void);',
+      '#ifdef __cplusplus',
+      '}',
+      '#endif',
+      '',
+    ].join('\n');
+    const out = blankCCplusplusGuardBodies(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('extern "C"');
+    expect(out).toContain('#ifdef __cplusplus'); // directives stay
+    expect(out).toContain('int real_decl(void);');
+    // A guard with a nested directive bails (needs real preprocessing).
+    const nested = [
+      '#ifdef __cplusplus',
+      '#define EXTERNC extern "C"',
+      '#endif',
+      '',
+    ].join('\n');
+    expect(blankCCplusplusGuardBodies(nested)).toBe(nested);
+    // The `#ifndef` inverse guard is C-visible and must be untouched.
+    const inverse = ['#ifndef __cplusplus', 'int c_only(void);', '#endif', ''].join('\n');
+    expect(blankCCplusplusGuardBodies(inverse)).toBe(inverse);
+  });
+
+  it('blankLoneMacroLines blanks namespace-management macros, spares expression operands', async () => {
+    const { blankLoneMacroLines } = await import('../src/extraction/languages/c-cpp');
+    const src = ['FMT_BEGIN_NAMESPACE', 'struct S { int x; };', 'FMT_END_NAMESPACE', ''].join('\n');
+    const out = blankLoneMacroLines(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('FMT_BEGIN_NAMESPACE');
+    expect(out).toContain('struct S { int x; };');
+    // An ALL-CAPS operand alone on a line inside a multi-line expression is
+    // NOT a lone macro — the next line starts with an operator.
+    const expr = ['int x = 0', '  | FLAG_ONE', '  | FLAG_TWO;', ''].join('\n');
+    expect(blankLoneMacroLines(expr)).toBe(expr);
+    const cont = ['int y =', 'SOME_FLAG', '| OTHER;', ''].join('\n');
+    expect(blankLoneMacroLines(cont)).toBe(cont);
+    // Underscore-free solid words are too risky and stay.
+    const bare = ['NDEBUG', 'int z;', ''].join('\n');
+    expect(blankLoneMacroLines(bare)).toBe(bare);
+  });
+
+  it('blankCDesignatedMacroArgs empties a designated-initializer macro call, offsets kept (#1729)', async () => {
+    const { blankCDesignatedMacroArgs } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void resetProfile(profile_t *p)',
+      '{',
+      '    RESET_CONFIG(profile_t, p,',
+      '        .pid = { [PID_ROLL] = PID_ROLL_DEFAULT, [PID_YAW] = { 50, 75 } },',
+      '        .limit = 500, // trailing comma follows',
+      '    );',
+      '    log(.5);',
+      '    OTHER_MACRO(a == b, c);',
+      '}',
+    ].join('\n');
+    const out = blankCDesignatedMacroArgs(src);
+    expect(out.length).toBe(src.length);
+    expect(out.split('\n').length).toBe(src.split('\n').length);
+    expect(out).toContain('RESET_CONFIG(');
+    expect(out).not.toContain('.pid');
+    expect(out).not.toContain('PID_ROLL');
+    // The closing `);` keeps its column; the argument lines are spaces.
+    expect(out.split('\n')[5]).toBe('    );');
+    expect(out.split('\n')[3]).toBe(' '.repeat(src.split('\n')[3].length));
+    // A numeric literal and a comparison are not designators.
+    expect(out).toContain('log(.5);');
+    expect(out).toContain('OTHER_MACRO(a == b, c);');
+  });
+
+  it('a designated-initializer macro call no longer swallows the functions after it (#1729)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1729-'));
+    try {
+      // Issue fixture: designated-initializer args + trailing comma. Without
+      // blankCDesignatedMacroArgs, tree-sitter-c error recovery extends
+      // `function_definition` to EOF — `g` vanishes and `h` nests as `f::h`.
+      fs.writeFileSync(
+        path.join(dir, 'pid.c'),
+        [
+          'void f(void)',
+          '{',
+          '    M(a, b,',
+          '        .x = 1,',
+          '        .y = { 1, 2 },',
+          '    );',
+          '}',
+          '',
+          'void g(void)',
+          '{',
+          '}',
+          '',
+          'int h(void)',
+          '{',
+          '    return 1;',
+          '}',
+          '',
+        ].join('\n')
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'pid.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['f', 'g', 'h']);
+        expect(byName.f!.endLine).toBe(7);
+        expect(byName.g!.qualifiedName).toBe('g');
+        expect(byName.h!.qualifiedName).toBe('h');
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a large designated-initializer macro call keeps later functions top-level (#1729)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1729-large-'));
+    try {
+      // Scale guard for betaflight-sized RESET_CONFIG argument lists.
+      const fields = Array.from({ length: 120 }, (_, i) => `        .field${i} = ${i},`).join('\n');
+      fs.writeFileSync(
+        path.join(dir, 'pid.c'),
+        `void resetProfile(profile_t *p)\n{\n    RESET_CONFIG(profile_t, p,\n${fields}\n    );\n}\n\nvoid g(void)\n{\n}\n\nint h(void)\n{\n    return 1;\n}\n`
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'pid.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['g', 'h', 'resetProfile']);
+        expect(byName.resetProfile!.endLine).toBe(125);
+        expect(byName.g!.qualifiedName).toBe('g');
+        expect(byName.h!.qualifiedName).toBe('h');
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('Go: a method carries the exportedness of its name, like a function', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-method-exported-'));
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'log.go'),
+        'package log\n\ntype writer struct{}\n\nfunc (w *writer) Close() error { return nil }\n\nfunc (w *writer) flush() {}\n\nfunc Open() *writer { return &writer{} }\n\nfunc helper() {}\n'
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const flag = (name: string) =>
+          cg.getNodesByKind('method').concat(cg.getNodesByKind('function')).find((n) => n.name === name)!.isExported;
+        expect(flag('Close')).toBe(true);
+        expect(flag('flush')).toBe(false);
+        expect(flag('Open')).toBe(true);
+        expect(flag('helper')).toBe(false);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('Go: a call through a package stays on its function, not an exported method of that name', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-package-member-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/app\n\ngo 1.22\n');
+      fs.mkdirSync(path.join(dir, 'applog'));
+      // The method comes first, so a lookup by name meets it before the function.
+      fs.writeFileSync(
+        path.join(dir, 'applog', 'log.go'),
+        'package applog\n\ntype Logger struct{}\n\nfunc (l *Logger) Infof(format string) {}\n\nfunc Infof(format string) {}\n'
+      );
+      fs.mkdirSync(path.join(dir, 'svc'));
+      fs.writeFileSync(
+        path.join(dir, 'svc', 'use.go'),
+        'package svc\n\nimport "example.com/app/applog"\n\nfunc Use(l *applog.Logger) {\n\tapplog.Infof("x")\n\tl.Infof("y")\n}\n'
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const use = cg.getNodesByKind('function').find((n) => n.name === 'Use')!;
+        const calls = cg.getOutgoingEdgesFrom([use.id], ['calls']).map((e) => {
+          const target = cg.getNode(e.target)!;
+          return `${e.line} ${target.kind} ${target.qualifiedName}`;
+        }).sort();
+        expect(calls).toEqual(['6 function Infof', '7 method Logger::Infof']);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
+    const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'static void walk(struct list *head) {',
+      '\tlist_for_each_entry(pos, head, member) {',
+      '\t\tuse(pos);',
+      '\t}',
+      '}',
+      '',
+    ].join('\n');
+    const out = blankCStatementMacroCalls(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('list_for_each_entry');
+    expect(out).toContain('use(pos);');
+    // A real call statement ends with `;` — untouched.
+    expect(out).toContain('use(pos);');
+    const call = ['void f(void) {', '\tdo_thing(a, b);', '}', ''].join('\n');
+    expect(blankCStatementMacroCalls(call)).toBe(call);
+    // Column-0 `name(args) {` is an implicit-int function definition — untouched.
+    const kandr = ['main(argc, argv)', '{', '\treturn 0;', '}', ''].join('\n');
+    expect(blankCStatementMacroCalls(kandr)).toBe(kandr);
+    // Control-flow keywords are never macros.
+    const ctrl = ['void g(int x) {', '\twhile (x) {', '\t\tx--;', '\t}', '}', ''].join('\n');
+    expect(blankCStatementMacroCalls(ctrl)).toBe(ctrl);
+  });
+
+  it('blankCTrailingParamAttrMacros blanks `name UNUSED` params, spares call args', async () => {
+    const { blankCTrailingParamAttrMacros } = await import('../src/extraction/languages/c-cpp');
+    const src = 'static int run(int argc UNUSED, const char **argv UNUSED)\n{\n\treturn 0;\n}\n';
+    const out = blankCTrailingParamAttrMacros(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('UNUSED');
+    expect(out).toContain('int argc ');
+    // A macro CONSTANT as a call argument is preceded by `,`/`(`, never by a
+    // bare identifier — untouched.
+    const call = 'void f(void) {\n\tconnect(sock, DEFAULT_TIMEOUT);\n}\n';
+    expect(blankCTrailingParamAttrMacros(call)).toBe(call);
+  });
+
+  it('blankCKernelAnnotations blanks sparse/section dunders, spares parameterized ones and real types', async () => {
+    const { blankCKernelAnnotations } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'static int __init audit_init(void) { return 0; }',
+      'void copy(void __user *dst, const char *src);',
+      '__bpf_kfunc void bpf_iter_destroy(struct bpf_iter_num *it);',
+      '__printf(1, 2) void log_fmt(const char *fmt, ...);',
+      'struct e *entry = container_of(r, struct audit_entry, rule);',
+      '__u32 count = 0;',
+      '',
+    ].join('\n');
+    const out = blankCKernelAnnotations(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('__init');
+    expect(out).not.toContain('__user');
+    expect(out).not.toContain('__bpf_kfunc');
+    // Parameterized annotations keep their name — blanking it would strand
+    // the argument list as a floating parenthesis.
+    expect(out).toContain('__printf(1, 2)');
+    // container_of's type-keyword argument blanks; other `struct` keywords stay.
+    expect(out).toContain('container_of(r,        audit_entry, rule)');
+    expect(out).toContain('struct e *entry');
+    // Real dunder TYPES are not annotations.
+    expect(out).toContain('__u32 count');
+  });
+
+  it('blankCParameterizedAnnotationMacros blanks name+args whole, eats a stranded field semicolon', async () => {
+    const { blankCParameterizedAnnotationMacros } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'struct file *f __free(fput) = NULL;',
+      'static void __printf(4, 0) log_it(int a, const char *fmt, ...);',
+      'struct ctx {',
+      '\t__bpf_md_ptr(struct bpf_iter_meta *, meta);',
+      '};',
+      'int keep = __hash(key);',
+      '',
+    ].join('\n');
+    const out = blankCParameterizedAnnotationMacros(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('__free');
+    expect(out).not.toContain('__printf');
+    // Mid-line match keeps its statement tail…
+    expect(out).toContain('= NULL;');
+    // …but a whole-line FIELD match eats the `;` too — a lone `;` field is
+    // itself a parse error while an empty struct body is not.
+    expect(out).not.toContain('__bpf_md_ptr');
+    expect(out.split('\n')[3]?.trim()).toBe('');
+    // Non-curated dunder calls are real code.
+    expect(out).toContain('__hash(key)');
+  });
+
+  it('blankCTypeKeywordArgs blanks bare type-keyword call args, spares valid look-alikes', async () => {
+    const { blankCTypeKeywordArgs } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void j(void *head, void *map) {',
+      '\tvoid *p = kzalloc_obj(struct bpf_mount_opts);',
+      '\tvoid *e = list_first_entry(head,',
+      '\t\t\tstruct async_entry, domain_list);',
+      '\tvoid *n = hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(head)),',
+      '\t\t\tstruct bpf_dtab_netdev, index_hlist);',
+      '\treturn container_of(map, struct bpf_map, inner);',
+      '}',
+      'DEFINE_PER_CPU(struct task_struct *, ksoftirqd);',
+      '',
+    ].join('\n');
+    const out = blankCTypeKeywordArgs(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('struct bpf_mount_opts');
+    expect(out).toContain('       bpf_mount_opts'); // keyword → spaces, ident stays
+    expect(out).toContain('       async_entry, domain_list');
+    expect(out).toContain('       bpf_dtab_netdev'); // nested-paren predecessor arg
+    expect(out).toContain('       bpf_map, inner'); // `return` precedes real calls
+    // Pointer form blanks the stars too — two plain identifier args remain.
+    expect(out).toContain('       task_struct  , ksoftirqd');
+    // Valid look-alikes stay byte-identical.
+    for (const valid of [
+      'int a = sizeof(struct point);',
+      'int b = offsetof(struct point, y);',
+      'int c = _Generic(x, struct foo *: 1, default: 0);',
+      'int wf(struct a,\n\tstruct b);',
+      'void cast(void *p) { use((struct foo *)p); }',
+      'struct ops { int (*probe)(struct device *dev); };',
+    ]) {
+      expect(blankCTypeKeywordArgs(valid)).toBe(valid);
+    }
+  });
+
+  it('blankCFileScopePrefixedDeclMacros blanks static/extern CAPS-macro lines at any scope', async () => {
+    const { blankCFileScopePrefixedDeclMacros } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'static DEFINE_PER_CPU(struct llist_head, rstat_backlog_list);',
+      'void f(void) {',
+      '\tstatic DEFINE_RATELIMIT_STATE(ratelimit, 5 * HZ, 5);',
+      '}',
+      'EXPORT_SYMBOL(vmalloc);',
+      'static DEFINE_PER_CPU(struct cpuhp_cpu_state, cpuhp_state) = {',
+      '',
+    ].join('\n');
+    const out = blankCFileScopePrefixedDeclMacros(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('DEFINE_PER_CPU(struct llist_head');
+    expect(out).not.toContain('DEFINE_RATELIMIT_STATE'); // block scope blanks too
+    // Bare CAPS lines parse natively as K&R declarations — untouched.
+    expect(out).toContain('EXPORT_SYMBOL(vmalloc);');
+    // Initializer forms belong to the rewrite, not the blank.
+    expect(out).toContain('cpuhp_state) = {');
+  });
+
+  it('rewriteCPrefixedDeclMacroInitializers rewrites `static CAPS(type, name) = {` into the declaration', async () => {
+    const { rewriteCPrefixedDeclMacroInitializers } = await import('../src/extraction/languages/c-cpp');
+    const line = 'static DEFINE_PER_CPU(struct cpuhp_cpu_state, cpuhp_state) = {';
+    const src = [line, '\t.fail = CPUHP_INVALID,', '};', ''].join('\n');
+    const out = rewriteCPrefixedDeclMacroInitializers(src);
+    expect(out.length).toBe(src.length);
+    const rewritten = out.split('\n')[0] as string;
+    expect(rewritten).toContain('static struct cpuhp_cpu_state');
+    expect(rewritten).not.toContain('DEFINE_PER_CPU');
+    // The NAME keeps its exact original column, and the tail its offsets.
+    expect(rewritten.indexOf('cpuhp_state')).not.toBe(-1);
+    expect(rewritten.indexOf('cpuhp_state', 30)).toBe(line.indexOf('cpuhp_state', 30));
+    expect(rewritten.indexOf('= {')).toBe(line.indexOf('= {'));
+    // Three-argument macros never match.
+    const threeArg = 'static DEFINE_TIMER(t, fn, 0) = {\n};\n';
+    expect(rewriteCPrefixedDeclMacroInitializers(threeArg)).toBe(threeArg);
+  });
+
+  it('blankCVaArgQualifiedTypeArgs blanks multi-token va_arg types, spares single tokens', async () => {
+    const { blankCVaArgQualifiedTypeArgs } = await import('../src/extraction/languages/c-cpp');
+    const src = 'void f(va_list ap) {\n\tconst char *s = va_arg(ap, const char *);\n\tint n = va_arg(ap, int);\n}\n';
+    const out = blankCVaArgQualifiedTypeArgs(src);
+    expect(out.length).toBe(src.length);
+    expect(out).toContain('va_arg(ap              );');
+    expect(out).toContain('va_arg(ap, int);'); // parses natively — untouched
+  });
+
+  it('blankCNamedVariadicDefineDots blanks only the dots of GNU named-variadic params', async () => {
+    const { blankCNamedVariadicDefineDots } = await import('../src/extraction/languages/c-cpp');
+    const named = '#define verbose(env, fmt, args...) log_write(env, fmt, ##args)\nint x;\n';
+    const out = blankCNamedVariadicDefineDots(named);
+    expect(out.length).toBe(named.length);
+    expect(out).toContain('args   )'); // dots → spaces
+    expect(out).toContain('##args'); // body untouched
+    const std = '#define pr(fmt, ...) printk(fmt, __VA_ARGS__)\nint y;\n';
+    expect(blankCNamedVariadicDefineDots(std)).toBe(std);
+  });
+
+  it('blankCSandwichedAnnotations and blankCAutoInference: sandwich and C23-auto guards', async () => {
+    const { blankCSandwichedAnnotations, blankCAutoInference } = await import(
+      '../src/extraction/languages/c-cpp'
+    );
+    const src = 'static notrace void tick_do(void) { }\nstatic nokprobe_inline void arm(void) { }\n';
+    const out = blankCSandwichedAnnotations(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('notrace');
+    expect(out).not.toContain('nokprobe_inline');
+    // As a variable name (no following word) it survives.
+    const varUse = 'void f(void) { int notrace = 1; use(notrace); }\n';
+    expect(blankCSandwichedAnnotations(varUse)).toBe(varUse);
+    const c23 = 'void q(void) { auto hb = get_hb(); }\n';
+    const autoOut = blankCAutoInference(c23);
+    expect(autoOut.length).toBe(c23.length);
+    expect(autoOut).toContain('     hb = get_hb();');
+    // The storage-class reading has a TYPE after `auto` — untouched.
+    const storage = 'void s(void) { auto int x = 1; }\n';
+    expect(blankCAutoInference(storage)).toBe(storage);
+  });
+
+  it('blankCStatementMacroCalls spans wrapped iterator macros, spares wrapped real calls', async () => {
+    const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'static void walk(void *head) {',
+      '\thlist_for_each_entry_rcu(p, head, hlist,',
+      '\t\t\t\t lockdep_is_held(&kprobe_mutex)) {',
+      '\t\tuse(p);',
+      '\t}',
+      '}',
+      '',
+    ].join('\n');
+    const out = blankCStatementMacroCalls(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('hlist_for_each_entry_rcu');
+    expect(out).not.toContain('lockdep_is_held');
+    expect(out).toContain('use(p);');
+    // A wrapped REAL call ends in `;` — untouched.
+    const call = 'void f(void) {\n\tdo_thing(a,\n\t\t b);\n}\n';
+    expect(blankCStatementMacroCalls(call)).toBe(call);
+    // A wrapped condition is keyword-led — untouched.
+    const cond = 'void g(int a) {\n\tif (check(a,\n\t\t  a)) {\n\t\tuse(a);\n\t}\n}\n';
+    expect(blankCStatementMacroCalls(cond)).toBe(cond);
+  });
+
+  it('restoreDirectiveLines keeps #define lines out of the blanking blast radius', async () => {
+    const { extractFromSource } = await import('../src/extraction');
+    // FMT_API matches the _API-suffix member blank; without the directive
+    // restore the #define loses its NAME and the file gains a parse error.
+    const src = [
+      '#define FMT_API FMT_VISIBILITY("default")',
+      'class Widget {',
+      ' public:',
+      '  int size() const { return 1; }',
+      '};',
+      '',
+    ].join('\n');
+    const result = extractFromSource('lib.hpp', src, 'cpp');
+    expect(result.errors).toEqual([]);
+    expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
+  });
+});
+
+// `init` on a project CodeGraph has no grammar for used to look identical to a
+// successful index of an empty repo: 0 files, `index_state: complete`, exit 0.
+// Nothing said "there are 24k files here and I understood none of them", so an
+// agent told to trust the graph concluded the code did not exist (#1502).
+//
+// The scan already visits every file, so the count comes from the walk it
+// already does — no second pass.
+describe('Unsupported-language projects report what they skipped (#1502)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  it('counts files it could not index, by extension, on the git path', async () => {
+    const runGit = (...args: string[]) =>
+      execFileSync('git', args, { cwd: tempDir, stdio: 'pipe' });
+    fs.mkdirSync(tempDir, { recursive: true });
+    runGit('init', '-q');
+    runGit('config', 'user.email', 'test@test.com');
+    runGit('config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(tempDir, 'a.move'), 'module a {}');
+    fs.writeFileSync(path.join(tempDir, 'b.move'), 'module b {}');
+    fs.writeFileSync(path.join(tempDir, 'c.pl'), 'print 1;');
+    runGit('add', '-A');
+    runGit('commit', '-q', '-m', 'unsupported only');
+
+    const stats: ScanSkipStats = { unsupportedByExtension: new Map() };
+    const files = await scanDirectoryAsync(tempDir, undefined, stats);
+
+    expect(files).toEqual([]);
+    expect(stats.unsupportedByExtension.get('.move')).toBe(2);
+    expect(stats.unsupportedByExtension.get('.pl')).toBe(1);
+  });
+
+  it('counts them on the filesystem-walk path too (non-git project)', async () => {
+    fs.mkdirSync(tempDir, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'a.move'), 'module a {}');
+    fs.writeFileSync(path.join(tempDir, 'b.pl'), 'print 1;');
+
+    const stats: ScanSkipStats = { unsupportedByExtension: new Map() };
+    const files = await scanDirectoryAsync(tempDir, undefined, stats);
+
+    expect(files).toEqual([]);
+    expect(stats.unsupportedByExtension.get('.move')).toBe(1);
+    expect(stats.unsupportedByExtension.get('.pl')).toBe(1);
+  });
+
+  it('stays silent when every file was indexable', async () => {
+    fs.mkdirSync(tempDir, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const a = 1;');
+
+    const stats: ScanSkipStats = { unsupportedByExtension: new Map() };
+    const files = await scanDirectoryAsync(tempDir, undefined, stats);
+
+    expect(files).toEqual(['a.ts']);
+    expect(stats.unsupportedByExtension.size).toBe(0);
+  });
+});
+
+
+describe('C++ COM interface declarations (#1519)', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+  afterEach(() => {
+    cg?.close();
+    cg = undefined;
+    if (tempDir) cleanupTempDir(tempDir);
+  });
+
+  it.each(['\n', '\r\n'])('indexes COM owners, methods and inheritance with %j line endings', async (eol) => {
+    const source = [
+      '#define interface struct',
+      'struct IParentInterface { virtual void Parent() = 0; };',
+      'interface IMyComInterface : IParentInterface {',
+      '    virtual void Foo() = 0;',
+      '    virtual void Bar() = 0;',
+      '};',
+      'interface IStandalone { virtual void Run() = 0; };',
+      '',
+    ].join(eol);
+    expect(detectLanguage('MyInterface.h', source)).toBe('cpp');
+    tempDir = createTempDir();
+    fs.writeFileSync(path.join(tempDir, 'MyInterface.h'), source);
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+    const nodes = cg.getNodesInFile('MyInterface.h');
+    const owner = nodes.find((n) => n.name === 'IMyComInterface');
+    expect(owner).toMatchObject({ kind: 'struct', startLine: 3 });
+    for (const [name, line] of [['Foo', 4], ['Bar', 5]] as const) {
+      expect(nodes.find((n) => n.name === name)).toMatchObject({
+        kind: 'method', qualifiedName: `IMyComInterface::${name}`, isAbstract: true, startLine: line,
+      });
+    }
+    expect(nodes.find((n) => n.name === 'IStandalone')).toMatchObject({ kind: 'struct' });
+    expect(nodes.find((n) => n.name === 'Run')).toMatchObject({ qualifiedName: 'IStandalone::Run', isAbstract: true });
+    expect(nodes.filter((n) => n.kind === 'function')).toEqual([]);
+    const parent = nodes.find((n) => n.name === 'IParentInterface');
+    expect(cg.getOutgoingEdges(owner!.id)).toContainEqual(expect.objectContaining({ kind: 'extends', target: parent!.id }));
+    expect(await cg.getCode(owner!.id)).toContain('interface IMyComInterface');
+  });
+
+  it('normalizes declaration evidence without a local alias and preserves all other bytes', async () => {
+    const { cppExtractor } = await import('../src/extraction/languages/c-cpp');
+    const source = [
+      '// interface Comment : Base {};',
+      '/* interface Block { virtual void Fake() = 0; }; */',
+      'const char* text = "interface String : Base {};";',
+      'const char* raw = R"tag(interface Raw : Base {})tag";',
+      '#define SAMPLE interface Macro : Base {}',
+      '#define MULTI \\',
+      'interface Continued : Base {}',
+      'int interface = 1;',
+      'void interface();',
+      'interface value;',
+      'interface ordinary{};',
+      'interface IDerived : Base { virtual void Foo() = 0; };',
+      'interface IStandalone { virtual void Run() = 0; };',
+      '',
+    ].join('\r\n');
+    const expected = source.replace('interface IDerived', 'struct    IDerived').replace('interface IStandalone', 'struct    IStandalone');
+    expect(cppExtractor.preParse!(source, 'com.hpp')).toBe(expected);
+    expect(Buffer.byteLength(expected)).toBe(Buffer.byteLength(source));
   });
 });

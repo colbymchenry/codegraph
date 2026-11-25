@@ -1,8 +1,14 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
+import { preParsePascal } from './pascal-preparse';
 
 export const pascalExtractor: LanguageExtractor = {
+  // Blank Delphi syntax the grammar has no rule for, such as an attribute on a
+  // parameter (`const [ref] AValue: Integer`), offsets kept (#2545). Signatures
+  // still read the attribute from the source as written.
+  preParse: preParsePascal,
+  signatureAsWritten: true,
   functionTypes: ['declProc'],
   classTypes: ['declClass'],
   methodTypes: ['declProc'],
@@ -17,6 +23,16 @@ export const pascalExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'args',
   returnField: 'type',
+  // Pascal/Delphi `function GetInstance: TBar` — the return type is a `typeref`
+  // child. Capture its bare class name for the chained static-factory call
+  // mechanism (#750). A procedure (no return) has no typeref → undefined.
+  getReturnType: (node, source) => {
+    const typeref = node.namedChildren.find((c: SyntaxNode) => c.type === 'typeref');
+    if (!typeref) return undefined;
+    const id = typeref.namedChildren.find((c: SyntaxNode) => c.type === 'identifier') ?? typeref;
+    const name = getNodeText(id, source).trim();
+    return /^[A-Za-z_]\w*$/.test(name) ? name : undefined;
+  },
   getSignature: (node, source) => {
     const args = getChildByField(node, 'args');
     const returnType = node.namedChildren.find(

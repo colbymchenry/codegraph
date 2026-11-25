@@ -1,0 +1,211 @@
+/**
+ * `GET /api/routes` — the URL to handler map, when the project has one.
+ *
+ * The engine's routing manifest is a flat list of (url, handler, file, line)
+ * rows; it deliberately carries no node ids, because its own consumer (the MCP
+ * context builder) renders text. A reader needs to *navigate*, so each entry is
+ * matched back to its handler's node id here — batched by file, never a lookup
+ * per route.
+ *
+ * `null` from the engine means "fewer than three real routes", i.e. this
+ * project is not a routed app. That is reported as an empty manifest with
+ * `routed: false` rather than as an error: "this isn't a web app" is an
+ * answer, not a failure.
+ *
+ * Two things about the manifest shape the numbers here have to work around.
+ * Its `limit` is applied in SQL *before* the three-route test, so asking for
+ * fewer than three would make every routed project look unrouted — hence the
+ * floor on the parameter. And its own `totalRoutes` counts only the rows inside
+ * that window, so the headline count comes from the graph's `route` nodes
+ * instead, which is the number a reader means by "how many routes are there".
+ */
+
+import type { CodeGraph } from '../../index';
+import { intParam } from './respond';
+import { toPosixPath } from './wire';
+import { routeRoots } from './route-roots';
+import { isTestFile } from '../../search/query-utils';
+
+/**
+ * HTTP verbs a route name may lead with, plus the two stand-ins the resolvers
+ * emit when the registration names no verb (`mux.Handle`, `app.use`).
+ *
+ * The split is done against this list rather than against "the first word" so
+ * a file-routed page (`/blog/[slug]`) or a message-bus subscription keeps its
+ * whole name in the URL column instead of losing its first segment to a
+ * method column that was never there.
+ */
+const HTTP_METHODS: ReadonlySet<string> = new Set([
+  'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'TRACE', 'CONNECT',
+  'ANY', 'ALL', 'USE',
+]);
+
+/** One row of the URL → handler map. */
+export interface WireRoute {
+  /** The route node's name, verbatim: "POST /v1/users/{id}". */
+  url: string;
+  /** The verb, when the name leads with one. Null for file-routed pages. */
+  method: string | null;
+  /** The URL without the verb — the same string as `url` when there is none. */
+  path: string;
+  handler: string;
+  handlerKind: string;
+  /** Where the request is SERVED. */
+  file: string;
+  line: number;
+  handlerId: string | null;
+  /** Where the URL is REGISTERED — the router file, which is how routes group. */
+  routeFile: string;
+  routeLine: number;
+  routeId: string;
+  /** The handler is written inline at the registration: the route stands in for it. */
+  inline: boolean;
+}
+
+export interface WireRoutes {
+  routed: boolean;
+  /** Every URL the index holds, whether or not its handler resolved. */
+  routeCount: number;
+  /** Rows in `entries` — the ones whose handler the manifest could name. */
+  shown: number;
+  truncated: boolean;
+  topHandlerFile: string | null;
+  topHandlerFileCount: number;
+  entries: WireRoute[];
+}
+
+/** "POST /v1/users" -> { method: 'POST', path: '/v1/users' }. */
+export function splitRouteName(url: string): { method: string | null; path: string } {
+  const space = url.indexOf(' ');
+  if (space <= 0) return { method: null, path: url };
+  const head = url.slice(0, space);
+  if (!HTTP_METHODS.has(head.toUpperCase())) return { method: null, path: url };
+  return { method: head.toUpperCase(), path: url.slice(space + 1).trimStart() };
+}
+
+/**
+ * The engine needs three surviving rows to call a project routed, and applies
+ * `limit` before that test — so anything below three is a question that cannot
+ * be answered truthfully rather than a small page.
+ */
+const MIN_LIMIT = 3;
+
+/**
+ * Routes fetched per route shown. Some routes in the window are dropped only
+ * after their rows come back (a test or generated handler, an inline route
+ * written in a test), so the window is over-fetched for them, or a project
+ * whose first routes are its tests' would list few or none of its own.
+ */
+const ROUTES_PER_ROUTE_SHOWN = 4;
+
+type ManifestRow = NonNullable<ReturnType<CodeGraph['getRoutingManifest']>>['entries'][number];
+
+/**
+ * The manifest's rows folded to one per route, in its order: the row naming
+ * the route's root (the handler a resolver bound, or the component a screen
+ * renders), else the route's first row. A route whose root is its own inline
+ * body is that route, labelled as an inline handler — not whichever call in
+ * the body sorted first — and is left out when it is written in a test, as
+ * the manifest leaves out test handlers.
+ */
+function oneRowPerRoute(cg: CodeGraph, entries: readonly ManifestRow[]): Array<ManifestRow & { inline: boolean }> {
+  const byRoute = new Map<string, ManifestRow[]>();
+  for (const entry of entries) {
+    const list = byRoute.get(entry.routeId);
+    if (list) list.push(entry);
+    else byRoute.set(entry.routeId, [entry]);
+  }
+  const routes = [...cg.getNodesByIds([...byRoute.keys()]).values()];
+  const roots = routeRoots(cg, routes);
+  const out: Array<ManifestRow & { inline: boolean }> = [];
+  for (const [routeId, list] of byRoute) {
+    const root = roots.get(routeId);
+    if (root?.inline) {
+      const first = list[0]!;
+      if (isTestFile(first.routeFile)) continue;
+      out.push({
+        ...first,
+        handler: 'inline handler',
+        handlerKind: 'route',
+        handlerFile: first.routeFile,
+        handlerLine: first.routeLine,
+        inline: true,
+      });
+      continue;
+    }
+    const named = root
+      ? list.find((e) => e.handlerFile === root.node.filePath && e.handlerLine === root.node.startLine && e.handler === root.node.name)
+      : undefined;
+    out.push({ ...(named ?? list[0]!), inline: false });
+  }
+  return out;
+}
+
+export function buildRoutes(cg: CodeGraph, query: URLSearchParams): WireRoutes {
+  const limit = intParam(query, 'limit', { min: MIN_LIMIT, max: 500, default: 200 });
+
+  // The engine's manifest is a row per (route, edge): a route bound to two
+  // symbols, or an inline handler whose every call reads as a "handler"
+  // (hono's `GET /stream/text` came back three times, as `streamText`,
+  // `writeln` and `sleep`), repeats. A route has ONE answer to "what serves
+  // this" — route-roots.ts's — so every row of a route is fetched and folded
+  // onto it. The window counts routes, not rows: one inline handler with
+  // dozens of calls must not push the routes after it off the page.
+  const fetched = limit * ROUTES_PER_ROUTE_SHOWN + 1;
+  const manifest = cg.getRoutingManifest(fetched, true);
+  const routeCount = cg.getStats().nodesByKind.route ?? 0;
+
+  if (!manifest) {
+    return {
+      routed: false,
+      routeCount,
+      shown: 0,
+      truncated: false,
+      topHandlerFile: null,
+      topHandlerFileCount: 0,
+      entries: [],
+    };
+  }
+
+  const folded = oneRowPerRoute(cg, manifest.entries);
+  const truncated = folded.length > limit || new Set(manifest.entries.map((e) => e.routeId)).size >= fetched;
+  const rows = folded.slice(0, limit);
+
+  // Every row's handler file in one batched query, so a project that scatters
+  // handlers across hundreds of files still costs one query per chunk, and no
+  // row past a cap is reported as "not in the index" (#1975).
+  const handlerFiles = [...new Set(rows.map((e) => e.handlerFile))];
+  const byFileLineName = new Map<string, string>();
+  for (const node of cg.getNodesInFiles(handlerFiles)) {
+    // Keyed on what the manifest actually knows: file, line and name. Two
+    // symbols can share a line (a decorator and its method); the name breaks
+    // the tie, and a miss simply leaves that entry unlinked.
+    byFileLineName.set(`${node.filePath} ${node.startLine} ${node.name}`, node.id);
+  }
+
+  const entries: WireRoute[] = rows.map((entry) => ({
+    url: entry.url,
+    ...splitRouteName(entry.url),
+    handler: entry.handler,
+    handlerKind: entry.handlerKind,
+    file: toPosixPath(entry.handlerFile),
+    line: entry.handlerLine,
+    handlerId: entry.inline
+      ? entry.routeId
+      : byFileLineName.get(`${entry.handlerFile} ${entry.handlerLine} ${entry.handler}`) ?? null,
+    routeFile: toPosixPath(entry.routeFile),
+    routeLine: entry.routeLine,
+    routeId: entry.routeId,
+    inline: entry.inline,
+  }));
+
+  return {
+    routed: true,
+    routeCount,
+    shown: entries.length,
+    truncated,
+    topHandlerFile: manifest.topHandlerFile ? toPosixPath(manifest.topHandlerFile) : null,
+    topHandlerFileCount: manifest.topHandlerFileCount,
+    entries,
+  };
+}

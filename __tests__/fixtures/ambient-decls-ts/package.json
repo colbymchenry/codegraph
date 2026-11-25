@@ -1,0 +1,7 @@
+{
+  "name": "ambient-decls-ts-fixture",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "CG-28 fixture — declaration-only files competing with implementation for one explore envelope."
+}

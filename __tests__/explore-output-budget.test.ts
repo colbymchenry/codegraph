@@ -6,11 +6,11 @@
  * grep+Read. These tests pin the per-tier budget shape so future tuning
  * doesn't silently drift the small-project case back into bloat.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { getExploreOutputBudget, getExploreBudget, ToolHandler } from '../src/mcp/tools';
+import { getExploreOutputBudget, getExploreBudget, normalizeQuerySpelling, ToolHandler } from '../src/mcp/tools';
 import CodeGraph from '../src/index';
 
 describe('getExploreOutputBudget', () => {
@@ -197,8 +197,33 @@ describe('codegraph_explore output respects the adaptive budget', () => {
     const result = await handler.execute('codegraph_explore', { query: 'Session method helper' });
     const text = result.content?.[0]?.text ?? '';
     expect(text).not.toContain('### Additional relevant files');
-    expect(text).not.toContain('Complete source code is included above');
-    expect(text).not.toContain('Explore budget:');
+    // The completeness note, which reads "Complete source for 1 file is
+    // included above…" on this fixture ("Verbatim source for N files…" after
+    // a trim).
+    expect(text).not.toContain('is included above');
+    expect(text).not.toContain('advisory only, NOT a quota');
+  });
+
+  it('emits advisory-only exploration guidance on medium projects — never quota wording', async () => {
+    // Medium tier (500–4,999 files) turns the guidance note on. The synthetic
+    // project is tiny, so fake the stats to land in that tier — the note's
+    // WORDING is what this test pins. Regression guard: quota phrasing
+    // ("remaining calls" / "Synthesize once") must never come back — agents
+    // read it as a hard cap, stop exploring early, and fall back to grep+Read.
+    const spy = vi.spyOn(cg, 'getStats').mockReturnValue({ fileCount: 1000 } as ReturnType<CodeGraph['getStats']>);
+    try {
+      const result = await handler.execute('codegraph_explore', { query: 'Session method helper' });
+      const text = result.content?.[0]?.text ?? '';
+      expect(text).toContain('advisory only, NOT a quota');
+      expect(text).toContain('extra calls are never rejected or rate-limited');
+      // The completeness note is on here, so the small tier's check for its
+      // absence above still names text the note has.
+      expect(text).toContain('is included above');
+      expect(text).not.toContain('remaining calls');
+      expect(text).not.toContain('Synthesize once');
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('still includes the Relationships section — it is the cheapest structural signal', async () => {
@@ -206,8 +231,8 @@ describe('codegraph_explore output respects the adaptive budget', () => {
     const text = result.content?.[0]?.text ?? '';
     // Either there are relationships, or no edges were significant — both are fine.
     // We just want to confirm we did not accidentally gate it off.
-    const hasRelationships = text.includes('### Relationships');
-    const sourceFollowsHeader = text.indexOf('### Source Code') > 0;
+    const hasRelationships = text.includes('**Relationships');
+    const sourceFollowsHeader = text.indexOf('**Source Code') > 0;
     expect(hasRelationships || sourceFollowsHeader).toBe(true);
   });
 
@@ -252,5 +277,29 @@ describe('codegraph_explore output respects the adaptive budget', () => {
     // the `export class Session {` opener.
     const hasMethodBody = /method\d+\(arg: string\)/.test(text);
     expect(hasMethodBody).toBe(true);
+  });
+});
+
+describe('normalizeQuerySpelling (Erlang mod:fn/arity)', () => {
+  it('rewrites Erlang-native symbol spellings to pipeline shapes', () => {
+    expect(normalizeQuerySpelling('cowboy_stream_h:request_process/3'))
+      .toBe('cowboy_stream_h.request_process');
+    expect(normalizeQuerySpelling('ejabberd_router:route/1 do_route/1 session'))
+      .toBe('ejabberd_router.route do_route session');
+    expect(normalizeQuerySpelling('init/2 handle_call/3')).toBe('init handle_call');
+  });
+
+  it('leaves query-language field prefixes and other spellings alone', () => {
+    expect(normalizeQuerySpelling('kind:function lang:erlang route'))
+      .toBe('kind:function lang:erlang route');
+    expect(normalizeQuerySpelling('path:src/api name:auth')).toBe('path:src/api name:auth');
+    expect(normalizeQuerySpelling('Foo::bar baz')).toBe('Foo::bar baz');
+    expect(normalizeQuerySpelling('https://example.com/docs')).toBe('https://example.com/docs');
+    expect(normalizeQuerySpelling('meeting at 12:30')).toBe('meeting at 12:30');
+    expect(normalizeQuerySpelling('src/2fa/handler.ts')).toBe('src/2fa/handler.ts');
+  });
+
+  it('maps Lua colon-method spelling onto the qualified form', () => {
+    expect(normalizeQuerySpelling('logger:log message')).toBe('logger.log message');
   });
 });

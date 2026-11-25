@@ -21,12 +21,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
+import { once } from 'events';
+import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
 function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
   // --no-watch keeps the test deterministic and avoids watcher startup noise.
-  return spawn(process.execPath, [BIN, 'serve', '--mcp', '--no-watch'], {
+  return spawn(process.execPath, [...WASM_RUNTIME_FLAGS, BIN, 'serve', '--mcp', '--no-watch'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
   }) as ChildProcessWithoutNullStreams;
@@ -84,11 +86,15 @@ describe('MCP project resolution via roots/list (issue #196)', () => {
     projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-proj-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
+  afterEach(async () => {
+    // Spawn with the runtime flags so this is the server, not a relauncher
+    // whose grandchild would retain the Windows cwd/database handles.
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const closed = once(child, 'close');
       child.kill('SIGKILL');
-      child = null;
+      await closed;
     }
+    child = null;
     fs.rmSync(cwdDir, { recursive: true, force: true });
     fs.rmSync(projectDir, { recursive: true, force: true });
   });

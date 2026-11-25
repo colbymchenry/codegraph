@@ -10,6 +10,9 @@
  *   - Instructions to `~/.claude/CLAUDE.md` (global) or
  *     `./.claude/CLAUDE.md` (local).
  *
+ * A non-blank `CLAUDE_CONFIG_DIR` moves all three global files into
+ * that profile directory, including `.claude.json` (#1627).
+ *
  * Earlier versions wrote the local MCP entry to `./.claude.json` — a
  * file Claude Code never reads — so the server silently never loaded
  * until the user manually renamed it to `.mcp.json` (issue #207). We
@@ -32,26 +35,53 @@ import {
   getMcpServerConfig,
   jsonDeepEqual,
   readJsonFile,
+  removeFileUnlessLinked,
   removeMarkedSection,
   writeJsonFile,
+  upsertInstructionsEntry,
 } from './shared';
 import {
   CODEGRAPH_SECTION_END,
   CODEGRAPH_SECTION_START,
 } from '../instructions-template';
 
+/**
+ * The shared stdio entry plus `alwaysLoad: true`, Claude Code's exemption from
+ * tool-search deferral (https://code.claude.com/docs/en/mcp#exempt-a-server-from-deferral).
+ * `codegraph_explore` carries the same flag in its `_meta`, which covers an
+ * entry written before this key; the entry-level key additionally makes
+ * Claude Code wait for this server's tools at startup, so they are in the
+ * first prompt rather than listed after the server connects in the background.
+ */
+function getClaudeMcpServerConfig() {
+  return { ...getMcpServerConfig(), alwaysLoad: true };
+}
+
+/**
+ * Root of the global Claude Code profile. Settings and instructions follow
+ * CLAUDE_CONFIG_DIR; local installs stay anchored to the project (#1627).
+ */
+function globalConfigDir(): string {
+  const override = process.env.CLAUDE_CONFIG_DIR;
+  return override && override.trim().length > 0
+    ? path.resolve(override)
+    : path.join(os.homedir(), '.claude');
+}
 function configDir(loc: Location): string {
   return loc === 'global'
-    ? path.join(os.homedir(), '.claude')
+    ? globalConfigDir()
     : path.join(process.cwd(), '.claude');
 }
 function mcpJsonPath(loc: Location): string {
-  // global → ~/.claude.json (user scope: visible in every project).
+  // global → $CLAUDE_CONFIG_DIR/.claude.json for a custom profile, else
+  // ~/.claude.json (beside ~/.claude, not inside it). User scope: every project.
   // local  → ./.mcp.json (project scope: the ONLY project-level MCP
   // file Claude Code reads — NOT ./.claude.json, which it ignores).
-  return loc === 'global'
-    ? path.join(os.homedir(), '.claude.json')
-    : path.join(process.cwd(), '.mcp.json');
+  if (loc !== 'global') return path.join(process.cwd(), '.mcp.json');
+  const override = process.env.CLAUDE_CONFIG_DIR;
+  return override && override.trim().length > 0
+    ? path.join(path.resolve(override), '.claude.json')
+    : path.join(os.homedir(), '.claude.json');
 }
 /**
  * Where pre-#207 installers wrote the local MCP entry. Claude Code
@@ -120,15 +150,24 @@ class ClaudeCodeTarget implements AgentTarget {
     const hookCleanup = cleanupLegacyHooks(loc);
     if (hookCleanup.action === 'removed') files.push(hookCleanup);
 
-    // 3. CLAUDE.md instructions — no longer written. The codegraph
-    // usage guidance now ships solely in the MCP server's `initialize`
-    // response (see `mcp/server-instructions.ts`), which Claude Code
-    // surfaces in the system prompt automatically. Writing it into
-    // CLAUDE.md as well meant the agent read the same playbook twice
-    // every turn (issue #529). Strip any block a previous install left
-    // behind so an upgrade self-heals — same idiom as the hook cleanup.
-    const instrCleanup = removeInstructionsEntry(loc);
-    if (instrCleanup.action === 'removed') files.push(instrCleanup);
+    // 2c. Front-load prompt hook (Claude UserPromptSubmit). Opt-in via the
+    // installer prompt (default-yes): `promptHook === true` writes it;
+    // `=== false` strips any a prior install wrote so opting out round-trips
+    // (and an upgrade re-run honors the new choice); `undefined` leaves it
+    // untouched for callers that don't manage it.
+    if (opts.promptHook === true) {
+      files.push(writePromptHookEntry(loc));
+    } else if (opts.promptHook === false) {
+      const removed = removePromptHookEntry(loc);
+      if (removed.action === 'removed') files.push(removed);
+    }
+
+    // 3. CLAUDE.md instructions — the short marker-fenced CodeGraph
+    // block (#704). The MCP initialize instructions reach only the main
+    // agent; CLAUDE.md is what Task-tool subagents (and non-MCP
+    // harnesses) actually see, so the block carries the codegraph
+    // pointers there. Upsert self-heals a stale pre-#529 long block.
+    files.push(upsertInstructionsEntry(instructionsPath(loc)));
 
     return { files };
   }
@@ -189,6 +228,10 @@ class ClaudeCodeTarget implements AgentTarget {
     const hookCleanup = cleanupLegacyHooks(loc);
     if (hookCleanup.action === 'removed') files.push(hookCleanup);
 
+    // 2c. Remove the front-load prompt hook this installer may have written.
+    const promptHookCleanup = removePromptHookEntry(loc);
+    if (promptHookCleanup.action === 'removed') files.push(promptHookCleanup);
+
     // 3. Instructions — strip the legacy CodeGraph block if present.
     files.push(removeInstructionsEntry(loc));
 
@@ -197,7 +240,7 @@ class ClaudeCodeTarget implements AgentTarget {
 
   printConfig(loc: Location): string {
     const target = mcpJsonPath(loc);
-    const snippet = JSON.stringify({ mcpServers: { codegraph: getMcpServerConfig() } }, null, 2);
+    const snippet = JSON.stringify({ mcpServers: { codegraph: getClaudeMcpServerConfig() } }, null, 2);
     return `# Add to ${target}\n\n${snippet}\n`;
   }
 
@@ -217,7 +260,7 @@ export function writeMcpEntry(loc: Location): WriteResult['files'][number] {
   const file = mcpJsonPath(loc);
   const existing = readJsonFile(file);
   const before = existing.mcpServers?.codegraph;
-  const after = getMcpServerConfig();
+  const after = getClaudeMcpServerConfig();
 
   if (jsonDeepEqual(before, after)) {
     // Already exactly what we'd write — preserve byte-identical file.
@@ -253,7 +296,7 @@ function cleanupLegacyLocalMcp(): WriteResult['files'][number] | null {
   delete config.mcpServers.codegraph;
   if (Object.keys(config.mcpServers).length === 0) delete config.mcpServers;
   if (Object.keys(config).length === 0) {
-    try { fs.unlinkSync(file); } catch { /* ignore */ }
+    removeFileUnlessLinked(file, '{}\n');
   } else {
     writeJsonFile(file, config);
   }
@@ -281,6 +324,28 @@ function isLegacyCodegraphHookCommand(command: unknown): boolean {
 }
 
 /**
+ * The front-load prompt-hook command the installer writes into Claude's
+ * `UserPromptSubmit` (see writePromptHookEntry). On Windows the launcher on
+ * PATH is `codegraph.cmd`, and Claude Code executes hooks through Git Bash,
+ * which — unlike cmd.exe — applies no PATHEXT: a bare `codegraph` is
+ * "command not found", exit 127 (#1466). Write the extension there; the
+ * `.cmd` spelling also resolves fine under cmd.exe and PowerShell.
+ */
+const PROMPT_HOOK_COMMAND = process.platform === 'win32'
+  ? 'codegraph.cmd prompt-hook'
+  : 'codegraph prompt-hook';
+
+/**
+ * Every spelling the installer has ever written (a settings.json can carry
+ * the other platform's form across a sync). Matched by substring so an
+ * `npx @colbymchenry/codegraph prompt-hook` form is recognized too.
+ */
+const PROMPT_HOOK_FORMS = ['codegraph prompt-hook', 'codegraph.cmd prompt-hook'];
+function isPromptHookCommand(command: unknown): boolean {
+  return typeof command === 'string' && PROMPT_HOOK_FORMS.some((f) => command.includes(f));
+}
+
+/**
  * Remove stale codegraph auto-sync hooks from Claude `settings.json`.
  *
  * Surgical at the individual-command level: only entries matching
@@ -295,7 +360,10 @@ function isLegacyCodegraphHookCommand(command: unknown): boolean {
  * Exported so it can be unit-tested directly and reused by both
  * `install` (an upgrade self-heals) and `uninstall`.
  */
-export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] {
+function removeHookCommandsMatching(
+  loc: Location,
+  match: (command: unknown) => boolean,
+): WriteResult['files'][number] {
   const file = settingsJsonPath(loc);
   if (!fs.existsSync(file)) return { path: file, action: 'not-found' };
 
@@ -305,7 +373,7 @@ export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] 
     return { path: file, action: 'unchanged' };
   }
 
-  // Pass 1: drop the legacy command(s) from inside every matcher group.
+  // Pass 1: drop matching command(s) from inside every matcher group.
   let removedAny = false;
   for (const event of Object.keys(hooks)) {
     const groups = hooks[event];
@@ -313,18 +381,17 @@ export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] 
     for (const group of groups) {
       if (!group || !Array.isArray(group.hooks)) continue;
       const before = group.hooks.length;
-      group.hooks = group.hooks.filter(
-        (h: any) => !isLegacyCodegraphHookCommand(h?.command),
-      );
+      group.hooks = group.hooks.filter((h: any) => !match(h?.command));
       if (group.hooks.length !== before) removedAny = true;
     }
   }
 
   if (!removedAny) return { path: file, action: 'unchanged' };
 
-  // Pass 2: prune empty matcher groups, then events with no groups
-  // left, then an empty top-level `hooks`. Guarded by `removedAny` so
-  // we never restructure a settings.json that had no codegraph hooks.
+  // Pass 2: prune empty matcher groups, then events with no groups left,
+  // then an empty top-level `hooks`. Guarded by `removedAny` so we never
+  // restructure a settings.json that had no matching hooks. Sibling hooks
+  // (a different command in the group, or a different event) survive.
   for (const event of Object.keys(hooks)) {
     const groups = hooks[event];
     if (!Array.isArray(groups)) continue;
@@ -337,6 +404,24 @@ export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] 
 
   writeJsonFile(file, settings);
   return { path: file, action: 'removed' };
+}
+
+/**
+ * Remove stale codegraph auto-sync hooks (`mark-dirty` / `sync-if-dirty`) that a
+ * pre-0.8 install wrote. Exported for direct unit-testing; reused by both
+ * `install` (an upgrade self-heals) and `uninstall`.
+ */
+export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] {
+  return removeHookCommandsMatching(loc, isLegacyCodegraphHookCommand);
+}
+
+/**
+ * Remove the front-load `UserPromptSubmit` hook this installer writes (see
+ * writePromptHookEntry). Used by `uninstall`, and by `install` when the user
+ * opts out, so the choice round-trips.
+ */
+export function removePromptHookEntry(loc: Location): WriteResult['files'][number] {
+  return removeHookCommandsMatching(loc, isPromptHookCommand);
 }
 
 export function writePermissionsEntry(loc: Location): WriteResult['files'][number] {
@@ -357,6 +442,58 @@ export function writePermissionsEntry(loc: Location): WriteResult['files'][numbe
   if (jsonDeepEqual(before, settings.permissions.allow) && !created) {
     return { path: file, action: 'unchanged' };
   }
+  writeJsonFile(file, settings);
+  return { path: file, action: created ? 'created' : 'updated' };
+}
+
+/**
+ * Write the front-load `UserPromptSubmit` hook into Claude `settings.json` —
+ * a `command` hook that runs `codegraph prompt-hook`, which injects
+ * codegraph_explore context for structural prompts so the agent reliably uses
+ * the graph. Idempotent: if our command is already wired under UserPromptSubmit
+ * the file is left byte-for-byte untouched and reported `unchanged`. Sibling
+ * hooks (the user's own, or other events) are preserved. Opt-in — the installer
+ * only calls this when the user accepts the prompt (default-yes).
+ */
+export function writePromptHookEntry(loc: Location): WriteResult['files'][number] {
+  const file = settingsJsonPath(loc);
+  const created = !fs.existsSync(file);
+  const settings = readJsonFile(file);
+
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+    settings.hooks = {};
+  }
+  if (!Array.isArray(settings.hooks.UserPromptSubmit)) settings.hooks.UserPromptSubmit = [];
+
+  // Self-heal (#1466): a pre-fix install on Windows wrote the bare
+  // `codegraph prompt-hook`, which Git Bash resolves to nothing; a
+  // settings.json carried across platforms can hold the other spelling too.
+  // Rewrite an installer-written command to this platform's form in place.
+  // Only the exact installer spellings migrate — an `npx …` or hand-edited
+  // variant is the user's own and stays untouched.
+  let migrated = false;
+  for (const group of settings.hooks.UserPromptSubmit) {
+    if (!group || !Array.isArray(group.hooks)) continue;
+    for (const h of group.hooks) {
+      if (h && PROMPT_HOOK_FORMS.includes(h.command) && h.command !== PROMPT_HOOK_COMMAND) {
+        h.command = PROMPT_HOOK_COMMAND;
+        migrated = true;
+      }
+    }
+  }
+
+  const already = settings.hooks.UserPromptSubmit.some(
+    (g: any) => g && Array.isArray(g.hooks) && g.hooks.some((h: any) => isPromptHookCommand(h?.command)),
+  );
+  if (already) {
+    if (!migrated) return { path: file, action: 'unchanged' };
+    writeJsonFile(file, settings);
+    return { path: file, action: 'updated' };
+  }
+
+  settings.hooks.UserPromptSubmit.push({
+    hooks: [{ type: 'command', command: PROMPT_HOOK_COMMAND }],
+  });
   writeJsonFile(file, settings);
   return { path: file, action: created ? 'created' : 'updated' };
 }

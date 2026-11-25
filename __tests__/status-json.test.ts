@@ -87,3 +87,61 @@ describe('codegraph status --json — CI fields (#329)', () => {
     expect(ms).toBeLessThanOrEqual(after + 1000);
   });
 });
+
+describe('index completeness marker (index_state)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-index-state-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('a clean full index stamps state=complete with reconciled counts', async () => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export function f(): number { return 1; }\n');
+    fs.writeFileSync(path.join(tempDir, 'b.ts'), 'import { f } from "./a";\nexport const y = f();\n');
+    const cg = CodeGraph.initSync(tempDir);
+    const result = await cg.indexAll();
+
+    // The scan's ground truth is reported and fully accounted for.
+    expect(result.filesDiscovered).toBeDefined();
+    expect(result.filesIndexed + result.filesSkipped + result.filesErrored).toBe(
+      result.filesDiscovered
+    );
+    expect(result.errors.filter((e) => e.code === 'index_partial')).toHaveLength(0);
+    expect(cg.getIndexState()).toBe('complete');
+    cg.close();
+
+    const out = runStatusJson(tempDir);
+    expect((out.index as Record<string, unknown>).state).toBe('complete');
+  });
+
+  it('a run killed mid-index leaves state=indexing, and status --json surfaces it', async () => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const x = 1;\n');
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.close();
+
+    // Simulate a kill between the start-marker write and completion: the
+    // marker a dead process leaves behind is exactly 'indexing'. Written
+    // straight into the DB — the process that died can't have cleaned it up.
+    // (require, not import: vite tries to bundle a dynamic import specifier.)
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    db.prepare(
+      "INSERT INTO project_metadata (key, value, updated_at) VALUES ('index_state', 'indexing', 0) " +
+        "ON CONFLICT(key) DO UPDATE SET value = 'indexing'"
+    ).run();
+    db.close();
+
+    const out = runStatusJson(tempDir);
+    expect((out.index as Record<string, unknown>).state).toBe('indexing');
+
+    const reopened = await CodeGraph.open(tempDir);
+    expect(reopened.getIndexState()).toBe('indexing');
+    reopened.close();
+  });
+});

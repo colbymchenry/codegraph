@@ -1,0 +1,13 @@
+--- a/src/scanner.c	2026-10-09 00:00:00
++++ b/src/scanner.c	2026-10-09 00:00:00
+@@ -128,7 +128,9 @@
+     0, // EQ_EQ,
+     0, // PLUS_THEN_WS,
+     0, // MINUS_THEN_WS,
+-    1UL << FAKE_TRY_BANG, // BANG,
++    // 1ULL, as upstream has it from 0.7.4: 1UL << 32 overflows where unsigned
++    // long is 32 bits (MSVC), and `try!` lost its `!`. (codegraph patch)
++    1ULL << FAKE_TRY_BANG, // BANG,
+         0, // THROWS_KEYWORD,
+         0, // RETHROWS_KEYWORD,
+         0, // DEFAULT_KEYWORD,

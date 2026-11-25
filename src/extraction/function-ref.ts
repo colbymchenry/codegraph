@@ -1,0 +1,1035 @@
+/**
+ * Function-as-value capture (#756) — registration-linking for callbacks.
+ *
+ * A function name used as a VALUE — passed as a call argument
+ * (`register_handler(target_cb)`, `signal(SIGINT, handler)`), assigned to a
+ * field or function pointer (`o->cb = target_cb`, `OnFire := TargetCb`),
+ * placed in a struct/object initializer (`{ .recv_cb = my_cb }`,
+ * `{ recv: targetCb }`, `Ops{Cb: targetCb}`), or listed in a function table
+ * (`static cb_t table[] = { cb_a, cb_b }`) — is a real dependency that static
+ * call extraction misses entirely: `callers(target_cb)` showed nothing but
+ * direct calls, so every callback looked dead and its registration sites were
+ * invisible to impact analysis.
+ *
+ * This module captures those value positions during the AST walk as
+ * `function_ref` candidates. Capture is table-driven per language (the value
+ * positions and wrapper forms differ per grammar — `&fn` in C, `Main::fn` in
+ * Java, `::fn` in Kotlin, `#selector(fn)` in Swift, `@TargetCb` in Pascal,
+ * `method(:fn)` in Ruby). Candidates are GATED at end-of-file extraction
+ * (see `TreeSitterExtractor.flushFnRefCandidates`): only names matching a
+ * same-file function/method or an imported binding survive, which bounds
+ * volume and keeps precision high. Resolution then matches survivors against
+ * function/method nodes ONLY (`matchFunctionRef` in
+ * `src/resolution/name-matcher.ts`) and persists them as `references` edges,
+ * which `callers`/`impact` already traverse.
+ *
+ * Deliberately NOT covered (resolving the *dispatch* — `o->cb(x)` → the
+ * registered function — needs data-flow through struct fields; a wrong edge
+ * is worse than none): indirect-call resolution. Member values where the
+ * receiver isn't `this`/`self` (`pool.submit(obj.method)`, `Submit(c.store.Fetch)`)
+ * retain their receiver (#1820), so resolution can use type/import scope
+ * before considering a unique method name.
+ */
+
+import type { Node as SyntaxNode } from 'web-tree-sitter';
+import { getNodeText, getChildByField } from './tree-sitter-helpers';
+
+export interface FnRefCandidate {
+  name: string;
+  line: number;
+  column: number;
+  /** Which capture position produced this candidate (gate policy keys on it). */
+  mode: CaptureMode;
+  /**
+   * True when the value was an explicit reference form (`&fn`, `&Cls::m`,
+   * `::fn`, `#selector`, `method(:sym)`) rather than a bare identifier —
+   * C++'s flush policy keys on it.
+   */
+  explicitRef: boolean;
+  /**
+   * Skip the same-file/import name gate for this candidate. Set for PHP
+   * string callables in known HOF positions: PHP global functions are
+   * referenced cross-file WITHOUT imports (global namespace), so the gate
+   * can't see them — the strong positional prior (a string argument to
+   * `usort`/`array_map`/…) plus resolution's unique-or-drop rule carry the
+   * precision instead. Python/Go member values also skip the name gate,
+   * retaining their receiver for scoped resolution.
+   */
+  skipGate?: boolean;
+}
+
+/** How to pull candidate value nodes out of a dispatched container node. */
+type CaptureMode =
+  | 'args' // every named child is a potential value (call argument lists)
+  | 'rhs' // the assignment right-hand side (named field, else last named child)
+  | 'value' // the `value` field of a keyed pair (object/struct/table initializers)
+  | 'list' // every named child (array / initializer-list / table positional elements)
+  | 'varinit'; // a variable declarator's initializer value
+
+interface CaptureRule {
+  mode: CaptureMode;
+  /** Field holding the value for rhs/value/varinit (defaults per mode). */
+  field?: string;
+}
+
+export interface FnRefSpec {
+  /** Bare identifier node types that can act as a function value. */
+  idTypes: Set<string>;
+  /** Container node type → how to extract candidate values from it. */
+  dispatch: Map<string, CaptureRule>;
+  /**
+   * Transparent wrapper layers between a container and its values
+   * (`argument`, `value_argument`, `literal_element`, `expression_list`…).
+   * Value: the field to descend into, or null for "named children".
+   * `expression_list` fans out to ALL named children (Go multi-assign).
+   */
+  layers?: Map<string, string | null>;
+  /**
+   * Unary wrappers whose operand is the function value — C/C++ `&fn`
+   * (pointer_expression), Pascal `@Fn` (exprUnary), Scala eta `fn _`
+   * (postfix_expression). Value: operand field, or null for first named child.
+   */
+  unwrap?: Map<string, string | null>;
+  /**
+   * Whole-node reference forms needing bespoke name extraction —
+   * `method_reference` (Java), `callable_reference` / `navigation_expression`
+   * (Kotlin), `selector_expression` (Swift `#selector` / ObjC `@selector`),
+   * Ruby `method(:sym)` calls, and `this.method` member forms.
+   */
+  special?: Set<string>;
+  /**
+   * Capture modes whose candidates skip the same-file/import gate and rely on
+   * resolution's unique-or-drop rule instead. C-family only: an initializer
+   * value, function-pointer assignment RHS, or table element is a
+   * function-pointer position by construction, and C has no symbol imports —
+   * the dominant repo-scale pattern (`server.c`'s command table naming
+   * handlers defined across files) would otherwise be invisible. Call
+   * arguments stay gated everywhere (locals passed as args dwarf callbacks).
+   */
+  ungatedModes?: Set<CaptureMode>;
+  /**
+   * C++ only: in args/rhs/varinit positions, accept ONLY explicit reference
+   * forms (`&fn`, `&Cls::method`) — never bare identifiers. C++ codebases are
+   * dense with generic free-function/accessor names (`begin`, `end`, `out`,
+   * `size`, `data`) that collide with parameters and locals, and out-of-line
+   * member definitions extract as function-kind nodes — bare-id matching on
+   * fmt was mostly wrong edges. File-scope initializer tables (value/list)
+   * still accept bare identifiers, same as C.
+   */
+  addressOfOnly?: boolean;
+}
+
+/** Names that are never function references even when grammars call them identifiers. */
+const NAME_STOPLIST = new Set([
+  'this',
+  'self',
+  'super',
+  'null',
+  'nil',
+  'true',
+  'false',
+  'undefined',
+  'new',
+  'NULL',
+  'nullptr',
+  'None',
+]);
+
+// ---------------------------------------------------------------------------
+// Per-language specs. Node types verified against each grammar (probe fixtures
+// in the #756 investigation; see docs/design/function-ref-capture.md).
+// ---------------------------------------------------------------------------
+
+/** C / C++ / Objective-C share the C-family initializer & assignment shapes. */
+function cFamilySpec(extra?: { special?: string[]; addressOfOnly?: boolean }): FnRefSpec {
+  return {
+    idTypes: new Set(['identifier']),
+    dispatch: new Map<string, CaptureRule>([
+      ['argument_list', { mode: 'args' }],
+      ['assignment_expression', { mode: 'rhs', field: 'right' }],
+      ['init_declarator', { mode: 'varinit', field: 'value' }],
+      ['initializer_list', { mode: 'list' }],
+      ['initializer_pair', { mode: 'value', field: 'value' }],
+    ]),
+    unwrap: new Map([['pointer_expression', 'argument']]),
+    special: new Set(extra?.special ?? []),
+    // C has no symbol imports, and callbacks are registered cross-file at repo
+    // scale (redis: server.c's command table names handlers from t_*.c) — so
+    // initializer positions bypass the gate and lean on resolution's
+    // unique-or-drop rule. ONLY 'value'/'list' (struct/array initializers),
+    // and the flush additionally requires FILE scope: a C file-scope
+    // initializer is a constant-expression context, so a bare identifier
+    // there can only be a function address (or enum/macro, which the
+    // function-kind filter drops) — never a variable. 'rhs'/'varinit' were
+    // tried and produced false edges (`prev = next`, `*str = field` — data
+    // assignments matching a unique same-named function elsewhere), so
+    // assignments stay gated to same-file/import.
+    ungatedModes: new Set<CaptureMode>(['value', 'list']),
+    addressOfOnly: extra?.addressOfOnly,
+  };
+}
+
+// `this.handleClick` capture (member_expression) emits a `this.`-PREFIXED
+// candidate name: resolution scopes it to the enclosing symbol's class
+// (qualified-name prefix), so `this.fonts` (a property, post-#808) and
+// inherited/unknown members yield no edge, while same-class methods —
+// `btn.on('click', this.handleClick)`, the observer-registration idiom —
+// resolve precisely. Bare identifiers stay function-kind-only (a bare id can
+// never be a method value in JS).
+const TS_JS_SPEC: FnRefSpec = {
+  // `shorthand_property_identifier`: `{ handleSubmit }` — the object a hook
+  // returns its handlers in, and a namespace object's members.
+  idTypes: new Set(['identifier', 'shorthand_property_identifier']),
+  dispatch: new Map<string, CaptureRule>([
+    ['arguments', { mode: 'args' }],
+    ['assignment_expression', { mode: 'rhs', field: 'right' }],
+    ['variable_declarator', { mode: 'varinit', field: 'value' }],
+    ['pair', { mode: 'value', field: 'value' }],
+    ['array', { mode: 'list' }],
+    // A JSX attribute value or child: `onPress={handleSubmit}`, `renderItem={renderRow}`,
+    // `<Route component={Home}/>`. The expression's one named child is the value; a
+    // spread or a call normalizes to nothing. This is THE handler-binding idiom of
+    // React, and without it a tap's handler had no edge from the component that
+    // renders it — the Screens and Steps views could not see what a tap does.
+    ['jsx_expression', { mode: 'list' }],
+    // An object literal's shorthand members — `return { handleApprove,
+    // handleRetake }` from a hook, `const Api = { upload, createFolder }`.
+    // Every named child is offered; only a shorthand identifier normalizes
+    // (a `pair` is its own container above, a spread or a method is nothing).
+    ['object', { mode: 'list' }],
+  ]),
+  special: new Set(['member_expression']),
+};
+
+const PYTHON_SPEC: FnRefSpec = {
+  idTypes: new Set(['identifier']),
+  dispatch: new Map<string, CaptureRule>([
+    ['argument_list', { mode: 'args' }],
+    ['assignment', { mode: 'rhs', field: 'right' }],
+    ['keyword_argument', { mode: 'value', field: 'value' }], // Thread(target=worker)
+    ['pair', { mode: 'value', field: 'value' }],
+    ['list', { mode: 'list' }],
+    // `return SomeClass` / `return handler` — factory returns are how DRF
+    // wires views to serializers (get_serializer_class) and how Python
+    // factories hand back callables (#1478). A single returned expression is
+    // a direct named child, so 'list' covers it; tuple returns (`return A, B`)
+    // sit under an expression_list child and are deliberately not descended.
+    ['return_statement', { mode: 'list' }],
+  ]),
+  special: new Set(['attribute']),
+};
+
+const GO_SPEC: FnRefSpec = {
+  idTypes: new Set(['identifier']),
+  dispatch: new Map<string, CaptureRule>([
+    ['argument_list', { mode: 'args' }],
+    ['assignment_statement', { mode: 'rhs', field: 'right' }],
+    ['short_var_declaration', { mode: 'rhs', field: 'right' }],
+    ['var_spec', { mode: 'varinit', field: 'value' }],
+    ['keyed_element', { mode: 'value' }], // value = last literal_element child
+    ['literal_value', { mode: 'list' }], // positional composite literals
+  ]),
+  layers: new Map<string, string | null>([
+    ['literal_element', null],
+    ['expression_list', null],
+  ]),
+  special: new Set(['selector_expression']),
+};
+
+const RUST_SPEC: FnRefSpec = {
+  idTypes: new Set(['identifier']),
+  dispatch: new Map<string, CaptureRule>([
+    ['arguments', { mode: 'args' }],
+    ['assignment_expression', { mode: 'rhs', field: 'right' }],
+    ['field_initializer', { mode: 'value', field: 'value' }],
+    ['array_expression', { mode: 'list' }],
+    ['static_item', { mode: 'varinit', field: 'value' }],
+    ['let_declaration', { mode: 'varinit', field: 'value' }],
+  ]),
+};
+
+const JAVA_SPEC: FnRefSpec = {
+  // No bare-identifier function values in Java — only method references.
+  idTypes: new Set<string>(),
+  dispatch: new Map<string, CaptureRule>([
+    ['argument_list', { mode: 'args' }],
+    ['assignment_expression', { mode: 'rhs', field: 'right' }],
+    ['variable_declarator', { mode: 'varinit', field: 'value' }],
+  ]),
+  special: new Set(['method_reference']),
+};
+
+const KOTLIN_SPEC: FnRefSpec = {
+  idTypes: new Set<string>(),
+  dispatch: new Map<string, CaptureRule>([
+    ['value_arguments', { mode: 'args' }],
+    ['assignment', { mode: 'rhs' }], // RHS = last named child (no field in grammar)
+  ]),
+  layers: new Map<string, string | null>([['value_argument', null]]),
+  special: new Set(['callable_reference', 'navigation_expression']),
+};
+
+const CSHARP_SPEC: FnRefSpec = {
+  idTypes: new Set(['identifier']),
+  dispatch: new Map<string, CaptureRule>([
+    ['argument_list', { mode: 'args' }],
+    ['assignment_expression', { mode: 'rhs', field: 'right' }], // covers `+=` event subscription
+    ['initializer_expression', { mode: 'list' }],
+    ['variable_declarator', { mode: 'varinit' }],
+  ]),
+  layers: new Map<string, string | null>([['argument', null]]),
+  special: new Set(['member_access_expression']),
+};
+
+const RUBY_SPEC: FnRefSpec = {
+  // Bare identifiers in Ruby args are method CALLS or locals, never function
+  // values — only the `method(:name)` idiom (and `&method(:name)`) plus
+  // hook-DSL symbols (`before_action :authenticate`) qualify.
+  idTypes: new Set<string>(),
+  dispatch: new Map<string, CaptureRule>([
+    ['argument_list', { mode: 'args' }],
+    ['pair', { mode: 'value', field: 'value' }],
+  ]),
+  layers: new Map<string, string | null>([['block_argument', null]]),
+  special: new Set(['call', 'simple_symbol']),
+};
+
+/**
+ * Rails/ActiveSupport-style hook DSLs whose symbol arguments name a method of
+ * the enclosing class: lifecycle callbacks (`before_action`, `after_save`,
+ * `around_create`, `skip_before_action`…), `validate :method`, `set_callback`,
+ * `helper_method`, and `rescue_from(..., with: :handler)`. NOT `validates`
+ * (plural) — its symbols name ATTRIBUTES, not methods.
+ */
+const RUBY_HOOK_RE = /^(skip_)?(before|after|around)_[a-z_]+$/;
+const RUBY_HOOK_NAMES = new Set(['validate', 'set_callback', 'helper_method', 'rescue_from']);
+function isRubyHookCall(name: string): boolean {
+  return RUBY_HOOK_RE.test(name) || RUBY_HOOK_NAMES.has(name);
+}
+
+const SWIFT_SPEC: FnRefSpec = {
+  idTypes: new Set(['simple_identifier']),
+  dispatch: new Map<string, CaptureRule>([
+    ['value_arguments', { mode: 'args' }],
+    ['assignment', { mode: 'rhs', field: 'result' }],
+    ['array_literal', { mode: 'list' }],
+    ['property_declaration', { mode: 'varinit', field: 'value' }],
+  ]),
+  layers: new Map<string, string | null>([['value_argument', 'value']]),
+  special: new Set(['selector_expression']),
+};
+
+const SCALA_SPEC: FnRefSpec = {
+  idTypes: new Set(['identifier']),
+  dispatch: new Map<string, CaptureRule>([
+    ['arguments', { mode: 'args' }],
+    ['assignment_expression', { mode: 'rhs', field: 'right' }],
+    ['val_definition', { mode: 'varinit', field: 'value' }],
+  ]),
+  unwrap: new Map<string, string | null>([['postfix_expression', null]]), // eta-expansion `fn _`
+};
+
+const DART_SPEC: FnRefSpec = {
+  idTypes: new Set(['identifier']),
+  dispatch: new Map<string, CaptureRule>([
+    ['arguments', { mode: 'args' }],
+    ['assignment_expression', { mode: 'rhs', field: 'right' }],
+    ['pair', { mode: 'value', field: 'value' }],
+    ['list_literal', { mode: 'list' }],
+    ['static_final_declaration', { mode: 'varinit' }],
+  ]),
+  layers: new Map<string, string | null>([['argument', null]]),
+};
+
+const LUA_SPEC: FnRefSpec = {
+  idTypes: new Set(['identifier']),
+  dispatch: new Map<string, CaptureRule>([
+    ['arguments', { mode: 'args' }],
+    ['assignment_statement', { mode: 'rhs' }], // RHS expression_list children carry `value` fields
+    ['field', { mode: 'value', field: 'value' }], // table fields, keyed AND positional
+  ]),
+  layers: new Map<string, string | null>([['expression_list', null]]),
+};
+
+const PASCAL_SPEC: FnRefSpec = {
+  idTypes: new Set(['identifier']),
+  dispatch: new Map<string, CaptureRule>([
+    ['exprArgs', { mode: 'args' }],
+    ['assignment', { mode: 'rhs', field: 'rhs' }], // OnClick := @Handler
+  ]),
+  unwrap: new Map<string, string | null>([['exprUnary', 'operand']]), // @Handler
+  // A bare name (`OnClick := Handler`, `Register(Handler)`) is a paren-less
+  // name the extractor records itself, linked by scope (#2514); only the
+  // explicit `@Handler` is a function value here.
+  addressOfOnly: true,
+};
+
+/**
+ * PHP core functions whose string arguments are CALLABLES — the positional
+ * prior that makes a bare string trustworthy as a function reference.
+ * Deliberately core-PHP only; framework registries (WordPress `add_action`)
+ * belong in a frameworks/ resolver if ever added.
+ */
+const PHP_CALLABLE_HOFS = new Set([
+  'array_map', 'array_filter', 'array_walk', 'array_walk_recursive', 'array_reduce',
+  'usort', 'uasort', 'uksort',
+  'array_udiff', 'array_udiff_assoc', 'array_uintersect', 'array_uintersect_assoc',
+  'call_user_func', 'call_user_func_array',
+  'forward_static_call', 'forward_static_call_array',
+  'preg_replace_callback', 'preg_replace_callback_array',
+  'register_shutdown_function', 'register_tick_function',
+  'set_error_handler', 'set_exception_handler', 'spl_autoload_register',
+  'ob_start', 'iterator_apply', 'header_register_callback',
+  'is_callable',
+]);
+
+const PHP_SPEC: FnRefSpec = {
+  // PHP has no bare-identifier function values (the first-class callable
+  // `fn(...)` already extracts as a `calls` edge). What qualifies:
+  //  - a string argument to a known callable-taking core function
+  //    (`usort($a, 'cmp_items')`) — see PHP_CALLABLE_HOFS
+  //  - array callables: `[$this, 'method']` (class-scoped) and
+  //    `[Foo::class, 'method']` (qualified), in any call's arguments
+  idTypes: new Set<string>(),
+  dispatch: new Map<string, CaptureRule>([['arguments', { mode: 'args' }]]),
+  layers: new Map<string, string | null>([['argument', null]]),
+  special: new Set(['encapsed_string', 'string', 'array_creation_expression']),
+};
+
+/**
+ * Capture specs by language.
+ */
+export const FN_REF_SPECS: Record<string, FnRefSpec | undefined> = {
+  c: cFamilySpec(),
+  cpp: cFamilySpec({ addressOfOnly: true }),
+  objc: cFamilySpec({ special: ['selector_expression'] }),
+  typescript: TS_JS_SPEC,
+  tsx: TS_JS_SPEC,
+  javascript: TS_JS_SPEC,
+  jsx: TS_JS_SPEC,
+  python: PYTHON_SPEC,
+  go: GO_SPEC,
+  rust: RUST_SPEC,
+  java: JAVA_SPEC,
+  kotlin: KOTLIN_SPEC,
+  csharp: CSHARP_SPEC,
+  php: PHP_SPEC,
+  ruby: RUBY_SPEC,
+  swift: SWIFT_SPEC,
+  scala: SCALA_SPEC,
+  dart: DART_SPEC,
+  lua: LUA_SPEC,
+  luau: LUA_SPEC,
+  pascal: PASCAL_SPEC,
+};
+
+// ---------------------------------------------------------------------------
+// Capture
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract candidate names from a dispatched container node. Returns the
+ * (name, position) pairs of every function-value-shaped expression found.
+ */
+export function captureFnRefCandidates(
+  container: SyntaxNode,
+  rule: CaptureRule,
+  spec: FnRefSpec,
+  source: string
+): FnRefCandidate[] {
+  const valueNodes: SyntaxNode[] = [];
+
+  switch (rule.mode) {
+    case 'args':
+    case 'list': {
+      for (let i = 0; i < container.namedChildCount; i++) {
+        const child = container.namedChild(i);
+        if (child) valueNodes.push(child);
+      }
+      break;
+    }
+    case 'rhs': {
+      const rhs = rule.field
+        ? getChildByField(container, rule.field)
+        : container.namedChild(container.namedChildCount - 1);
+      if (rhs) {
+        // Param-storage skip: `this.status = status` / `o->cb = cb` — when
+        // the assigned member's name EQUALS the RHS identifier, the RHS is a
+        // local/parameter being stored, and the function it holds (if any)
+        // is unknowable statically. A same-named function elsewhere would
+        // resolve to the WRONG target (excalidraw A/B finding), so skip.
+        const lhs =
+          getChildByField(container, 'left') ??
+          getChildByField(container, 'lhs') ??
+          getChildByField(container, 'target') ??
+          (container.namedChildCount >= 2 ? container.namedChild(0) : null);
+        const lhsText = lhs ? getNodeText(lhs, source) : '';
+        const lhsLastName = lhsText.match(/([A-Za-z_$][A-Za-z0-9_$]*)\s*$/)?.[1];
+        const rhsText = getNodeText(rhs, source).trim();
+        if (lhsLastName && lhsLastName === rhsText) break;
+        valueNodes.push(rhs);
+      }
+      break;
+    }
+    case 'value': {
+      let value = rule.field ? getChildByField(container, rule.field) : null;
+      // Keyed containers without a value field (Go keyed_element): the value
+      // is the LAST named child (the first is the key).
+      if (!value && container.namedChildCount > 0) {
+        value = container.namedChild(container.namedChildCount - 1);
+      }
+      if (value) valueNodes.push(value);
+      break;
+    }
+    case 'varinit': {
+      // Destructuring (`const { center } = ellipse`) extracts DATA from the
+      // RHS — never a function alias. Without this skip, a parameter that
+      // shadows a same-named imported function produced a wrong edge.
+      const nameNode =
+        getChildByField(container, 'name') ?? getChildByField(container, 'pattern');
+      if (nameNode && (nameNode.type === 'object_pattern' || nameNode.type === 'array_pattern' ||
+                       nameNode.type === 'tuple_pattern' || nameNode.type === 'struct_pattern')) {
+        break;
+      }
+      if (rule.field) {
+        const value = getChildByField(container, rule.field);
+        if (value) valueNodes.push(value);
+      } else {
+        // No value field in this grammar (C# variable_declarator, Dart
+        // static_final_declaration): the initializer is the last named child —
+        // but a declarator WITHOUT an initializer has its NAME there instead.
+        // Require ≥2 named children and never pick the name/pattern child.
+        const value = container.namedChild(container.namedChildCount - 1);
+        const nameChild =
+          getChildByField(container, 'name') ?? getChildByField(container, 'pattern');
+        if (
+          value &&
+          container.namedChildCount >= 2 &&
+          (!nameChild || value.id !== nameChild.id)
+        ) {
+          valueNodes.push(value);
+        }
+      }
+      break;
+    }
+  }
+
+  const out: FnRefCandidate[] = [];
+  for (const v of valueNodes) {
+    // A bare identifier is one that normalizes without passing through an
+    // unwrap/special reference form. C++'s addressOfOnly policy (applied at
+    // flush, where file scope is known) drops bare ids outside file-scope
+    // initializer tables.
+    const explicitRef = !spec.idTypes.has(v.type);
+    for (const { name, node, skipGate } of normalizeValue(v, spec, source, 0)) {
+      if (!name || NAME_STOPLIST.has(name)) continue;
+      out.push({
+        name,
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column,
+        mode: rule.mode,
+        explicitRef,
+        skipGate,
+      });
+    }
+  }
+  return out;
+}
+
+/** One normalized function-value: its name, source node, and gate policy. */
+interface NormalizedRef {
+  name: string;
+  node: SyntaxNode;
+  skipGate?: boolean;
+}
+
+/**
+ * Normalize one value expression to zero or more function names. Recursion is
+ * bounded (wrapper layers only); anything that isn't a recognized
+ * function-value shape yields [].
+ */
+function normalizeValue(
+  node: SyntaxNode,
+  spec: FnRefSpec,
+  source: string,
+  depth: number
+): NormalizedRef[] {
+  if (depth > 4) return [];
+  const type = node.type;
+
+  // Bare identifier
+  if (spec.idTypes.has(type)) {
+    return [{ name: getNodeText(node, source), node }];
+  }
+
+  // Transparent layers (argument, value_argument, literal_element,
+  // expression_list, block_argument). expression_list fans out (Go `a, b = f, g`).
+  const layerField = spec.layers?.get(type);
+  if (spec.layers?.has(type)) {
+    // Labeled-argument param-forward skip (Swift/Kotlin): `value: value` /
+    // `delay: delay` — when the label EQUALS the value identifier, the value
+    // is a forwarded local/parameter, not a function reference (Alamofire
+    // A/B finding; same rationale as the `this.x = x` assignment skip).
+    if (type === 'value_argument') {
+      const label = getChildByField(node, 'name');
+      const value = getChildByField(node, 'value') ?? node.namedChild(node.namedChildCount - 1);
+      if (
+        label &&
+        value &&
+        getNodeText(label, source).trim() === getNodeText(value, source).trim()
+      ) {
+        return [];
+      }
+    }
+    if (layerField) {
+      const inner = getChildByField(node, layerField);
+      return inner ? normalizeValue(inner, spec, source, depth + 1) : [];
+    }
+    const results: NormalizedRef[] = [];
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child) results.push(...normalizeValue(child, spec, source, depth + 1));
+    }
+    return results;
+  }
+
+  // Unary wrappers: &fn / @Fn / `fn _`
+  const unwrapField = spec.unwrap?.get(type);
+  if (spec.unwrap?.has(type)) {
+    // C-family `pointer_expression` covers BOTH `&x` (address-of — a function
+    // value) and `*x` (dereference — a data read, never a function value).
+    // Only `&` qualifies; without this, fmt's `*begin` reads resolved to its
+    // free `begin()` functions.
+    if (type === 'pointer_expression' && node.child(0)?.type !== '&') return [];
+    const inner = unwrapField ? getChildByField(node, unwrapField) : node.namedChild(0);
+    if (!inner) return [];
+    // C++ `&Widget::on_click` — keep the QUALIFIED name. Resolution scopes the
+    // method to that class (more precise than a bare-name match, and exempt
+    // from the cpp bare-ids-are-free-functions rule since `&Cls::m` is an
+    // explicit member-pointer).
+    if (inner.type === 'qualified_identifier') {
+      const text = getNodeText(inner, source).trim();
+      return /^[A-Za-z_][\w:]*$/.test(text) ? [{ name: text, node: inner }] : [];
+    }
+    return normalizeValue(inner, spec, source, depth + 1);
+  }
+
+  // Special whole-node reference forms
+  if (spec.special?.has(type)) {
+    return normalizeSpecial(node, type, source);
+  }
+
+  return [];
+}
+
+/** Rightmost descendant-or-self named child of one of the given types. */
+function lastNamedOfType(node: SyntaxNode, types: Set<string>): SyntaxNode | null {
+  let found: SyntaxNode | null = null;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    if (types.has(child.type)) found = child;
+    const deeper = lastNamedOfType(child, types);
+    if (deeper) found = deeper;
+  }
+  return found;
+}
+
+function normalizeSpecial(
+  node: SyntaxNode,
+  type: string,
+  source: string
+): NormalizedRef[] {
+  switch (type) {
+    // Java method references. Receiver decides the resolution route (#808):
+    //   `this::run0` / `super::close` → `this.<m>` (class-scoped resolver;
+    //     super rides the inherited-member supertype pass)
+    //   `Type::method` (capitalized) → qualified `Type::method` (suffix-
+    //     matched against that type's members, cross-file capable)
+    //   `variable::method` → nothing (receiver type unknown statically —
+    //     the deferred obj.method class)
+    case 'method_reference': {
+      let last: SyntaxNode | null = null;
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (child && child.type === 'identifier') last = child;
+      }
+      if (!last) return [];
+      const m = getNodeText(last, source);
+      const text = getNodeText(node, source);
+      if (text.startsWith('this::') || text.startsWith('super::')) {
+        return [{ name: `this.${m}`, node: last }];
+      }
+      const recv = text.match(/^([A-Z][A-Za-z0-9_]*)\s*::/);
+      if (recv) {
+        // `Type::method` — but `Type::new` (constructor ref) has no method
+        // node to land on; let the stoplist drop it via the bare name.
+        return m === 'new' ? [] : [{ name: `${recv[1]}::${m}`, node: last }];
+      }
+      return [];
+    }
+
+    // Kotlin `::targetCb` (one part) / `OtherClass::handle` (two parts —
+    // receiver is a type_identifier; lowercase receivers are variables, the
+    // deferred obj.method class).
+    case 'callable_reference': {
+      let receiver: SyntaxNode | null = null;
+      let member: SyntaxNode | null = null;
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (!child) continue;
+        if (child.type === 'type_identifier') receiver = child;
+        if (child.type === 'simple_identifier') member = child;
+      }
+      if (!member) return [];
+      const m = getNodeText(member, source);
+      if (!receiver) return [{ name: m, node: member }]; // ::topLevelFn
+      const recvText = getNodeText(receiver, source);
+      return /^[A-Z]/.test(recvText)
+        ? [{ name: `${recvText}::${m}`, node: member }]
+        : []; // variable::method — unknown receiver type
+    }
+
+    // Kotlin `this::fire` parses as navigation_expression with a `::fire`
+    // navigation_suffix — route through the class-scoped `this.` resolver.
+    // Ordinary `a.b` navigation (and any non-`this` receiver) MUST yield
+    // nothing.
+    case 'navigation_expression': {
+      if (!getNodeText(node, source).startsWith('this::')) return [];
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (child && child.type === 'navigation_suffix' && getNodeText(child, source).startsWith('::')) {
+          const id = child.namedChild(child.namedChildCount - 1);
+          if (id) return [{ name: `this.${getNodeText(id, source)}`, node: id }];
+        }
+      }
+      return [];
+    }
+
+    // Go `c.store.Fetch` (has a `field` child) vs Swift `#selector(...)` /
+    // ObjC `@selector(...)` (no `field` — inner identifier / selector text).
+    case 'selector_expression': {
+      const field = getChildByField(node, 'field');
+      if (field) {
+        const name = getNodeText(field, source);
+        const receiver = getChildByField(node, 'operand');
+        const value = receiver ? `${getNodeText(receiver, source)}.${name}` : '';
+        return /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/.test(value)
+          ? [{ name: value, node: field, skipGate: true }] : [];
+      }
+      const inner = node.namedChild(0);
+      if (!inner) return [];
+      if (inner.type === 'identifier' || inner.type === 'simple_identifier') {
+        return [{ name: getNodeText(inner, source), node: inner }];
+      }
+      // Swift dotted form: rightmost simple_identifier; ObjC keeps selector text.
+      const last = lastNamedOfType(node, new Set(['simple_identifier']));
+      if (last) return [{ name: getNodeText(last, source), node: last }];
+      return [{ name: getNodeText(inner, source).trim(), node: inner }];
+    }
+
+    // Ruby `method(:target_cb)` — a `call` whose method is literally `method`
+    // with a single symbol argument.
+    case 'call': {
+      const method = getChildByField(node, 'method');
+      if (!method || getNodeText(method, source) !== 'method') return [];
+      const args = getChildByField(node, 'arguments');
+      if (!args || args.namedChildCount !== 1) return [];
+      const sym = args.namedChild(0);
+      if (!sym || sym.type !== 'simple_symbol') return [];
+      const name = getNodeText(sym, source).replace(/^:/, '');
+      return name ? [{ name, node: sym }] : [];
+    }
+
+    // `this.handleClick` (TS/JS) — object must be EXACTLY `this`. The name
+    // keeps the `this.` prefix so resolution can scope it to the enclosing
+    // class (see resolveThisMemberFnRef) instead of bare name-matching.
+    case 'member_expression': {
+      const obj = getChildByField(node, 'object');
+      const prop = getChildByField(node, 'property');
+      if (obj && prop && obj.type === 'this' && prop.type === 'property_identifier') {
+        return [{ name: `this.${getNodeText(prop, source)}`, node: prop }];
+      }
+      return [];
+    }
+
+    // Keep the receiver on Python member values; calls/subscripts are not
+    // statically named receivers and must not collapse to a bare method.
+    case 'attribute': {
+      const attr = getChildByField(node, 'attribute');
+      const name = getNodeText(node, source);
+      return attr && /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/.test(name)
+        ? [{ name, node: attr, skipGate: true }] : [];
+    }
+
+    // `this.Run0` (C#) — receiver must be EXACTLY `this`. Two grammar shapes:
+    // newer tree-sitter-c-sharp exposes an `expression` field holding a
+    // `this_expression`; the vendored grammar keeps `this` as an anonymous
+    // token (only the `name` field is a named child), so fall back to the
+    // node text.
+    case 'member_access_expression': {
+      const name = getChildByField(node, 'name');
+      if (!name) return [];
+      const expr = getChildByField(node, 'expression');
+      const isThisReceiver = expr
+        ? expr.type === 'this_expression' || expr.type === 'this'
+        : getNodeText(node, source).startsWith('this.');
+      return isThisReceiver ? [{ name: getNodeText(name, source), node: name }] : [];
+    }
+
+    // PHP string callable — trustworthy ONLY as an argument to a known
+    // callable-taking core function (`usort($a, 'cmp_items')`). PHP global
+    // functions are referenced cross-file without imports, so these skip the
+    // name gate and rely on resolution's unique-or-drop rule. A
+    // `'Cls::method'` string becomes a qualified candidate.
+    case 'encapsed_string':
+    case 'string': {
+      const callee = phpEnclosingCallName(node);
+      if (!callee || !PHP_CALLABLE_HOFS.has(callee)) return [];
+      const content = phpStringContent(node, source);
+      if (!content) return [];
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(content)) {
+        return [{ name: content, node, skipGate: true }];
+      }
+      if (/^[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_][A-Za-z0-9_]*$/.test(content)) {
+        return [{ name: content, node, skipGate: true }];
+      }
+      return [];
+    }
+
+    // PHP array callables, valid in ANY call's arguments (the shape itself is
+    // unambiguous): `[$this, 'method']` → class-scoped `this.method`;
+    // `[Foo::class, 'method']` → qualified `Foo::method`.
+    case 'array_creation_expression': {
+      if (node.namedChildCount !== 2) return [];
+      const recv = node.namedChild(0)?.namedChild(0);
+      const strEl = node.namedChild(1)?.namedChild(0);
+      if (!recv || !strEl) return [];
+      if (strEl.type !== 'encapsed_string' && strEl.type !== 'string') return [];
+      const member = phpStringContent(strEl, source);
+      if (!member || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(member)) return [];
+      if (recv.type === 'variable_name' && getNodeText(recv, source) === '$this') {
+        return [{ name: `this.${member}`, node: strEl }];
+      }
+      if (recv.type === 'class_constant_access_expression') {
+        const cls = recv.namedChild(0);
+        const kw = recv.namedChild(1);
+        if (cls && kw && getNodeText(kw, source) === 'class') {
+          return [{ name: `${getNodeText(cls, source)}::${member}`, node: strEl }];
+        }
+      }
+      return [];
+    }
+
+    // Ruby hook-DSL symbols (`before_action :authenticate`,
+    // `rescue_from E, with: :render_404`): the symbol names a method of the
+    // ENCLOSING class — route through the class-scoped `this.` resolver
+    // (which also walks superclasses, covering ApplicationController-style
+    // inheritance). Symbols under any other call yield nothing.
+    case 'simple_symbol': {
+      const call = rubyEnclosingCall(node);
+      if (!call) return [];
+      const method = getChildByField(call, 'method');
+      if (!method || !isRubyHookCall(getNodeText(method, source))) return [];
+      const sym = getNodeText(node, source).replace(/^:/, '');
+      if (!/^[A-Za-z_][A-Za-z0-9_?!]*$/.test(sym)) return [];
+      return [{ name: `this.${sym}`, node }];
+    }
+
+    default:
+      return [];
+  }
+}
+
+/** Content of a PHP string literal node (single- or double-quoted). */
+function phpStringContent(node: SyntaxNode, source: string): string | null {
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child?.type === 'string_content') return getNodeText(child, source).trim();
+  }
+  return null;
+}
+
+/** The function name of the PHP call whose arguments contain `node`, if any. */
+function phpEnclosingCallName(node: SyntaxNode): string | null {
+  let cur: SyntaxNode | null = node.parent;
+  for (let hops = 0; cur && hops < 4; hops++, cur = cur.parent) {
+    if (cur.type === 'function_call_expression') {
+      const fn = getChildByField(cur, 'function');
+      return fn ? fn.text : null;
+    }
+    if (cur.type === 'member_call_expression' || cur.type === 'scoped_call_expression') {
+      return null; // method calls aren't core HOFs
+    }
+  }
+  return null;
+}
+
+/** The Ruby `call` node whose argument_list (or keyword pair) contains `node`. */
+function rubyEnclosingCall(node: SyntaxNode): SyntaxNode | null {
+  let cur: SyntaxNode | null = node.parent;
+  for (let hops = 0; cur && hops < 4; hops++, cur = cur.parent) {
+    if (cur.type === 'call') return cur;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Go: a local that shadows the function a value names (#2596)
+// ---------------------------------------------------------------------------
+
+/**
+ * Go nodes that open a scope a local can be declared in: a block, the implicit
+ * block of an `if` / `for` / `switch` / `select` statement, and each clause of
+ * a `switch` or `select`.
+ */
+const GO_SCOPE_TYPES = new Set([
+  'block',
+  'if_statement',
+  'for_statement',
+  'expression_switch_statement',
+  'type_switch_statement',
+  'select_statement',
+  'expression_case',
+  'default_case',
+  'type_case',
+  'communication_case',
+]);
+
+/**
+ * Where a Go function-value candidate sits: the innermost scope node around
+ * it, and the unit it is written in: the function or method declaration, or
+ * for a func literal at file scope (`var h = func(…) {…}`) the outermost
+ * literal, else null. Mirrored in the kernel (go.rs `go_fn_ref_site`).
+ */
+export interface GoFnRefSite {
+  scope: number;
+  unit: SyntaxNode | null;
+}
+
+/** {@link GoFnRefSite} of the value container `node`. */
+export function goFnRefSite(node: SyntaxNode): GoFnRefSite {
+  let scope = -1;
+  let literal: SyntaxNode | null = null;
+  for (let cur: SyntaxNode | null = node; cur; cur = cur.parent) {
+    if (scope < 0 && GO_SCOPE_TYPES.has(cur.type)) scope = cur.id;
+    if (cur.type === 'function_declaration' || cur.type === 'method_declaration') return { scope, unit: cur };
+    if (cur.type === 'func_literal') literal = cur;
+  }
+  return { scope, unit: literal };
+}
+
+/**
+ * The names among `names` that a Go function binds itself, keyed
+ * `<unit id>|<name>`: its func literals' parameters, `:=`, `var` and `const`,
+ * range and type-switch variables, and a select case's received value. Such a
+ * local shadows a package function of the same name for the rest of its
+ * scope, which the resolver reads per use (`isGoLocallyBound`). A name the
+ * function's own receiver, parameters or results bind is left out: those
+ * cover its whole body, so every use is the local and one reference is
+ * enough. Mirrored in the kernel (go.rs `go_local_bindings`).
+ */
+export function goLocalBindings(
+  units: Iterable<SyntaxNode>,
+  names: ReadonlySet<string>,
+  source: string
+): Set<string> {
+  const out = new Set<string>();
+  for (const unit of units) {
+    const bind = (id: SyntaxNode | null | undefined): void => {
+      if (id?.type !== 'identifier') return;
+      const name = getNodeText(id, source);
+      if (names.has(name)) out.add(`${unit.id}|${name}`);
+    };
+    const declares = (n: SyntaxNode): boolean => {
+      for (let i = 0; i < n.childCount; i++) {
+        const c = n.child(i);
+        if (c && !c.isNamed && c.type === ':=') return true;
+      }
+      return false;
+    };
+    const stack: SyntaxNode[] = [unit];
+    while (stack.length > 0) {
+      const n = stack.pop()!;
+      switch (n.type) {
+        case 'short_var_declaration':
+          for (const c of getChildByField(n, 'left')?.namedChildren ?? []) bind(c);
+          break;
+        case 'range_clause':
+        case 'receive_statement':
+          if (declares(n)) for (const c of getChildByField(n, 'left')?.namedChildren ?? []) bind(c);
+          break;
+        case 'type_switch_statement':
+          for (const c of getChildByField(n, 'alias')?.namedChildren ?? []) bind(c);
+          break;
+        case 'var_spec':
+        case 'const_spec':
+        case 'parameter_declaration':
+        case 'variadic_parameter_declaration':
+          for (const c of n.childrenForFieldName('name')) bind(c);
+          break;
+      }
+      for (let i = n.namedChildCount - 1; i >= 0; i--) {
+        const c = n.namedChild(i);
+        if (c) stack.push(c);
+      }
+    }
+    for (const field of ['receiver', 'parameters', 'result']) {
+      const list = getChildByField(unit, field);
+      if (list?.type !== 'parameter_list') continue;
+      for (const p of list.namedChildren) {
+        if (p.type !== 'parameter_declaration' && p.type !== 'variadic_parameter_declaration') continue;
+        for (const c of p.childrenForFieldName('name')) {
+          if (c.type === 'identifier') out.delete(`${unit.id}|${getNodeText(c, source)}`);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * The Go function-value candidates that need one reference per scope instead
+ * of one per function (#2596), each with the id of the scope it sits in. A
+ * function records a value-use of a name once, at its first use; but when the
+ * function also binds that name itself, the first use can be the local while
+ * a later one, in another scope, is the package function. The resolver drops
+ * a use the local shadows, so the later use needs a reference of its own. One
+ * per scope node is enough: within one scope a local declared before the
+ * first use still covers every later use. Only a name a function uses at
+ * least twice is looked up, so a candidate's position is read from the tree
+ * just for those. Mirrored in the kernel (go.rs `go_scoped_fn_ref_scopes`).
+ */
+export function goScopedFnRefScopes<C extends { name: string; fromNodeId: string; goNode?: SyntaxNode }>(
+  candidates: ReadonlyArray<C>,
+  source: string
+): Map<C, number> {
+  const groups = new Map<string, C[]>();
+  for (const c of candidates) {
+    if (!c.goNode || c.name.includes('.')) continue;
+    const key = `${c.fromNodeId}|${c.name}`;
+    const group = groups.get(key);
+    if (group) group.push(c);
+    else groups.set(key, [c]);
+  }
+  const sites = new Map<C, GoFnRefSite>();
+  const units = new Map<number, SyntaxNode>();
+  const names = new Set<string>();
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    for (const c of group) {
+      const site = goFnRefSite(c.goNode!);
+      if (!site.unit) continue;
+      sites.set(c, site);
+      units.set(site.unit.id, site.unit);
+      names.add(c.name);
+    }
+  }
+  const out = new Map<C, number>();
+  if (units.size === 0) return out;
+  const bound = goLocalBindings(units.values(), names, source);
+  for (const [c, site] of sites) {
+    if (bound.has(`${site.unit!.id}|${c.name}`)) out.set(c, site.scope);
+  }
+  return out;
+}

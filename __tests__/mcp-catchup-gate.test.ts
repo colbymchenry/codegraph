@@ -63,6 +63,20 @@ describe('MCP catch-up gate', () => {
     expect(res.content[0].text).toMatch(/survivor/);
   });
 
+  it('keeps concurrent calls behind the same unfinished gate', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    handler.setCatchUpGate(gate);
+    let completed = 0;
+    const calls = [1, 2].map(() => handler.execute('codegraph_search', { query: 'survivor' })
+      .then((result) => { completed++; return result; }));
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(completed).toBe(0);
+    } finally { release(); }
+    expect((await Promise.all(calls)).every((result) => !result.isError)).toBe(true);
+  });
+
   it('drops the gate after first await — second call does not re-wait', async () => {
     let awaitCount = 0;
     const gate = new Promise<void>((resolve) => {
@@ -108,6 +122,57 @@ describe('MCP catch-up gate', () => {
     const res = await handler.execute('codegraph_search', { query: 'survivor' });
     expect(res.isError).toBeFalsy();
     expect(cg.getStats().fileCount).toBe(0);
+  });
+
+  it('does not hang the first call when catch-up runs past the timeout (#905)', async () => {
+    // The issue #905 hang: on a huge repo the post-open reconcile takes minutes,
+    // and gating the first tool call on all of it reads as a multi-minute hang.
+    // With the time-box, the call is served promptly and the reconcile finishes
+    // in the background.
+    const prev = process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
+    process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS = '50';
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      let gateResolved = false;
+      const gate = new Promise<void>((resolve) => {
+        timer = setTimeout(() => { gateResolved = true; resolve(); }, 5000);
+      });
+      handler.setCatchUpGate(gate);
+
+      const started = Date.now();
+      const res = await handler.execute('codegraph_search', { query: 'survivor' });
+      const elapsed = Date.now() - started;
+
+      expect(res.isError).toBeFalsy();
+      expect(res.content[0].text).toMatch(/survivor/);
+      // Served on the timeout (~50ms), NOT after the 5s reconcile.
+      expect(gateResolved).toBe(false);
+      expect(elapsed).toBeLessThan(2000);
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (prev === undefined) delete process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
+      else process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS = prev;
+    }
+  });
+
+  it('CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS=0 restores the unbounded wait', async () => {
+    const prev = process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
+    process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS = '0';
+    try {
+      let gateResolved = false;
+      const gate = new Promise<void>((resolve) => {
+        setTimeout(() => { gateResolved = true; resolve(); }, 80);
+      });
+      handler.setCatchUpGate(gate);
+
+      const res = await handler.execute('codegraph_search', { query: 'survivor' });
+      // With the time-box disabled, the call waits for the full reconcile.
+      expect(gateResolved).toBe(true);
+      expect(res.isError).toBeFalsy();
+    } finally {
+      if (prev === undefined) delete process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
+      else process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS = prev;
+    }
   });
 
   it('gate that rejects does not break the tool call', async () => {

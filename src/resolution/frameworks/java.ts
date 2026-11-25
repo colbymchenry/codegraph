@@ -7,6 +7,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { pickByNameAndKind } from './name-heuristic';
 
 export const springResolver: FrameworkResolver = {
   name: 'spring',
@@ -84,14 +85,22 @@ export const springResolver: FrameworkResolver = {
       // (the bindings come from `@Value`). Skip non-Spring refs that happen to
       // have dots in them.
     }
+    // Spring config-key resolution: `@Value("${a.b.c}")` and
+    // `@ConfigurationProperties`. Gate on the `references` kind — those bindings
+    // are emitted as `references` by extractSpringValueBindings, whereas the far
+    // more numerous method-call refs (`list.add()`, `builder.build()`, every
+    // `receiver.method()`) are `calls`. A config key is NEVER a `calls` ref, so
+    // this loses no resolution. Without the gate, every dotted `calls` ref fell
+    // into the uncached getNodesByKind('constant') scan below — an
+    // O(dotted-calls × constant-nodes) cost that dominated resolution and made a
+    // full index take ~1h on large Java/Kotlin (Spring) monorepos (#1180). The
+    // old `split('.').length >= 2` heuristic couldn't separate keys from calls;
+    // the kind check does it exactly.
     if (
+      ref.referenceKind === 'references' &&
       (ref.language === 'java' || ref.language === 'kotlin') &&
       ref.referenceName.includes('.') &&
-      !ref.referenceName.includes('::') &&
-      // Exclude method-call style (single-dot, both sides lower-camel). Spring
-      // config keys are typically 3+ segments and contain kebabs/dashes; we
-      // can't filter perfectly but skipping single-dot keeps the lookup tight.
-      ref.referenceName.split('.').length >= 2
+      !ref.referenceName.includes('::')
     ) {
       const canonRef = canonicalConfigKey(ref.referenceName);
       const candidates = context.getNodesByKind('constant').filter(
@@ -118,9 +127,18 @@ export const springResolver: FrameworkResolver = {
       }
     }
 
+    // The DI/convention patterns below (1–5) are Spring-specific heuristics:
+    // they must only fire on Java/Kotlin refs, and never on inheritance refs.
+    // Without these gates a Scala `extends ExtCustomer` (Spring detected via a
+    // sibling Java module) was hijacked by Pattern 4's bare-name fallback to an
+    // unrelated same-named test class — `extends`/`implements` must resolve via
+    // imports/name matching, not directory heuristics.
+    if (ref.language !== 'java' && ref.language !== 'kotlin') return null;
+    if (ref.referenceKind === 'extends' || ref.referenceKind === 'implements') return null;
+
     // Pattern 1: Service references (dependency injection)
     if (ref.referenceName.endsWith('Service')) {
-      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);
+      const result = resolveByNameAndKind(ref, SERVICE_KINDS, SERVICE_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -133,7 +151,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 2: Repository references
     if (ref.referenceName.endsWith('Repository')) {
-      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, REPO_DIRS, context);
+      const result = resolveByNameAndKind(ref, SERVICE_KINDS, REPO_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -146,7 +164,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 3: Controller references
     if (ref.referenceName.endsWith('Controller')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, CONTROLLER_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, CONTROLLER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -159,7 +177,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 4: Entity/Model references
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, ENTITY_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, ENTITY_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -172,7 +190,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 5: Component references
     if (ref.referenceName.endsWith('Component') || ref.referenceName.endsWith('Config')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, COMPONENT_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, COMPONENT_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -203,14 +221,17 @@ export const springResolver: FrameworkResolver = {
     const now = Date.now();
     const lang: 'java' | 'kotlin' = filePath.endsWith('.kt') ? 'kotlin' : 'java';
     const safe = stripCommentsForRegex(content, 'java');
+    const consts = new Map<string, string>();
+    for (const m of safe.matchAll(/\bstatic\s+final\s+String\s+(\w+)\s*=\s*"([^"]*)"\s*;/g)) {
+      consts.set(m[1]!, m[2]!);
+    }
 
     // Class-level @RequestMapping prefix (an @RequestMapping whose tail leads to a
     // `class`). Joined onto each method's path — and, crucially, NOT treated as a
     // route itself (the old regex did, creating one bogus class route and missing
     // every BARE method mapping like `@PostMapping` with the path on the class).
-    let classPrefix = '';
     const cls = /@RequestMapping\s*\(([^)]*)\)\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:public\s+|final\s+|abstract\s+|open\s+|data\s+|sealed\s+)*class\b/.exec(safe);
-    if (cls) classPrefix = parseMappingPath(cls[1]!);
+    const classPrefixes = cls ? parseMappingPaths(cls[1]!, consts) : [''];
 
     const VERB: Record<string, string> = {
       GetMapping: 'GET', PostMapping: 'POST', PutMapping: 'PUT', PatchMapping: 'PATCH', DeleteMapping: 'DELETE',
@@ -220,38 +241,39 @@ export const springResolver: FrameworkResolver = {
     let match: RegExpExecArray | null;
     while ((match = mappingRegex.exec(safe)) !== null) {
       const method = VERB[match[1]!]!;
-      const sub = parseMappingPath((match[2] || '').replace(/^\(|\)$/g, ''));
-      const routePath = joinPath(classPrefix, sub);
+      const paths = parseMappingPaths((match[2] || '').replace(/^\(|\)$/g, ''), consts);
       const line = safe.slice(0, match.index).split('\n').length;
-      const routeNode: Node = {
-        id: `route:${filePath}:${line}:${method}:${routePath}`,
-        kind: 'route',
-        name: `${method} ${routePath}`,
-        qualifiedName: `${filePath}::route:${routePath}`,
-        filePath,
-        startLine: line,
-        endLine: line,
-        startColumn: 0,
-        endColumn: match[0].length,
-        language: lang,
-        updatedAt: now,
-      };
-      nodes.push(routeNode);
-
       // Method it decorates: first declared method after (skip stacked annotations;
       // Java puts the return type before the name). Bounded so we don't grab a far one.
       const tail = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
       const methodMatch = tail.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
-      if (methodMatch) {
-        references.push({
-          fromNodeId: routeNode.id,
-          referenceName: (methodMatch[1] ?? methodMatch[2])!,
-          referenceKind: 'references',
-          line,
-          column: 0,
+      for (const routePath of classPrefixes.flatMap(prefix => paths.map(sub => joinPath(prefix, sub)))) {
+        const routeNode: Node = {
+          id: `route:${filePath}:${line}:${method}:${routePath}`,
+          kind: 'route',
+          name: `${method} ${routePath}`,
+          qualifiedName: `${filePath}::route:${routePath}`,
           filePath,
+          startLine: line,
+          endLine: line,
+          startColumn: 0,
+          endColumn: match[0].length,
           language: lang,
-        });
+          updatedAt: now,
+        };
+        nodes.push(routeNode);
+
+        if (methodMatch) {
+          references.push({
+            fromNodeId: routeNode.id,
+            referenceName: (methodMatch[1] ?? methodMatch[2])!,
+            referenceKind: 'references',
+            line,
+            column: 0,
+            filePath,
+            language: lang,
+          });
+        }
       }
     }
 
@@ -265,24 +287,26 @@ export const springResolver: FrameworkResolver = {
       if (/^\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:public\s+|final\s+|abstract\s+|open\s+|data\s+|sealed\s+)*class\b/.test(after)) continue; // class-level prefix
       const methodMatch = after.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
       if (!methodMatch) continue;
-      const verbM = args.match(/method\s*=\s*(?:RequestMethod\.)?(\w+)/);
+      const verbM = args.match(/method\s*=\s*[{\[]?\s*(?:RequestMethod\.)?(\w+)/);
       const method = verbM ? verbM[1]!.toUpperCase() : 'ANY';
-      const routePath = joinPath(classPrefix, parseMappingPath(args));
+      const paths = parseMappingPaths(args, consts);
       const line = safe.slice(0, match.index).split('\n').length;
-      const routeNode: Node = {
-        id: `route:${filePath}:${line}:${method}:${routePath}`,
-        kind: 'route',
-        name: `${method} ${routePath}`,
-        qualifiedName: `${filePath}::route:${routePath}`,
-        filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length, language: lang, updatedAt: now,
-      };
-      nodes.push(routeNode);
-      references.push({
-        fromNodeId: routeNode.id,
-        referenceName: (methodMatch[1] ?? methodMatch[2])!,
-        referenceKind: 'references',
-        line, column: 0, filePath, language: lang,
-      });
+      for (const routePath of classPrefixes.flatMap(prefix => paths.map(sub => joinPath(prefix, sub)))) {
+        const routeNode: Node = {
+          id: `route:${filePath}:${line}:${method}:${routePath}`,
+          kind: 'route',
+          name: `${method} ${routePath}`,
+          qualifiedName: `${filePath}::route:${routePath}`,
+          filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length, language: lang, updatedAt: now,
+        };
+        nodes.push(routeNode);
+        references.push({
+          fromNodeId: routeNode.id,
+          referenceName: (methodMatch[1] ?? methodMatch[2])!,
+          referenceKind: 'references',
+          line, column: 0, filePath, language: lang,
+        });
+      }
     }
 
     // @Value("${key}") and @ConfigurationProperties(prefix="...") — bind
@@ -335,7 +359,12 @@ function extractSpringConfig(
       endColumn: valueText.length,
       language: lang,
       signature: dottedKey,
-      docstring: valueText.slice(0, 200),
+      // SECURITY (#383): store the KEY only, never the value. Config files
+      // routinely hold secrets (DB passwords, API keys, JDBC URLs with embedded
+      // credentials), and surfacing the value here pushes it into agent context
+      // unbidden (it lands in codegraph_node/explore output via the docstring).
+      // The key is all `@Value`/`@ConfigurationProperties` resolution needs; an
+      // agent that genuinely needs a value can read the file directly.
       updatedAt: now,
     });
   };
@@ -499,10 +528,24 @@ const COMPONENT_DIRS = ['/component/', '/components/', '/config/'];
 const CLASS_KINDS = new Set(['class']);
 const SERVICE_KINDS = new Set(['class', 'interface']);
 
-/** Path string from a mapping's args (`"/x"`, `value = "/x"`, `path = "/x"`); '' if bare. */
-function parseMappingPath(args: string): string {
-  const m = args.match(/["']([^"']*)["']/);
-  return m ? m[1]! : '';
+/** All declared paths; [''] for an omitted path, [] for an unresolved one. */
+function parseMappingPaths(args: string, consts: Map<string, string>): string[] {
+  const paths: string[] = [];
+  let hasPaths = false;
+  // Keep Java/Kotlin arrays and quoted URI variables together when separating
+  // attributes. Strings in produces/consumes/etc. are never mapping paths.
+  const argRe = /(?:^|,)\s*(?:(\w+)\s*=\s*)?(\{(?:[^"'}]|"[^"]*"|'[^']*')*\}|\[(?:[^"'\]]|"[^"]*"|'[^']*')*\]|"[^"]*"|'[^']*'|[^,]+)/g;
+  for (const arg of args.matchAll(argRe)) {
+    if (arg[1] && arg[1] !== 'value' && arg[1] !== 'path') continue;
+    hasPaths = true;
+    const scope = arg[2]!.trim().replace(/^[{\[]|[}\]]$/g, '').trim();
+    if (!scope) paths.push(''); // An explicitly empty path array also inherits the prefix.
+    for (const value of scope.matchAll(/(?:^|,)\s*(?:"([^"]*)"|'([^']*)'|([\w.]+))\s*(?=,|$)/g)) {
+      const path = value[1] ?? value[2] ?? consts.get(value[3]!.split('.').pop()!);
+      if (path !== undefined) paths.push(path);
+    }
+  }
+  return hasPaths ? [...new Set(paths)] : [''];
 }
 
 /** Join a class-level prefix and a method sub-path into one normalized `/path`. */
@@ -511,28 +554,13 @@ function joinPath(prefix: string, sub: string): string {
   return '/' + parts.join('/');
 }
 
-/**
- * Resolve a symbol by name using indexed queries instead of scanning all files.
- */
+/** A framework name heuristic's pick (see name-heuristic.ts), preferring these folders. */
 function resolveByNameAndKind(
-  name: string,
+  ref: UnresolvedRef,
   kinds: Set<string>,
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  const candidates = context.getNodesByName(name);
-  if (candidates.length === 0) return null;
-
-  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
-  if (kindFiltered.length === 0) return null;
-
-  // Prefer candidates in framework-conventional directories
-  const preferred = kindFiltered.filter((n) =>
-    preferredDirPatterns.some((d) => n.filePath.includes(d))
-  );
-
-  if (preferred.length > 0) return preferred[0]!.id;
-
-  // Fall back to any match
-  return kindFiltered[0]!.id;
+  return pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context);
 }
+

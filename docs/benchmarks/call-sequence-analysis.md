@@ -419,6 +419,15 @@ cumulative — using it under-counts tokens badly (an earlier excalidraw cut rep
 off this bug; the real figure is ~90%). Sum **per-turn assistant `usage`** for the true total.
 `total_cost_usd` and `duration_ms` are already cumulative/correct.
 
+> **Fixed in the harness 2026-08-05** (`parse-run.mjs`, commit `04c0f8e`). Until then this
+> gotcha was documented here but *not* implemented — `processed` still read `result.usage`,
+> and the "summed per-turn tokens" claim below was aspirational. It cost three separate wrong
+> results: the excalidraw cut above, a sonnet 3-turn campaign that read 23% when the truth was
+> 56%, and an Opus re-measure that read 19% when the truth was 62% and invented a token
+> *regression* on two repos. The error is one-sided — it under-counts whichever arm takes more
+> turns, always the without-arm — so it always understates codegraph. If you are reading a
+> token figure produced before this date, re-derive it.
+
 Reproduce:
 ```bash
 bash scripts/agent-eval/bench-readme.sh      # 7 repos × with/without × 4 runs (RUNS=4) → /tmp/ab-readme

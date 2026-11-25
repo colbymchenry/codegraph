@@ -1,0 +1,363 @@
+/**
+ * Kernel↔wasm C/C++ extraction parity (R7a of the kernel migration).
+ *
+ * Asserts the native walker (codegraph-kernel/src/ccpp/) produces the SAME
+ * ExtractionResult as the wasm TreeSitterExtractor — nodes, edges, and
+ * unresolved refs compared as canonicalized multisets — over:
+ *   - the checked-in torture fixtures (torture.c / torture.cpp / torture.hpp:
+ *     fn-ptr tables, typedef enum/struct, multi-declarator consts, namespaces
+ *     incl. C++17 nested, out-of-line Cls::method defs, templates + template
+ *     bases, operators, stack construction, local fn-ptrs, UE-macro shapes
+ *     through the hoisted preParse, using-aliases, value-ref shadowing), and
+ *   - Metal/CUDA-shaped sources arriving as language 'cpp' — pinning that the
+ *     route point applies the SAME extension/content-gated preParse blanks to
+ *     the kernel arm (docs/design/ccpp-kernel-port-checklist.md, decision 1/2).
+ *
+ * Files with parse errors — including the spaced explicit-operator CALL-SITE
+ * shape (#1247), which rides an ERROR node — must DEFER to wasm (`defer:`),
+ * asserted below. The full-repo sweep lives in scripts/kernel-parity.mjs
+ * (redis/git/fmt et al., run for the §5 gate); this suite keeps the invariant
+ * alive in `npm test`. Skips when no kernel binary is staged;
+ * CODEGRAPH_KERNEL_EXPECT=1 turns that into a failure (kernel-scaffold.test.ts).
+ */
+
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+import * as fs from 'fs';
+import * as path from 'path';
+import { extractFromSource } from '../src/extraction';
+import { initGrammars, loadGrammarsForLanguages } from '../src/extraction/grammars';
+import { tryKernelExtract, resetKernelForTests } from '../src/extraction/kernel';
+import type { ExtractionResult, Language } from '../src/types';
+
+const KERNEL_PATH = path.join(
+  __dirname,
+  '..',
+  'codegraph-kernel',
+  'prebuilds',
+  `${process.platform}-${process.arch}`,
+  'codegraph-kernel.node'
+);
+const kernelBuilt = fs.existsSync(KERNEL_PATH);
+
+const FIXTURE_DIR = path.join(__dirname, 'fixtures', 'kernel-parity');
+
+function canon(result: ExtractionResult): { nodes: string[]; edges: string[]; refs: string[] } {
+  return {
+    nodes: result.nodes
+      .map(({ updatedAt: _u, ...n }) => JSON.stringify(n, Object.keys(n).sort()))
+      .sort(),
+    edges: result.edges.map((e) => JSON.stringify(e, Object.keys(e).sort())).sort(),
+    refs: result.unresolvedReferences
+      .map((r) => JSON.stringify(r, Object.keys(r).sort()))
+      .sort(),
+  };
+}
+
+const ENV_KEYS = ['CODEGRAPH_KERNEL', 'CODEGRAPH_KERNEL_LANGS'] as const;
+let savedEnv: Record<string, string | undefined>;
+
+describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
+  beforeAll(async () => {
+    await initGrammars();
+    await loadGrammarsForLanguages(['c', 'cpp']);
+  });
+
+  beforeEach(() => {
+    savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+    resetKernelForTests();
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+    resetKernelForTests();
+  });
+
+  function assertParity(filePath: string, source: string, language: Language, minNodes = 3): void {
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    delete process.env.CODEGRAPH_KERNEL;
+    const viaKernel = tryKernelExtract(filePath, source, language);
+    expect(viaKernel, `kernel extraction failed for ${filePath}`).not.toBeNull();
+
+    process.env.CODEGRAPH_KERNEL = '0';
+    const viaWasm = extractFromSource(filePath, source, language);
+    delete process.env.CODEGRAPH_KERNEL;
+
+    const k = canon(viaKernel!);
+    const w = canon(viaWasm);
+    expect(k.nodes, `${filePath}: nodes`).toEqual(w.nodes);
+    expect(k.edges, `${filePath}: edges`).toEqual(w.edges);
+    expect(k.refs, `${filePath}: refs`).toEqual(w.refs);
+    // Meaningful comparison, not empty-vs-empty (the inline Metal/CUDA
+    // sources are deliberately small — they pass their exact node count).
+    expect(viaWasm.nodes.length).toBeGreaterThanOrEqual(minNodes);
+  }
+
+  it.each(['c', 'cpp'] as const)('single-argument function macros and negative controls: %s (#1373)', (language) => {
+    const source = [
+      '#define NATIVE_FN(name) int name(void)',
+      'NATIVE_FN(get_version) { return helper(); }',
+      'int use_it(void) { return get_version(); }',
+      '#define FN(name) int name(void)',
+      'FN(short_macro) { return 0; }',
+      '#define POINTER_FN(name) const char *name(void)',
+      'POINTER_FN(get_text) { return 0; }',
+      '#define TEST_CASE(name) int test_ ## name(void)',
+      'TEST_CASE(candidate) { return 0; }',
+      '#define REGISTER_FN(name) register_test(name)',
+      'REGISTER_FN(registration) { return 0; }',
+      'int (parenthesized)(void) { return 1; }',
+      '',
+    ].join('\n');
+    assertParity(`fixtures/macros.${language}`, source, language);
+    assertParity(`fixtures/macros-crlf.${language}`, source.replace(/\n/g, '\r\n'), language);
+    const result = tryKernelExtract(`fixtures/macros.${language}`, source, language)!;
+    const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+    expect(names).toContain('get_version');
+    expect(names).toContain('get_text');
+    expect(names).toContain('short_macro');
+    expect(names).not.toContain('candidate');
+    expect(names).not.toContain('registration');
+  });
+
+  it.each(['\n', '\r\n'])('classes named with a scope or template arguments retain parity (%j)', (eol) => {
+    const source = [
+      'namespace leveldb {',
+      'template <typename Key, class Comparator>',
+      'class SkipList { struct Node; Node* head_; };',
+      'template <typename Key, class Comparator>',
+      'struct SkipList<Key, Comparator>::Node {',
+      '  Node* Next(int n) { return nullptr; }',
+      '  struct Link { int hops() const { return 0; } };',
+      '};',
+      'class Table { struct Rep; };',
+      'struct Table::Rep { int seqno() const { return 0; } };',
+      'namespace leveldb {',
+      'struct leveldb::Table::Rep2 {};',
+      '}',
+      'struct ::Top { int depth() const { return 0; } };',
+      '}  // namespace leveldb',
+      'template <typename R, typename... Args>',
+      'class FunctionMocker<R(Args...)> { R Invoke(Args... args) { return R(); } };',
+      'template <> struct fmt::formatter<int> { int format(int x) const { return x; } };',
+      'union ::Global::Bits { int all; };',
+      'struct Tag;',
+      'struct ::Tag { int bits() const { return 0; } };',
+      '',
+    ].join(eol);
+    assertParity('scoped-classes.h', source, 'cpp', 10);
+    const result = tryKernelExtract('scoped-classes.h', source, 'cpp')!;
+    const named = (kind: string) => result.nodes.filter((n) => n.kind === kind).map((n) => n.qualifiedName).sort();
+    // A name written from the global scope alone has no scope to be qualified under.
+    expect(result.nodes.map((n) => n.qualifiedName).filter((q) => q.startsWith('::') || q.includes('::::'))).toEqual([]);
+    expect(named('struct')).toEqual(expect.arrayContaining(['leveldb::SkipList::Node', 'leveldb::SkipList::Node::Link', 'leveldb::Table::Rep', 'leveldb::Table::Rep2']));
+    expect(named('union')).toEqual(['Global::Bits']);
+    expect(named('method')).toEqual(expect.arrayContaining(['leveldb::SkipList::Node::Next', 'leveldb::SkipList::Node::Link::hops', 'leveldb::Table::Rep::seqno']));
+    // A specialization is not named after its template.
+    expect([...named('struct'), ...named('class')].filter((q) => /formatter|FunctionMocker/.test(q))).toEqual([]);
+  });
+
+  it.each(['\n', '\r\n'])('COM interface declarations retain native/wasm parity (%j)', (eol) => {
+    const source = [
+      '#define interface struct',
+      'struct IParentInterface { virtual void Parent() = 0; };',
+      'interface IMyComInterface : IParentInterface {',
+      '    virtual void Foo() = 0;',
+      '    virtual void Bar() = 0;',
+      '};',
+      'interface IStandalone { virtual void Run() = 0; };',
+      '',
+    ].join(eol);
+    assertParity('MyInterface.h', source, 'cpp', 8);
+  });
+
+  it('torture fixture (c): fn-ptr tables, typedefs, file-scope consts, value-refs', () => {
+    const file = path.join(FIXTURE_DIR, 'torture.c');
+    assertParity('fixtures/torture.c', fs.readFileSync(file, 'utf8'), 'c');
+  });
+
+  it('torture fixture (cpp): namespaces, out-of-line methods, templates, fn-ptrs, UE macros', () => {
+    const file = path.join(FIXTURE_DIR, 'torture.cpp');
+    assertParity('fixtures/torture.cpp', fs.readFileSync(file, 'utf8'), 'cpp');
+  });
+
+  it('torture fixture (hpp): fwd decls, extern "C", header templates, reflection markup', () => {
+    const file = path.join(FIXTURE_DIR, 'torture.hpp');
+    assertParity('fixtures/torture.hpp', fs.readFileSync(file, 'utf8'), 'cpp');
+  });
+
+  it('macro + constructor fixture (cpp): #define constants, constructor signatures, per-declarator ctor refs (#1838/#1839)', () => {
+    const file = path.join(FIXTURE_DIR, 'torture-macros-ctors.cpp');
+    const source = fs.readFileSync(file, 'utf8');
+    assertParity('fixtures/torture-macros-ctors.cpp', source, 'cpp');
+    // Pin the shapes the resolver relies on, so parity is never empty-vs-empty.
+    process.env.CODEGRAPH_KERNEL = '0';
+    const result = extractFromSource('fixtures/torture-macros-ctors.cpp', source, 'cpp');
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(result.nodes.filter((n) => n.kind === 'constant').map((n) => n.qualifiedName).sort()).toEqual([
+      'TRACE_POINT',
+      'app::APP_LOG',
+      'app::constructions::LOCAL_TRACE',
+    ]);
+    expect(
+      result.nodes.filter((n) => n.kind === 'method' && n.name === 'Widget').map((n) => n.signature).sort()
+    ).toEqual(['()', '();', '(int a, int b = 2)', '(int value)', '(int value);']);
+    const ctorRefs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls' && r.referenceName.includes('/'))
+      .map((r) => r.referenceName);
+    expect(ctorRefs).toEqual([
+      'Aggregate::Aggregate/0',
+      'Widget::Widget/0',
+      'Widget::Widget/0',
+      'Widget::Widget/1',
+      'Widget::Widget/2',
+      'Widget::Widget/0',
+      'Widget::Widget/1',
+      'Widget::Widget/2',
+      'app::Widget::Widget/1',
+      'Box::Box/1',
+      'Widget::Widget/0',
+    ]);
+  });
+
+  it.each(['\n', '\r\n'])('constructor prototypes and array elements remain in parity (%j)', (eol) => {
+    const source = ['struct Widget {', ' Widget(int value = 1);', '};',
+      'Widget::Widget(int renamed) {}', 'int argument() { return 2; }',
+      'void run() { Widget plain[2]; Widget empty[2]{}; Widget items[3]{{argument()}, {2}}; Widget grid[2][2]{{{1}, {2}}, {{3}}}; Widget scalars[2]{1, 2}; Widget hex[0x2]{{1}}; Widget sized[2u]{{1}}; }', ''].join(eol);
+    assertParity('arrays.cpp', source, 'cpp');
+  });
+
+  it('macro fixture (c): #define constants at file scope and inside a body (#1838)', () => {
+    const file = path.join(FIXTURE_DIR, 'torture-macros.c');
+    const source = fs.readFileSync(file, 'utf8');
+    assertParity('fixtures/torture-macros.c', source, 'c');
+    process.env.CODEGRAPH_KERNEL = '0';
+    const result = extractFromSource('fixtures/torture-macros.c', source, 'c');
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name).sort()).toEqual([
+      'LOCAL_TRACE',
+      'MAX',
+      'TRACE_POINT',
+    ]);
+  });
+
+  // Metal rides the cpp route: `.metal` maps to language 'cpp' and the
+  // extension-gated `[[attribute]]` blank must reach the kernel arm through
+  // the route-point preParse hoist (filePath rides along for the gate).
+  it('metal-shaped source (.metal → cpp): attribute blanks applied on both arms', () => {
+    const metal = [
+      'struct VertexIn {',
+      '  float3 position [[attribute(0)]];',
+      '  float2 uv [[attribute(1)]];',
+      '};',
+      'static float2 scale_uv(float2 uv) { return uv; }',
+      '',
+    ].join('\n');
+    assertParity('fixtures/shader.metal', metal, 'cpp');
+  });
+
+  // CUDA rides the cpp route too: specifier + launch-config blanks are gated
+  // by extension OR content, and both fire before the kernel call.
+  it('cuda-shaped source (.cu → cpp): specifier + launch blanks applied on both arms', () => {
+    const cuda = [
+      '__global__ void step_kernel(float *data) { data[0] += 1.0f; }',
+      'void launch(float *data) { step_kernel<<<1, 256>>>(data); }',
+      '',
+    ].join('\n');
+    assertParity('fixtures/kern.cu', cuda, 'cpp');
+  });
+
+  // protobuf's generated headers and leveldb's thread annotations put
+  // attribute macros where tree-sitter can't read them: stacked in a class
+  // head, between a pointer and its name, after a parameter list or a field,
+  // opening a member. The hoisted preParse blanks them all, so the file parses
+  // clean and goes through the kernel instead of deferring — at parity.
+  it.each(['\n', '\r\n'])('attribute-macro shapes parse clean through the hoisted preParse (%j)', (eol) => {
+    const source = [
+      'namespace google {',
+      'namespace protobuf {',
+      'class PROTOBUF_EXPORT  PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED Any final : public ::google::protobuf::Message',
+      '/* @@protoc_insertion_point(class_definition:google.protobuf.Any) */ {',
+      ' public:',
+      '  ~Any() PROTOBUF_FINAL;',
+      '  [[nodiscard]] const ::google::protobuf::UnknownFieldSet& unknown_fields() const',
+      '      ABSL_ATTRIBUTE_LIFETIME_BOUND {',
+      '    return _internal_metadata_.unknown_fields();',
+      '  }',
+      '  [[nodiscard]] static const ::google::protobuf::Descriptor* PROTOBUF_NONNULL',
+      '  GetDescriptor() {',
+      '    return default_instance().GetMetadata().descriptor;',
+      '  }',
+      '  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD absl::string_view name() const { return name_; }',
+      '  void Swap(Any* PROTOBUF_RESTRICT PROTOBUF_NONNULL other) { InternalSwap(other); }',
+      '',
+      ' private:',
+      '  void InternalSwap(Any* PROTOBUF_NONNULL other);',
+      '  int count_ GUARDED_BY(mu_);',
+      '};',
+      'void Any::InternalSwap(Any* PROTOBUF_NONNULL other) { swap(*other); }',
+      '}  // namespace protobuf',
+      '}  // namespace google',
+      '',
+    ].join(eol);
+    assertParity('fixtures/any.pb.h', source, 'cpp', 6);
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    const result = tryKernelExtract('fixtures/any.pb.h', source, 'cpp')!;
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+    expect(methods).toEqual(expect.arrayContaining([
+      'google::protobuf::Any::GetDescriptor',
+      'google::protobuf::Any::InternalSwap',
+      'google::protobuf::Any::Swap',
+      'google::protobuf::Any::name',
+      'google::protobuf::Any::unknown_fields',
+    ]));
+  });
+
+  // Every torture fixture again with CRLF line endings — the shape every
+  // Windows autocrlf checkout has. Derived in memory (not a checked-in CRLF
+  // file) so no platform or editor can silently normalize it away. Pins the
+  // JS-multiline-^ docstring semantics for the C comment markers (#1329).
+  it.each([
+    ['torture.c', 'c'],
+    ['torture.cpp', 'cpp'],
+    ['torture.hpp', 'cpp'],
+    ['torture-macros-ctors.cpp', 'cpp'],
+    ['torture-macros.c', 'c'],
+  ] as const)('torture fixture CRLF parity: %s', (name, lang) => {
+    const file = path.join(FIXTURE_DIR, name);
+    const crlf = fs.readFileSync(file, 'utf8').replace(/(?<!\r)\n/g, '\r\n');
+    assertParity(`fixtures/${name} (crlf)`, crlf, lang);
+  });
+
+  it('spaced explicit-operator call sites defer to the wasm extractor (#1247 rides an ERROR node)', () => {
+    const source = [
+      'struct It { int operator*() const { return 1; } };',
+      'int read_it(const It &it) { return it.operator *(); }',
+      '',
+    ].join('\n');
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(tryKernelExtract('src/op.cpp', source, 'cpp')).toBeNull();
+    // The seam still serves the file — through the wasm path, where the
+    // operator-call recovery emits the `it.operator*` ref.
+    process.env.CODEGRAPH_KERNEL = '0';
+    const viaWasm = extractFromSource('src/op.cpp', source, 'cpp');
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(
+      viaWasm.unresolvedReferences.some((r) => r.referenceName === 'it.operator*')
+    ).toBe(true);
+  });
+
+  it('files with parse errors defer to the wasm extractor (recovery is encoding-dependent)', () => {
+    const broken = 'void f( {\n  return }} 12 (\n';
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(tryKernelExtract('src/broken.c', broken, 'c')).toBeNull();
+    process.env.CODEGRAPH_KERNEL = '0';
+    const viaWasm = extractFromSource('src/broken.c', broken, 'c');
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(viaWasm.nodes.some((n) => n.kind === 'file')).toBe(true);
+  });
+});

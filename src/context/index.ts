@@ -24,9 +24,33 @@ import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
-import { validatePathWithinRoot } from '../utils';
+import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
 import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
+import { findNamedCopybooks, isCopybookInclude } from '../graph/cobol-copybooks';
+import { describeSynthesizedHop } from '../graph/synthesized-hop';
+
+/**
+ * Most top-level declarations of one copybook that become entry points — its
+ * record layouts, or the first paragraphs of a procedure copybook. The rest of
+ * the copybook is one hop away (explore pins the whole file).
+ */
+const MAX_COPYBOOK_DECLARATION_ENTRIES = 3;
+
+/**
+ * The most symbol names, and search terms, of one query that
+ * `findRelevantContext` searches the index for. A question or a bag of symbol
+ * names stays well below both: a name like `RefreshTokenService` is one
+ * symbol but several terms (`refreshtokenservice`, `refresh`, `token`,
+ * `service`, stems). A pasted log, document or source file runs to hundreds
+ * of words, and every word costs several searches of the index, so such a
+ * query took minutes on a large project and the prompt hook gave up on it
+ * (#2620). Both lists put code-shaped words (camelCase, snake_case, dotted
+ * names) first and keep the order they appear in, so a long query is searched
+ * by its identifiers and its opening words.
+ */
+export const MAX_QUERY_SYMBOLS = 64;
+export const MAX_QUERY_TERMS = 128;
 
 /**
  * Extract likely symbol names from a natural language query
@@ -157,7 +181,7 @@ const DEFAULT_BUILD_OPTIONS: Required<BuildContextOptions> = {
  * they tell you something exists, not how it works.
  */
 const HIGH_VALUE_NODE_KINDS: NodeKind[] = [
-  'function', 'method', 'class', 'interface', 'type_alias', 'struct', 'trait',
+  'function', 'method', 'class', 'interface', 'type_alias', 'struct', 'union', 'trait',
   'component', 'route', 'variable', 'constant', 'enum', 'module', 'namespace',
 ];
 
@@ -171,6 +195,7 @@ const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
   minScore: 0.3,
   edgeKinds: [],
   nodeKinds: HIGH_VALUE_NODE_KINDS, // Filter out imports/exports by default
+  seedNames: [],         // Segment-vocab supplement — filled by the facade
 };
 
 // Re-export the low-confidence sentinel (defined in a dependency-free leaf so
@@ -187,6 +212,7 @@ export { LOW_CONFIDENCE_MARKER } from './markers';
 export class ContextBuilder {
   private projectRoot: string;
   private queries: QueryBuilder;
+
   private traverser: GraphTraverser;
 
   constructor(
@@ -197,6 +223,26 @@ export class ContextBuilder {
     this.projectRoot = projectRoot;
     this.queries = queries;
     this.traverser = traverser;
+  }
+
+  /**
+   * Whether the project's `codegraph.json` `deprioritize` patterns cover this
+   * path (#982). Explore ranks through its own path scorer as well as through
+   * `searchNodes`, so the lever has to be applied here too or the setting would
+   * only half-work — and explore is the surface #982 actually reports on.
+   *
+   * Only the -15 relevance penalty is shared. Explore's hard `continue` filters
+   * and its non-production budget cap are deliberately NOT joined: those REMOVE
+   * content, and `deprioritize` is a ranking lever by definition — `exclude` is
+   * the lever for taking things out of reach.
+   *
+   * Returned as a predicate with the patterns read once, for the candidate
+   * loops of one search: asking the live matcher per candidate re-checked
+   * `codegraph.json` hundreds of thousands of times on a long query (#2620).
+   */
+  private deprioritizedPaths(): (filePath: string) => boolean {
+    const matcher = this.queries.getDeprioritizedPathSnapshot?.() ?? this.queries.getDeprioritizedPathMatcher?.();
+    return (filePath) => matcher?.(filePath) ?? false;
   }
 
   /**
@@ -265,7 +311,14 @@ export class ContextBuilder {
 
     // Return formatted output or raw context
     if (opts.format === 'markdown') {
-      return formatContextAsMarkdown(context)
+      // Bounded candidate set (entry points + subgraph + code blocks), so the
+      // DB-backed generated check is one probe, not a per-comparison query.
+      const isGenerated = this.queries.generatedPredicateFor([
+        ...entryPoints.map((n) => n.filePath),
+        ...Array.from(subgraph.nodes.values(), (n) => n.filePath),
+        ...codeBlocks.map((b) => b.filePath),
+      ]);
+      return formatContextAsMarkdown(context, isGenerated)
         + this.buildCallPathsSection(subgraph)
         + (subgraph.confidence === 'low' ? this.buildLowConfidenceNote(entryPoints) : '');
     } else if (opts.format === 'json') {
@@ -371,25 +424,17 @@ export class ContextBuilder {
     const name = (id: string): string => subgraph.nodes.get(id)?.name ?? id;
 
     // Synthesized (dynamic-dispatch) hops are real `calls` edges but invisible to
-    // static parsing — mark them inline so the agent sees WHERE the callback was
-    // wired up (`registered @file:line`) instead of grepping for it. Keyed by
-    // "source>target".
+    // static parsing — mark them inline so the agent sees WHAT bridged the hop
+    // and WHERE it was wired up (`@file:line`) instead of grepping for it. The
+    // wording is `graph/synthesized-hop.ts`'s, the same explore's Flow uses, plus
+    // the detail this roomier line has space for. Keyed by "source>target".
     const synthByPair = new Map<string, string>();
     for (const e of subgraph.edges) {
-      if (e.kind !== 'calls' || e.provenance !== 'heuristic') continue;
-      const m = e.metadata as Record<string, unknown> | undefined;
-      if (!m?.synthesizedBy) continue;
-      const at = typeof m.registeredAt === 'string' ? ` @${m.registeredAt}` : '';
-      const label = m.synthesizedBy === 'callback'
-        ? `callback via ${m.via ? `\`${String(m.via)}\`` : 'registrar'}${at}`
-        : m.synthesizedBy === 'react-render'
-        ? `React re-render via setState${at}`
-        : m.synthesizedBy === 'jsx-render'
-        ? `renders <${String(m.via || 'child')}>`
-        : m.synthesizedBy === 'vue-handler'
-        ? `Vue @${String(m.event || 'event')} handler`
-        : `event ${m.event ? `\`${String(m.event)}\`` : ''}${at}`;
-      synthByPair.set(`${e.source}>${e.target}`, label);
+      if (e.kind !== 'calls') continue;
+      const hop = describeSynthesizedHop(e);
+      if (!hop) continue;
+      const at = hop.registeredAt ? ` @${hop.registeredAt}` : '';
+      synthByPair.set(`${e.source}>${e.target}`, `${hop.summary}${hop.detail}${at}`);
     }
     const renderChain = (c: string[]): string => {
       let s = name(c[0]!);
@@ -409,7 +454,7 @@ export class ContextBuilder {
       ...kept.map((c) => `- ${renderChain(c)}`),
       '',
       hasSynth
-        ? '_Hops marked `[callback/event …]` are dynamic dispatch bridged by codegraph (with the registration site); the rest are direct calls. codegraph_node any symbol for its body._'
+        ? '_Hops marked `[…]` are dynamic dispatch bridged by codegraph (with the registration site); the rest are direct calls. codegraph_node any symbol for its body._'
         : '_codegraph_node any symbol above for its source + its own callers/callees._',
     ];
     return '\n' + lines.join('\n') + '\n';
@@ -448,18 +493,42 @@ export class ContextBuilder {
     // === HYBRID SEARCH ===
 
     // Step 1: Extract potential symbol names from query
-    const symbolsFromQuery = extractSymbolsFromQuery(query);
+    const symbolsFromQuery = extractSymbolsFromQuery(query).slice(0, MAX_QUERY_SYMBOLS);
     logDebug('Extracted symbols from query', { query, symbols: symbolsFromQuery });
 
     // Step 2: Look up exact matches for extracted symbols
     let exactMatches: SearchResult[] = [];
-    if (symbolsFromQuery.length > 0) {
+    if (symbolsFromQuery.length > 0 || opts.seedNames.length > 0) {
       try {
-        // Get more results so we can apply co-location boosting before trimming
-        exactMatches = this.queries.findNodesByExactName(symbolsFromQuery, {
-          limit: Math.ceil(opts.searchLimit * 5),
-          kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
-        });
+        if (symbolsFromQuery.length > 0) {
+          // Get more results so we can apply co-location boosting before trimming
+          exactMatches = this.queries.findNodesByExactName(symbolsFromQuery, {
+            limit: Math.ceil(opts.searchLimit * 5),
+            kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
+          });
+        }
+
+        // Step 2a: segment-vocabulary seeds. Word-level query terms cannot
+        // reach camelCase names through FTS (one token per name), so the
+        // caller resolves query words → names via the segment vocab and hands
+        // them in as seedNames. Merged at a dampened score — a symbol the
+        // query names outright must outrank a segment-derived one — but
+        // BEFORE the co-location boost below, because several seeds landing
+        // in one file (pinFeedIfNearBottom + feedAtBottom + handleFeedScroll)
+        // is exactly the evidence that file is the answer.
+        if (opts.seedNames.length > 0) {
+          const seedResults = this.queries.findNodesByExactName(opts.seedNames, {
+            limit: Math.ceil(opts.searchLimit * 3),
+            kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
+          });
+          const known = new Set(exactMatches.map((r) => r.node.id));
+          for (const r of seedResults) {
+            if (known.has(r.node.id)) continue;
+            known.add(r.node.id);
+            exactMatches.push({ ...r, score: r.score * 0.6 });
+          }
+          logDebug('Segment seed matches', { seedNames: opts.seedNames, added: known.size });
+        }
 
         // Co-location boost: when multiple extracted symbols appear in the same file,
         // those results are much more likely to be what the user is looking for.
@@ -496,7 +565,7 @@ export class ContextBuilder {
     // like RestController, BulkRequest, AllocationService — not nodes named exactly that.
     // Also tries stem variants: "caching" → "cache" finds Cache, CacheBuilder.
     if (symbolsFromQuery.length > 0) {
-      const definitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'trait',
+      const definitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'union', 'trait',
         'protocol', 'enum', 'type_alias'];
       // Expand symbols with stem variants for broader definition matching
       const expandedSymbols = new Set(symbolsFromQuery);
@@ -536,13 +605,62 @@ export class ContextBuilder {
       exactMatches = exactMatches.slice(0, Math.ceil(opts.searchLimit * 3));
     }
 
+    // Step 2c: Match an exact Han filename (with or without its extension).
+    // Keep this separate from natural-language terms so partial Chinese words
+    // do not become broad FTS queries.
+    const filenameQuery = query.trim();
+    const hasHanInFilename = Array.from(filenameQuery).some(
+      (char) => /\p{Script_Extensions=Han}/u.test(char)
+    );
+    const allowsFileNodes = options.nodeKinds === undefined
+      || options.nodeKinds.length === 0
+      || options.nodeKinds.includes('file');
+    const exactFileMatches: SearchResult[] = [];
+
+    if (hasHanInFilename && allowsFileNodes) {
+      const candidates = [
+        ...this.queries.getNodesByName(filenameQuery)
+          .filter((node) => node.kind === 'file'),
+        ...this.queries.getFileNodesByNamePrefix(`${filenameQuery}.`),
+      ];
+      for (const node of candidates) {
+        const fileName = path.basename(node.filePath);
+        const fileExtension = path.extname(fileName);
+        const fileStem = fileExtension
+          ? fileName.slice(0, -fileExtension.length)
+          : fileName;
+        const isExactMatch = fileName === filenameQuery || fileStem === filenameQuery;
+        if (isExactMatch) exactFileMatches.push({ node, score: 1 });
+      }
+    }
+
+    // Step 2d: COBOL copybook members (#2342). `COPY CVACT01Y` / `EXEC SQL
+    // INCLUDE MYCOPYBOOK` are `import` nodes, which the default kind filter
+    // drops — so a query naming a copybook found nothing at all, though the
+    // include statement and the copybook are exactly what it asks for. Gathered
+    // apart from the kind-filtered channels and admitted ahead of them below,
+    // like an exact filename. Honors an explicit kind filter that leaves
+    // imports out.
+    const allowsIncludes = options.nodeKinds === undefined
+      || options.nodeKinds.length === 0
+      || options.nodeKinds.includes('import');
+    const copybooks = allowsIncludes
+      ? this.findCopybookEntries(query)
+      : { entries: [], members: new Set<string>() };
+
     // Step 3: Run text search for natural language term matching
     // This catches file-name and node-name matches that semantic search may miss,
     // which is critical for template-heavy codebases (e.g., Liquid/Shopify themes)
     // where file names are the primary identifiers.
     let textResults: SearchResult[] = [];
     try {
-      const searchTerms = extractSearchTerms(query);
+      // A copybook member Step 2d resolved is not searched again as text: its
+      // only FTS hits are the import nodes this channel excludes, so the search
+      // fell through to the fuzzy fallback and returned whatever program name
+      // sat within edit distance (`CVACT01Y` → `CBACT01C`).
+      const searchTerms = extractSearchTerms(query)
+        .filter((term) => !copybooks.members.has(term.toUpperCase()))
+        .slice(0, MAX_QUERY_TERMS);
       if (searchTerms.length > 0) {
         // Search each term individually to get broader coverage,
         // then boost results that match multiple terms
@@ -552,7 +670,7 @@ export class ContextBuilder {
         // but are almost never what exploration queries want.
         const searchKinds = opts.nodeKinds && opts.nodeKinds.length > 0
           ? opts.nodeKinds
-          : ['file', 'module', 'class', 'struct', 'interface', 'trait', 'protocol',
+          : ['file', 'module', 'class', 'struct', 'union', 'interface', 'trait', 'protocol',
              'function', 'method', 'property', 'field', 'variable', 'constant',
              'enum', 'enum_member', 'type_alias', 'namespace', 'export',
              'route', 'component'] as NodeKind[];
@@ -662,7 +780,7 @@ export class ContextBuilder {
     // than nodes matching just one generic term. Without this, "ExecutionUtils"
     // (matches only "execution") fills budget slots meant for "ShardSearchRequest"
     // (matches "shard" + "search" + "request").
-    const queryTermsForBoost = extractSearchTerms(query);
+    const queryTermsForBoost = extractSearchTerms(query).slice(0, MAX_QUERY_TERMS);
     if (queryTermsForBoost.length >= 2) {
       // Group terms that are substrings of each other (stem variants of the same
       // root word). "indexed", "indexe", "index" should count as ONE concept match,
@@ -747,8 +865,27 @@ export class ContextBuilder {
     // LIKE reliably finds these substring matches. Results are appended with
     // guaranteed slots so they don't compete with higher-scoring prefix matches.
     if (symbolsFromQuery.length > 0) {
-      const camelDefinitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'trait',
+      const camelDefinitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'union', 'trait',
         'protocol', 'enum', 'type_alias'];
+      // Callable kinds participate too: in service-layer codebases the
+      // camel-infix definers of a queried FIELD are methods/functions
+      // (`profileInfo` → `getProfileInfoV2`), not classes — the type-only
+      // whitelist made this whole step dead code there (#1196). Fetched as a
+      // SEPARATE LIKE batch so one hot single-word term can't crowd classes
+      // out of the length-ordered 200-row batch.
+      const camelCallableKinds: NodeKind[] = ['function', 'method', 'component'];
+      // A path's relevance to the query depends on nothing else, and the
+      // candidates of every term share their files: score each path once.
+      const isDeprioritized = this.deprioritizedPaths();
+      const pathScores = new Map<string, number>();
+      const pathScoreOf = (filePath: string): number => {
+        let score = pathScores.get(filePath);
+        if (score === undefined) {
+          score = scorePathRelevance(filePath, query, undefined, isDeprioritized(filePath));
+          pathScores.set(filePath, score);
+        }
+        return score;
+      };
       const camelSearchedTerms = new Set<string>();
       const searchIdSet = new Set(searchResults.map(r => r.node.id));
       // Track per-node term hits for multi-term boosting
@@ -766,25 +903,39 @@ export class ContextBuilder {
         // have hundreds of substring matches. The LIKE scan cost is the same
         // regardless of LIMIT (SQLite scans all matches to sort), so we fetch
         // generously and let path-relevance scoring pick the best ones.
-        const likeResults = this.queries.findNodesByNameSubstring(titleCased, {
-          limit: 200,
-          kinds: camelDefinitionKinds,
-          excludePrefix: true,
-        });
+        const likeResults = [
+          ...this.queries.findNodesByNameSubstring(titleCased, {
+            limit: 200,
+            kinds: camelDefinitionKinds,
+            excludePrefix: true,
+          }),
+          ...this.queries.findNodesByNameSubstring(titleCased, {
+            limit: 200,
+            kinds: camelCallableKinds,
+            excludePrefix: true,
+          }),
+        ];
 
         // Filter to CamelCase boundaries, score by path relevance, and take top N
         const termCandidates: SearchResult[] = [];
         for (const r of likeResults) {
           const name = r.node.name;
-          const idx = name.indexOf(titleCased);
+          // Case-INSENSITIVE hump lookup: title-casing lowercases interior
+          // humps (`profileInfo` → `Profileinfo`), which SQLite's LIKE still
+          // matched but a case-sensitive indexOf here silently dropped —
+          // making every multi-hump query term unfindable by this step
+          // (#1196). The match must still LAND on an uppercase char, so a
+          // plain lowercase infix can't slip through.
+          const idx = name.toLowerCase().indexOf(termKey);
           if (idx <= 0) continue;
+          if (!/[A-Z]/.test(name.charAt(idx))) continue;
           // Accept CamelCase boundary (lowercase before match) OR
           // acronym boundary (uppercase before match, e.g., RPCProtocol)
           if (!/[a-zA-Z]/.test(name.charAt(idx - 1))) continue;
           if (searchIdSet.has(r.node.id)) continue;
           if (isTestFile(r.node.filePath) && !isTestQuery) continue;
 
-          const pathScore = scorePathRelevance(r.node.filePath, query);
+          const pathScore = pathScoreOf(r.node.filePath);
           const brevityBonus = Math.max(0, 6 - (name.length - titleCased.length) / 4);
           termCandidates.push({ node: r.node, score: 8 + brevityBonus + pathScore });
         }
@@ -841,11 +992,19 @@ export class ContextBuilder {
           const titleCased = sym.charAt(0).toUpperCase() + sym.slice(1).toLowerCase();
           if (titleCased.length < 3) continue;
 
-          const likeResults = this.queries.findNodesByNameSubstring(titleCased, {
-            limit: 200,
-            kinds: camelDefinitionKinds,
-            excludePrefix: false,
-          });
+          const likeResults = [
+            ...this.queries.findNodesByNameSubstring(titleCased, {
+              limit: 200,
+              kinds: camelDefinitionKinds,
+              excludePrefix: false,
+            }),
+            // Same separate callable batch as Step 5b (#1196).
+            ...this.queries.findNodesByNameSubstring(titleCased, {
+              limit: 200,
+              kinds: camelCallableKinds,
+              excludePrefix: false,
+            }),
+          ];
 
           for (const r of likeResults) {
             if (searchIdSet.has(r.node.id)) continue;
@@ -863,7 +1022,7 @@ export class ContextBuilder {
         const compoundResults: SearchResult[] = [];
         for (const [, entry] of compoundTermMap) {
           if (entry.terms.size >= 2) {
-            const pathScore = scorePathRelevance(entry.node.filePath, query);
+            const pathScore = pathScoreOf(entry.node.filePath);
             const brevityBonus = Math.max(0, 6 - entry.node.name.length / 8);
             compoundResults.push({
               node: entry.node,
@@ -894,6 +1053,40 @@ export class ContextBuilder {
     // they want the TerminalPanel class, not the import statement
     filteredResults = this.resolveImportsToDefinitions(filteredResults);
 
+    // An exact filename is the query's requested entry point. Keep it ahead of
+    // broader text matches before applying the entry-point cap.
+    if (exactFileMatches.length > 0) {
+      const exactFileIds = new Set(exactFileMatches.map((result) => result.node.id));
+      filteredResults = [
+        ...exactFileMatches,
+        ...filteredResults.filter((result) => !exactFileIds.has(result.node.id)),
+      ];
+    }
+
+    // A named copybook leads too: its own declarations, then its include
+    // statements. When the query also matched other things, the copybook takes
+    // at most half the entry slots so they are not capped away.
+    const copybookIds = new Set(copybooks.entries.map((r) => r.node.id));
+    const leafEntryIds = new Set<string>();
+    if (copybooks.entries.length > 0) {
+      const matchedElsewhere = new Set(filteredResults.map((r) => r.node.id));
+      const others = filteredResults.filter((r) => !copybookIds.has(r.node.id));
+      // Include statements in a file the rest of the query also matched come
+      // first ("COACTUPC CVACT01Y" wants COACTUPC's COPY, not the first one by
+      // path). Stable, so the declarations stay ahead of every include.
+      const otherFiles = new Set(others.map((r) => r.node.filePath));
+      const rank = (r: SearchResult): number =>
+        !isCopybookInclude(r.node) ? 0 : otherFiles.has(r.node.filePath) ? 1 : 2;
+      const ordered = [...copybooks.entries].sort((a, b) => rank(a) - rank(b));
+      const kept = others.length > 0 ? ordered.slice(0, Math.ceil(opts.searchLimit / 2)) : ordered;
+      // The copybook's own entries are not walked: an include statement has
+      // nothing to walk but the program around it, and a record layout's
+      // neighbourhood is whichever program happens to MOVE into it — walking
+      // either spent the answer on unrelated paragraphs of an including program.
+      for (const r of kept) if (!matchedElsewhere.has(r.node.id)) leafEntryIds.add(r.node.id);
+      filteredResults = [...kept, ...others];
+    }
+
     // Cap entry points so traversal budget isn't spread too thin.
     // With 36 entry points and maxNodes=120, each gets only 3 nodes — useless.
     // Cap to searchLimit so each entry point gets a meaningful traversal budget.
@@ -916,6 +1109,8 @@ export class ContextBuilder {
         symbolsFromQuery.filter(isDistinctiveIdentifier).map(s => s.toLowerCase())
       );
       const anyStrong = filteredResults.some(r => {
+        // A copybook the query named is an exact identifier match, not prose.
+        if (copybookIds.has(r.node.id)) return true;
         if (distinctive.has(r.node.name.toLowerCase())) return true;
         const nameLower = r.node.name.toLowerCase();
         const dirSegs = path.dirname(r.node.filePath).toLowerCase().split('/');
@@ -941,20 +1136,23 @@ export class ContextBuilder {
     // before reaching extends/implements neighbors. This dedicated step
     // ensures subclasses and superclasses always appear in results.
     // Budget: up to maxNodes/4 hierarchy nodes to avoid flooding.
-    const typeHierarchyKinds = new Set<string>(['class', 'interface', 'struct', 'trait', 'protocol']);
+    const typeHierarchyKinds = new Set<string>(['class', 'interface', 'struct', 'union', 'trait', 'protocol']);
     const maxHierarchyNodes = Math.ceil(opts.maxNodes / 4);
     let hierarchyNodesAdded = 0;
     for (const result of filteredResults) {
       if (hierarchyNodesAdded >= maxHierarchyNodes) break;
       if (typeHierarchyKinds.has(result.node.kind)) {
         const hierarchy = this.traverser.getTypeHierarchy(result.node.id);
+        // The budget holds per node: a widely implemented interface brings
+        // its whole descendant tree (IDisposable: hundreds of types).
         for (const [id, node] of hierarchy.nodes) {
-          if (!nodes.has(id)) {
+          if (!nodes.has(id) && hierarchyNodesAdded < maxHierarchyNodes) {
             nodes.set(id, node);
             hierarchyNodesAdded++;
           }
         }
         for (const edge of hierarchy.edges) {
+          if (!nodes.has(edge.source) || !nodes.has(edge.target)) continue;
           const exists = edges.some(
             (e) => e.source === edge.source && e.target === edge.target && e.kind === edge.kind
           );
@@ -995,6 +1193,7 @@ export class ContextBuilder {
 
     // Traverse from each entry point
     for (const result of filteredResults) {
+      if (leafEntryIds.has(result.node.id)) continue;
       const traversalResult = this.traverser.traverseBFS(result.node.id, {
         maxDepth: opts.traversalDepth,
         edgeKinds: opts.edgeKinds && opts.edgeKinds.length > 0 ? opts.edgeKinds : undefined,
@@ -1121,7 +1320,7 @@ export class ContextBuilder {
 
     // Edge recovery: BFS with many entry points leaves most nodes disconnected.
     // Discover edges between already-selected nodes to recover connectivity.
-    const recoveryKinds: EdgeKind[] = ['calls', 'extends', 'implements', 'references', 'overrides'];
+    const recoveryKinds: EdgeKind[] = ['calls', 'extends', 'implements', 'references', 'overrides', 'navigates'];
     const recoveredEdges = this.queries.findEdgesBetweenNodes(
       [...finalNodes.keys()],
       recoveryKinds,
@@ -1138,6 +1337,45 @@ export class ContextBuilder {
     }
 
     return { nodes: finalNodes, edges: finalEdges, roots, confidence };
+  }
+
+  /**
+   * Entry points for the COBOL copybooks a query names (#2342): each indexed
+   * copybook's top-level declarations (its record layouts, or the paragraphs
+   * of a procedure copybook), then the include statements themselves — taken
+   * round-robin across the named members, so one widely-included copybook
+   * cannot crowd out another the query also names. `members` holds the
+   * matched member names, upper-cased. Both are empty when the query names no
+   * copybook, which is every query on a project without COBOL.
+   */
+  private findCopybookEntries(query: string): { entries: SearchResult[]; members: Set<string> } {
+    const named = findNamedCopybooks(this.queries, query);
+    const members = new Set(named.map((c) => c.member.toUpperCase()));
+    const entries: SearchResult[] = [];
+    const seen = new Set<string>();
+    const add = (node: Node): void => {
+      if (seen.has(node.id)) return;
+      seen.add(node.id);
+      entries.push({ node, score: 1 });
+    };
+    for (const copybook of named) {
+      for (const file of copybook.files) {
+        const declarationIds = this.queries.getOutgoingEdges(file.id, ['contains']).map((e) => e.target);
+        [...this.queries.getNodesByIds(declarationIds).values()]
+          .filter((n) => n.kind !== 'import' && n.kind !== 'export')
+          .sort((a, b) => a.startLine - b.startLine || a.id.localeCompare(b.id))
+          .slice(0, MAX_COPYBOOK_DECLARATION_ENTRIES)
+          .forEach(add);
+      }
+    }
+    const longest = Math.max(0, ...named.map((c) => c.includes.length));
+    for (let i = 0; i < longest; i++) {
+      for (const copybook of named) {
+        const include = copybook.includes[i];
+        if (include) add(include);
+      }
+    }
+    return { entries, members };
   }
 
   /**
@@ -1161,6 +1399,14 @@ export class ContextBuilder {
    * Extract code from a node's source file
    */
   private async extractNodeCode(node: Node): Promise<string | null> {
+    // SECURITY (#383): a config-leaf node's on-disk line is `key = <secret>`.
+    // Return the KEY only — never read the value off disk. This closes the
+    // includeCode / buildContext code-block path, mirroring the explore source
+    // renderer; an agent that genuinely needs a value can read the file itself.
+    if (isConfigLeafNode(node)) {
+      return node.signature || node.qualifiedName || node.name;
+    }
+
     const filePath = validatePathWithinRoot(this.projectRoot, node.filePath);
 
     if (!filePath || !fs.existsSync(filePath)) {

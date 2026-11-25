@@ -123,4 +123,189 @@ export function onMessage(listener: (m: any) => void) {
     expect(edge.target_name).toBe('onMessage');
     expect(['function', 'method']).toContain(edge.target_kind);
   });
+  it('synthesizes an edge from a Java sendEvent(ctx, "X", body) wrapper to a JS handler', async () => {
+    fs.writeFileSync(path.join(dir, 'package.json'), '{"dependencies":{"react-native":"^0.74.0"}}');
+    // The literal event name lives in the WRAPPER CALL, not in `.emit` (whose
+    // first arg is the `eventName` VARIABLE) — the common react-native-device-info
+    // shape that RN_JVM_EMIT_RE alone misses.
+    fs.writeFileSync(path.join(dir, 'BatteryModule.java'),
+      'public class BatteryModule extends ReactContextBaseJavaModule {\n' +
+      '  @Override public String getName() { return "BatteryModule"; }\n' +
+      '  public void onBatteryChanged() {\n' +
+      '    sendEvent(getReactApplicationContext(),\n' +
+      '      "myWrapperBatteryEvent", null);\n' +
+      '  }\n' +
+      '  private void sendEvent(ReactContext ctx, String eventName, Object data) {\n' +
+      '    ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class).emit(eventName, data);\n' +
+      '  }\n' +
+      '}\n');
+    fs.writeFileSync(path.join(dir, 'index.ts'),
+      "function onBattery() {}\n" +
+      "emitter.addListener('myWrapperBatteryEvent', onBattery);\n");
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const rows = db.prepare(
+      "SELECT s.name source_name, s.language sl, t.name target_name FROM edges e " +
+      "JOIN nodes s ON s.id=e.source JOIN nodes t ON t.id=e.target " +
+      "WHERE json_extract(e.metadata,'$.synthesizedBy')='rn-event-channel' AND json_extract(e.metadata,'$.event')='myWrapperBatteryEvent'"
+    ).all();
+    cg.close?.();
+    expect(rows.length).toBeGreaterThanOrEqual(1);
+    expect(rows[0].sl).toBe('java');
+    expect(rows[0].source_name).toBe('onBatteryChanged');
+    expect(rows[0].target_name).toBe('onBattery');
+  });
+});
+
+describe('RN event channel synthesizer — inline listeners', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rn-event-inline-'));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('attributes an inline arrow listener to the enclosing component, from a Swift sendEvent(withName:)', async () => {
+    fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"x","dependencies":{"react-native":"^0.76"}}');
+    fs.writeFileSync(
+      path.join(dir, 'CaptureEvents.swift'),
+      `import Foundation
+class CaptureEvents: RCTEventEmitter {
+  func emitZipComplete() {
+    sendEvent(withName: "onZipComplete", body: ["ok": true])
+  }
+  func emitProgress() {
+    sendEvent(withName: "onCaptureProgress", body: nil)
+  }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'App.tsx'),
+      `import { useEffect } from 'react'
+export default function ReviewScreen() {
+  useEffect(() => {
+    const zip = nativeEmitter.addListener('onZipComplete', (data) => {
+      upload(data)
+    })
+    const progress = nativeEmitter.addListener('onCaptureProgress', async function () {
+      await tick()
+    })
+    return () => {
+      zip.remove()
+      progress.remove()
+    }
+  }, [])
+  return null
+}
+function upload(d: unknown) {}
+function tick() {}
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const rows = db
+      .prepare(
+        `SELECT s.name source_name, t.name target_name, json_extract(e.metadata,'$.event') event,
+                json_extract(e.metadata,'$.registeredAt') registered_at
+         FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'rn-event-channel'
+         ORDER BY event`
+      )
+      .all();
+    cg.close?.();
+    expect(rows.map((r: any) => [r.source_name, r.target_name, r.event])).toEqual([
+      ['emitProgress', 'ReviewScreen', 'onCaptureProgress'],
+      ['emitZipComplete', 'ReviewScreen', 'onZipComplete'],
+    ]);
+    expect(rows[1].registered_at).toBe('App.tsx:4');
+  });
+});
+
+describe('RN event channel — event names held in constants', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rn-event-const-'));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const write = (rel: string, content: string) => {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), content);
+  };
+  const channel = (cg: CodeGraph) =>
+    ((cg as any).db.db
+      .prepare(
+        `SELECT s.name s, t.name t, json_extract(e.metadata,'$.event') event FROM edges e
+         JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'rn-event-channel' ORDER BY s, t`
+      )
+      .all() as Array<{ s: string; t: string; event: string }>).map((r) => `${r.s} -> ${r.t} (${r.event})`);
+
+  it('NetInfo: a JS listener on `PrivateTypes.DEVICE_CONNECTIVITY_EVENT`, native sends the literal', async () => {
+    write('package.json', '{"name":"netinfo","dependencies":{"react-native":"^0.73"}}');
+    write('ios/RNCNetInfo.m', `@implementation RNCNetInfo
+- (void)connectionChanged {
+  [self sendEventWithName:@"netInfo.networkStatusDidChange" body:@{}];
+}
+@end
+`);
+    write('src/internal/privateTypes.ts', `export const DEVICE_CONNECTIVITY_EVENT = 'netInfo.networkStatusDidChange';
+`);
+    write('src/internal/state.ts', `import * as PrivateTypes from './privateTypes';
+export default class State {
+  start(emitter: any) {
+    emitter.addListener(
+      PrivateTypes.DEVICE_CONNECTIVITY_EVENT,
+      this._handleNativeStateUpdate,
+    );
+  }
+  _handleNativeStateUpdate(state: unknown) { return state; }
+}
+`);
+    const cg = await CodeGraph.init(dir, { index: true });
+    try {
+      expect(channel(cg)).toEqual(['connectionChanged -> _handleNativeStateUpdate (netInfo.networkStatusDidChange)']);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('a Java constant emit and a Kotlin const val meet a JS literal listener', async () => {
+    write('package.json', '{"name":"lib","dependencies":{"react-native":"^0.73"}}');
+    write('android/src/main/java/app/Tracker.java', `package app;
+public class Tracker {
+  private static final String PROGRESS_EVENT = "downloadProgress";
+  void report(ReactContext ctx) {
+    ctx.getJSModule(RCTDeviceEventEmitter.class).emit(PROGRESS_EVENT, null);
+  }
+}
+`);
+    write('android/src/main/java/app/Finisher.kt', `package app
+const val DONE_EVENT = "downloadDone"
+class Finisher {
+  fun finish(ctx: ReactContext) {
+    sendEvent(ctx, DONE_EVENT, null)
+  }
+}
+`);
+    write('src/index.js', `export function onProgress(e) { return e; }
+export function onDone(e) { return e; }
+emitter.addListener('downloadProgress', onProgress);
+emitter.addListener('downloadDone', onDone);
+`);
+    const cg = await CodeGraph.init(dir, { index: true });
+    try {
+      expect(channel(cg)).toEqual(['finish -> onDone (downloadDone)', 'report -> onProgress (downloadProgress)']);
+    } finally {
+      cg.close();
+    }
+  });
 });

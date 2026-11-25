@@ -1,0 +1,51 @@
+// codegraph telemetry dashboard — see README.md.
+// Secrets are NOT configured here: ADMIN_PASSWORD and SESSION_SECRET are set
+// via `wrangler secret put`.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "codegraph-telemetry-dashboard",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-28",
+
+  // Private admin surface. Same pattern as the ingest worker: a custom domain
+  // that auto-provisions DNS + cert from the getcodegraph.com zone, with
+  // workers.dev off so there is no second, undocumented way in.
+  "routes": [{ "pattern": "stats.getcodegraph.com", "custom_domain": true }],
+  "workers_dev": false,
+
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+
+  // `run_worker_first: true` is load-bearing. Without it Cloudflare serves a
+  // matching static asset BEFORE the worker runs, which would hand out the
+  // dashboard — and its data — to anyone who guesses a filename. With it, every
+  // request goes through src/index.ts and only an authenticated one is proxied
+  // on to ASSETS.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "none"
+  },
+
+  // The ingest worker's database, read-only from here. Migrations live with the
+  // writer: telemetry-worker/migrations/.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "codegraph-telemetry",
+      "database_id": "5ed36dfb-d2d7-4e35-9e63-a1b99d0b1ed3"
+    }
+  ],
+
+  // Brute-force cap on the shared password, keyed by client IP. Two humans sign
+  // in roughly once a year each; 5/min is generous for a typo and useless for a
+  // guessing attack.
+  "ratelimits": [
+    {
+      "name": "LOGIN_RATE_LIMITER",
+      "namespace_id": "2001",
+      "simple": { "limit": 5, "period": 60 }
+    }
+  ]
+}

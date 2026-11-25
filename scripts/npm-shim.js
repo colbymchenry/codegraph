@@ -45,7 +45,14 @@ async function main() {
   // Happy path: the npm-installed optional dependency. Fall back to a download
   // when the registry didn't deliver it.
   var resolved = resolveInstalledBundle() || (await selfHealBundle());
-  var res = childProcess.spawnSync(resolved.command, resolved.args, { stdio: 'inherit' });
+  // Thread the MCP host's pid (our parent) down to the bundled server so its
+  // orphan watchdog can poll the host directly. Without this, the server can
+  // only watch THIS shim — and a shim killed during the server's first ~100ms
+  // of startup used to leave the server orphaned forever (issue #1185). An
+  // already-set value (an outer launcher) wins.
+  var env = Object.assign({}, process.env);
+  if (!env.CODEGRAPH_HOST_PPID) env.CODEGRAPH_HOST_PPID = String(process.ppid);
+  var res = childProcess.spawnSync(resolved.command, resolved.args, { stdio: 'inherit', windowsHide: true, env: env });
   if (res.error) {
     process.stderr.write('codegraph: ' + res.error.message + '\n');
     process.exit(1);
@@ -91,8 +98,12 @@ function launcherIn(dir) {
 // --liftoff-only keeps tree-sitter's WASM grammars off V8's turboshaft tier to
 // avoid the Zone OOM on Node >= 22 (issues #293/#298). The unix bin/codegraph
 // launcher already passes it; on Windows we invoke node.exe directly so add it.
+// --disable-warning=ExperimentalWarning mutes node:sqlite's per-thread
+// "experimental feature" warning, which otherwise prints once per parse worker
+// mid-index, shredding the progress UI. The bundled node.exe is always new
+// enough for both flags.
 function liftoff(entry) {
-  return ['--liftoff-only', entry].concat(process.argv.slice(2));
+  return ['--liftoff-only', '--disable-warning=ExperimentalWarning', entry].concat(process.argv.slice(2));
 }
 
 // Download + cache the platform bundle from GitHub Releases. Returns
@@ -105,7 +116,7 @@ async function selfHealBundle() {
   // Already downloaded by a previous run? Use it even when downloads are
   // disabled — CODEGRAPH_NO_DOWNLOAD blocks fetching, not a cached bundle.
   var cached = launcherIn(dest);
-  if (cached) return cached;
+  if (cached) { pruneOldBundles(bundlesDir, dest); return cached; }
 
   if (process.env.CODEGRAPH_NO_DOWNLOAD) {
     fail('the network fallback is disabled (CODEGRAPH_NO_DOWNLOAD is set).');
@@ -149,6 +160,7 @@ async function selfHealBundle() {
 
   var ready = launcherIn(dest);
   if (!ready) fail('downloaded bundle is missing its launcher under ' + dest + '.');
+  pruneOldBundles(bundlesDir, dest);
   process.stderr.write('codegraph: bundle ready.\n');
   return ready;
 }
@@ -221,13 +233,34 @@ function extract(archive, destDir) {
   var args = isWindows
     ? ['-xf', archive, '-C', destDir, '--strip-components=1']
     : ['-xzf', archive, '-C', destDir, '--strip-components=1'];
-  var res = childProcess.spawnSync('tar', args, { stdio: 'ignore' });
+  var res = childProcess.spawnSync('tar', args, { stdio: 'ignore', windowsHide: true });
   if (res.error) throw new Error('tar unavailable: ' + res.error.message);
   if (res.status !== 0) throw new Error('tar exited ' + res.status);
 }
 
 function rmrf(p) {
   try { fs.rmSync(p, { recursive: true, force: true }); } catch (e) { /* best effort */ }
+}
+
+// Drop sibling bundles for OTHER versions of this same platform target, keeping
+// only keepDir. The self-heal cache otherwise accumulates a full ~50 MB bundle
+// per version forever (issue #1074). Best-effort: a locked/busy dir (a
+// concurrent run still mapping an older node.exe on Windows) just stays — rmrf
+// already swallows its own errors, and the readdir is guarded — so cleanup can
+// never break a working command. Only this target's "<target>-<version>" dirs
+// are touched; other platforms' bundles and the ".dl-*" staging dirs are left
+// alone.
+function pruneOldBundles(bundlesDir, keepDir) {
+  var keep = path.basename(keepDir);
+  try {
+    var names = fs.readdirSync(bundlesDir);
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i];
+      if (name === keep) continue;
+      if (name.indexOf(target + '-') !== 0) continue;
+      rmrf(path.join(bundlesDir, name));
+    }
+  } catch (e) { /* best effort — never break a working run over cleanup */ }
 }
 
 function fail(reason) {

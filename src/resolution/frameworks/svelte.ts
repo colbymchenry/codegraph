@@ -45,6 +45,9 @@ const SVELTEKIT_MODULE_PREFIXES = [
 export const svelteResolver: FrameworkResolver = {
   name: 'svelte',
   languages: ['svelte'],
+  // Runes are written in `.svelte.ts` / `.svelte.js` modules too, and a
+  // SvelteKit `+page.ts` or `hooks.server.ts` imports `$lib/…` and `$app/…`.
+  resolveLanguages: ['svelte', 'typescript', 'javascript'],
 
   detect(context: ResolutionContext): boolean {
     // Check for svelte or @sveltejs/kit in package.json
@@ -80,8 +83,10 @@ export const svelteResolver: FrameworkResolver = {
       };
     }
 
-    // Pattern 2: Store auto-subscriptions ($storeName)
-    if (ref.referenceName.startsWith('$') && !ref.referenceName.startsWith('$$')) {
+    // Pattern 2: Store auto-subscriptions ($storeName) — a `.svelte`
+    // component's syntax only. In any other script `$n` is a name of its own
+    // (jQuery's `$el`, a compiler's `$n`), never the store `n`.
+    if (ref.language === 'svelte' && ref.referenceName.startsWith('$') && !ref.referenceName.startsWith('$$')) {
       const storeName = ref.referenceName.substring(1);
       const storeNode = context.getNodesByName(storeName).find(
         (n) => n.kind === 'variable' || n.kind === 'constant'
@@ -153,7 +158,12 @@ export const svelteResolver: FrameworkResolver = {
     const fileName = filePath.split(/[/\\]/).pop() || '';
     const routeMatch = getSvelteKitRouteInfo(fileName);
 
-    if (routeMatch) {
+    // Only a `+page.svelte` is a URL. A `+layout.svelte` and a `+error.svelte`
+    // sit at the same path as the page beside them, so emitting a route for
+    // them put the same address in the index two and three times over — one
+    // `/` for the page, one for the layout, one for the error page — which the
+    // Screens picture then drew as three separate screens.
+    if (routeMatch === 'page') {
       // Extract route path from directory structure
       // e.g., src/routes/blog/[slug]/+page.svelte -> /blog/:slug
       const routePath = filePathToSvelteKitRoute(filePath);
@@ -220,7 +230,11 @@ function resolveComponent(
   const sameDir = components.filter((n) => n.filePath.startsWith(fromDir));
   if (sameDir.length > 0) return sameDir[0]!.id;
 
-  return components[0]!.id;
+  // No positional signal: only an UNAMBIGUOUS name may resolve — picking
+  // components[0] chose an arbitrary same-named component in a multi-app
+  // monorepo (#764). Ambiguity falls through to the name-matcher, whose
+  // proximity scoring decides.
+  return components.length === 1 ? components[0]!.id : null;
 }
 
 /**
@@ -267,11 +281,14 @@ function filePathToSvelteKitRoute(filePath: string): string | null {
   const lastSlash = afterRoutes.lastIndexOf('/');
   const dirPath = lastSlash === -1 ? '' : afterRoutes.substring(0, lastSlash);
 
-  // Convert SvelteKit param syntax [param] to :param
-  let route = '/' + dirPath
-    .replace(/\[\.\.\.([^\]]+)\]/g, '*$1')  // [...rest] -> *rest
-    .replace(/\[{2}([^\]]+)\]{2}/g, ':$1?') // [[optional]] -> :optional?
-    .replace(/\[([^\]]+)\]/g, ':$1');        // [param] -> :param
+  // A `(group)` directory shares a layout and never appears in the URL:
+  // `(app)/(layout)/blocks` is `/blocks`. A parameter's `=matcher` checks
+  // its value and is no part of its name.
+  const segments = dirPath.split('/').filter((seg) => seg.length > 0 && !/^\(.*\)$/.test(seg));
+  let route = '/' + segments.join('/')
+    .replace(/\[\.\.\.([^\]=]+)(?:=[^\]]*)?\]/g, '*$1')  // [...rest] / [...rest=m] -> *rest
+    .replace(/\[{2}([^\]=]+)(?:=[^\]]*)?\]{2}/g, ':$1?') // [[optional]] -> :optional?
+    .replace(/\[([^\]=]+)(?:=[^\]]*)?\]/g, ':$1');        // [param] / [param=m] -> :param
 
   if (route === '/') return '/';
   // Remove trailing slash

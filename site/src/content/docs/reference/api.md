@@ -43,3 +43,27 @@ cg.close();
 | `buildContext(task, opts)` | Markdown / JSON context for AI |
 | `watch()` / `unwatch()` | Start / stop the file watcher |
 | `close()` | Close the database connection |
+
+CommonJS works too — `const { CodeGraph } = require('@colbymchenry/codegraph');`.
+
+## Lower-level building blocks
+
+The same entry point exports primitives for callers that drive the graph directly rather than through the `CodeGraph` facade: `DatabaseConnection`, `QueryBuilder`, `getDatabasePath`, `initGrammars` / `loadGrammarsForLanguages`, and `FileLock`.
+
+```typescript
+import {
+  CodeGraph,
+  DatabaseConnection,
+  QueryBuilder,
+  getDatabasePath,
+  initGrammars,
+  loadGrammarsForLanguages,
+  FileLock,
+} from '@colbymchenry/codegraph';
+```
+
+## Embedding requirements
+
+- **Install from npm** (`npm i @colbymchenry/codegraph`) so the matching per-platform package — which carries the compiled library — is fetched alongside the shim.
+- The API runs on **your** runtime, so it needs **Node 22.5+** for the built-in `node:sqlite` module (an Electron main process qualifies when its bundled Node is 22.5+). The CLI and MCP server are unaffected — they ship with a self-contained bundled runtime and need no Node at all.
+- TypeScript types ship with the package. Keep `@types/node` available and `skipLibCheck: true` (the common default).

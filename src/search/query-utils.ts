@@ -4,8 +4,54 @@
  * Shared module for search term extraction and scoring.
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 import { Node } from '../types';
+
+/** Normalize a name to a comparable token: lowercase, alphanumerics only. */
+export function normalizeNameToken(raw: string): string {
+  return raw.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Tokens that name the PROJECT as a whole — its `go.mod` module, `package.json`
+ * name, or repo root directory — rather than any specific symbol. A user
+ * naturally puts the project name in a query as context ("MyApp backend
+ * routes"), but it carries no discriminative signal: when it's also a substring
+ * of a symbol or path on one stack (a `MyAppFrontend/` dir, a `MyAppApp` class)
+ * it lexically inflates that stack and buries the rest (#720).
+ *
+ * Returned normalized (lowercase, alphanumerics only) so a query word can be
+ * compared by its normalized form. Only names ≥5 chars are kept — short ones
+ * (`api`, `app`, `core`, `web`) collide with real query terms too often to
+ * safely down-weight.
+ */
+export function deriveProjectNameTokens(projectRoot: string): Set<string> {
+  const tokens = new Set<string>();
+  const add = (raw: string | undefined | null): void => {
+    if (!raw) return;
+    const norm = normalizeNameToken(raw);
+    if (norm.length >= 5) tokens.add(norm);
+  };
+
+  // go.mod module last segment (the most reliable signal for Go repos).
+  try {
+    const gomod = fs.readFileSync(path.join(projectRoot, 'go.mod'), 'utf-8');
+    const m = gomod.match(/^\s*module\s+(\S+)/m);
+    if (m && m[1]) add(m[1].split('/').pop());
+  } catch { /* no go.mod */ }
+
+  // package.json name (strip an `@scope/` prefix).
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf-8'));
+    if (typeof pkg.name === 'string') add(pkg.name.replace(/^@[^/]+\//, ''));
+  } catch { /* no / invalid package.json */ }
+
+  // Repo root directory name — a fallback when neither manifest names the project.
+  add(path.basename(path.resolve(projectRoot)));
+
+  return tokens;
+}
 
 /**
  * Common stop words to filter from search queries.
@@ -169,33 +215,120 @@ export function extractSearchTerms(query: string, options?: { stems?: boolean })
 }
 
 /**
+ * The query half of {@link scorePathRelevance}: the sub-tokens of each query
+ * word that is scored, with how many times the word occurs, and whether the
+ * query is about tests.
+ */
+interface PathRelevanceQuery {
+  projectNameTokens: Set<string> | undefined;
+  /** No words at all: every path scores 0. */
+  empty: boolean;
+  words: Array<{ subtokens: string[]; count: number }>;
+  isTestQuery: boolean;
+}
+
+/**
+ * The few most recent queries' halves. A search scores every candidate path
+ * against one query, and re-splitting every word of it for each path was
+ * most of the scoring time on a long query: a pasted page is hundreds of
+ * words, and explore scores thousands of paths (#2620).
+ */
+const pathRelevanceQueries = new Map<string, PathRelevanceQuery>();
+const PATH_RELEVANCE_QUERY_CACHE = 8;
+
+function pathRelevanceQuery(query: string, projectNameTokens: Set<string> | undefined): PathRelevanceQuery {
+  const cached = pathRelevanceQueries.get(query);
+  if (cached && cached.projectNameTokens === projectNameTokens) return cached;
+
+  // Score per original query WORD, not per sub-token. A single PascalCase word
+  // splits into many sub-tokens (a project name "SuperBizAgent" →
+  // superbizagent / super / biz / agent) that all match the SAME path segment,
+  // so summing per sub-token boosted that path 4× for one concept — enough to
+  // bury the rest of the query's stack (#720). A word matches a path level if
+  // ANY of its sub-tokens do, and counts ONCE; distinct words still each add.
+  // Split the ORIGINAL-case query into words; extractSearchTerms does the
+  // camelCase/snake split per word (so `getUserName` still matches a
+  // `get_user_name` path) — we just attribute each word's matches once.
+  const allWords = query.split(/\s+/).filter((w) => w.length > 0);
+
+  // A query word that just names the PROJECT (its go.mod / package.json / repo
+  // name) carries no discriminative path signal — drop it so the rest of the
+  // query decides the ranking, instead of every file under a `<ProjectName>…/`
+  // tree winning on the project name alone (#720). Only when OTHER words remain,
+  // so a bare project-name query still scores on its path.
+  const kept =
+    projectNameTokens && projectNameTokens.size > 0
+      ? allWords.filter((w) => !projectNameTokens.has(normalizeNameToken(w)))
+      : allWords;
+  const scored = kept.length > 0 ? kept : allWords;
+
+  // A word that occurs twice adds its score twice; words with the same
+  // sub-tokens score alike, so each such group is matched once and counted.
+  const groups = new Map<string, { subtokens: string[]; count: number }>();
+  for (const word of scored) {
+    // Use base terms only — stem variants inflate path scores by generating
+    // many near-duplicate terms that all match the same path segments.
+    const subtokens = extractSearchTerms(word, { stems: false });
+    if (subtokens.length === 0) continue;
+    const key = subtokens.join('\u0000');
+    const group = groups.get(key);
+    if (group) group.count++;
+    else groups.set(key, { subtokens, count: 1 });
+  }
+
+  const queryLower = query.toLowerCase();
+  const prepared: PathRelevanceQuery = {
+    projectNameTokens,
+    empty: allWords.length === 0,
+    words: [...groups.values()],
+    isTestQuery: queryLower.includes('test') || queryLower.includes('spec'),
+  };
+  pathRelevanceQueries.delete(query);
+  pathRelevanceQueries.set(query, prepared);
+  if (pathRelevanceQueries.size > PATH_RELEVANCE_QUERY_CACHE) {
+    pathRelevanceQueries.delete(pathRelevanceQueries.keys().next().value!);
+  }
+  return prepared;
+}
+
+/**
  * Score path relevance to a query
  * Higher score = more relevant path
  */
-export function scorePathRelevance(filePath: string, query: string): number {
-  // Use base terms only — stem variants inflate path scores by generating
-  // many near-duplicate terms that all match the same path segments.
-  const terms = extractSearchTerms(query, { stems: false });
-  if (terms.length === 0) return 0;
+export function scorePathRelevance(
+  filePath: string,
+  query: string,
+  projectNameTokens?: Set<string>,
+  isDeprioritized?: boolean,
+): number {
+  const prepared = pathRelevanceQuery(query, projectNameTokens);
+  if (prepared.empty) return 0;
 
   const pathLower = filePath.toLowerCase();
   const fileName = path.basename(filePath).toLowerCase();
   const dirName = path.dirname(filePath).toLowerCase();
   let score = 0;
 
-  for (const term of terms) {
+  for (const { subtokens, count } of prepared.words) {
     // Exact filename match (strongest)
-    if (fileName.includes(term)) score += 10;
+    if (subtokens.some((t) => fileName.includes(t))) score += 10 * count;
     // Directory match
-    if (dirName.includes(term)) score += 5;
+    if (subtokens.some((t) => dirName.includes(t))) score += 5 * count;
     // General path match
-    else if (pathLower.includes(term)) score += 3;
+    else if (subtokens.some((t) => pathLower.includes(t))) score += 3 * count;
   }
 
-  // Deprioritize test files unless the query is explicitly about tests
-  const queryLower = query.toLowerCase();
-  const isTestQuery = queryLower.includes('test') || queryLower.includes('spec');
-  if (!isTestQuery && isTestFile(filePath)) {
+  // Deprioritize test files unless the query is explicitly about tests, and
+  // apply the same -15 to a path the project declared peripheral (#982).
+  //
+  // Two deliberate asymmetries, both pinned by tests:
+  //  - the built-in test/fixture penalty is waived for a test-y query, because
+  //    the tool inferred that classification; a `deprioritize` pattern is a
+  //    standing statement by the project, so it is NOT waived. The name-bonus
+  //    damping at the call site is what keeps such a tree findable.
+  //  - a path that is both is docked ONCE, not twice.
+  const offTarget = (!prepared.isTestQuery && isTestFile(filePath)) || isDeprioritized === true;
+  if (offTarget) {
     score -= 15;
   }
 
@@ -204,8 +337,29 @@ export function scorePathRelevance(filePath: string, query: string): number {
 
 /**
  * Check if a file path looks like a test file
+ *
+ * "Test" here is the wide reading: anything that is not production code,
+ * including examples, samples, benchmarks and fixtures. That is the right
+ * default for ranking — none of them are what a search is looking for — but it
+ * is the wrong set to put under a heading that says "Tests". A caller that
+ * means literally a test suite wants {@link isTestPath}.
  */
 export function isTestFile(filePath: string): boolean {
+  // Non-production directories: examples, samples, benchmarks, fixtures, demos.
+  // Check both mid-path (/integration/) and start-of-path (integration/) since
+  // file paths may be stored as relative paths without a leading slash.
+  return isTestPath(filePath) || matchesNonProductionDir(filePath.toLowerCase());
+}
+
+/**
+ * Check if a file path names a TEST — a suite that exercises other code.
+ *
+ * The narrow half of {@link isTestFile}: the filename and directory
+ * conventions every ecosystem uses for its test suites, and nothing else. An
+ * example, a benchmark or a fixture is not a test, and a list headed "Tests"
+ * that contains them is telling the reader something untrue.
+ */
+export function isTestPath(filePath: string): boolean {
   const lower = filePath.toLowerCase();
   const fileName = path.basename(filePath);   // original case — needed for camelCase boundaries
   const lowerName = fileName.toLowerCase();
@@ -214,8 +368,10 @@ export function isTestFile(filePath: string): boolean {
   if (
     lowerName.startsWith('test_') ||                              // python: test_foo.py
     lowerName.startsWith('test.') ||
-    // separator-delimited: foo_test.go, foo.test.ts, foo-spec.rb, bar_spec.py
-    /[._-](test|tests|spec|specs)\.[a-z0-9]+$/.test(lowerName) ||
+    // separator-delimited: foo_test.go, foo.test.ts, foo-spec.rb, bar_spec.py,
+    // and Google's C++ foo_unittest.cc (protobuf, Chromium). A bare
+    // `unittest.go` is no test: promtool's is the code that runs rule tests.
+    /[._-](test|tests|unittest|unittests|spec|specs)\.[a-z0-9]+$/.test(lowerName) ||
     // CamelCase suffix (Java/Kotlin/Swift/C#/Scala): FooTest.kt, BarTests.swift,
     // BazSpec.scala, QuxTestCase.java. Capital-led so "latest.kt"/"manifest.kt"
     // (lowercase "test") are NOT matched.
@@ -229,21 +385,27 @@ export function isTestFile(filePath: string): boolean {
     lower.includes('/tests/') || lower.includes('/test/') ||
     lower.includes('/__tests__/') || lower.includes('/spec/') ||
     lower.includes('/specs/') || lower.includes('/testlib/') ||
-    lower.includes('/testing/') ||
+    lower.includes('/testing/') || lower.includes('/e2e/') ||
     lower.startsWith('test/') || lower.startsWith('tests/') ||
     lower.startsWith('spec/') || lower.startsWith('specs/') ||
+    lower.startsWith('e2e/') ||
     // CamelCase test source-set dirs (Kotlin Multiplatform / Gradle / Xcode):
     // jvmTest/, commonTest/, androidTest/, iosTest/, integrationTest/. Capital-led
     // so "latest/" / "manifest/" are not matched.
-    /(?:^|\/)[A-Za-z0-9]*(?:Test|Tests|Spec)\//.test(filePath)
+    /(?:^|\/)[A-Za-z0-9]*(?:Test|Tests|Spec)\//.test(filePath) ||
+    // Test-support modules and doubles by directory name: Gradle's
+    // `core/data-test/`, `core/datastore-test/`, `:testing`; Go's `testdata/`;
+    // `testutil(s)/`, `test-utils/`, `fakes/`, `mocks/`, `__mocks__/`.
+    /(?:^|\/)(?:[\w.]+[-_]test(?:s|ing)?|testdata|testutils?|test[-_]utils?|fakes?|mocks?|__mocks__|stubs)\//.test(lower) ||
+    // Unit-test trees: LLVM's and Breakpad's `unittests/`, glog's
+    // `dcheck_unittest/`. Not a bare `unittest/`: CPython's `Lib/unittest/` is
+    // the framework itself.
+    /(?:^|\/)(?:unittests|[\w.]+[-_]unittests?)\//.test(lower)
   ) {
     return true;
   }
 
-  // Non-production directories: examples, samples, benchmarks, fixtures, demos.
-  // Check both mid-path (/integration/) and start-of-path (integration/) since
-  // file paths may be stored as relative paths without a leading slash.
-  return matchesNonProductionDir(lower);
+  return false;
 }
 
 /**
@@ -255,8 +417,13 @@ function matchesNonProductionDir(lowerPath: string): boolean {
     'integration', 'sample', 'samples', 'example', 'examples',
     'fixture', 'fixtures', 'benchmark', 'benchmarks', 'demo', 'demos',
   ];
+  // Only the project layout above a `src/` counts, never the package path
+  // below it: `core/data/src/main/kotlin/com/google/samples/apps/…` is a
+  // Google sample by name and production code by layout.
+  const src = lowerPath.indexOf('/src/');
+  const scope = src >= 0 ? lowerPath.slice(0, src + 1) : lowerPath.startsWith('src/') ? '' : lowerPath;
   for (const dir of dirs) {
-    if (lowerPath.includes('/' + dir + '/') || lowerPath.startsWith(dir + '/')) {
+    if (scope.includes('/' + dir + '/') || scope.startsWith(dir + '/')) {
       return true;
     }
   }
@@ -321,6 +488,7 @@ export function kindBonus(kind: Node['kind']): number {
     interface: 9,
     type_alias: 6,
     struct: 6,
+    union: 6,
     trait: 9,
     enum: 5,
     component: 8,

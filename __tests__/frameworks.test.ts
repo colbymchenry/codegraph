@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import type { FrameworkResolver, UnresolvedRef } from '../src/resolution/types';
 import type { Node } from '../src/types';
 
@@ -244,6 +244,186 @@ describe('expressResolver.extract', () => {
     const src = `app.get('/x', userController.list);\n`;
     const { nodes, references } = expressResolver.extract!('routes.ts', src);
     expect(references[0].referenceName).toBe('list');
+  });
+
+  // Only the handler — the LAST argument — decides whether the route has an
+  // inline body. An arrow inside a middleware argument used to make the whole
+  // route "inline", attributing the middleware's calls to it and dropping the
+  // named handler.
+  const refsOf = (src: string) =>
+    expressResolver.extract!('routes.ts', src).references.map((r) => `${r.referenceKind}:${r.referenceName}`);
+
+  it('keeps the named handler when a middleware argument holds an arrow', () => {
+    const refs = refsOf(`router.get('/users', rateLimit({ keyGenerator: (req) => lookup(req.ip) }), getUsers);\n`);
+    expect(refs).toContain('references:getUsers');
+    expect(refs).not.toContain('calls:lookup');
+  });
+
+  it('keeps the named handler after an inline arrow middleware', () => {
+    const refs = refsOf(`router.get('/x', (req, res, next) => audit(req, next), getUsers);\n`);
+    expect(refs).toContain('references:getUsers');
+    expect(refs).not.toContain('calls:audit');
+  });
+
+  it('still reads an inline handler, wrapped or after named middleware', () => {
+    expect(refsOf(`router.post('/x', asyncHandler(async (req, res) => { createItem(req.body); }));\n`)).toContain('calls:createItem');
+    const afterAuth = refsOf(`router.post('/x', auth, async (req, res) => { createItem(req.body); });\n`);
+    expect(afterAuth).toContain('calls:createItem');
+    expect(afterAuth).not.toContain('references:auth');
+  });
+
+  it('reads a `function` expression handler', () => {
+    expect(refsOf(`router.get('/x', function (req, res) { listUsers(); });\n`)).toContain('calls:listUsers');
+  });
+
+  it('a `function` handler whose body holds an arrow keeps every call', () => {
+    const plain = refsOf(`router.get('/x', function (req, res) { const u = findUser(req.id); res.json(u.items.map((i) => shape(i))); });\n`);
+    expect(plain).toContain('calls:findUser');
+    expect(plain).toContain('calls:shape');
+    const chained = refsOf(`router.route('/x').get(function (req, res) { const a = load(); a.forEach((x) => shape(x)); });\n`);
+    expect(chained).toContain('calls:load');
+    expect(chained).toContain('calls:shape');
+  });
+
+  it('a `function` elsewhere in the argument is not the handler', () => {
+    expect(refsOf(`router.get('/x', (req, res, cb = function () {}) => { svc(); });\n`)).toContain('calls:svc');
+    expect(refsOf(`router.get('/x', wrap(ctrl.list, { onError: function (e) { report(e); } }));\n`)).not.toContain('calls:report');
+    expect(refsOf(`router.get('/x', asyncHandler(function (req, res) { svc(); }));\n`)).toContain('calls:svc');
+  });
+
+  it('a `function` callback before the handler inside a wrapper is not the handler', () => {
+    const refs = refsOf(`router.get('/x', withErrors(function onErr(e) { report(e); }, async (req, res) => { svc(); }));\n`);
+    expect(refs).toContain('calls:svc');
+    expect(refs).not.toContain('calls:report');
+  });
+
+  it('a regex literal in an argument does not throw off the split', () => {
+    expect(refsOf(`router.get('/x', body('tags').matches(/^[^\\]]+$/), getUsers);\n`)).toContain('references:getUsers');
+    expect(refsOf(`router.get('/x', check('q').matches(/\\[/), getUsers);\n`)).toContain('references:getUsers');
+    const inline = refsOf(`router.get('/x', async (req, res) => { const re = /[^]]/, out = compute(req); save(out); });\n`);
+    expect(inline).toContain('calls:compute');
+    expect(inline).toContain('calls:save');
+  });
+
+  it('keywords in a handler body are not calls', () => {
+    const refs = refsOf(`router.get('/x', function (req, res) { if (ok(req)) { for (const a of b) run(a); } items.forEach(function (i) { shape(i); }); });\n`);
+    expect(refs).toEqual(expect.arrayContaining(['calls:ok', 'calls:run', 'calls:shape']));
+    expect(refs.filter((r) => /^calls:(if|for|function|while|switch|catch|return)$/.test(r))).toEqual([]);
+  });
+
+  it('a JSX closing tag is not a regex', () => {
+    const refs = expressResolver.extract!('server.tsx', `app.get('/a', (req, res) => { res.send(renderToString(<div>{a()}</div>)); });\napp.get('/b', (req, res) => { res.send(renderPage(<>{b()}</>)); });\n`).references.map((r) => `${r.referenceKind}:${r.referenceName}`);
+    expect(refs).toEqual(expect.arrayContaining(['calls:renderToString', 'calls:a', 'calls:renderPage', 'calls:b']));
+  });
+
+  it('a self-closing JSX tag after an attribute, and division after `}`, are not regexes', () => {
+    const tsx = (src: string) =>
+      expressResolver.extract!('server.tsx', src).references.map((r) => `${r.referenceKind}:${r.referenceName}`);
+    expect(tsx(`app.get('*', (req, res) => {\n  const html = renderToString(<App store={store} />);\n  sendPage(res, html);\n});\n`)).toEqual(
+      expect.arrayContaining(['calls:renderToString', 'calls:sendPage'])
+    );
+    expect(refsOf(`router.get('/x', (req, res) => { const v = { a: 1 }\n/ 2; svc(v); });\n`)).toContain('calls:svc');
+  });
+
+  it('division after `!` or `++` is not a regex', () => {
+    expect(refsOf(`router.get('/x', rateLimit({ max: cfg.max! / 2 }), getUsers);\n`)).toContain('references:getUsers');
+    expect(refsOf(`router.get('/x', limiter(hits++ / 2), getUsers);\n`)).toContain('references:getUsers');
+  });
+
+  it('an `async function` handler whose body has a `}` regex and an arrow keeps every call', () => {
+    const refs = refsOf(`router.route('/x').get(async function (req, res) { const s = t.replace(/}/g, ''); load(); items.map((i) => shape(i)); });\n`);
+    expect(refs).toContain('calls:load');
+    expect(refs).toContain('calls:shape');
+  });
+
+  it('`async` and a nested `function` declaration name are not calls; a regex with `)` is skipped', () => {
+    const refs = refsOf(`router.get('/x', function (req, res) { function helper(a) { return a; } Promise.all(items.map(async (i) => save(i))); });\n`);
+    expect(refs).toContain('calls:save');
+    expect(refs).not.toContain('calls:async');
+    expect(refs).not.toContain('calls:helper');
+  });
+
+  it('regex literals in handlers do not cost the route its edges', () => {
+    expect(refsOf(`router.get('/u/:id', async (req, res) => { if (!/^\\d+/.test(req.params.id)) return res.sendStatus(400); const user = await userService.findById(req.params.id); res.json(user); });\n`)).toContain('calls:userService.findById');
+    const chained = expressResolver.extract!('routes.ts', `router.route('/:id').get((req, res) => { if (!/^\\w+/.test(req.params.id)) return bad(res); load(req); }).put(protect, updateThing);\n`);
+    expect(chained.nodes.map((n) => n.name)).toEqual(['GET /:id', 'PUT /:id']);
+    expect(chained.references.map((r) => `${r.referenceKind}:${r.referenceName}`)).toEqual(expect.arrayContaining(['calls:load', 'references:updateThing']));
+    expect(refsOf(`app.get('/echo', (req, res) => { res.send(String(req.query.q).replace(/</g, '&lt;').replace(/>/g, '&gt;')); audit(req); });\n`)).toContain('calls:audit');
+  });
+
+  it('a call inside a template interpolation in the body still counts', () => {
+    expect(refsOf('router.get(\'/x\', (req, res) => { res.send(`<p>${fmtUser(req.user)}</p>`); });\n')).toContain('calls:fmtUser');
+  });
+
+  it('a division that looks like a regex opener does not cost the route', () => {
+    expect(refsOf(`router.get('/stats', async (req, res) => { const pct = Math.round((a - b) / total * 100) / 100; res.json({ pct: summarize(pct) }); });\n`)).toContain('calls:summarize');
+    const chained = expressResolver.extract!('routes.ts', `router.route('/s').get((req, res) => { const m = Math.floor((t1 - t0) / 1000) / 60; res.json(fmt(m)); }).post(protect, createS);\n`);
+    expect(chained.nodes.map((n) => n.name)).toEqual(['GET /s', 'POST /s']);
+    expect(chained.references.map((r) => `${r.referenceKind}:${r.referenceName}`)).toEqual(expect.arrayContaining(['calls:fmt', 'references:createS']));
+    const tsx = expressResolver.extract!('server.tsx', `app.get('/list', (req, res) => { res.send(renderToString(<ul>{items.map((x) => (<li key={x}>{x}</li>))}</ul>)); audit(req); });\n`).references.map((r) => `${r.referenceKind}:${r.referenceName}`);
+    expect(tsx).toEqual(expect.arrayContaining(['calls:renderToString', 'calls:audit']));
+  });
+
+  it('a division after `)` with a `/` in a later string does not cost the route', () => {
+    const refs = refsOf(`router.get('/s', (req, res) => { res.json({ pct: Math.round(s.done) / s.total, next: '/stats/2' }); audit(req); });\n`);
+    expect(refs).toEqual(expect.arrayContaining(['calls:Math.round', 'calls:audit']));
+    expect(refsOf(`router.get('/p', (req, res) => { const n = Math.ceil(count(req)) / size; res.redirect('/p/' + n); after(req); });\n`)).toContain('calls:after');
+    expect(refsOf(`router.get('/c', cfg(f(a) / 2, 'x/y'), handler);\n`)).toContain('references:handler');
+  });
+
+  it('a callback inside middleware, or a middleware that calls `next()`, is not the handler', () => {
+    expect(refsOf(`router.get('/admin', authorize(function (user, req) { return user.isAdmin; }), adminCtrl.index);\n`)).toContain('references:index');
+    expect(refsOf(`router.get('/referrals', function (req, res, next) { check(); next(); }, getReferrals);\n`)).toContain('references:getReferrals');
+    expect(refsOf(`router.get('/cfg', (req, res, next) => { load(); next(); }, overrideConfig);\n`)).toContain('references:overrideConfig');
+  });
+
+  it('the last argument decides: middleware before a named handler, guards, factories, generics', () => {
+    expect(refsOf(`router.get('/admin', authorize(function (user, req) { return user.isAdmin; }), adminCtrl.index);\n`)).toContain('references:index');
+    expect(refsOf(`router.get('/u/:id', function (req, res, next) { User.findById(id, function (err, user) { req.user = user; next(err); }); }, userCtrl.show);\n`)).toContain('references:show');
+    expect(refsOf(`router.get('/x', responseTime(function (req, res, time) { stats.timing(req.path, time); }), ctrl.list);\n`)).toContain('references:list');
+    expect(refsOf(`router.get('/errors', function (req, res, next) { auth(req); next(); }, getErrors);\n`)).toContain('references:getErrors');
+    expect(refsOf(`app.use('/api', function (req, res, next) { if (!ok) return res.sendStatus(403); authorize(req, next); }, apiRouter);\n`)).toContain('references:apiRouter');
+    expect(refsOf(`router.post('/g', auth, asyncHandler<Req, Res>(async (req, res) => { doIt(); }));\n`)).toContain('calls:doIt');
+    expect(refsOf(`router.post('/d', asyncHandler<Req>(async (req, res) => { saveFile(req.file); }));\n`)).toContain('calls:saveFile');
+  });
+
+  it('JSX apostrophes, a trailing options object, a callback before a named handler', () => {
+    const tsx = expressResolver.extract!('server.tsx', `app.get('/x', (req, res) => {\n  res.send(render(<p>Don't</p>));\n  res.send(render(<p>won't</p>));\n  load();\n});\n`).references.map((r) => `${r.referenceKind}:${r.referenceName}`);
+    expect(tsx).toContain('calls:load');
+    expect(refsOf(`router.get('/o', (req, res) => { svc.list(); res.json(1) }, { cache: true });\n`)).toContain('calls:svc.list');
+    expect(refsOf(`router.get('/w', withErrors(function onErr(e) { report(e); }, ctrl.list));\n`)).not.toContain('calls:report');
+    // An array of handlers: its last element is the handler.
+    expect(refsOf(`router.post('/x', auth, [validate, ctrl.create]);\n`)).toEqual(['references:create']);
+  });
+
+  it('a regex that ends its line without a semicolon is still a regex', () => {
+    expect(refsOf(`router.get('/re', (req, res) => {\n  const re = /[}]/\n  run(re)\n})\n`)).toContain('calls:run');
+  });
+
+  it('a backtick in an earlier regex does not cost later routes', () => {
+    const refs = refsOf("const esc = (s) => s.replace(/`/g, 'x');\nrouter.get('/d', async (req, res) => { await svc.doThing(); res.end(); });\nrouter.get('/e', ctrl.list);\n");
+    expect(refs).toEqual(expect.arrayContaining(['calls:svc.doThing', 'references:list']));
+  });
+
+  it('a division after a non-null `!` is not a regex, even with a path string later on the line', () => {
+    expect(refsOf(`app.get('/x', (req, res) => {\n const r = done! / total!; res.redirect(r ? '/:id' : '/');\n svc.run(r);\n});\n`)).toContain('calls:svc.run');
+    expect(refsOf(`app.get('/y', (req, res) => {\n const r = sum! / count!; const parts = csv.split(/,/);\n svc.run(parts);\n});\n`)).toContain('calls:svc.run');
+  });
+
+  it('a method named like a keyword is still a call', () => {
+    const refs = refsOf(`router.delete('/users/:id', async (req, res) => { await userService.delete(req.params.id); cache .with(k); });\n`);
+    expect(refs).toContain('calls:userService.delete');
+    expect(refs).toContain('calls:cache.with');
+    expect(refsOf(`router.get('/x', (req, res) => { return of(load()); });\n`)).toContain('calls:of');
+  });
+
+  it('chained routes: the handler decides too', () => {
+    const refs = refsOf(
+      `router.route('/items').get(rateLimit({ keyGenerator: (r) => lookup(r.ip) }), getItem).post(async (req, res) => { createItem(); });\n`
+    );
+    expect(refs).toContain('references:getItem');
+    expect(refs).not.toContain('calls:lookup');
+    expect(refs).toContain('calls:createItem');
   });
 });
 
@@ -837,6 +1017,118 @@ describe('railsResolver.extract', () => {
 import { springResolver } from '../src/resolution/frameworks/java';
 
 describe('springResolver.extract', () => {
+  it.each([
+    ['UserController.java', '{"/a", "/b"}', '@GetMapping({"/x", "/y"})', 'public String handle() { return "ok"; }'],
+    ['UserController.java', 'path = {"/a", "/b"}', '@RequestMapping(value = {"/x", "/y"}, method = RequestMethod.GET)', 'public String handle() { return "ok"; }'],
+    ['UserController.kt', 'value = ["/a", "/b"]', '@GetMapping(path = ["/x", "/y"])', 'fun handle(): String = "ok"'],
+  ])('indexes every class/method path pair in %s with %s and %s (#1461)', (filePath, base, mapping, handler) => {
+    const src = `@RestController
+@RequestMapping(${base})
+public class UserController {
+  ${mapping}
+  ${handler}
+}`;
+    const { nodes, references } = springResolver.extract!(filePath, src);
+    expect(nodes.map(n => n.name)).toEqual(['GET /a/x', 'GET /a/y', 'GET /b/x', 'GET /b/y']);
+    expect(new Set(nodes.map(n => n.id)).size).toBe(4);
+    expect(references.map(r => [r.fromNodeId, r.referenceName])).toEqual(nodes.map(n => [n.id, 'handle']));
+  });
+
+  it.each(['ErrorHandler.PATH', 'PATH', 'value = ErrorHandler.PATH', 'path = PATH'])(
+    'resolves a same-file constant prefix in @RequestMapping(%s) (#1461)', (args) => {
+      const src = `@Controller
+@RequestMapping(${args})
+public class ErrorHandler {
+  public static final String PATH = "/error";
+  @RequestMapping(method = {RequestMethod.GET})
+  public String handle() { return "err"; }
+}`;
+      const { nodes, references } = springResolver.extract!('ErrorHandler.java', src);
+      expect(nodes.map(n => n.name)).toEqual(['GET /error']);
+      expect(references.map(r => [r.fromNodeId, r.referenceName])).toEqual([[nodes[0].id, 'handle']]);
+    },
+  );
+
+  it('keeps literals and resolved constants in path arrays, including URI variables (#1461)', () => {
+    const src = `@RequestMapping({"/api", "/{tenant}/api"})
+public class ItemController {
+  public static final String ITEMS = "/items";
+  @GetMapping(path = {ITEMS, "/items/{id}", External.MISSING}, produces = "application/json")
+  public String get() { return "ok"; }
+}`;
+    const { nodes, references } = springResolver.extract!('ItemController.java', src);
+    expect(nodes.map(n => n.name)).toEqual([
+      'GET /api/items', 'GET /api/items/{id}', 'GET /{tenant}/api/items', 'GET /{tenant}/api/items/{id}',
+    ]);
+    expect(references.map(r => r.referenceName)).toEqual(['get', 'get', 'get', 'get']);
+  });
+
+  it.each([
+    ['value = "/ok", produces = "application/json"', '/base/ok'],
+    ['consumes = {"application/json", "text/plain"}, path = "/ok", produces = "application/json"', '/base/ok'],
+    ['produces = "application/json", consumes = "text/plain"', '/base'],
+  ])('only treats path arguments as paths: %s (#1461)', (args, expected) => {
+    const src = `@RequestMapping("/base")
+public class UserController {
+  @GetMapping(${args})
+  public String handle() { return "ok"; }
+}`;
+    const { nodes } = springResolver.extract!('UserController.java', src);
+    expect(nodes.map(n => n.name)).toEqual([`GET ${expected}`]);
+  });
+
+  it.each([
+    ['External.MISSING', '@GetMapping'],
+    ['value = MISSING, produces = "application/json"', '@GetMapping("/ok")'],
+    ['"/base"', '@GetMapping(External.MISSING)'],
+    ['"/base"', '@GetMapping(path = MISSING, produces = "application/json")'],
+    ['"/base"', '@RequestMapping(value = MISSING, method = RequestMethod.GET)'],
+  ])('omits unresolved paths: class %s, method %s (#1461)', (base, mapping) => {
+    const src = `@RequestMapping(${base})
+public class UserController {
+  // public static final String MISSING = "/comment";
+  ${mapping}
+  public String handle() { return "ok"; }
+}`;
+    expect(springResolver.extract!('UserController.java', src)).toEqual({ nodes: [], references: [] });
+  });
+
+  it.each([
+    ['@GetMapping', 'GET'],
+    ['@GetMapping()', 'GET'],
+    ['@RequestMapping(method = RequestMethod.GET)', 'GET'],
+    ['@RequestMapping(method = {RequestMethod.GET})', 'GET'],
+    ['@RequestMapping', 'ANY'],
+  ])('inherits the class prefix for %s without emitting a class route (#1461)', (mapping, verb) => {
+    const src = `@RequestMapping("/base")
+public class UserController {
+  ${mapping}
+  public String handle() { return "ok"; }
+}`;
+    const { nodes, references } = springResolver.extract!('UserController.java', src);
+    expect(nodes.map(n => n.name)).toEqual([`${verb} /base`]);
+    expect(references.map(r => r.referenceName)).toEqual(['handle']);
+  });
+
+  it('preserves annotation and reference line numbers after multiline Javadocs (#1461)', () => {
+    const src = `/**
+ * Controller documentation.
+ */
+@RequestMapping("/base")
+public class UserController {
+  /**
+   * Handler documentation with @GetMapping("/fake").
+   */
+  @GetMapping({"/x", "/y"})
+  public String handle() { return "ok"; }
+}`;
+    const { nodes, references } = springResolver.extract!('UserController.java', src);
+    expect(nodes.map(n => [n.name, n.startLine, n.endLine])).toEqual([
+      ['GET /base/x', 9, 9], ['GET /base/y', 9, 9],
+    ]);
+    expect(references.map(r => [r.referenceName, r.line])).toEqual([['handle', 9], ['handle', 9]]);
+  });
+
   it('extracts route with @GetMapping and next method', () => {
     const src = `
 @GetMapping("/users")
@@ -877,6 +1169,77 @@ class OwnerController {
     const { nodes, references } = springResolver.extract!('OwnerController.kt', src);
     expect(nodes[0].name).toBe('GET /owners/{ownerId}');
     expect(references[0].referenceName).toBe('showOwner');
+  });
+});
+
+describe('springResolver.resolve — DI heuristics are gated to Java/Kotlin non-inheritance refs', () => {
+  // A polyglot repo (Scala + a sibling Java module) detects Spring globally.
+  // The DI/convention patterns (bare-name Pattern 4 especially) must then not
+  // hijack a Scala `extends X` to a same-named class found via directory
+  // heuristics — inheritance must resolve through imports/name matching.
+  const decoyNode: Node = {
+    id: 'class:src/main/model/ExtCustomer.java:ExtCustomer:3',
+    kind: 'class',
+    name: 'ExtCustomer',
+    qualifiedName: 'src/main/model/ExtCustomer.java::ExtCustomer',
+    filePath: 'src/main/model/ExtCustomer.java',
+    language: 'java',
+    startLine: 3,
+    endLine: 10,
+    startColumn: 0,
+    endColumn: 0,
+    updatedAt: Date.now(),
+  };
+  const context = {
+    getNodesInFile: () => [],
+    getNodesByName: (n: string) => (n === 'ExtCustomer' ? [decoyNode] : []),
+    getNodesByQualifiedName: () => [],
+    getNodesByKind: () => [],
+    fileExists: () => false,
+    readFile: () => null,
+    getProjectRoot: () => '/test',
+    getAllFiles: () => [],
+    getNodesByLowerName: () => [],
+    getImportMappings: () => [],
+  };
+  const baseRef = {
+    fromNodeId: 'class:A.scala:MExtCustomer:5',
+    referenceName: 'ExtCustomer',
+    line: 5,
+    column: 10,
+    filePath: 'A.scala',
+  };
+
+  it('does NOT resolve a Scala extends reference (Pattern 4 bare-name fallback)', () => {
+    const ref = { ...baseRef, referenceKind: 'extends' as const, language: 'scala' as const };
+    expect(springResolver.resolve(ref, context as any)).toBeNull();
+  });
+
+  it('does NOT resolve a non-Java/Kotlin plain reference either', () => {
+    const ref = { ...baseRef, referenceKind: 'references' as const, language: 'scala' as const };
+    expect(springResolver.resolve(ref, context as any)).toBeNull();
+  });
+
+  it('does NOT resolve a Java extends reference — inheritance is never a DI pattern', () => {
+    const ref = {
+      ...baseRef,
+      filePath: 'B.java',
+      referenceKind: 'extends' as const,
+      language: 'java' as const,
+    };
+    expect(springResolver.resolve(ref, context as any)).toBeNull();
+  });
+
+  it('still resolves a Java DI reference through the entity pattern', () => {
+    const ref = {
+      ...baseRef,
+      filePath: 'B.java',
+      referenceKind: 'references' as const,
+      language: 'java' as const,
+    };
+    const result = springResolver.resolve(ref, context as any);
+    expect(result?.targetNodeId).toBe(decoyNode.id);
+    expect(result?.resolvedBy).toBe('framework');
   });
 });
 
@@ -941,6 +1304,109 @@ describe('goResolver.extract', () => {
     const src = `s.HandleFunc("/users/{id}", listUsers).Methods("GET")\n`;
     const { references } = goResolver.extract!('routes.go', src);
     expect(references[0].referenceName).toBe('listUsers');
+  });
+
+  it('does NOT treat verb-named method calls with non-path args as routes (#1259)', () => {
+    // The issue's repro: a generic cache type whose Put/Get share router verb
+    // names. First args are keys, not URL paths — no route nodes.
+    const src = [
+      `c.Put("a", 1)`,
+      `c.Put("user:123", value)`,
+      `store.Get("config", out)`,
+      `bus.Handle("user.created", onUserCreated)`,
+      `m.HandleFunc("shutdown", hook)`,
+    ].join('\n');
+    const { nodes } = goResolver.extract!('cache.go', src);
+    expect(nodes).toHaveLength(0);
+  });
+
+  it('keeps real registrations whose paths start with "/" for every router style', () => {
+    const src = [
+      `r.Put("/users/{id}", updateUser)`, // chi
+      `v1.GET("/ping", ping)`, // gin group
+      `mux.HandleFunc("/healthz", health)`, // net/http
+    ].join('\n');
+    const { nodes } = goResolver.extract!('routes.go', src);
+    expect(nodes.map((n) => n.name)).toEqual(['PUT /users/{id}', 'GET /ping', 'ANY /healthz']);
+  });
+
+  it('recognizes Go 1.22 "METHOD /path" patterns on HandleFunc and extracts the method', () => {
+    const src = `mux.HandleFunc("GET /api/users/{id}", getUser)\n`;
+    const { nodes, references } = goResolver.extract!('main.go', src);
+    expect(nodes[0].name).toBe('GET /api/users/{id}');
+    expect(references[0].referenceName).toBe('getUser');
+  });
+});
+
+import { goframeResolver } from '../src/resolution/frameworks/goframe';
+
+describe('goframeResolver', () => {
+  it('detects GoFrame from a gogf/gf dependency in go.mod', () => {
+    const ctx: any = {
+      readFile: (f: string) =>
+        f === 'go.mod' ? 'module example.com/app\nrequire github.com/gogf/gf/v2 v2.7.0\n' : null,
+    };
+    expect(goframeResolver.detect(ctx)).toBe(true);
+    const noGf: any = { readFile: (f: string) => (f === 'go.mod' ? 'module example.com/app\n' : null) };
+    expect(goframeResolver.detect(noGf)).toBe(false);
+  });
+
+  it('extracts a route node from a g.Meta request struct (method upper-cased)', () => {
+    const src = `package v1
+import "github.com/gogf/gf/v2/frame/g"
+type SignInReq struct {
+	g.Meta   \`path:"/user/sign-in" method:"post" tags:"User" summary:"Sign in"\`
+	Passport string
+}
+type SignInRes struct{}
+`;
+    const { nodes } = goframeResolver.extract!('api/user/v1/user_sign_in.go', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].kind).toBe('route');
+    expect(nodes[0].name).toBe('POST /user/sign-in');
+    // The package-qualified request type is encoded for the synthesizer join.
+    expect(nodes[0].qualifiedName).toContain('::goframe-route:v1.SignInReq');
+  });
+
+  it('is independent of g.Meta tag attribute order', () => {
+    const src = `type DeptSearchReq struct {
+	g.Meta \`path:"/dept/list" tags:"Dept" method:"get" summary:"列表"\`
+}`;
+    const { nodes } = goframeResolver.extract!('api/system/dept.go', src);
+    expect(nodes[0].name).toBe('GET /dept/list');
+    expect(nodes[0].qualifiedName).toContain('::goframe-route:DeptSearchReq');
+  });
+
+  it('skips a response g.Meta that has no path (mime-only) and other non-route metadata', () => {
+    const src = `type ListRes struct {
+	g.Meta \`mime:"application/json"\`
+	Items []string
+}`;
+    const { nodes } = goframeResolver.extract!('api/x.go', src);
+    expect(nodes).toHaveLength(0);
+  });
+
+  it('defaults method to ANY when method: is omitted', () => {
+    const src = `type PingReq struct {
+	g.Meta \`path:"/ping"\`
+}`;
+    const { nodes } = goframeResolver.extract!('api/ping.go', src);
+    expect(nodes[0].name).toBe('ANY /ping');
+  });
+
+  it('extracts every request struct in a multi-route api file', () => {
+    const src = `type DeptListReq struct { g.Meta \`path:"/dept/list" method:"get"\` }
+type DeptListRes struct { g.Meta \`mime:"application/json"\` }
+type DeptAddReq struct { g.Meta \`path:"/dept/add" method:"post"\` }
+type DeptAddRes struct {}
+`;
+    const { nodes } = goframeResolver.extract!('api/dept.go', src);
+    expect(nodes.map((n) => n.name).sort()).toEqual(['GET /dept/list', 'POST /dept/add']);
+  });
+
+  it('returns nothing for a non-go file or a file without g.Meta', () => {
+    expect(goframeResolver.extract!('main.ts', 'const x = 1').nodes).toHaveLength(0);
+    expect(goframeResolver.extract!('main.go', 'package main\nfunc main() {}\n').nodes).toHaveLength(0);
   });
 });
 
@@ -1321,6 +1787,42 @@ public IActionResult ListUsers()
     expect(nodes[0].name).toBe('GET /users');
     expect(references[0].referenceName).toBe('ListUsers');
   });
+
+  it('extracts the handler-first endpoint-group form under the class, with the optional path', () => {
+    const src = `
+public class TodoItems : IEndpointGroup
+{
+    public static void Map(RouteGroupBuilder groupBuilder)
+    {
+        groupBuilder.RequireAuthorization();
+        groupBuilder.MapPost(CreateTodoItem);
+        groupBuilder.MapPut(UpdateTodoItem, "{id}");
+        groupBuilder.MapDelete(DeleteTodoItem, "{id}");
+    }
+    public static async Task<Created<int>> CreateTodoItem(ISender sender, CreateTodoItemCommand command) { }
+}
+`;
+    const { nodes, references } = aspnetResolver.extract!('Web/Endpoints/TodoItems.cs', src);
+    expect(nodes.map((n) => n.name)).toEqual(['POST /TodoItems', 'PUT /TodoItems/{id}', 'DELETE /TodoItems/{id}']);
+    expect(nodes.map((n) => n.startLine)).toEqual([7, 8, 9]);
+    expect(references.map((r) => r.referenceName)).toEqual(['CreateTodoItem', 'UpdateTodoItem', 'DeleteTodoItem']);
+    expect(nodes[0]!.qualifiedName).toBe('Web/Endpoints/TodoItems.cs::group:TodoItems:POST:');
+  });
+
+  it('a class with its own RoutePrefix literal names its routes under it', () => {
+    const src = `
+public class TodoLists : IEndpointGroup
+{
+    public static string RoutePrefix => "/api/todo-lists";
+    public static void Map(RouteGroupBuilder group)
+    {
+        group.MapGet(GetTodoLists);
+    }
+}
+`;
+    const { nodes } = aspnetResolver.extract!('TodoLists.cs', src);
+    expect(nodes.map((n) => n.name)).toEqual(['GET /api/todo-lists']);
+  });
 });
 
 import { vaporResolver } from '../src/resolution/frameworks/swift';
@@ -1330,7 +1832,7 @@ describe('vaporResolver.extract', () => {
     const src = `app.get("users", use: listUsers)\n`;
     const { nodes, references } = vaporResolver.extract!('routes.swift', src);
     expect(nodes[0].name).toBe('GET /users');
-    expect(references[0].referenceName).toBe('listUsers');
+    expect(references[0].referenceName).toBe('@listUsers');
   });
 
   it('extracts grouped RouteCollection routes with the group prefix and no path arg', () => {
@@ -1351,9 +1853,9 @@ func boot(routes: RoutesBuilder) throws {
       'POST /todos',
     ]);
     expect(references.map((r) => r.referenceName).sort()).toEqual([
-      'create',
-      'delete',
-      'index',
+      '@create',
+      '@delete',
+      '@index',
     ]);
   });
 
@@ -1361,7 +1863,7 @@ func boot(routes: RoutesBuilder) throws {
     const src = `router.get("users", User.parameter, "edit", use: self.editUserHandler)\n`;
     const { nodes, references } = vaporResolver.extract!('UserController.swift', src);
     expect(nodes[0].name).toBe('GET /users/edit');
-    expect(references[0].referenceName).toBe('editUserHandler');
+    expect(references[0].referenceName).toBe('@editUserHandler');
   });
 
   it('ignores non-route .get calls that lack use: (e.g. Environment.get)', () => {
@@ -1369,10 +1871,53 @@ func boot(routes: RoutesBuilder) throws {
     const { nodes } = vaporResolver.extract!('configure.swift', src);
     expect(nodes).toHaveLength(0);
   });
+
+  // A `.METHOD(...)` call with many comma-separated args and no `use:` used to
+  // make the route regex backtrack exponentially (60 args hung for minutes).
+  it('does not backtrack exponentially on a long arg list without use:', () => {
+    const args = Array.from({ length: 60 }, (_, i) => `arg${i}: value${i}`).join(', ');
+    const src = `app.get(${args})\n`;
+    const start = performance.now();
+    const { nodes } = vaporResolver.extract!('routes.swift', src);
+    const elapsed = performance.now() - start;
+    expect(nodes).toHaveLength(0);
+    expect(elapsed).toBeLessThan(250);
+  });
+
+  it('still parses every Vapor route shape after the arg-list rewrite', () => {
+    const src = `
+admin.get(use: self.list)
+app.get("users", use: listUsers)
+router.post("users", User.parameter, "edit", use: UserController.edit)
+app.patch(":id" ,  "meta" ,  use: update)
+app.get(
+  "multi",
+  "line",
+  use: multiLine
+)
+`;
+    const { nodes, references } = vaporResolver.extract!('routes.swift', src);
+    expect(nodes.map((n) => n.name)).toEqual([
+      'GET /',
+      'GET /users',
+      'POST /users/edit',
+      'PATCH /:id/meta',
+      'GET /multi/line',
+    ]);
+    expect(references.map((r) => r.referenceName)).toEqual([
+      '@list',
+      '@listUsers',
+      'UserController@edit',
+      '@update',
+      '@multiLine',
+    ]);
+  });
 });
 
 import { reactResolver } from '../src/resolution/frameworks/react';
+import { nextjsResolver } from '../src/resolution/frameworks/nextjs';
 import { svelteResolver } from '../src/resolution/frameworks/svelte';
+import { astroResolver } from '../src/resolution/frameworks/astro';
 
 describe('reactResolver.extract — React Router', () => {
   it('extracts a v6 <Route path element={<Comp/>}>', () => {
@@ -1410,13 +1955,14 @@ describe('reactResolver.extract — React Router', () => {
   });
 
   it('does not treat config files or a nextjs-pages dir as Next.js routes', () => {
-    const cfg = reactResolver.extract!('apps/nextjs-pages/next.config.mjs', 'export default {}');
+    const cfg = nextjsResolver.extract!('apps/nextjs-pages/next.config.mjs', 'export default {}');
     expect(cfg.nodes.filter((n) => n.kind === 'route')).toHaveLength(0);
-    const vite = reactResolver.extract!('src/pages/vite.config.ts', 'export default {}');
+    const vite = nextjsResolver.extract!('src/pages/vite.config.ts', 'export default {}');
     expect(vite.nodes.filter((n) => n.kind === 'route')).toHaveLength(0);
-    // a real page still works
-    const page = reactResolver.extract!('src/pages/about.tsx', 'export default function About(){return null}');
+    // a real page still works — and the React resolver leaves it to the Next one
+    const page = nextjsResolver.extract!('src/pages/about.tsx', 'export default function About(){return null}');
     expect(page.nodes.filter((n) => n.kind === 'route').map((n) => n.name)).toEqual(['/about']);
+    expect(reactResolver.extract!('src/pages/about.tsx', 'export default function About(){return null}').nodes).toHaveLength(0);
   });
 });
 
@@ -1425,6 +1971,77 @@ describe('svelteResolver.extract (smoke)', () => {
     const result = svelteResolver.extract!('+page.svelte', '');
     expect(result).toHaveProperty('nodes');
     expect(result).toHaveProperty('references');
+  });
+});
+
+describe('astroResolver.extract — src/pages file-based routing', () => {
+  const routeNames = (filePath: string): string[] =>
+    astroResolver.extract!(filePath, '').nodes.filter((n) => n.kind === 'route').map((n) => n.name);
+
+  it('maps index.astro to /', () => {
+    expect(routeNames('src/pages/index.astro')).toEqual(['/']);
+  });
+
+  it('maps nested index and plain pages', () => {
+    expect(routeNames('src/pages/blog/index.astro')).toEqual(['/blog']);
+    expect(routeNames('src/pages/about.astro')).toEqual(['/about']);
+  });
+
+  it('converts [param] and [...rest] syntax', () => {
+    expect(routeNames('src/pages/blog/[slug].astro')).toEqual(['/blog/:slug']);
+    expect(routeNames('src/pages/[...path].astro')).toEqual(['/*path']);
+  });
+
+  it('maps .ts endpoints under src/pages to routes', () => {
+    expect(routeNames('src/pages/api/posts.ts')).toEqual(['/api/posts']);
+    expect(routeNames('src/pages/rss.xml.js')).toEqual(['/rss.xml']);
+  });
+
+  it('excludes underscore-prefixed segments and config files', () => {
+    expect(routeNames('src/pages/_partial.astro')).toEqual([]);
+    expect(routeNames('src/pages/blog/_components/Card.astro')).toEqual([]);
+    expect(routeNames('src/pages/vite.config.ts')).toEqual([]);
+  });
+
+  it('ignores .astro files outside src/pages', () => {
+    expect(routeNames('src/components/Button.astro')).toEqual([]);
+    expect(routeNames('docs/pages/guide.astro')).toEqual([]);
+  });
+});
+
+describe('astroResolver.resolve — Astro global and virtual modules', () => {
+  const ctx = {} as never;
+  const baseRef = {
+    fromNodeId: 'component:a',
+    line: 1,
+    column: 0,
+    filePath: 'src/pages/index.astro',
+    language: 'astro',
+  };
+
+  it('claims Astro.* global references as framework-provided', () => {
+    const res = astroResolver.resolve(
+      { ...baseRef, referenceName: 'Astro.props', referenceKind: 'references' } as never,
+      ctx
+    );
+    expect(res?.resolvedBy).toBe('framework');
+    expect(res?.confidence).toBe(1.0);
+  });
+
+  it('claims astro:content virtual module imports', () => {
+    const res = astroResolver.resolve(
+      { ...baseRef, referenceName: 'astro:content', referenceKind: 'imports' } as never,
+      ctx
+    );
+    expect(res?.resolvedBy).toBe('framework');
+  });
+
+  it('leaves ordinary names alone', () => {
+    const res = astroResolver.resolve(
+      { ...baseRef, referenceName: 'astrolabe', referenceKind: 'calls' } as never,
+      { getNodesByName: () => [] } as never
+    );
+    expect(res).toBeNull();
   });
 });
 
@@ -1577,7 +2194,7 @@ app.get("real", use: listUsers)
 `;
     const { nodes, references } = vaporResolver.extract!('routes.swift', src);
     expect(nodes.map((n) => n.name)).toEqual(['GET /real']);
-    expect(references.map((r) => r.referenceName)).toEqual(['listUsers']);
+    expect(references.map((r) => r.referenceName)).toEqual(['@listUsers']);
   });
 
   it('nestjs: skips // and /* */ commented decorators', () => {
@@ -1595,5 +2212,39 @@ export class UsersController {
     const { nodes, references } = nestjsResolver.extract!('users.controller.ts', src);
     expect(nodes.map((n) => n.name)).toEqual(['GET /users/real']);
     expect(references.map((r) => r.referenceName)).toEqual(['real']);
+  });
+});
+
+describe('Express mounts with a division in a middleware argument', () => {
+  let dir: string | undefined;
+  afterEach(() => {
+    if (dir) require('fs').rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it('still composes the mount prefix (`x! / 2` is not a regex)', async () => {
+    const fs = await import('fs');
+    const os = await import('os');
+    const path = await import('path');
+    const { CodeGraph } = await import('../src');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-express-mount-'));
+    dir = root;
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ dependencies: { express: '4' } }));
+    fs.mkdirSync(path.join(root, 'routes'));
+    fs.writeFileSync(
+      path.join(root, 'app.ts'),
+      "import express from 'express';\nimport apiRouter from './routes/api';\nconst app = express();\n" +
+        "app.use('/api', rateLimit({ max: cfg.max! / 2 }), apiRouter);\n"
+    );
+    fs.writeFileSync(
+      path.join(root, 'routes', 'api.ts'),
+      "import { Router } from 'express';\nconst router = Router();\nfunction listUsers(req, res) {}\nrouter.get('/users', listUsers);\nexport default router;\n"
+    );
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      expect(cg.getNodesByKind('route').map((n) => n.name)).toContain('GET /api/users');
+    } finally {
+      cg.destroy();
+    }
   });
 });

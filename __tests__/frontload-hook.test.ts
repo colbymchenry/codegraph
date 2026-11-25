@@ -1,0 +1,629 @@
+/**
+ * Front-load hook project resolution (#964).
+ *
+ * The Claude `UserPromptSubmit` front-load hook must inject CodeGraph context
+ * for the RIGHT project — including the monorepo case where the agent's cwd is
+ * an un-indexed workspace root and the index lives in a sub-project. These test
+ * `planFrontload` / `findIndexedSubprojectRoots` directly (the hook's decision
+ * logic), plus the built CLI's confidence tiers against a real index.
+ */
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { spawnSync } from 'node:child_process';
+import { CodeGraph } from '../src';
+import { planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
+
+// Make the built-in exports configurable so HOME can point at a real temp
+// fixture without changing the process environment or the user's home files.
+vi.mock('os', async (importOriginal) => ({ ...await importOriginal<typeof import('os')>() }));
+
+/**
+ * Make `dir` indexed. isInitialized needs `.codegraph/codegraph.db` WITH the
+ * codegraph schema — an empty file no longer counts (#1895).
+ */
+function mkIndexed(dir: string): string {
+  fs.mkdirSync(dir, { recursive: true });
+  CodeGraph.initSync(dir).close();
+  return dir;
+}
+/** A workspace-root manifest so the down-scan gate (looksLikeProjectRoot) passes. */
+function mkWorkspaceRoot(dir: string): string {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'package.json'), '{"private":true,"workspaces":["packages/*"]}');
+  return dir;
+}
+
+/**
+ * Run the built CLI's `prompt-hook` in `dir` with a UserPromptSubmit payload
+ * shaped like the one Claude Code sends, and return what it injects.
+ */
+function runPromptHook(dir: string, prompt: string): string {
+  const payload = {
+    session_id: '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0',
+    transcript_path: path.join(dir, 'transcript.jsonl'),
+    cwd: dir,
+    permission_mode: 'default',
+    hook_event_name: 'UserPromptSubmit',
+    prompt,
+  };
+  const result = spawnSync(process.execPath, [path.resolve(__dirname, '../dist/bin/codegraph.js'), 'prompt-hook'], {
+    cwd: dir,
+    input: JSON.stringify(payload),
+    encoding: 'utf8',
+    timeout: 15_000,
+    env: {
+      ...process.env,
+      CODEGRAPH_TELEMETRY: '0', DO_NOT_TRACK: '1', CODEGRAPH_NO_DAEMON: '1',
+      CODEGRAPH_NO_RELAUNCH: '1', CODEGRAPH_WASM_RELAUNCHED: '1',
+      // Enable only the hook subprocess under test.
+      CODEGRAPH_NO_PROMPT_HOOK: '0', CODEGRAPH_PROMPT_HOOK: '1',
+    },
+  });
+  expect(result.error).toBeUndefined();
+  expect(result.status, result.stderr).toBe(0);
+  return result.stdout;
+}
+
+describe('planFrontload — front-load hook project resolution (#964)', () => {
+  let tmp: string;
+  beforeEach(() => { tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-frontload-'))); });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('cwd is itself indexed → front-load cwd (the common single-project case)', () => {
+    mkIndexed(tmp);
+    const plan = planFrontload(tmp, 'how does login work');
+    expect(plan.exploreRoot).toBe(tmp);
+    expect(plan.viaSubScan).toBe(false);
+    expect(plan.nudgeProjects).toEqual([]);
+  });
+
+  it('a nested file under an indexed project resolves up to that project', () => {
+    mkIndexed(tmp);
+    const nested = path.join(tmp, 'src', 'deep');
+    fs.mkdirSync(nested, { recursive: true });
+    expect(planFrontload(nested, 'trace the flow').exploreRoot).toBe(tmp);
+  });
+
+  it('un-indexed workspace root with ONE indexed sub-project → front-load it (the #964 case)', () => {
+    mkWorkspaceRoot(tmp);
+    const api = mkIndexed(path.join(tmp, 'packages', 'api'));
+    const plan = planFrontload(tmp, 'how does the request get handled');
+    expect(plan.exploreRoot).toBe(api);
+    expect(plan.viaSubScan).toBe(true);
+    expect(plan.nudgeProjects).toEqual([]);
+  });
+
+  it('multiple indexed sub-projects, prompt names one by path → front-load it, nudge the rest', () => {
+    mkWorkspaceRoot(tmp);
+    const api = mkIndexed(path.join(tmp, 'packages', 'api'));
+    const web = mkIndexed(path.join(tmp, 'packages', 'web'));
+    const plan = planFrontload(tmp, 'in packages/api, how does the handler validate the token?');
+    expect(plan.exploreRoot).toBe(api);
+    expect(plan.viaSubScan).toBe(true);
+    expect(plan.nudgeProjects).toEqual([web]);
+  });
+
+  it('multiple indexed sub-projects, prompt names one by package name → front-load it', () => {
+    mkWorkspaceRoot(tmp);
+    mkIndexed(path.join(tmp, 'packages', 'api'));
+    const web = mkIndexed(path.join(tmp, 'packages', 'web'));
+    const plan = planFrontload(tmp, 'how does the web frontend render the dashboard?');
+    expect(plan.exploreRoot).toBe(web);
+  });
+
+  it('multiple indexed sub-projects, NO clear match → nudge the full list, do not guess', () => {
+    mkWorkspaceRoot(tmp);
+    const api = mkIndexed(path.join(tmp, 'packages', 'api'));
+    const web = mkIndexed(path.join(tmp, 'packages', 'web'));
+    const plan = planFrontload(tmp, 'how does authentication work end to end?');
+    expect(plan.exploreRoot).toBeNull();
+    expect(plan.viaSubScan).toBe(true);
+    expect(plan.nudgeProjects.sort()).toEqual([api, web].sort());
+  });
+
+  it('un-indexed dir that is NOT a workspace root → no-op (guards $HOME-style crawls)', () => {
+    // Indexed project exists below, but cwd has no manifest, so the down-scan is skipped.
+    mkIndexed(path.join(tmp, 'some', 'project'));
+    const plan = planFrontload(tmp, 'how does it work');
+    expect(plan.exploreRoot).toBeNull();
+    expect(plan.nudgeProjects).toEqual([]);
+  });
+
+  it.each([
+    { root: 'home', manifest: 'package.json', children: 1 },
+    { root: 'home', manifest: 'package.json', children: 2 },
+    { root: 'home', manifest: 'WORKSPACE', children: 1 },
+    { root: 'parent of home', manifest: 'package.json', children: 1 },
+  ])('$root with stray $manifest and $children indexed children → no-op (#1454)', ({ root, manifest, children }) => {
+    const homeDir = root === 'home' ? tmp : path.join(tmp, 'user');
+    fs.mkdirSync(homeDir, { recursive: true });
+    vi.spyOn(os, 'homedir').mockReturnValue(homeDir);
+    if (manifest === 'package.json') mkWorkspaceRoot(tmp);
+    else fs.mkdirSync(path.join(tmp, manifest)); // Even a WORKSPACE directory opens the manifest gate.
+    mkIndexed(path.join(tmp, 'packages', 'api'));
+    if (children === 2) mkIndexed(path.join(tmp, 'packages', 'web'));
+    expect(unsafeIndexRootReason(tmp)).toBe(root === 'home' ? 'your home directory' : 'a parent of your home directory');
+
+    expect(planFrontload(tmp, 'how does authentication work end to end?')).toEqual({
+      exploreRoot: null,
+      nudgeProjects: [],
+      viaSubScan: false,
+    });
+    expect(findIndexedSubprojectRoots(tmp)).toEqual([]);
+  });
+
+  it('nothing indexed anywhere → no-op', () => {
+    mkWorkspaceRoot(tmp);
+    fs.mkdirSync(path.join(tmp, 'packages', 'api'), { recursive: true });
+    const plan = planFrontload(tmp, 'how does it work');
+    expect(plan.exploreRoot).toBeNull();
+    expect(plan.nudgeProjects).toEqual([]);
+  });
+});
+
+describe('findIndexedSubprojectRoots', () => {
+  let tmp: string;
+  beforeEach(() => { tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-subscan-'))); });
+  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+
+  it('finds indexed projects a couple levels down and skips node_modules/.git', () => {
+    mkIndexed(path.join(tmp, 'packages', 'api'));
+    mkIndexed(path.join(tmp, 'services', 'auth'));
+    // Decoys that must NOT be scanned into.
+    mkIndexed(path.join(tmp, 'node_modules', 'dep'));
+    mkIndexed(path.join(tmp, '.git', 'x'));
+    const found = findIndexedSubprojectRoots(tmp).map((p) => path.relative(tmp, p)).sort();
+    expect(found).toEqual([path.join('packages', 'api'), path.join('services', 'auth')].sort());
+  });
+
+  it('does not descend INTO an indexed project (a project\'s sub-dirs are not separate projects)', () => {
+    const api = mkIndexed(path.join(tmp, 'packages', 'api'));
+    mkIndexed(path.join(api, 'submodule')); // nested index under an already-indexed project
+    const found = findIndexedSubprojectRoots(tmp);
+    expect(found).toEqual([api]);
+  });
+
+  it('respects the depth bound', () => {
+    mkIndexed(path.join(tmp, 'a', 'b', 'c', 'd', 'e', 'deep'));
+    expect(findIndexedSubprojectRoots(tmp, { maxDepth: 2 })).toEqual([]);
+  });
+});
+
+describe('hasStructuralKeyword — keyword signal fires the hook directly (#994)', () => {
+  it('English keywords match with word boundaries so "flow" ≠ "flower"', () => {
+    expect(hasStructuralKeyword('how does article publish work')).toBe(true);
+    expect(hasStructuralKeyword('where is the token validated')).toBe(true);
+    expect(hasStructuralKeyword('trace the request flow')).toBe(true);
+    expect(hasStructuralKeyword('what calls parseToken')).toBe(true);
+    expect(hasStructuralKeyword('water the flower')).toBe(false);   // "flow" in "flower"
+  });
+
+  it('Chinese keywords match WITHOUT `\\b` — the #994 fix (were silently dropped)', () => {
+    expect(hasStructuralKeyword('介绍文章发布流程')).toBe(true);      // introduce / flow
+    expect(hasStructuralKeyword('登录是如何实现的')).toBe(true);       // how / implement
+    expect(hasStructuralKeyword('这个函数的调用链')).toBe(true);        // call (chain)
+    expect(hasStructuralKeyword('支付模块依赖哪些服务')).toBe(true);    // depend
+    expect(hasStructuralKeyword('修复这个拼写错误')).toBe(false);       // "fix this typo"
+  });
+
+  it('a bare code-token is NOT a keyword — it needs graph verification', () => {
+    expect(hasStructuralKeyword('看看 get_user 这段逻辑')).toBe(false);
+    expect(hasStructuralKeyword('I really love JavaScript')).toBe(false);
+  });
+});
+
+describe('hasStructuralKeyword — Latin-script languages, Cyrillic, JA/KO (#1126)', () => {
+  it('French structural prompts fire — including the prompts from the report', () => {
+    expect(hasStructuralKeyword('comment marche la state machine des commandes ?')).toBe(true);
+    expect(hasStructuralKeyword("explique l'architecture du module de stock")).toBe(true);
+    expect(hasStructuralKeyword('qui appelle cette fonction de parsing ?')).toBe(true);
+    expect(hasStructuralKeyword('de quoi dépend le module de paiement ?')).toBe(true);
+  });
+
+  it('accented keyword edges match — ASCII `\\b` could never bound "où"', () => {
+    expect(hasStructuralKeyword('où est validé le token ?')).toBe(true);
+    expect(hasStructuralKeyword("d'où vient cette valeur ?")).toBe(true);
+  });
+
+  it('Spanish / Portuguese / German / Italian fire', () => {
+    expect(hasStructuralKeyword('¿cómo funciona la máquina de estados de pedidos?')).toBe(true);
+    expect(hasStructuralKeyword('¿qué rompe este cambio?')).toBe(true);
+    expect(hasStructuralKeyword('como funciona a máquina de estados dos pedidos?')).toBe(true);
+    expect(hasStructuralKeyword('qual é a arquitetura do módulo de estoque?')).toBe(true);
+    expect(hasStructuralKeyword('wie funktioniert die Zustandsmaschine für Bestellungen?')).toBe(true);
+    expect(hasStructuralKeyword('wovon hängt das Zahlungsmodul ab?')).toBe(true);
+    expect(hasStructuralKeyword('come funziona la macchina a stati degli ordini?')).toBe(true);
+    expect(hasStructuralKeyword('spiegami la struttura del modulo ordini')).toBe(true);
+  });
+
+  it('Russian / Japanese / Korean / traditional Chinese fire', () => {
+    expect(hasStructuralKeyword('как работает конечный автомат заказов?')).toBe(true);
+    expect(hasStructuralKeyword('от чего зависит модуль оплаты?')).toBe(true);
+    expect(hasStructuralKeyword('注文のステートマシンの仕組みを説明して')).toBe(true);
+    expect(hasStructuralKeyword('この関数の呼び出しの流れは?')).toBe(true);
+    expect(hasStructuralKeyword('주문 상태 머신은 어떻게 작동하나요?')).toBe(true);
+    expect(hasStructuralKeyword('訂單狀態機的架構是怎麼實現的?')).toBe(true);
+  });
+
+  it('English derived forms fire — "architecture"/"dependencies" failed the old exact-word list', () => {
+    expect(hasStructuralKeyword('explain the architecture of the stock module')).toBe(true);
+    expect(hasStructuralKeyword('what are the dependencies of the parser?')).toBe(true);
+  });
+
+  it('second-tier languages fire — VI/TR/ID/PL/UA/NL/CS/RO/HU/EL/SV/NO/FI/HI', () => {
+    expect(hasStructuralKeyword('state machine của đơn hàng hoạt động thế nào?')).toBe(true);   // Vietnamese
+    expect(hasStructuralKeyword('sipariş durum makinesi nasıl çalışıyor?')).toBe(true);          // Turkish
+    expect(hasStructuralKeyword('bu fonksiyonun bağımlılıkları neler?')).toBe(true);             // Turkish (stem)
+    expect(hasStructuralKeyword('bagaimana cara kerja mesin status pesanan?')).toBe(true);       // Indonesian
+    expect(hasStructuralKeyword('jak działa maszyna stanów zamówień?')).toBe(true);              // Polish
+    expect(hasStructuralKeyword('co wywołuje tę funkcję?')).toBe(true);                          // Polish (stem)
+    expect(hasStructuralKeyword('як працює кінцевий автомат замовлень?')).toBe(true);            // Ukrainian
+    expect(hasStructuralKeyword('від чого залежить модуль оплати?')).toBe(true);                 // Ukrainian (stem)
+    expect(hasStructuralKeyword('hoe werkt de state machine van bestellingen?')).toBe(true);     // Dutch
+    expect(hasStructuralKeyword('jak funguje stavový automat objednávek?')).toBe(true);          // Czech
+    expect(hasStructuralKeyword('cum funcționează mașina de stări a comenzilor?')).toBe(true);   // Romanian
+    expect(hasStructuralKeyword('hogyan működik a rendelések állapotgépe?')).toBe(true);         // Hungarian
+    expect(hasStructuralKeyword('πώς λειτουργεί η μηχανή καταστάσεων παραγγελιών;')).toBe(true); // Greek
+    expect(hasStructuralKeyword('hur fungerar orderns tillståndsmaskin?')).toBe(true);           // Swedish
+    expect(hasStructuralKeyword('hvordan fungerer ordrenes tilstandsmaskin?')).toBe(true);       // Norwegian/Danish
+    expect(hasStructuralKeyword('miten tilausten tilakone toimii?')).toBe(true);                 // Finnish
+    expect(hasStructuralKeyword('ऑर्डर स्टेट मशीन कैसे काम करती है?')).toBe(true);                 // Hindi
+  });
+
+  it('RTL scripts and Thai fire — proclitics/unsegmented text uses substring matching', () => {
+    expect(hasStructuralKeyword('كيف تعمل آلة حالات الطلبات؟')).toBe(true);        // Arabic
+    expect(hasStructuralKeyword('وكيف يعتمد هذا على قاعدة البيانات؟')).toBe(true); // Arabic, proclitic و attached
+    expect(hasStructuralKeyword('ماشین وضعیت سفارش‌ها چگونه کار می‌کند؟')).toBe(true); // Farsi
+    expect(hasStructuralKeyword('איך עובדת מכונת המצבים של ההזמנות?')).toBe(true);  // Hebrew
+    expect(hasStructuralKeyword('สถาปัตยกรรมของระบบทำงานอย่างไร')).toBe(true);       // Thai
+  });
+
+  it('terms that collide with English or code words are deliberately excluded', () => {
+    expect(hasStructuralKeyword('pad the buffer with zeros')).toBe(false);     // NL pad=path skipped
+    expect(hasStructuralKeyword('declare a var for the count')).toBe(false);   // SV var=where skipped
+    expect(hasStructuralKeyword('refresh the token')).toBe(false);             // CS tok=flow skipped
+    expect(hasStructuralKeyword('run the llama model locally')).toBe(false);   // ES bare llama skipped
+    expect(hasStructuralKeyword('come back to this later')).toBe(false);       // IT bare come skipped
+  });
+
+  it('stems match only at word start — no mid-word false positives', () => {
+    expect(hasStructuralKeyword('restructure this paragraph')).toBe(false); // "structur" mid-word
+    expect(hasStructuralKeyword('an independent module')).toBe(false);      // "depend" mid-word
+    expect(hasStructuralKeyword('water the flower')).toBe(false);           // unchanged guarantee
+  });
+
+  it('bounded stems reject ordinary-English completions (#1138)', () => {
+    expect(hasStructuralKeyword('he has a callus on his palm')).toBe(false);
+    expect(hasStructuralKeyword('a lovely calligraphy font')).toBe(false);
+    expect(hasStructuralKeyword('Connecticut is a state')).toBe(false);
+    expect(hasStructuralKeyword('connective tissue damage')).toBe(false);
+    expect(hasStructuralKeyword('she is very affectionate')).toBe(false);
+    expect(hasStructuralKeyword('Tracey went home early')).toBe(false);
+  });
+
+  it('bounded stems keep every structural derived form (#1138)', () => {
+    // call
+    expect(hasStructuralKeyword('list the callers of parseToken')).toBe(true);
+    expect(hasStructuralKeyword('what callbacks fire on save')).toBe(true);
+    expect(hasStructuralKeyword('is submitOrder callable from the worker')).toBe(true);
+    expect(hasStructuralKeyword('find every call site of dispose')).toBe(true);
+    expect(hasStructuralKeyword('who called setupRouter')).toBe(true);
+    // trace ("tracing" is covered by the exact-word list — the e drops)
+    expect(hasStructuralKeyword('trace the request')).toBe(true);
+    expect(hasStructuralKeyword('we traced it to the cache layer')).toBe(true);
+    expect(hasStructuralKeyword('add tracing to the pipeline')).toBe(true);
+    // affect / connect
+    expect(hasStructuralKeyword('which modules are affected by this change')).toBe(true);
+    expect(hasStructuralKeyword('how do the connections get pooled')).toBe(true);
+    expect(hasStructuralKeyword('the connector registers itself at boot')).toBe(true);
+  });
+
+  it('non-structural prose stays a no-op in every covered language', () => {
+    expect(hasStructuralKeyword('corrige cette faute de frappe')).toBe(false);   // FR "fix this typo"
+    expect(hasStructuralKeyword('arregla este error tipográfico')).toBe(false);  // ES
+    expect(hasStructuralKeyword('behebe diesen Tippfehler')).toBe(false);        // DE
+    expect(hasStructuralKeyword('исправь эту опечатку')).toBe(false);            // RU
+    expect(hasStructuralKeyword('このタイプミスを直して')).toBe(false);            // JA
+    expect(hasStructuralKeyword('이 오타를 수정해줘')).toBe(false);                // KO
+    expect(hasStructuralKeyword('sửa lỗi chính tả này')).toBe(false);            // VI
+    expect(hasStructuralKeyword('bu yazım hatasını düzelt')).toBe(false);        // TR
+    expect(hasStructuralKeyword('popraw tę literówkę')).toBe(false);             // PL
+    expect(hasStructuralKeyword('صحح هذا الخطأ الإملائي')).toBe(false);          // AR
+  });
+});
+
+describe('prompt-hook ambiguous words need corroboration (#1654)', () => {
+  let tmp: string;
+
+  beforeEach(async () => {
+    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hook-ambiguous-')));
+    fs.writeFileSync(path.join(tmp, 'orders.ts'), `
+export class OrderStateMachine {
+  submitOrder() { return true; }
+}
+`);
+    const cg = await CodeGraph.init(tmp, { silent: true });
+    try { await cg.indexAll(); } finally { cg.destroy(); }
+  });
+  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+
+  const hook = (prompt: string): string => runPromptHook(tmp, prompt);
+
+  it('stays silent for everyday Portuguese, Spanish and German without indexed evidence', () => {
+    for (const prompt of [
+      'eu como pizza toda sexta',
+      'faz como a gente combinou ontem',
+      'roda os testes como esta e me diz o resultado',
+      'commita isso como fix, nao como feat',
+      'hazlo como ayer',
+      'mach es wie gestern',
+      'COMO combinado ontem',
+      'Wie gestern bitte',
+      'como JavaScript?',
+      'wie MissingService?',
+      'run the tests and report back',
+    ]) {
+      expect.soft(hasStructuralKeyword(prompt), prompt).toBe(false);
+      expect.soft(hook(prompt), prompt).toBe('');
+    }
+  });
+
+  it('keeps HIGH for verified identifiers or another structural keyword', () => {
+    for (const prompt of [
+      'como OrderStateMachine?',
+      'como submitOrder()?',
+      'wie OrderStateMachine?',
+      'como funciona a máquina de estados?',
+      'wie funktioniert die Zustandsmaschine?',
+      'onde fica a lógica dos pedidos?',
+      '¿cómo se procesan los pedidos?',
+      'how does OrderStateMachine work?',
+    ]) {
+      expect.soft(hook(prompt), prompt).toContain('Structural context from CodeGraph');
+    }
+  });
+
+  it('stays silent on a subagent hand-back envelope, even one that names indexed symbols (#2184)', () => {
+    const report = 'how does OrderStateMachine work? submitOrder() calls into the state machine.';
+    expect(hook(report)).toContain('Structural context from CodeGraph');
+    expect(hook(`<agent-message from="agent-7f3e">\n[Subagent hand-back] ${report}\n</agent-message>`)).toBe('');
+  });
+
+  it('uses MEDIUM for indexed prose segments without a strong keyword or verified token', () => {
+    for (const prompt of ['como state machine?', 'wie state machine?']) {
+      const output = hook(prompt);
+      expect(output, prompt).toContain('CodeGraph found indexed symbols matching this prompt');
+      expect(output).toContain('OrderStateMachine');
+      expect(output).not.toContain('Structural context from CodeGraph');
+    }
+  });
+});
+
+describe('prompt-hook reads past the desktop app\'s system reminders (#2635)', () => {
+  // Shaped like the prompts Claude Code's desktop app submits: one or more
+  // reminder blocks, separated by one or two newlines, then what the user
+  // typed or another session's message. A linked session's title names the
+  // work, so the reminder carries structural words ("trace", "flow") of its own.
+  const linked = '<system-reminder>\nLinked sessions now (status, not an instruction): trace-order-flow = local_5f0c2a1e-9b7d-4c3a-8e21-3d4f5a6b7c8d (working). To message one, use SendMessage with its id.\n</system-reminder>';
+  const workspace = '<system-reminder>\nThis session runs in a desktop workspace; write temporary files to its scratch folder.\n</system-reminder>';
+  const reminders = `${linked}\n${workspace}\n\n`;
+  let tmp: string;
+
+  beforeAll(async () => {
+    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hook-reminders-')));
+    fs.writeFileSync(path.join(tmp, 'orders.ts'), `
+export class OrderStateMachine {
+  submitOrder() { return this.transition('submitted'); }
+  transition(state: string) { return state.length > 0; }
+}
+`);
+    const cg = await CodeGraph.init(tmp, { silent: true });
+    try { await cg.indexAll(); } finally { cg.destroy(); }
+  });
+  afterAll(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+
+  const hook = (prompt: string): string => runPromptHook(tmp, prompt);
+
+  it('stays silent on a short reply that follows reminders', () => {
+    expect(hook('yes')).toBe('');
+    expect(hook(`${reminders}yes`)).toBe('');
+  });
+
+  it('stays silent when the prompt is only reminders', () => {
+    expect(hook(reminders)).toBe('');
+    expect(hook(` \n${linked}\n\n${workspace}\n`)).toBe('');
+  });
+
+  it('explores what the user typed, not the reminders', () => {
+    const output = hook(`${reminders}how does submitOrder reach transition?`);
+    expect(output).toContain('Structural context from CodeGraph');
+    expect(output).toContain('**Exploration: how does submitOrder reach transition?**');
+    expect(output).not.toContain('Linked sessions');
+    expect(output).not.toContain('trace-order-flow');
+  });
+
+  it('gates on what the user typed: prose that names indexed symbols gets the MEDIUM tier', () => {
+    const output = hook(`${linked}\n\nstate machine`);
+    expect(output).toContain('CodeGraph found indexed symbols matching this prompt');
+    expect(output).toContain('OrderStateMachine');
+    expect(output).not.toContain('Structural context from CodeGraph');
+  });
+
+  it.each([
+    ['a message from another session', '<cross-session-message from="local_9a8b7c6d-1e2f-4a3b-9c8d-7e6f5a4b3c2d" name="trace-order-flow">\nI traced how OrderStateMachine.submitOrder() reaches transition(). Ready for review.\n</cross-session-message>'],
+    ['a task notification', '<task-notification>\n<task-id>b7d3k2</task-id>\n<status>completed</status>\n<summary>Background command "trace submitOrder flow" completed (exit code 0)</summary>\n</task-notification>'],
+    ['a subagent hand-back', '<agent-message from="agent-7f3e">\n[Subagent hand-back] submitOrder() calls transition() on OrderStateMachine.\n</agent-message>'],
+  ])('stays silent on %s behind reminders', (_label, envelope) => {
+    expect(hook(`${linked}\n\n${envelope}`)).toBe('');
+    expect(hook(`${reminders}${envelope}`)).toBe('');
+  });
+
+  it('stays silent on a message from another session on its own', () => {
+    expect(hook('<cross-session-message from="local_9a8b7c6d-1e2f-4a3b-9c8d-7e6f5a4b3c2d" name="trace-order-flow">\nhow does OrderStateMachine work?\n</cross-session-message>')).toBe('');
+  });
+});
+
+describe('extractCodeTokens — candidate symbols the hook verifies against the graph', () => {
+  it('pulls camelCase / PascalCase / snake_case / call / member tokens', () => {
+    expect(extractCodeTokens('prepareArticlePublish 的调用链')).toContain('prepareArticlePublish');
+    expect(extractCodeTokens('看看 get_user 这段逻辑')).toContain('get_user');   // snake_case
+    expect(extractCodeTokens('render() 在哪触发')).toContain('render');          // call form
+    expect(extractCodeTokens('user.login 做了什么').sort()).toEqual(['login', 'user']); // member access
+    expect(extractCodeTokens('看看 UserService')).toContain('UserService');      // PascalCase class kept
+  });
+
+  it('a tech brand is extracted as a CANDIDATE — the hook’s graph check is what rejects it', () => {
+    // This is the #994 follow-up: "JavaScript" is identifier-shaped, so it surfaces
+    // here as a candidate; the hook only fires if it's a real symbol in the index.
+    expect(extractCodeTokens('I really love JavaScript')).toEqual(['JavaScript']);
+    expect(extractCodeTokens('thoughts on GitHub vs GitLab').sort()).toEqual(['GitHub', 'GitLab']);
+  });
+
+  it('ordinary prose and doc/data filenames yield no tokens', () => {
+    expect(extractCodeTokens('fix typo in readme')).toEqual([]);
+    expect(extractCodeTokens('fix the typo in README.md')).toEqual([]);   // doc filename excluded
+    expect(extractCodeTokens('bump the version in package.json')).toEqual([]);
+    expect(extractCodeTokens('water the flower')).toEqual([]);
+  });
+});
+
+describe('isStructuralPrompt — cheap candidate gate (keyword OR code-token)', () => {
+  it('fires on a keyword prompt in any language', () => {
+    expect(isStructuralPrompt('how does article publish work')).toBe(true);
+    expect(isStructuralPrompt('介绍文章发布流程')).toBe(true);
+  });
+
+  it('fires on a code-token prompt with no keyword', () => {
+    expect(isStructuralPrompt('看看 get_user 这段逻辑')).toBe(true);
+    expect(isStructuralPrompt('where is prepareArticlePublish 定义')).toBe(true);
+    expect(isStructuralPrompt('user.login 做了什么')).toBe(true);
+  });
+
+  it('a tech brand passes the CHEAP gate as a candidate — the hook then graph-verifies it', () => {
+    // Layering, not a bug: isStructuralPrompt is shape-only, so a token-shaped brand
+    // is a candidate here; the hook rejects it as a non-symbol (proven by the CLI e2e).
+    expect(isStructuralPrompt('I really love JavaScript')).toBe(true);
+  });
+
+  it('non-structural prose stays a no-op — in either language', () => {
+    expect(isStructuralPrompt('fix typo in readme')).toBe(false);
+    expect(isStructuralPrompt('修复这个拼写错误')).toBe(false);
+    expect(isStructuralPrompt('water the flower')).toBe(false);
+    expect(isStructuralPrompt('')).toBe(false);
+  });
+});
+
+describe('prompt-hook injection cap (#1694)', () => {
+  it('PROMPT_HOOK_INJECTION_MAX stays under Claude Code\'s 10k inline hook-output limit', () => {
+    expect(PROMPT_HOOK_INJECTION_MAX).toBe(9000);
+    expect(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT).toBe(10_000);
+    expect(PROMPT_HOOK_INJECTION_MAX).toBeLessThan(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+    // Leave headroom for the <codegraph_context> wrapper + projectPath nudge lines.
+    expect(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT - PROMPT_HOOK_INJECTION_MAX).toBeGreaterThanOrEqual(500);
+  });
+
+  it('capPromptHookInjection leaves short payloads intact', () => {
+    expect(capPromptHookInjection('hello')).toBe('hello');
+    expect(capPromptHookInjection('x'.repeat(PROMPT_HOOK_INJECTION_MAX))).toBe('x'.repeat(PROMPT_HOOK_INJECTION_MAX));
+  });
+
+  it('capPromptHookInjection truncates oversize payloads with the explore notice', () => {
+    const over = 'a'.repeat(PROMPT_HOOK_INJECTION_MAX + 500);
+    const out = capPromptHookInjection(over);
+    expect(out.length).toBeLessThan(over.length);
+    expect(out.startsWith('a'.repeat(PROMPT_HOOK_INJECTION_MAX))).toBe(true);
+    expect(out).toContain('…(truncated; call codegraph_explore for the rest)');
+    // Capped body alone must still fit under the host inline limit.
+    expect(out.length).toBeLessThan(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+  });
+});
+
+describe('system task notifications (#1832)', () => {
+  it('skips the complete system envelope', () => {
+    expect(isTaskNotification('<task-notification>trace AuthService login flow</task-notification>')).toBe(true);
+    expect(isTaskNotification(' <task-notification>\n<task-id>abc</task-id>\n<summary>done</summary>\n</task-notification>\n')).toBe(true);
+  });
+  it('does not suppress a user question that mentions the marker', () => {
+    expect(isTaskNotification('Why does <task-notification>trace</task-notification> trigger the hook?')).toBe(false);
+    expect(isTaskNotification('<task-notification>trace</task-notification> Explain this.')).toBe(false);
+    expect(isTaskNotification('<other-tag>trace AuthService</other-tag>')).toBe(false);
+    expect(isTaskNotification('trace AuthService login')).toBe(false);
+  });
+});
+
+describe('subagent hand-backs (#2184)', () => {
+  const handBack = '<agent-message from="a1b2c3">\n[Subagent hand-back] Traced how AuthService.login calls TokenStore.save and which callers are affected.\n</agent-message>';
+
+  it('skips the complete hand-back envelope', () => {
+    expect(isAgentMessage(handBack)).toBe(true);
+    expect(isAgentMessage(` \n${handBack}\n`)).toBe(true);
+    expect(isAgentMessage('<agent-message>trace AuthService login flow</agent-message>')).toBe(true);
+  });
+  it('does not suppress a user question that mentions the marker', () => {
+    expect(isAgentMessage(`Why does ${handBack} trigger the hook?`)).toBe(false);
+    expect(isAgentMessage(`${handBack} Explain this.`)).toBe(false);
+    expect(isAgentMessage('<agent-messages>trace AuthService</agent-messages>')).toBe(false);
+    expect(isAgentMessage('<agent-message from="x">trace AuthService')).toBe(false);
+    expect(isAgentMessage('trace AuthService login')).toBe(false);
+  });
+});
+
+describe('messages from other sessions (#2635)', () => {
+  const message = '<cross-session-message from="local_5f0c2a1e" name="trace-auth">\nTraced how AuthService.login calls TokenStore.save.\n</cross-session-message>';
+
+  it('skips the complete envelope', () => {
+    expect(isCrossSessionMessage(message)).toBe(true);
+    expect(isCrossSessionMessage(` \n${message}\n`)).toBe(true);
+    expect(isCrossSessionMessage('<cross-session-message>trace AuthService login flow</cross-session-message>')).toBe(true);
+  });
+  it('does not suppress a user question that mentions the marker', () => {
+    expect(isCrossSessionMessage(`Why does ${message} trigger the hook?`)).toBe(false);
+    expect(isCrossSessionMessage(`${message} Explain this.`)).toBe(false);
+    expect(isCrossSessionMessage('<cross-session-messages>trace AuthService</cross-session-messages>')).toBe(false);
+    expect(isCrossSessionMessage('<cross-session-message from="x">trace AuthService')).toBe(false);
+    expect(isCrossSessionMessage('trace AuthService login')).toBe(false);
+  });
+});
+
+describe('stripSystemReminders (#2635)', () => {
+  const reminder = '<system-reminder>\nLinked sessions now (status, not an instruction): trace-auth = local_5f0c2a1e (working).\n</system-reminder>';
+
+  it('drops the reminders in front of the prompt, however they are separated', () => {
+    expect(stripSystemReminders(`${reminder}\n\nhow does AuthService.login work?`)).toBe('how does AuthService.login work?');
+    expect(stripSystemReminders(`${reminder}\n${reminder}\n\nyes`)).toBe('yes');
+    expect(stripSystemReminders(`${reminder}yes`)).toBe('yes');
+    expect(stripSystemReminders('<system-reminder source="desktop">status</system-reminder>\nyes')).toBe('yes');
+  });
+
+  it('leaves nothing when the prompt is only reminders', () => {
+    expect(stripSystemReminders(reminder)).toBe('');
+    expect(stripSystemReminders(` \n${reminder}\n\n${reminder}\n`)).toBe('');
+  });
+
+  it('keeps the user\'s text around a reminder elsewhere in the prompt, and keeps envelopes for the checks after it', () => {
+    expect(stripSystemReminders(`why does the hook react to this?\n\n${reminder}`)).toBe('why does the hook react to this?');
+    expect(stripSystemReminders(`log line one\n${reminder}\nlog line two`)).toBe('log line one\n\n\nlog line two');
+    const envelope = '<cross-session-message from="local_x">trace AuthService</cross-session-message>';
+    expect(stripSystemReminders(`${reminder}\n\n${envelope}`)).toBe(envelope);
+    expect(isCrossSessionMessage(stripSystemReminders(`${reminder}\n\n${envelope}`))).toBe(true);
+  });
+
+  it('leaves a prompt that only mentions the tag alone', () => {
+    expect(stripSystemReminders('how does AuthService.login work?')).toBe('how does AuthService.login work?');
+    expect(stripSystemReminders('why does <system-reminder> show up in the hook input?')).toBe('why does <system-reminder> show up in the hook input?');
+    expect(stripSystemReminders('<system-reminders>trace AuthService</system-reminders>')).toBe('<system-reminders>trace AuthService</system-reminders>');
+    expect(stripSystemReminders('a stray </system-reminder> closing tag')).toBe('a stray </system-reminder> closing tag');
+  });
+
+  it('stays linear on a long pasted prompt full of unclosed tags', () => {
+    const pasted = `${'<system-reminder x=1 '.repeat(20_000)}\n${'word '.repeat(20_000)}</system-reminder>`;
+    const started = Date.now();
+    stripSystemReminders(pasted);
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+});

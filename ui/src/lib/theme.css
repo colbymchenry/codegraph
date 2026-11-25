@@ -1,0 +1,192 @@
+/* =====================================================================
+   @colbymchenry/codegraph-ui — design tokens
+
+   The engine's paper/ink editorial system, as specified in
+   docs/design/codegraph-ui-design-spec.md §2.2: flat, hairline rules,
+   square corners everywhere, no shadows, no gradients, sentence case,
+   one oxblood accent, one amber (the "untested" badge).
+
+   This file is the package's whole theming surface. Import it once and
+   override any variable on a narrower selector — the components read
+   nothing else. What is NOT themable is geometry: 34px rail rows, the
+   300/320px rails, the 20px code line. Those are measured against each
+   other by the Symbol view's layout pass, and a host that moves one of
+   them moves a callee row away from the line it points at.
+
+   Colour and type only. Every token is defined once on the bare :root
+   below and only REDEFINED in the two dark blocks, so a host that sets
+   `--accent` on its own container gets it in both schemes.
+   ===================================================================== */
+
+/* ---------- tokens: light / paper (the bare :root set) ---------- */
+:root {
+  --paper: #f7f6f2;
+  --paper-2: #f1efe8;
+  --press: #e8e6dd;
+  --press-2: #dedbd0;
+  --ink: #16150f;
+  --ink-2: #56544a;
+  --ink-3: #87847a;
+  --ink-4: #b4b1a5;
+  --rule: #16150f;
+  --rule-soft: #d6d3c8;
+  --rule-faint: #e6e3d9;
+  --accent: #7a2230;
+  --accent-ink: #5e1a25;
+  --accent-soft: #f0e3e5;
+  --accent-line: #d9b3b9;
+  --amber: #8a5a0b;
+  --amber-soft: #f3e9d2;
+
+  /* The one code colour that is not a plain re-use of the ink ramp.
+     The spec asks for comments at --ink-3; measured against --paper that
+     is 3.46:1 and against the hot-line tint --accent-soft it is 3.00:1,
+     both under the 4.5:1 an AA reading of 12.5px body text needs. This is
+     the smallest step DOWN the same warm-grey ramp that clears 4.5:1 on
+     all three backgrounds a code line can have (paper 5.23, paper-2 4.92,
+     accent-soft 4.53) while staying quieter than --ink-2, which strings
+     and numbers use — so the recession order the spec describes is
+     unchanged, only legible. Dark needed the mirror step UP (4.51 on
+     accent-soft, where --ink-3 was 4.10). */
+  --code-comment: #6a675d;
+
+  --sans: 'Archivo Variable', 'Archivo', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --code-size: 12.5px;
+  --code-lh: 20px;
+
+  /* App-shell geometry, shared by the grid and by anything that has to
+     offset itself under the bars (sticky rail headers, SVG overlays). */
+  --topbar-h: 48px;
+  --trailbar-h: 34px;
+
+  color-scheme: light dark;
+}
+
+/* ---------- tokens: dark / ink ----------
+   Every colour is defined on the bare :root above; these blocks only
+   redefine. `:not([data-theme="light"])` lets an explicit light choice
+   win over the OS preference. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --paper: #16150f;
+    --paper-2: #1c1a14;
+    --press: #23211a;
+    --press-2: #2c2a22;
+    --ink: #f3f1ea;
+    --ink-2: #b8b5a8;
+    --ink-3: #87847a;
+    --ink-4: #5d5b52;
+    --rule: #f3f1ea;
+    --rule-soft: #34322a;
+    --rule-faint: #26241d;
+    --accent: #d48b96;
+    --accent-ink: #e5a5ae;
+    --accent-soft: #33201f;
+    --accent-line: #6b3a42;
+    --amber: #d9a94a;
+    --amber-soft: #2e2716;
+    --code-comment: #8e8b81;
+  }
+}
+
+/* An explicit choice, wherever it is made. `:root[data-theme]` is the viewer's
+   own switch; the bare attribute selector is what `<CodegraphUi theme="dark">`
+   sets on its wrapper — custom properties inherit, so redefining them on a
+   container re-themes that subtree without touching :root. A host can therefore
+   put a light reader inside a dark application, and the reverse. */
+:root[data-theme='dark'],
+[data-theme='dark'] {
+  --paper: #16150f;
+  --paper-2: #1c1a14;
+  --press: #23211a;
+  --press-2: #2c2a22;
+  --ink: #f3f1ea;
+  --ink-2: #b8b5a8;
+  --ink-3: #87847a;
+  --ink-4: #5d5b52;
+  --rule: #f3f1ea;
+  --rule-soft: #34322a;
+  --rule-faint: #26241d;
+  --accent: #d48b96;
+  --accent-ink: #e5a5ae;
+  --accent-soft: #33201f;
+  --accent-line: #6b3a42;
+  --amber: #d9a94a;
+  --amber-soft: #2e2716;
+  --code-comment: #8e8b81;
+  color-scheme: dark;
+}
+
+/* The light values again, for a container that asks for light inside a page
+   the OS is painting dark. `:root[data-theme='light']` needs no block — the
+   media query above already excludes it. */
+[data-theme='light'] {
+  --paper: #f7f6f2;
+  --paper-2: #f1efe8;
+  --press: #e8e6dd;
+  --press-2: #dedbd0;
+  --ink: #16150f;
+  --ink-2: #56544a;
+  --ink-3: #87847a;
+  --ink-4: #b4b1a5;
+  --rule: #16150f;
+  --rule-soft: #d6d3c8;
+  --rule-faint: #e6e3d9;
+  --accent: #7a2230;
+  --accent-ink: #5e1a25;
+  --accent-soft: #f0e3e5;
+  --accent-line: #d9b3b9;
+  --amber: #8a5a0b;
+  --amber-soft: #f3e9d2;
+  --code-comment: #6a675d;
+  color-scheme: light;
+}
+
+/* ---------- Svelte Flow ----------
+   The Map and the Flow strip draw on @xyflow/svelte, which ships its own
+   blue-on-white palette in `--xy-*` variables. Mapping them onto the ink
+   ramp here — rather than in each canvas — is what stops a host from
+   seeing library defaults in the gaps our custom node and edge
+   components do not paint: the pane behind the cards, the controls, the
+   minimap, the selection ring, the attribution.
+
+   Set on :root so it reaches the portalled panes too. A host that wants
+   the library's own look overrides these after importing this file. */
+:root {
+  --xy-background-color: var(--paper);
+  --xy-background-pattern-color: var(--rule-faint);
+
+  --xy-edge-stroke: var(--ink-3);
+  --xy-edge-stroke-selected: var(--accent);
+  --xy-edge-stroke-width: 1;
+  --xy-connectionline-stroke: var(--ink-3);
+
+  --xy-node-color: var(--ink);
+  --xy-node-background-color: var(--paper);
+  --xy-node-border: 1px solid var(--rule-soft);
+  --xy-node-boxshadow-hover: none;
+  --xy-node-boxshadow-selected: none;
+  --xy-selection-background-color: var(--accent-soft);
+  --xy-selection-border: 1px solid var(--accent-line);
+
+  --xy-handle-background-color: transparent;
+  --xy-handle-border-color: transparent;
+
+  --xy-controls-button-background-color: var(--paper);
+  --xy-controls-button-background-color-hover: var(--press);
+  --xy-controls-button-color: var(--ink-2);
+  --xy-controls-button-color-hover: var(--ink);
+  --xy-controls-button-border-color: var(--rule-soft);
+  --xy-controls-box-shadow: none;
+
+  --xy-minimap-background-color: var(--paper-2);
+  --xy-minimap-mask-background-color: var(--paper);
+  --xy-minimap-node-background-color: var(--rule-soft);
+  --xy-minimap-node-stroke-color: var(--ink-3);
+
+  --xy-attribution-background-color: transparent;
+
+  --xy-resize-background-color: var(--accent);
+  --xy-error-color: var(--accent);
+}

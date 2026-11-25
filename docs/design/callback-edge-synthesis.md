@@ -38,7 +38,7 @@ We synthesize `dispatcher → callback` edges that static parsing misses. It wor
 npm run build
 rm -rf /tmp/codegraph-corpus/excalidraw/.codegraph
 ( cd /tmp/codegraph-corpus/excalidraw && codegraph init -i )
-# synthesized edges (provenance='heuristic', metadata.synthesizedBy in {callback,event-emitter}):
+# synthesized edges (provenance='heuristic', metadata.synthesizedBy in {callback,event-emitter,…,http-client,queue-job,event-bus}):
 sqlite3 /tmp/codegraph-corpus/excalidraw/.codegraph/codegraph.db \
   "select s.name||' → '||t.name||'  '||coalesce(e.metadata,'') from edges e \
    join nodes s on e.source=s.id join nodes t on e.target=t.id where e.provenance='heuristic';"
@@ -50,6 +50,49 @@ Probe scripts (dev-only, in `scripts/agent-eval/`): `probe-node.mjs` (symbol + t
 fixture lives at `/tmp/cb-fixture/bus.js` (ephemeral — recreate or move into `__tests__/`).
 
 ---
+
+## Cross-tier channels (`src/resolution/tier-synthesizer.ts`, 2026-08-28)
+
+The web's RN bridge: one pass, registered before the in-process emitter pass (the more specific edge wins a duplicate
+`source>target` pair in the merge), gated on JS-family files, never sourced from a test suite or a generated file.
+Three channels, each keyed on a literal on both sides, each edge `kind:'calls'`, `provenance:'heuristic'`, with
+`synthesizedBy`, `channel` (`http` | `queue` | `event` | `socket`), `tier` (`client→server` / `server→client`) when the
+direction is known, the `event` / `queue` / `method` / `href` it paired on, `line` + `column` of the call, and
+`registeredAt` = the other side (route registration, decorator, `.on`):
+
+- **`http-client`** — `fetch` / `$fetch` / `ofetch` / `axios` / `ky` / `got` / `useFetch` / `useSWR`, `<client>.get|post|…(`
+  where the receiver is a known client name or a binding made by `axios.create(…)` / `ky.extend(…)` (same file or the file it
+  is imported from — `resolveImportPath`, since import mappings carry no resolved path), with a literal / template first
+  argument (`new URL('/x', base)` and `{ url, method }` configs read too) → the ONE route `METHOD path` in the index it
+  denotes. A hole fills a `:param` / `{id}` / `[id]` / catch-all segment and never a literal one; a hole in front of the path
+  (`${API_URL}/users`) matches by the route's tail; a line a framework resolver made a route node on is a registration, not a
+  client call; a tie between routes is nothing. No fan-out cap — the match is exact.
+- **`queue-job`** — `<queue>.add('job', …)` where the queue is named (`new Queue('email')`, `@InjectQueue('email') x`, in the
+  file or its import) or queue-shaped → the `@Process('job')` method of the `@Processor('email')` class (a WorkerHost's
+  `process` when there is none), `new Worker('email', handler)` (an inline handler → the enclosing function, else the
+  enclosing constant), Bull's `queue.process('job', handler)`. Most specific pairing wins (queue+job > job > the queue's
+  default); an unnamed queue pairs only on a unique job name. Fan-out cap 6.
+- **`event-bus`** — `.emit|emitAsync('x')` on a bus-shaped receiver (`eventEmitter`, `bus`, `pubsub`, …) → `@OnEvent`
+  handlers, `*` / `**` globs honoured; on a socket-shaped receiver (`socket`, `io`, `server`, `client`, `.to(room)`, …) from a
+  file without a socket server → `@SubscribeMessage('x')` and server-side `socket.on('x')` (`client→server`); from a file
+  with one (`@WebSocketGateway`, `io.on('connection')`, `new Server`) → client-side `socket.on('x', …)`, named or inline
+  (→ the enclosing component) (`server→client`). Plain `.on` ↔ `.emit` stays the emitter pass's. Fan-out cap 6.
+
+The Steps view (`ui-server/api/steps.ts`) reads `tier` / `channel` before the languages in `crossing()`, so a hop between
+two TS files draws as a bridge (`⇢ POST /api/users`, a boundary like another screen) or an event (`⇠ welcome`); explore's
+Flow section labels them (`context/index.ts`, `mcp/tools.ts`). A Next `'use server'` action needs no edge: `steps.ts` marks
+the call at request time from the directive. Validated on `bradtraversy/proshop_mern` (30 routes, 23 client→route edges,
+all correct on inspection, after Express mounts + chained `router.route()` landed) and `nestjs/nest` (`sample/26-queues`,
+`sample/30-event-emitter`); test `__tests__/ui-steps-cross-tier.test.ts`.
+
+## Next.js links (`src/resolution/next-router-synthesizer.ts`, 2026-08-28)
+
+`<Link href="/x">`, `<Link href={`/users/${id}`}>`, `<Link href={{ pathname }}>` and an internal `<a href>` are JSX
+attributes — no reference is ever extracted for them — so this pass reads them from the source, attributes each to the
+component it is written in, matches the href against the Next page table (`frameworks/nextjs.ts`) and synthesizes a
+`navigates` edge (`synthesizedBy:'next-link'`, `href`, `navMethod: 'link' | 'a'`, `registeredAt` = the JSX site). Only files
+under a Next app's root, never test files; ≤ 24 links per component (a navigation menu is not a decision); an external `<a>`
+is nothing. The Screens view walks back from these edges exactly as from `router.push`; they draw dashed.
 
 ## The hole
 

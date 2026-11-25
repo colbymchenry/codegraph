@@ -5,11 +5,12 @@
  */
 
 import { SqliteDatabase } from './sqlite-adapter';
+import { referenceNameTail, MEMBER_TAIL_SQL, MODULE_PARKED_SQL } from './reference-tail';
 
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 16;
 
 /**
  * Migration definition
@@ -62,6 +63,254 @@ const migrations: Migration[] = [
       db.exec(`
         DROP INDEX IF EXISTS idx_edges_source;
         DROP INDEX IF EXISTS idx_edges_target;
+      `);
+    },
+  },
+  {
+    version: 5,
+    description:
+      'Add nodes.return_type — normalized return/result type for receiver-type inference (C++ singletons/factories, #645)',
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE nodes ADD COLUMN return_type TEXT;
+      `);
+    },
+  },
+  {
+    version: 6,
+    description:
+      'Dedup duplicate edge rows and add a UNIQUE identity index so INSERT OR IGNORE actually dedups (#1034)',
+    up: (db) => {
+      // `insertEdge` has always used `INSERT OR IGNORE`, but the edges table had
+      // no UNIQUE constraint, so nothing conflicted and byte-identical rows
+      // accumulated whenever two passes emitted the same edge. Collapse each
+      // identity group to its lowest id, then add the constraint that makes
+      // `OR IGNORE` keep its promise. IFNULL folds nullable line/col so
+      // coordinate-less edges dedup too (SQLite treats each NULL as distinct) —
+      // and it MUST match the GROUP BY exactly, or the index creation would
+      // fail on a pair the DELETE left behind. Idempotent: the index is
+      // `IF NOT EXISTS` and the DELETE is a no-op once the table is unique.
+      db.exec(`
+        DELETE FROM edges
+        WHERE id NOT IN (
+          SELECT MIN(id) FROM edges
+          GROUP BY source, target, kind, IFNULL(line, -1), IFNULL(col, -1)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
+          ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
+      `);
+    },
+  },
+  {
+    version: 7,
+    description:
+      'Add name_segment_vocab — prose-word → symbol-name lookup for the prompt hook’s graph-derived gate',
+    up: (db) => {
+      // DDL only — instant on any size database (the row-churn hazards of #1067
+      // don't apply). The table starts EMPTY on migrated databases; `sync`
+      // detects that over a populated graph and backfills batched+yielding
+      // (CodeGraph.rebuildNameSegmentVocab), and any full index rebuilds it
+      // from scratch. Keep the definition in lockstep with schema.sql.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS name_segment_vocab (
+          segment TEXT NOT NULL,
+          name TEXT NOT NULL,
+          PRIMARY KEY (segment, name)
+        ) WITHOUT ROWID;
+      `);
+    },
+  },
+  {
+    version: 8,
+    description:
+      'Track attempted-but-unresolvable refs as status=failed so sync can retry them when a changed file adds a matching symbol (#1240)',
+    up: (db) => {
+      // DDL only — instant on any size database. No backfill needed: rows are
+      // only ever queried by name_tail once they carry status='failed', and
+      // both fields are written together by markReferencesFailed. Legacy rows
+      // (all 'pending' after this migration) are orphans from interrupted runs
+      // that the #1187 sweep grinds down on the next sync, marking survivors
+      // failed with their tails as it goes. The tail index is partial: on a
+      // healthy index the pending set is empty and the failed set is the only
+      // population worth indexing. Keep the definitions in lockstep with
+      // schema.sql. ALTER TABLE has no IF NOT EXISTS, so guard each column for
+      // idempotency — a database created from current schema.sql already has
+      // both (matters when migrations are re-run from an older recorded
+      // version, as the v6 regression test does).
+      const cols = db.prepare('PRAGMA table_info(unresolved_refs)').all() as Array<{ name: string }>;
+      const hasColumn = (name: string) => cols.some((c) => c.name === name);
+      if (!hasColumn('status')) {
+        db.exec("ALTER TABLE unresolved_refs ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'");
+      }
+      if (!hasColumn('name_tail')) {
+        db.exec("ALTER TABLE unresolved_refs ADD COLUMN name_tail TEXT NOT NULL DEFAULT ''");
+      }
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_unresolved_status ON unresolved_refs(status);
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_tail ON unresolved_refs(name_tail) WHERE status = 'failed';
+      `);
+    },
+  },
+  {
+    version: 9,
+    description:
+      'Add files.generated — index-time content-header generated-file detection for ranking (#1500)',
+    up: (db) => {
+      // DDL only — instant on any size database, and NO backfill: the flag is
+      // derived from file CONTENT, which this migration has no access to (the
+      // files table stores a hash, not the bytes). Migrated rows therefore stay
+      // 0 until the next full index re-extracts them, and every reader unions
+      // the flag with the path-only check, so an un-backfilled database keeps
+      // exactly the pre-#1500 behavior instead of regressing. `sync` heals it
+      // file-by-file as files change. This is why the CHANGELOG entry says a
+      // re-index is required to pick up the new detection.
+      //
+      // ALTER TABLE has no IF NOT EXISTS, so guard for idempotency — a database
+      // created from current schema.sql already has the column (matters when
+      // migrations are re-run from an older recorded version, as the v6
+      // regression test does). Keep in lockstep with schema.sql.
+      const cols = db.prepare('PRAGMA table_info(files)').all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === 'generated')) {
+        db.exec('ALTER TABLE files ADD COLUMN generated INTEGER NOT NULL DEFAULT 0');
+      }
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1'
+      );
+    },
+  },
+  {
+    version: 10,
+    description: 'Track synthesis inputs and stabilize synthesis traversal for incremental refresh (#1988)',
+    up: (db) => {
+      db.exec(`
+        DROP INDEX IF EXISTS idx_nodes_kind;
+        CREATE INDEX idx_nodes_kind ON nodes(kind, file_path, start_line, id);
+        CREATE TABLE IF NOT EXISTS synthesis_inputs (
+          file_path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_edges_synthesis_site ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
+          WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+        UPDATE edges SET metadata = json_set(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, '$.synthesizedBy', 'go-method-contains')
+          WHERE kind = 'contains' AND provenance IS NULL AND EXISTS (
+            SELECT 1 FROM nodes s JOIN nodes t ON t.id = edges.target
+            WHERE s.id = edges.source AND s.language = 'go' AND t.language = 'go'
+              AND s.kind IN ('struct', 'class', 'interface', 'enum', 'type_alias') AND t.kind = 'method'
+              AND s.file_path != t.file_path
+          );
+        INSERT OR REPLACE INTO project_metadata(key, value, updated_at)
+          VALUES ('synthesis_pending', '1', 0);
+      `);
+    },
+  },
+  {
+    version: 11,
+    description: 'Guard synthesis metadata lookups against malformed JSON',
+    up: (db) => {
+      // Existing v10 indexes keep their old expression under IF NOT EXISTS.
+      // Rebuild transactionally; the guarded v10 definition also lets older
+      // databases containing malformed metadata reach this migration safely.
+      db.exec(`
+        DROP INDEX IF EXISTS idx_edges_synthesis_site;
+        CREATE INDEX idx_edges_synthesis_site
+          ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
+          WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+      `);
+    },
+  },
+  {
+    version: 12,
+    description: 'Retry a failed import when sync adds the file it names: path tails and failed-import indexes',
+    up: (db) => {
+      // Partial over failed imports, so both stay small. Keep the definitions
+      // in lockstep with schema.sql.
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_import_tail ON unresolved_refs(reference_kind, name_tail) WHERE status = 'failed' AND reference_kind = 'imports';
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_import_name ON unresolved_refs(reference_kind, reference_name) WHERE status = 'failed' AND reference_kind = 'imports';
+      `);
+      // A path import parked before this version carries its dotted tail —
+      // the extension or a path fragment — which no file's keys match.
+      // Rewrite it to the path tail a failed import is parked under now.
+      // Idempotent: a rewritten tail rewrites to itself.
+      const update = db.prepare('UPDATE unresolved_refs SET name_tail = ? WHERE id = ?');
+      const rows = db
+        .prepare("SELECT id, reference_name FROM unresolved_refs WHERE status = 'failed' AND reference_kind = 'imports' AND reference_name LIKE '%/%'")
+        .all() as Array<{ id: number; reference_name: string }>;
+      for (const row of rows) update.run(referenceNameTail(row.reference_name, 'imports'), row.id);
+    },
+  },
+  {
+    version: 13,
+    description: 'Retry a failed path reference when sync adds the file it names: file-name tails',
+    up: (db) => {
+      // A path reference parked before this version — a Liquid
+      // `snippets/price.liquid` — carries its extension as its tail, which no
+      // node is named. Rewrite it to the file name a failed path reference is
+      // parked under now. Idempotent: a rewritten tail rewrites to itself.
+      const update = db.prepare('UPDATE unresolved_refs SET name_tail = ? WHERE id = ?');
+      const rows = db
+        .prepare("SELECT id, reference_name, name_tail FROM unresolved_refs WHERE status = 'failed' AND reference_kind = 'references' AND reference_name LIKE '%/%.%'")
+        .all() as Array<{ id: number; reference_name: string; name_tail: string }>;
+      for (const row of rows) {
+        const tail = referenceNameTail(row.reference_name, 'references');
+        if (tail !== row.name_tail) update.run(tail, row.id);
+      }
+    },
+  },
+  {
+    version: 14,
+    description: 'Retry a failed route module reference when sync adds or changes its file: module tails',
+    up: (db) => {
+      // A route's reference to the module it lazily loads, parked before this
+      // version — React Router's `lazy-import:./pages/Team`, Vue Router's and
+      // Angular's `import:./home/home.component#HomeComponent`, each also
+      // behind `layout:` — carries a fragment of its path as its tail
+      // ('/pages/Team', 'component#HomeComponent'), which no file's keys
+      // match. Rewrite it to the module tail it is parked under now.
+      // Idempotent: a rewritten tail rewrites to itself.
+      //
+      // Each prefix is a range of idx_unresolved_name. The `+` keeps the
+      // planner off idx_unresolved_status, which it otherwise picks although
+      // 'failed' is nearly every row: on vscode's index that read 830K rows,
+      // about a second, to select none.
+      const update = db.prepare('UPDATE unresolved_refs SET name_tail = ? WHERE id = ?');
+      const rows = db
+        .prepare(`SELECT id, reference_name, reference_kind, name_tail FROM unresolved_refs
+          WHERE (reference_name GLOB 'lazy-import:*' OR reference_name GLOB 'import:*' OR reference_name GLOB 'layout:*')
+            AND +status = 'failed' AND +reference_kind IN ('references', 'calls')`)
+        .all() as Array<{ id: number; reference_name: string; reference_kind: string; name_tail: string }>;
+      for (const row of rows) {
+        const tail = referenceNameTail(row.reference_name, row.reference_kind);
+        if (tail !== row.name_tail) update.run(tail, row.id);
+      }
+    },
+  },
+  {
+    version: 15,
+    description: 'Retry a failed reference through an import binding by its whole name: module-tail name index',
+    up: (db) => {
+      // A failed reference through an import binding the module declares
+      // under another name is parked under the module's key from this
+      // version on, and still looked up by its whole name. Rows parked before
+      // keep the tail their name gives, which the name lookup already finds;
+      // a re-index parks them under their modules. Keep the definition in
+      // lockstep with schema.sql.
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_module_name ON unresolved_refs(status, reference_name) WHERE status = 'failed' AND name_tail GLOB 'module:*';
+      `);
+    },
+  },
+  {
+    version: 16,
+    description: 'Retry a failed member reference through an import binding by its member: module-tail member index',
+    up: (db) => {
+      // A failed member reference through an import binding (`store.get`) is
+      // parked under the module's key from this version on, and still looked
+      // up by its member, the tail its name gives. Rows parked before keep
+      // that tail, which the tail lookup already finds; a re-index parks
+      // them under their modules. Keep the definition in lockstep with
+      // schema.sql: the expression is MEMBER_TAIL_SQL.
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_unresolved_failed_module_member ON unresolved_refs(status, ${MEMBER_TAIL_SQL}) WHERE ${MODULE_PARKED_SQL};
       `);
     },
   },

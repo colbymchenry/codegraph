@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { FileLock, validateProjectPath } from '../src/utils';
+import { FileLock, validateProjectPath, validatePathWithinRoot } from '../src/utils';
 import CodeGraph from '../src/index';
 import { ToolHandler, tools } from '../src/mcp/tools';
 import { scanDirectory, isSourceFile } from '../src/extraction';
@@ -64,6 +64,23 @@ describe('FileLock', () => {
     expect(() => lock2.acquire()).toThrow(/locked by another process/);
 
     lock1.release();
+  });
+
+  it('keeps a live holder protected after its lock file is older than two minutes (#1959)', () => {
+    const holder = new FileLock(lockPath);
+    const contender = new FileLock(lockPath);
+    holder.acquire();
+    const old = new Date(Date.now() - 3 * 60_000);
+    fs.utimesSync(lockPath, old, old);
+
+    try {
+      expect(() => contender.acquire()).toThrow(/locked by another process/);
+      expect(fs.readFileSync(lockPath, 'utf8')).toBe(String(process.pid));
+    } finally {
+      holder.release();
+      contender.release();
+    }
+    expect(fs.existsSync(lockPath)).toBe(false);
   });
 
   it('should detect and remove stale locks from dead processes', () => {
@@ -173,6 +190,178 @@ describe('Path Traversal Prevention', () => {
   it('should return null for non-existent node', async () => {
     const code = await cg.getCode('does-not-exist');
     expect(code).toBeNull();
+  });
+});
+
+describe('Symlink escape prevention (#527)', () => {
+  // An in-repo symlink whose logical path is inside the project root but whose
+  // REAL target escapes the root must never be served. validatePathWithinRoot
+  // is the chokepoint both content-serving read sinks go through (codegraph_node
+  // includeCode + codegraph_explore source rendering), so it must resolve
+  // symlinks, not just compare strings. realpathSync the roots so the test's own
+  // expectations don't trip over /tmp -> /private/tmp on macOS.
+  let root: string;
+  let outside: string;
+
+  beforeEach(() => {
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-root-')));
+    outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-outside-')));
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.writeFileSync(path.join(root, 'src', 'in.ts'), 'export const x = 1;\n');
+    fs.mkdirSync(path.join(outside, 'pkg'));
+    fs.writeFileSync(path.join(outside, 'pkg', 'secret.txt'), 'TOP-SECRET\n');
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  });
+
+  // Symlink creation needs privileges on Windows; skip gracefully if it fails.
+  const link = (linkPath: string, target: string): boolean => {
+    try { fs.symlinkSync(target, linkPath); return true; } catch { return false; }
+  };
+
+  it('allows a real file inside the root (and realpaths consistently)', () => {
+    expect(validatePathWithinRoot(root, 'src/in.ts')).not.toBeNull();
+  });
+
+  it('allows a not-yet-existing path inside the root (ENOENT — files about to be written)', () => {
+    expect(validatePathWithinRoot(root, 'src/will-write.ts')).not.toBeNull();
+  });
+
+  it('rejects a lexical ../ traversal out of the root', () => {
+    expect(validatePathWithinRoot(root, `../${path.basename(outside)}/pkg/secret.txt`)).toBeNull();
+  });
+
+  it('rejects an in-repo symlink to an out-of-root FILE', () => {
+    if (!link(path.join(root, 'escape'), path.join(outside, 'pkg', 'secret.txt'))) return;
+    expect(validatePathWithinRoot(root, 'escape')).toBeNull();
+  });
+
+  it('rejects a path that escapes through an in-repo symlink to an out-of-root DIR', () => {
+    if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
+    expect(validatePathWithinRoot(root, 'escapedir/secret.txt')).toBeNull();
+  });
+
+  it('rejects a missing leaf below an out-of-root directory symlink', () => {
+    if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
+    expect(validatePathWithinRoot(root, 'escapedir/not-created-yet/file.txt')).toBeNull();
+  });
+
+  // A directory link that needs no privilege on Windows (a junction), so the
+  // cases below run there without Developer Mode; a symlink elsewhere. Each
+  // test removes its own link, so nothing recursive ever walks through one.
+  const dirLink = (linkPath: string, target: string): void =>
+    fs.symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+
+  it.runIf(process.platform === 'win32')('rejects a missing leaf below an out-of-root directory junction', () => {
+    const junction = path.join(root, 'escapejunction');
+    dirLink(junction, path.join(outside, 'pkg'));
+    try {
+      expect(validatePathWithinRoot(root, 'escapejunction/not-created-yet/file.txt')).toBeNull();
+    } finally {
+      fs.unlinkSync(junction);
+    }
+  });
+
+  it('still allows a missing leaf below a directory link that stays WITHIN the root', () => {
+    fs.mkdirSync(path.join(root, 'src', 'realdir'));
+    const inLink = path.join(root, 'src', 'linkdir');
+    dirLink(inLink, path.join(root, 'src', 'realdir'));
+    try {
+      expect(validatePathWithinRoot(root, 'src/linkdir/new/file.ts')).toBe(
+        path.join(root, 'src', 'linkdir', 'new', 'file.ts')
+      );
+    } finally {
+      fs.unlinkSync(inLink);
+    }
+  });
+
+  it('rejects every path under a root that does not exist', () => {
+    expect(validatePathWithinRoot(path.join(root, 'gone'), 'src/in.ts')).toBeNull();
+  });
+
+  it('still allows an in-repo symlink that stays WITHIN the root (no over-blocking)', () => {
+    if (!link(path.join(root, 'src', 'inlink.ts'), path.join(root, 'src', 'in.ts'))) return;
+    expect(validatePathWithinRoot(root, 'src/inlink.ts')).not.toBeNull();
+  });
+
+  // The INDEXING read path opts into following in-root symlinks the directory
+  // walk already descended into — discovery and the reader must agree, or files
+  // reached via an in-root symlink-to-outside fail to index (#935). The lexical
+  // `../` guard is NOT waived, and content-serving sinks never pass the flag.
+  it('allowSymlinkEscape follows an in-repo symlink to an out-of-root FILE (indexing read)', () => {
+    if (!link(path.join(root, 'escape'), path.join(outside, 'pkg', 'secret.txt'))) return;
+    expect(validatePathWithinRoot(root, 'escape', { allowSymlinkEscape: true })).not.toBeNull();
+  });
+
+  it('allowSymlinkEscape follows a path through an in-repo out-of-root DIR symlink (indexing read)', () => {
+    if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
+    expect(validatePathWithinRoot(root, 'escapedir/secret.txt', { allowSymlinkEscape: true })).not.toBeNull();
+  });
+
+  it('allowSymlinkEscape still allows a missing leaf through an out-of-root DIR link (indexing read)', () => {
+    const escapeLink = path.join(root, 'escapedir');
+    dirLink(escapeLink, path.join(outside, 'pkg'));
+    try {
+      expect(
+        validatePathWithinRoot(root, 'escapedir/not-created-yet/file.txt', { allowSymlinkEscape: true })
+      ).not.toBeNull();
+    } finally {
+      fs.unlinkSync(escapeLink);
+    }
+  });
+
+  it('allowSymlinkEscape STILL rejects a lexical ../ traversal (guard not waived)', () => {
+    expect(
+      validatePathWithinRoot(root, `../${path.basename(outside)}/pkg/secret.txt`, { allowSymlinkEscape: true })
+    ).toBeNull();
+  });
+
+  it('end-to-end: getCode never serves an out-of-root file reached via a dir symlink', async () => {
+    fs.writeFileSync(path.join(outside, 'pkg', 'leak.ts'),
+      'export function leaked() { return "LEAKED-ZZZ-9"; }\n');
+    if (!link(path.join(root, 'vendored'), path.join(outside, 'pkg'))) return;
+
+    const cg = CodeGraph.initSync(root, { config: { include: ['**/*.ts'], exclude: [] } });
+    try {
+      await cg.indexAll();
+      // Whether or not extraction followed the dir symlink, NO node may ever
+      // yield the out-of-root content through getCode.
+      for (const n of cg.getNodesByKind('function')) {
+        const code = await cg.getCode(n.id);
+        expect(code ?? '').not.toContain('LEAKED-ZZZ-9');
+      }
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('end-to-end (#935): indexes source reached through an in-root dir symlink to outside', async () => {
+    // The Dota custom-game layout symlinks `game/` and `content/` into an SDK
+    // tree outside the repo. Before #935 the batch reader's strict symlink-escape
+    // guard blocked every file under them, so nothing indexed — even though the
+    // directory walk deliberately followed the symlink to enumerate them. The
+    // reader now agrees with discovery: the file indexes.
+    fs.writeFileSync(path.join(outside, 'pkg', 'vendored.ts'),
+      'export function vendoredHelper() { return "LEAKED-ZZZ-9"; }\n');
+    if (!link(path.join(root, 'game'), path.join(outside, 'pkg'))) return;
+
+    const cg = CodeGraph.initSync(root, { config: { include: ['**/*.ts'], exclude: [] } });
+    try {
+      await cg.indexAll();
+      // The symlinked-in file is now part of the graph...
+      const names = cg.getNodesByKind('function').map((n) => n.name);
+      expect(names).toContain('vendoredHelper');
+      // ...but its out-of-root contents are STILL never served (the #527 sink
+      // stays strict — indexing relaxes only the read path, not getCode).
+      for (const n of cg.getNodesByKind('function')) {
+        expect((await cg.getCode(n.id)) ?? '').not.toContain('LEAKED-ZZZ-9');
+      }
+    } finally {
+      cg.close();
+    }
   });
 });
 
@@ -286,6 +475,11 @@ describe('MCP Input Validation', () => {
     }));
     const fakeCg = {
       searchNodes: () => many,
+      getFile: () => undefined,
+      // Search down-ranks generated files, and since #1500 that verdict comes
+      // from the index (path convention ∪ content banner) rather than the
+      // filename alone. No database here — none of these paths is generated.
+      generatedFilePredicate: () => () => false,
     };
     const fakeHandler = new ToolHandler(fakeCg as unknown as CodeGraph);
 

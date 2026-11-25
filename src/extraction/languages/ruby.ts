@@ -2,6 +2,20 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/**
+ * A class method: `def self.x` or `def Widget.x` (a singleton_method), or a
+ * `def` inside `class << self`. It shares its qualified name with an instance
+ * method of the same name (`Widget::build` for both), so only this tells the
+ * two apart.
+ */
+function isRubyClassMethod(node: SyntaxNode): boolean {
+  if (node.type === 'singleton_method') return true;
+  if (node.type !== 'method') return false;
+  let parent = node.parent;
+  if (parent?.type === 'body_statement') parent = parent.parent;
+  return parent?.type === 'singleton_class';
+}
+
 export const rubyExtractor: LanguageExtractor = {
   functionTypes: ['method'],
   classTypes: ['class'],
@@ -17,6 +31,42 @@ export const rubyExtractor: LanguageExtractor = {
   bodyField: 'body',
   paramsField: 'parameters',
   visitNode: (node, ctx) => {
+    // Ruby mixins: `include Mod`, `extend Mod`, `prepend Mod[, Other]` — the
+    // primary composition mechanism (ActiveSupport concerns, Comparable, …).
+    // These parse as a bare `call` to `include`/`extend`/`prepend` with the
+    // module(s) as constant arguments, so without special handling they'd be
+    // mis-extracted as a call to a method named "include" and the module would
+    // record no dependent — even though it's mixed into a class. Emit an
+    // `implements` edge (enclosing class/module → mixed-in module), so editing a
+    // concern surfaces every class that includes it.
+    if (node.type === 'call' && !node.childForFieldName('receiver')) {
+      const method = node.childForFieldName('method');
+      const mname = method?.text;
+      if (mname === 'include' || mname === 'extend' || mname === 'prepend') {
+        const parentId = ctx.nodeStack.length > 0 ? ctx.nodeStack[ctx.nodeStack.length - 1] : undefined;
+        const args = node.childForFieldName('arguments')
+          ?? node.namedChildren.find((c: SyntaxNode) => c.type === 'argument_list');
+        if (parentId && args) {
+          for (let i = 0; i < args.namedChildCount; i++) {
+            const arg = args.namedChild(i);
+            // `Mod` is `constant`, `Foo::Bar` is `scope_resolution`. Skip
+            // `extend self` / dynamic args (`include foo()`).
+            if (arg && (arg.type === 'constant' || arg.type === 'scope_resolution')) {
+              ctx.addUnresolvedReference({
+                fromNodeId: parentId,
+                referenceName: getNodeText(arg, ctx.source),
+                referenceKind: 'implements',
+                filePath: ctx.filePath,
+                line: node.startPosition.row + 1,
+                column: node.startPosition.column,
+              });
+            }
+          }
+          return true; // handled — don't also extract as a call to "include"
+        }
+      }
+    }
+
     if (node.type !== 'module') return false;
 
     const nameNode = node.childForFieldName('name');
@@ -67,6 +117,7 @@ export const rubyExtractor: LanguageExtractor = {
 
     return name;
   },
+  isStatic: isRubyClassMethod,
   getVisibility: (node) => {
     // Ruby visibility is based on preceding visibility modifiers
     let sibling = node.previousNamedSibling;

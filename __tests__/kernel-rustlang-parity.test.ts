@@ -1,0 +1,216 @@
+/**
+ * Kernel↔wasm Rust extraction parity (R7b of the kernel migration).
+ *
+ * Asserts the native walker (codegraph-kernel/src/rustlang.rs) produces the
+ * SAME ExtractionResult as the wasm TreeSitterExtractor — nodes, edges, and
+ * unresolved refs compared as canonicalized multisets — over the checked-in
+ * torture fixture (torture.rs: impl/trait quirks incl. generic / lifetime /
+ * reference / scoped / generic-trait impl receivers (#1588), unit structs
+ * (a bodiless struct IS a definition — both walkers mint a node), phantom
+ * const identifiers, use-binding refs incl. nested groups + wildcard-emits-
+ * nothing, chained-call re-encode, turbofish, Rocket route macros body-only,
+ * fn-ref shapes, value-ref shadowing, attribute-broken docstrings, dead-code
+ * isAsync) and its CRLF variant (derived in-memory — #1329 docstring
+ * semantics).
+ *
+ * The full-repo sweep lives in scripts/kernel-parity.mjs (ripgrep/tokio/
+ * rust-analyzer for the §5 gate); this suite keeps the invariant alive in
+ * `npm test`. Skips when no kernel binary is staged; CODEGRAPH_KERNEL_EXPECT=1
+ * turns that into a failure (kernel-scaffold.test.ts).
+ */
+
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+import * as fs from 'fs';
+import * as path from 'path';
+import { extractFromSource } from '../src/extraction';
+import { initGrammars, loadGrammarsForLanguages } from '../src/extraction/grammars';
+import { tryKernelExtract, resetKernelForTests } from '../src/extraction/kernel';
+import type { ExtractionResult } from '../src/types';
+
+const KERNEL_PATH = path.join(
+  __dirname,
+  '..',
+  'codegraph-kernel',
+  'prebuilds',
+  `${process.platform}-${process.arch}`,
+  'codegraph-kernel.node'
+);
+const kernelBuilt = fs.existsSync(KERNEL_PATH);
+
+const FIXTURE_DIR = path.join(__dirname, 'fixtures', 'kernel-parity');
+
+function canon(result: ExtractionResult): { nodes: string[]; edges: string[]; refs: string[] } {
+  return {
+    nodes: result.nodes
+      .map(({ updatedAt: _u, ...n }) => JSON.stringify(n, Object.keys(n).sort()))
+      .sort(),
+    edges: result.edges.map((e) => JSON.stringify(e, Object.keys(e).sort())).sort(),
+    refs: result.unresolvedReferences
+      .map((r) => JSON.stringify(r, Object.keys(r).sort()))
+      .sort(),
+  };
+}
+
+const ENV_KEYS = ['CODEGRAPH_KERNEL', 'CODEGRAPH_KERNEL_LANGS'] as const;
+let savedEnv: Record<string, string | undefined>;
+
+describe.skipIf(!kernelBuilt)('kernel Rust extraction parity', () => {
+  beforeAll(async () => {
+    await initGrammars();
+    await loadGrammarsForLanguages(['rust']);
+  });
+
+  beforeEach(() => {
+    savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+    resetKernelForTests();
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+    resetKernelForTests();
+  });
+
+  function assertParity(filePath: string, source: string, minNodes = 3): void {
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    delete process.env.CODEGRAPH_KERNEL;
+    const viaKernel = tryKernelExtract(filePath, source, 'rust');
+    expect(viaKernel, `kernel extraction failed for ${filePath}`).not.toBeNull();
+
+    process.env.CODEGRAPH_KERNEL = '0';
+    const viaWasm = extractFromSource(filePath, source, 'rust');
+    delete process.env.CODEGRAPH_KERNEL;
+
+    const k = canon(viaKernel!);
+    const w = canon(viaWasm);
+    expect(k.nodes, `${filePath}: nodes`).toEqual(w.nodes);
+    expect(k.edges, `${filePath}: edges`).toEqual(w.edges);
+    expect(k.refs, `${filePath}: refs`).toEqual(w.refs);
+    expect(viaWasm.nodes.length).toBeGreaterThanOrEqual(minNodes);
+  }
+
+  it('preserves Tauri command attributes without treating comments or strings as registrations', () => {
+    const source = `
+#[tauri::command]
+fn port() -> u16 { 4000 }
+#[tauri :: command(rename_all = "snake_case")]
+/* between attributes */
+#[allow(dead_code)]
+pub async fn settings() {}
+// #[tauri::command]
+fn ordinary() {}
+const TEXT: &str = r#"#[tauri::command]"#;
+fn after_string() {}
+#[other::command]
+fn unrelated() {}
+#[tauri::command]
+fn outer() { fn inner() {} }
+fn next() {}
+`;
+    assertParity('commands.rs', source);
+    assertParity('commands.rs', source.replace(/\n/g, '\r\n'));
+  });
+
+  it('variant paths reference their receiver (#2328)', () => {
+    const source = `
+use crate::mode::{self, Mode};
+const DEFAULT: Mode = Mode::A;
+impl Mode {
+    fn flip(&self) -> u8 {
+        let _s = "ü"; let _x = Self::B;
+        match self { Self::A => 1, Mode::C(x) => *x, mode::Mode::D { x } => *x, _ => 0 }
+    }
+}
+trait Tr { fn t(&self) { let _ = Self::K; } }
+fn uses() {
+    use crate::mode::Mode::A;
+    let _a = crate::mode::Mode::A; let _b = Mode::C(1); let _c = Mode::D { x: 2 };
+    let _d = Mode::new(); let _e = util::take(3); let _f = u8::MAX; let _g = Limits::MAX;
+    let _h = xs.map(Mode::C); let _i = Option::<u8>::None; let _j = Mode::A.flip();
+    if let Mode::C(x) | Mode::B = m {}
+    match o { Option::Some(_) => std::cmp::Ordering::Less, _ => cmp::Ordering::Greater };
+}
+`;
+    assertParity('variants.rs', source);
+    assertParity('variants.rs', source.replace(/\n/g, '\r\n'));
+
+    // Not vacuous: each path to a capitalized member outside a call's callee,
+    // a struct literal and a `use` is a `references` ref to its receiver
+    // (`Self` read as the impl's type; none in a trait). The resolver decides
+    // which of them name a project enum's variant.
+    process.env.CODEGRAPH_KERNEL = '0';
+    const refs = extractFromSource('variants.rs', source, 'rust').unresolvedReferences;
+    delete process.env.CODEGRAPH_KERNEL;
+    const lines = source.split('\n');
+    const paths = refs
+      .filter((r) => r.referenceKind === 'references' && /^\w+\s*::/.test(lines[r.line - 1]!.slice(r.column)))
+      .map((r) => `${r.referenceName}:${r.line}`);
+    expect(paths.sort()).toEqual([
+      'Limits:14', 'Mode:13', 'Mode:15', 'Mode:15', 'Mode:16', 'Mode:16', 'Mode:3', 'Mode:6',
+      'Mode:7', 'Mode:7', 'Mode:7', 'Option:17', 'Ordering:17', 'Ordering:17',
+    ]);
+  });
+
+  it('a call keeps its receiver chain of fields and method calls (#2836)', () => {
+    const links = Array.from({ length: 17 }, (_, i) => `l${i}()`).join('.');
+    const source = `
+pub struct Svc { services: Services, store: Box<dyn Store>, pair: (u8, Config) }
+impl Svc {
+    fn chains(&self, vis: &Vis) {
+        self.services.store.put("a"); let _ = self.services.store.put("ü");
+        self
+            .services // rustfmt
+            .store
+            .put("c");
+        self.store().put("m"); self.store.put("d"); self.put("e"); vis.put(1);
+        vis.map.get("k").get(0); self.0.len(); self.pair.1.port();
+        vis.get::<u8>(1).put::<u16>(2); vis.a.b().c.d();
+        Foo::new().a().b(); (vis).a.b(); self.a?.b(); self.a.b().await.c(); vis[0].a.b();
+        r#vis.a.b(); vis.${links}.m();
+    }
+}
+`;
+    assertParity('chains.rs', source);
+    assertParity('chains.rs', source.replace(/\n/g, '\r\n'));
+
+    // Not vacuous: the chains are kept, the other receivers keep their old names.
+    process.env.CODEGRAPH_KERNEL = '0';
+    const names = new Set(extractFromSource('chains.rs', source, 'rust').unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName));
+    delete process.env.CODEGRAPH_KERNEL;
+    for (const name of [
+      'self.services.store.put', 'self.store().put', 'self.store.put', 'self.put', 'vis.put', 'vis.map.get',
+      'vis.map.get().get', 'self.0.len', 'self.pair.1.port', 'vis.get', 'vis.get().put', 'vis.a.b().c.d',
+      'Foo::new().a', 'b', 'c', 'm',
+    ]) {
+      expect(names, name).toContain(name);
+    }
+  });
+
+  it('torture fixture: impl/trait quirks, use bindings, chains, fn-refs, value-refs, route macros', () => {
+    const file = path.join(FIXTURE_DIR, 'torture.rs');
+    assertParity('fixtures/torture.rs', fs.readFileSync(file, 'utf8'), 20);
+  });
+
+  // CRLF variant — the shape every Windows autocrlf checkout has. Derived in
+  // memory so no platform or editor can silently normalize it away; pins the
+  // JS-multiline-^ docstring semantics for `///` runs (#1329).
+  it('torture fixture CRLF parity', () => {
+    const file = path.join(FIXTURE_DIR, 'torture.rs');
+    const crlf = fs.readFileSync(file, 'utf8').replace(/(?<!\r)\n/g, '\r\n');
+    assertParity('fixtures/torture.rs (crlf)', crlf, 20);
+  });
+
+  it('files with parse errors defer to the wasm extractor (recovery is encoding-dependent)', () => {
+    const broken = 'fn f( {\n  return }} 12 (\n';
+    process.env.CODEGRAPH_KERNEL_LANGS = 'all';
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(tryKernelExtract('src/broken.rs', broken, 'rust')).toBeNull();
+    process.env.CODEGRAPH_KERNEL = '0';
+    const viaWasm = extractFromSource('src/broken.rs', broken, 'rust');
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(viaWasm.nodes.some((n) => n.kind === 'file')).toBe(true);
+  });
+});

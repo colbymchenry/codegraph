@@ -1,6 +1,14 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
+import {
+  blankLoneMacroLines,
+  definingDeclaration,
+  isConstDeclaration,
+  OBJC_LONE_MACROS,
+  rewriteFoundationEnumMacros,
+  unnamedTypeVariableName,
+} from './c-cpp';
 
 function findCompoundStatement(node: SyntaxNode): SyntaxNode | null {
   for (let i = 0; i < node.namedChildCount; i++) {
@@ -31,6 +39,46 @@ function extractObjcMethodName(node: SyntaxNode, source: string): string | undef
   return identifiers.map((id) => `${getNodeText(id, source)}:`).join('');
 }
 
+/** Nullability / ARC qualifiers that sit where a return type's first type
+ *  identifier does (`(nonnull instancetype)`, `(nullable Bar *)`) — never the type. */
+const OBJC_TYPE_QUALIFIERS = new Set([
+  'nonnull', 'nullable', 'null_unspecified', 'null_resettable',
+  '_Nonnull', '_Nullable', '_Null_unspecified', '__nonnull', '__nullable',
+  'const', 'volatile', 'strong', 'weak', 'copy', 'assign', 'retain', 'oneway',
+  '__strong', '__weak', '__unsafe_unretained', '__autoreleasing', '__kindof',
+]);
+
+/** Collect the type identifiers under a `method_type`, in document order. */
+function collectTypeIdentifiers(node: SyntaxNode, source: string, out: string[]): void {
+  if (node.type === 'type_identifier') out.push(getNodeText(node, source).trim());
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child) collectTypeIdentifiers(child, source, out);
+  }
+}
+
+/**
+ * Capture an ObjC method's declared return type as a bare class name, for the
+ * chained static-factory call mechanism (#750). `+ (Bar *)create` yields `Bar`;
+ * a nullability/ARC qualifier (`(nonnull instancetype)`, `(nullable Bar *)`) is
+ * skipped to reach the real type. `void` / `id` / `instancetype` / primitives
+ * yield undefined — for a class-message factory that means the receiver's type
+ * is the class itself (handled in resolution), so `[[X alloc] init]` and
+ * singleton chains still resolve.
+ */
+function extractObjcReturnType(node: SyntaxNode, source: string): string | undefined {
+  if (node.type !== 'method_definition' && node.type !== 'method_declaration') return undefined;
+  const methodType = node.namedChildren.find((c) => c.type === 'method_type');
+  if (!methodType) return undefined;
+  const ids: string[] = [];
+  collectTypeIdentifiers(methodType, source, ids);
+  const name = ids.find((n) => !OBJC_TYPE_QUALIFIERS.has(n));
+  if (!name || !/^[A-Za-z_]\w*$/.test(name) || name === 'void' || name === 'id' || name === 'instancetype') {
+    return undefined;
+  }
+  return name;
+}
+
 function extractObjcPropertyName(node: SyntaxNode, source: string): string | null {
   if (node.type !== 'property_declaration') return null;
 
@@ -56,6 +104,12 @@ function extractObjcPropertyName(node: SyntaxNode, source: string): string | nul
 }
 
 export const objcExtractor: LanguageExtractor = {
+  // A macro alone on its line, like `NS_ASSUME_NONNULL_BEGIN` or
+  // `RCT_EXTERN_C_BEGIN`, reads to the parser as the start of a declaration:
+  // it swallowed the `typedef` below it, and an `@interface` below it lost
+  // its class to error recovery. Blanked as in C, offsets kept. A
+  // `typedef NS_ENUM(NSInteger, Name) {` is rewritten as `enum Name {`.
+  preParse: (source) => blankLoneMacroLines(rewriteFoundationEnumMacros(source), OBJC_LONE_MACROS),
   functionTypes: ['function_definition'],
   // Only @interface emits a class node; @implementation reuses it via visitNode.
   classTypes: ['class_interface'],
@@ -63,6 +117,8 @@ export const objcExtractor: LanguageExtractor = {
   interfaceTypes: ['protocol_declaration'],
   interfaceKind: 'protocol',
   structTypes: ['struct_specifier'],
+  // Objective-C is a C superset: union declarations preserve their own kind.
+  unionTypes: ['union_specifier'],
   enumTypes: ['enum_specifier'],
   enumMemberTypes: ['enumerator'],
   typeAliasTypes: ['type_definition'],
@@ -73,7 +129,17 @@ export const objcExtractor: LanguageExtractor = {
   nameField: 'declarator',
   bodyField: 'body',
   paramsField: 'parameters',
-  resolveName: extractObjcMethodName,
+  getReturnType: extractObjcReturnType,
+  // `static const NSInteger kMaxRetries = 3;` is a constant, as in C.
+  isConst: isConstDeclaration,
+  // A method is named by its selector. An unnamed struct, union or enum
+  // defined in a declaration's type takes the first variable's name, as in C:
+  // `static struct { … } placeholder;` is the struct `placeholder`.
+  resolveName: (node, source) =>
+    extractObjcMethodName(node, source) ?? unnamedTypeVariableName(node, source),
+  // A struct, union or enum defined in a declaration's type is documented by
+  // the comment above the declaration.
+  getDeclarationWrapper: (node) => definingDeclaration(node) ?? undefined,
   extractPropertyName: extractObjcPropertyName,
   resolveBody: (node, bodyField) => {
     const fromField = getChildByField(node, bodyField);
@@ -87,7 +153,9 @@ export const objcExtractor: LanguageExtractor = {
       const child = node.namedChild(i);
       if (!child) continue;
       if (child.type === 'enum_specifier' && getChildByField(child, 'body')) return 'enum';
-      if (child.type === 'struct_specifier' && getChildByField(child, 'body')) return 'struct';
+      if (child.type === 'struct_specifier' && getChildByField(child, 'body'))
+        return 'struct';
+      if (child.type === 'union_specifier' && getChildByField(child, 'body')) return 'union';
     }
     return undefined;
   },

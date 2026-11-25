@@ -16,7 +16,7 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { LOW_CONFIDENCE_MARKER } from '../src/context';
-import { isDistinctiveIdentifier } from '../src/search/query-utils';
+import { isDistinctiveIdentifier, scorePathRelevance, deriveProjectNameTokens } from '../src/search/query-utils';
 
 describe('isDistinctiveIdentifier', () => {
   it('treats plain dictionary words as non-distinctive', () => {
@@ -36,6 +36,72 @@ describe('isDistinctiveIdentifier', () => {
     expect(isDistinctiveIdentifier('user_store')).toBe(true);
     expect(isDistinctiveIdentifier('REST')).toBe(true);
     expect(isDistinctiveIdentifier('v2')).toBe(true);
+  });
+});
+
+// A single PascalCase query word (notably a project name a user naturally
+// includes) splits into sub-tokens that all match the SAME path segment; summed
+// per sub-token it boosted that path 4×, burying the rest of the query's stack
+// (#720). Path relevance must count each original WORD once per level, while
+// still splitting it for cross-convention matching.
+describe('scorePathRelevance per-word scoring (#720)', () => {
+  it('counts a single PascalCase word once per path level, not once per sub-token', () => {
+    // "SuperBizAgent" → super/biz/agent/superbizagent all hit the dir, but it's
+    // one concept: +5 (dir) once, not +20.
+    expect(scorePathRelevance('SuperBizAgentFrontend/app.js', 'SuperBizAgent')).toBe(5);
+  });
+
+  it('still splits a word so it matches across naming conventions', () => {
+    // getUserName must still match a snake_case path via its sub-tokens.
+    expect(scorePathRelevance('get_user_name.go', 'getUserName')).toBeGreaterThanOrEqual(10);
+  });
+
+  it('still credits distinct query words matching different path segments', () => {
+    // auth (dir) and handler (filename) are separate concepts — each counts.
+    expect(scorePathRelevance('src/auth/login_handler.go', 'auth handler')).toBeGreaterThan(
+      scorePathRelevance('src/auth/login_handler.go', 'auth')
+    );
+  });
+});
+
+// The project name is context, not a discriminator: dropping it from path
+// scoring stops every file under a `<ProjectName>…/` tree from winning on the
+// name alone, so the rest of the query decides the ranking (#720).
+describe('project-name down-weighting in path relevance (#720)', () => {
+  it('derives the project name from go.mod / package.json, skipping short names', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-projname-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/SuperBizAgent\n\ngo 1.21\n');
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: '@acme/superbizagent-web' }));
+      const tokens = deriveProjectNameTokens(dir);
+      expect(tokens.has('superbizagent')).toBe(true);
+      expect(tokens.has('superbizagentweb')).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('drops a project-name query word from path scoring when other words remain', () => {
+    const proj = new Set(['superbizagent']);
+    // Without the project name dropped, the frontend path wins on it (+5).
+    // With it dropped, only "backend" is left — and it doesn't match this path.
+    const withDrop = scorePathRelevance('SuperBizAgentFrontend/app.js', 'SuperBizAgent backend', proj);
+    const noDrop = scorePathRelevance('SuperBizAgentFrontend/app.js', 'SuperBizAgent backend');
+    expect(withDrop).toBeLessThan(noDrop);
+    expect(withDrop).toBe(0);
+  });
+
+  it('keeps the project-name word when it is the ONLY query word (bare query still scores)', () => {
+    const proj = new Set(['superbizagent']);
+    expect(scorePathRelevance('SuperBizAgentFrontend/app.js', 'SuperBizAgent', proj)).toBe(5);
+  });
+
+  it('does not affect a query that omits the project name', () => {
+    const proj = new Set(['superbizagent']);
+    const path0 = 'internal/controller/chat/chat.go';
+    expect(scorePathRelevance(path0, 'controller chat', proj)).toBe(
+      scorePathRelevance(path0, 'controller chat')
+    );
   });
 });
 

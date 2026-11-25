@@ -23,6 +23,65 @@
  * framework extractors scan for.
  */
 
+/**
+ * Text before a `/` (up to ~32 chars) after which that `/` can open a regex
+ * literal rather than divide: expression-start punctuation or a keyword.
+ * A heuristic — callers that act on a guess must tolerate it being wrong.
+ */
+export const REGEX_START_BEFORE = /(?:^|[=(:,)!&|?;{}\[\]+*%~^<>-]|\b(?:return|throw|case|yield|await|else|do|typeof|void|delete|new|in|of|instanceof))\s*$/;
+
+/**
+ * Blank string contents while preserving quotes and offsets. Template
+ * interpolations are blanked too; callers checking executable expressions
+ * must conservatively inspect those expressions in the original source.
+ * `regexLiterals`, when given, receives the offsets of the opening and
+ * closing `/` of every span read as a regex literal (left as is).
+ */
+export function blankStringContents(text: string, regexLiterals?: number[]): string {
+  const out = text.split('');
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i]!;
+    // A quote inside a JS regex is data, not the beginning of a string.
+    // Expression-start punctuation and keywords distinguish these from division.
+    if (c === '/' && REGEX_START_BEFORE.test(text.slice(Math.max(0, i - 32), i))) {
+      let end = i + 1;
+      let inClass = false;
+      for (; end < n && text[end] !== '\n'; end++) {
+        if (text[end] === '\\') { end++; continue; }
+        if (text[end] === '[') inClass = true;
+        if (text[end] === ']') inClass = false;
+        if (text[end] === '/' && !inClass) break;
+      }
+      if (end < n && text[end] === '/') {
+        regexLiterals?.push(i, end);
+        i = end + 1;
+        continue;
+      }
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      const quote = c;
+      i++;
+      while (i < n && text[i] !== quote) {
+        if (text[i] === '\\' && i + 1 < n) {
+          out[i] = ' ';
+          out[i + 1] = ' ';
+          i += 2;
+          continue;
+        }
+        if (quote !== '`' && text[i] === '\n') break;
+        if (text[i] !== '\n') out[i] = ' ';
+        i++;
+      }
+      if (i < n && text[i] === quote) i++;
+      continue;
+    }
+    i++;
+  }
+  return out.join('');
+}
+
 export type CommentLang =
   | 'python'
   | 'javascript'
@@ -33,7 +92,10 @@ export type CommentLang =
   | 'csharp'
   | 'swift'
   | 'go'
-  | 'rust';
+  | 'rust'
+  | 'c'
+  | 'cpp'
+  | 'erlang';
 
 export function stripCommentsForRegex(content: string, lang: CommentLang): string {
   switch (lang) {
@@ -43,6 +105,8 @@ export function stripCommentsForRegex(content: string, lang: CommentLang): strin
       return stripRuby(content);
     case 'rust':
       return stripRust(content);
+    case 'erlang':
+      return stripErlang(content);
     case 'php':
       return stripPhp(content);
     case 'go':
@@ -52,6 +116,8 @@ export function stripCommentsForRegex(content: string, lang: CommentLang): strin
     case 'java':
     case 'csharp':
     case 'swift':
+    case 'c':
+    case 'cpp':
       return stripCStyle(content, /* allowSingleQuoteStrings */ lang === 'javascript' || lang === 'typescript');
     default:
       return content;
@@ -459,6 +525,58 @@ function stripRust(src: string): string {
         i++;
       }
       if (i < n && src[i] === "'") i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  return out.join('');
+}
+
+// ---------- Erlang ----------
+
+/**
+ * Erlang: `%` starts a line comment unless it sits inside a `"string"`, a
+ * `'quoted atom'`, or is the character literal `$%`. Strings and quoted atoms
+ * are left intact (a behaviour callback name can be a quoted atom); only the
+ * comment text is blanked.
+ */
+function stripErlang(src: string): string {
+  const out = src.split('');
+  let i = 0;
+  const n = src.length;
+
+  while (i < n) {
+    const c = src[i];
+
+    if (c === '"' || c === "'") {
+      const quote = c;
+      i++;
+      while (i < n && src[i] !== quote) {
+        if (src[i] === '\\' && i + 1 < n) {
+          i += 2;
+          continue;
+        }
+        i++;
+      }
+      if (i < n) i++;
+      continue;
+    }
+
+    // Character literal: `$x`, `$\n`, `$%` — the next char (or escape) is data.
+    if (c === '$') {
+      i++;
+      if (i < n && src[i] === '\\') i++;
+      i++;
+      continue;
+    }
+
+    if (c === '%') {
+      let end = i;
+      while (end < n && src[end] !== '\n') end++;
+      blankRange(out, i, end, src);
+      i = end;
       continue;
     }
 

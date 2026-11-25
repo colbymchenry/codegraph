@@ -5,23 +5,139 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+import { isWslWindowsDrive } from './sync/watch-policy';
+import { loadNodeSqlite } from './db/node-sqlite';
+
+/** The default per-project data directory name. */
+export const DEFAULT_CODEGRAPH_DIR = '.codegraph';
 
 /**
- * CodeGraph directory name
+ * The data directory name WSL gives a fresh project on a Windows drive, so it
+ * never shares one index with CodeGraph on Windows (issue #995). Indexing and
+ * watching skip every `.codegraph-*` sibling on both sides (#636).
  */
-export const CODEGRAPH_DIR = '.codegraph';
+export const WSL_CODEGRAPH_DIR = '.codegraph-wsl';
+
+let warnedBadDirName = false;
+
+/**
+ * Resolve the per-project data directory name, honoring the `CODEGRAPH_DIR`
+ * environment override (default `.codegraph`). The override is a single path
+ * segment that lives in the project root.
+ *
+ * Why this exists: two environments that share one working tree must NOT share
+ * one `.codegraph/` — most concretely Windows-native and WSL (issue #636). The
+ * daemon lockfile (`.codegraph/daemon.pid`) records a platform-specific pid and
+ * socket path (a Windows named pipe vs a WSL Unix socket), and SQLite file
+ * locking across the WSL2 ↔ Windows filesystem boundary is unreliable, so two
+ * daemons sharing one index risks corruption. Setting `CODEGRAPH_DIR=.codegraph-win`
+ * on one side gives each environment its own index in the same tree.
+ *
+ * Read live (not captured at load) so it is both process-accurate and testable.
+ * An override that isn't a plain directory name — empty, containing a path
+ * separator, `.`, `..`/traversal, or absolute — is ignored (we keep the
+ * default) rather than risk writing the index outside the project or into the
+ * project root itself; we warn once to stderr so the misconfiguration is seen.
+ */
+export function codeGraphDirName(): string {
+  const raw = process.env.CODEGRAPH_DIR?.trim();
+  if (!raw) return DEFAULT_CODEGRAPH_DIR;
+  const invalid =
+    raw === '.' ||
+    raw.includes('..') ||
+    raw.includes('/') ||
+    raw.includes('\\') ||
+    path.isAbsolute(raw);
+  if (invalid) {
+    if (!warnedBadDirName) {
+      warnedBadDirName = true;
+      // stderr only — stdout is the MCP protocol channel.
+      console.warn(
+        `[codegraph] Ignoring invalid CODEGRAPH_DIR="${raw}" — it must be a plain ` +
+          `directory name (no path separators, no "..", not absolute). Using "${DEFAULT_CODEGRAPH_DIR}".`
+      );
+    }
+    return DEFAULT_CODEGRAPH_DIR;
+  }
+  return raw;
+}
+
+/**
+ * CodeGraph directory name — a load-time snapshot of {@link codeGraphDirName}.
+ * A running process's environment is fixed, so this equals the live value;
+ * it's kept as a stable string export for backward compatibility. Internal code
+ * resolves the name through {@link codeGraphDirName} / {@link getCodeGraphDir}
+ * so the `CODEGRAPH_DIR` override always applies.
+ */
+export const CODEGRAPH_DIR = codeGraphDirName();
+
+/**
+ * Is `name` (a single path segment) a CodeGraph data directory? Matches the
+ * default `.codegraph`, the active `CODEGRAPH_DIR` override, and any
+ * `.codegraph-*` sibling. File-watching and the indexer skip ALL of these, so
+ * when two environments share one working tree (Windows + WSL, issue #636)
+ * neither indexes or watches the other's index directory.
+ */
+export function isCodeGraphDataDir(name: string): boolean {
+  return (
+    name === DEFAULT_CODEGRAPH_DIR ||
+    name === codeGraphDirName() ||
+    name.startsWith(DEFAULT_CODEGRAPH_DIR + '-')
+  );
+}
+
+/**
+ * The data directory name for one project: {@link codeGraphDirName}, except
+ * for a project on a Windows drive under WSL (`/mnt/c/...`) with no
+ * `CODEGRAPH_DIR` set. Windows-native CodeGraph opens `.codegraph` in that
+ * same tree, and SQLite's locking doesn't hold across the 9p/DrvFs bridge, so
+ * the two sharing one index fails with "disk I/O error" (issue #995). There:
+ *
+ *   1. `.codegraph-wsl/` exists → it. Once WSL has its own index it keeps it,
+ *      even after Windows builds a `.codegraph` beside it.
+ *   2. `.codegraph/codegraph.db` exists → `.codegraph`. An index built before
+ *      this default is kept rather than silently rebuilt somewhere else.
+ *   3. neither → `.codegraph-wsl`, so a fresh WSL index never shares.
+ *
+ * Every other host keeps the plain name without a stat: the WSL check is
+ * cached per process.
+ */
+export function codeGraphDirNameFor(projectRoot: string): string {
+  if (process.env.CODEGRAPH_DIR?.trim() || !isWslWindowsDrive(projectRoot)) return codeGraphDirName();
+  try {
+    if (fs.statSync(path.join(projectRoot, WSL_CODEGRAPH_DIR)).isDirectory()) return WSL_CODEGRAPH_DIR;
+  } catch {
+    // absent — fall through
+  }
+  if (fs.existsSync(path.join(projectRoot, DEFAULT_CODEGRAPH_DIR, 'codegraph.db'))) return DEFAULT_CODEGRAPH_DIR;
+  return WSL_CODEGRAPH_DIR;
+}
 
 /**
  * Get the .codegraph directory path for a project
  */
 export function getCodeGraphDir(projectRoot: string): string {
-  return path.join(projectRoot, CODEGRAPH_DIR);
+  return path.join(projectRoot, codeGraphDirNameFor(projectRoot));
 }
 
 /**
- * Check if a project has been initialized with CodeGraph
- * Requires both .codegraph/ directory AND codegraph.db to exist
+ * Check if a project has been initialized with CodeGraph.
+ *
+ * Requires `.codegraph/codegraph.db` to exist AND to carry the codegraph
+ * schema. A file that merely exists — empty, or a SQLite database with no
+ * tables, as an interrupted `init` or a stray `touch` leaves behind — used to
+ * count as initialized, so one such file in an ANCESTOR directory (worst
+ * case: `$HOME`) captured the upward resolution of every project beneath it
+ * and made their real indexes unreachable (#1895).
+ *
+ * The probe is cheap and gated so hot callers (the prompt hook, MCP root
+ * resolution on every call) pay one `stat`: file size, then a read-only
+ * SQLite open with a single `sqlite_master` lookup — memoized per path +
+ * mtime + size so an unchanged db is never reopened. A database that cannot
+ * be inspected counts as initialized (see probeSchema) — only a proven-absent
+ * schema, or a file SQLite refuses as not a database, says no.
  */
 export function isInitialized(projectRoot: string): boolean {
   const codegraphDir = getCodeGraphDir(projectRoot);
@@ -30,7 +146,89 @@ export function isInitialized(projectRoot: string): boolean {
   }
   // Must have codegraph.db, not just .codegraph folder
   const dbPath = path.join(codegraphDir, 'codegraph.db');
-  return fs.existsSync(dbPath);
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(dbPath);
+  } catch {
+    return false;
+  }
+  return hasCodeGraphSchema(dbPath, st);
+}
+
+/**
+ * `codegraph.db` exists at `projectRoot` but does not carry the schema, and
+ * `init` can add it in place: an empty file, or a SQLite database without the
+ * codegraph tables (#1895). A file that is not SQLite at all is NOT this case —
+ * see {@link hasForeignDbFile}.
+ */
+export function hasSchemalessDb(projectRoot: string): boolean {
+  const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+  let st: fs.Stats;
+  try { st = fs.statSync(dbPath); } catch { return false; }
+  if (!st.isFile() || isInitialized(projectRoot)) return false;
+  return st.size === 0 || probeSchema(dbPath) === 'no-schema';
+}
+
+/**
+ * `codegraph.db` exists at `projectRoot` and is not a SQLite database (no
+ * header magic): SQLite refuses to open it, so `init` cannot rebuild it in
+ * place. The caller must say so rather than promise a repair; nothing here
+ * deletes the file.
+ */
+export function hasForeignDbFile(projectRoot: string): boolean {
+  const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+  let st: fs.Stats;
+  try { st = fs.statSync(dbPath); } catch { return false; }
+  return st.isFile() && st.size > 0 && probeSchema(dbPath) === 'not-sqlite';
+}
+
+/** A SQLite file header is 100 bytes; anything shorter cannot hold a schema. */
+const SQLITE_HEADER_SIZE = 100;
+/** SQLITE_NOTADB: SQLite read the file and it is not a database. */
+const SQLITE_NOTADB = 26;
+const schemaProbeCache = new Map<string, { mtimeMs: number; size: number; ok: boolean }>();
+
+function hasCodeGraphSchema(dbPath: string, st: fs.Stats): boolean {
+  if (!st.isFile() || st.size < SQLITE_HEADER_SIZE) return false;
+  const cached = schemaProbeCache.get(dbPath);
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached.ok;
+  const probe = probeSchema(dbPath);
+  const ok = probe === 'schema' || probe === 'unknown';
+  schemaProbeCache.set(dbPath, { mtimeMs: st.mtimeMs, size: st.size, ok });
+  return ok;
+}
+
+/**
+ * What `codegraph.db` holds, asked of SQLite itself through a read-only
+ * connection: the codegraph schema, a database without it, not a database at
+ * all (SQLITE_NOTADB), or `unknown` — locked, busy, a WAL db in a directory we
+ * cannot create `-shm` in (read-only checkout, mount, another user's tree),
+ * disk I/O. Callers treat `unknown` as initialized: the pre-existing behaviour
+ * for a database we cannot inspect.
+ *
+ * The file is never read through a descriptor of our own, not even for its
+ * 16-byte header. Closing ANY descriptor on a database file drops every POSIX
+ * lock this process holds on it, including those of a connection it already
+ * has open (sqlite.org/howtocorrupt.html §2.2.1) — and the MCP server resolves
+ * projects through isInitialized on every call while it holds the index as
+ * its writer. SQLite's own connections share one lock table per file, so a
+ * second connection opened and closed here leaves the first one's locks alone.
+ */
+function probeSchema(dbPath: string): 'schema' | 'no-schema' | 'not-sqlite' | 'unknown' {
+  let db: any = null;
+  try {
+    // A runtime without node:sqlite can't inspect the file: `unknown`, so the
+    // command goes on to open it and reports why that is impossible.
+    const { DatabaseSync } = loadNodeSqlite();
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'nodes'").get();
+    return row !== undefined ? 'schema' : 'no-schema';
+  } catch (error) {
+    return (error as { errcode?: number })?.errcode === SQLITE_NOTADB ? 'not-sqlite' : 'unknown';
+  } finally {
+    // Never hold the handle: Windows file locking would block the owner.
+    try { db?.close(); } catch { /* already closed */ }
+  }
 }
 
 /**
@@ -42,6 +240,126 @@ export function isInitialized(projectRoot: string): boolean {
  * @param startPath - Directory to start searching from
  * @returns The project root containing .codegraph/, or null if not found
  */
+/**
+ * Reason a directory is unsafe to use as an index ROOT, or null when it's fine.
+ *
+ * Indexing your home directory or a filesystem root drags in caches, `Library`,
+ * every other project, etc. — a multi-GB index, constant file-watcher churn, and
+ * (pre-1.0 on macOS) a file-descriptor blowup that exhausted `kern.maxfiles` and
+ * took unrelated apps / the whole machine down (#845). The classic trigger:
+ * running the installer or `codegraph init` from `$HOME`, which auto-indexes the
+ * current directory. These are never intended project roots, so the installer
+ * and `init`/`index` refuse them (overridable with `--force`).
+ *
+ * Pure-ish (reads only `os.homedir()` + realpath) so it's easy to unit-test.
+ * The returned string is a human phrase that slots into "… looks like {reason}".
+ */
+export function unsafeIndexRootReason(projectRoot: string): string | null {
+  const resolve = (p: string): string => {
+    try {
+      return fs.realpathSync(path.resolve(p));
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  const resolved = resolve(projectRoot);
+
+  // Filesystem root: `/` on POSIX, a drive root like `C:\` on Windows.
+  if (path.parse(resolved).root === resolved) {
+    return 'the filesystem root';
+  }
+
+  const home = resolve(os.homedir());
+  // Case-insensitive on macOS/Windows (case-preserving but case-insensitive FS).
+  const norm = (p: string): string =>
+    process.platform === 'darwin' || process.platform === 'win32' ? p.toLowerCase() : p;
+  const r = norm(resolved);
+  const h = norm(home);
+
+  if (r === h) {
+    return 'your home directory';
+  }
+  // An ancestor of home (e.g. `/Users`, `/home`) — even broader than home.
+  if (h.startsWith(r + path.sep)) {
+    return 'a parent of your home directory';
+  }
+  return null;
+}
+
+/**
+ * `dev:ino` for a path, or null if it can't be stat'd or the platform doesn't
+ * report a usable inode. Read as bigints: WSL DrvFs (`/mnt/c`) reports inodes
+ * above 2^53, where a plain number rounds nearby inodes onto one value. Windows
+ * st_ino is unreliable across handle reopens, so we deliberately return null
+ * there — the deleted-but-open-inode hazard this guards (#925) is a POSIX
+ * file-semantics issue that doesn't arise on Windows (an open file can't be
+ * unlinked).
+ */
+export function statInode(p: string): string | null {
+  if (process.platform === 'win32') return null;
+  try {
+    const s = fs.statSync(p, { bigint: true });
+    return `${s.dev}:${s.ino}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Canonicalize a project root for IDENTITY: hashing it into a rendezvous key
+ * (the daemon's named pipe / tmpdir socket, a registry record). Not for display
+ * — the caller-visible root keeps its own spelling.
+ *
+ * The contract is that two spellings of ONE directory yield ONE string, because
+ * a client that derives a different key silently fails to meet the daemon that
+ * is already running: it probes a socket nobody bound, spawns a redundant
+ * daemon, and that daemon dies on the lock the first one holds, so the session
+ * degrades to a single-process engine. `path.resolve` alone does NOT satisfy
+ * that contract — NTFS is case-insensitive, so `d:\work\codegraph` and
+ * `D:\work\codegraph` name one directory but two strings, and non-native
+ * `fs.realpathSync` keeps whichever casing the caller passed (only `.native`
+ * asks the filesystem for the on-disk name — the same reason
+ * {@link isSameIndexRoot} uses it). Both spellings really do occur: a
+ * cwd-derived root is the on-disk case, while a client-supplied
+ * `rootUri`/`workspaceFolders` path arrives as `file:///d%3A/…`.
+ *
+ * The Windows lowercase is belt-and-braces on top of the native realpath — NTFS
+ * can't hold two directories differing only by case, and it also absorbs a
+ * `\\?\`-prefixed native result diverging from a plain one.
+ */
+export function canonicalProjectRoot(projectRoot: string): string {
+  const resolved = path.resolve(projectRoot);
+  let canonical = resolved;
+  try {
+    canonical = fs.realpathSync.native(resolved);
+  } catch {
+    // ENOENT/EACCES/ELOOP — the root is normally there (`.codegraph/` lives in
+    // it), so this is a fallback rather than a path we expect to take.
+  }
+  return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+}
+
+/**
+ * Whether two resolved index roots are one index spelled two ways — a symlinked
+ * checkout, or a case-variant on a case-insensitive mount (macOS, NTFS, WSL
+ * DrvFs `/mnt/c`), where `realpathSync` keeps the caller's casing (#1057).
+ * Compares the identity of both data directories as they are NOW, so an inode
+ * reused after a delete can't match: the deleted root no longer stats. Windows
+ * has no usable inode, so it compares the on-disk-cased native realpaths.
+ */
+export function isSameIndexRoot(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (process.platform === 'win32') {
+    try {
+      return fs.realpathSync.native(getCodeGraphDir(a)) === fs.realpathSync.native(getCodeGraphDir(b));
+    } catch {
+      return false;
+    }
+  }
+  const id = statInode(getCodeGraphDir(a));
+  return id !== null && id === statInode(getCodeGraphDir(b));
+}
+
 export function findNearestCodeGraphRoot(startPath: string): string | null {
   let current = path.resolve(startPath);
   const root = path.parse(current).root;
@@ -63,35 +381,575 @@ export function findNearestCodeGraphRoot(startPath: string): string | null {
   return null;
 }
 
-/**
- * Create the .codegraph directory structure
- * Note: Only throws if codegraph.db already exists, not just if .codegraph/ exists.
- */
-export function createDirectory(projectRoot: string): void {
-  const codegraphDir = getCodeGraphDir(projectRoot);
-  const dbPath = path.join(codegraphDir, 'codegraph.db');
+/** Heavy/irrelevant directory names the sub-project scan never descends into. */
+const SUBPROJECT_SCAN_SKIP = new Set([
+  'node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out', 'target',
+  'vendor', 'bin', 'obj', '.next', '.nuxt', '.svelte-kit', '.cache', 'coverage',
+  '.venv', 'venv', '__pycache__', '.turbo', '.idea', '.vscode', 'tmp', 'temp',
+]);
 
-  // Only throw if CodeGraph is actually initialized (db exists)
-  // .codegraph/ folder alone is fine
-  if (fs.existsSync(dbPath)) {
-    throw new Error(`CodeGraph already initialized in ${projectRoot}`);
+/** Manifests that mark a directory as a project/workspace root. The down-scan
+ *  is gated on one of these so a non-project cwd (e.g. `$HOME`) is a cheap
+ *  no-op instead of a deep filesystem crawl. */
+const WORKSPACE_ROOT_MANIFESTS = [
+  'package.json', 'pnpm-workspace.yaml', 'lerna.json', 'nx.json', 'turbo.json',
+  'go.work', 'go.mod', 'Cargo.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts',
+  'settings.gradle', 'pyproject.toml', 'composer.json', 'Gemfile', 'rush.json',
+  'WORKSPACE', 'WORKSPACE.bazel',
+];
+
+function looksLikeProjectRoot(dir: string): boolean {
+  return WORKSPACE_ROOT_MANIFESTS.some((m) => fs.existsSync(path.join(dir, m)));
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Indexed sub-project roots beneath `root` (bounded breadth-first scan). For
+ * the monorepo case behind #964: the index lives in a CHILD
+ * (`packages/x/.codegraph/`), not at the workspace root the agent's cwd points
+ * at. Descent stops at the first indexed directory on a branch (a project's
+ * own sub-dirs aren't separate projects) and is bounded by depth + count so it
+ * never turns into a full-tree crawl on a large repo.
+ */
+export function findIndexedSubprojectRoots(
+  root: string,
+  opts: { maxDepth?: number; max?: number } = {},
+): string[] {
+  // A stray workspace manifest must not enable scanning home or broader roots (#1454).
+  if (unsafeIndexRootReason(root) !== null) return [];
+  const maxDepth = opts.maxDepth ?? 4;
+  const max = opts.max ?? 64;
+  const out: string[] = [];
+  const walk = (dir: string, depth: number): void => {
+    if (out.length >= max || depth > maxDepth) return;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (out.length >= max) return;
+      if (!e.isDirectory()) continue;
+      if (e.name.startsWith('.') || SUBPROJECT_SCAN_SKIP.has(e.name)) continue;
+      const child = path.join(dir, e.name);
+      if (isInitialized(child)) { out.push(child); continue; } // don't descend into an indexed project
+      walk(child, depth + 1);
+    }
+  };
+  walk(root, 1);
+  return out;
+}
+
+/** Result of {@link resolveServerRoot}. */
+export interface ServerRootResolution {
+  /** The project root to serve as the default, or null when none resolved. */
+  root: string | null;
+  /** True when `root` was adopted from the down-scan rather than the up-walk. */
+  viaSubScan: boolean;
+  /**
+   * Indexed sub-projects the down-scan saw when it ran but could NOT adopt
+   * (zero or several candidates). Empty when the up-walk resolved or the scan
+   * was skipped. Callers surface these so "no default project" errors can say
+   * what IS reachable (#1607).
+   */
+  candidates: string[];
+}
+
+/**
+ * Whether `base` is a plausible workspace root for the sub-project down-scan.
+ * Mirrors `planFrontload`'s manifest gate, widened to accept a bare `.git`
+ * entry — the #1606 shape is a workspace container holding only agent config
+ * and a `.git`, with every build manifest living in the indexed children. The
+ * user's home directory and the filesystem root are never eligible: a stray
+ * manifest there must not turn server startup into a scan that could adopt an
+ * unrelated project (#1454 documents that failure mode for the prompt-hook).
+ */
+function eligibleForSubprojectScan(base: string): boolean {
+  if (base === path.parse(base).root) return false;
+  let home: string | null = null;
+  try { home = os.homedir(); } catch { home = null; }
+  if (home && (base === home || base === path.resolve(home))) return false;
+  if (looksLikeProjectRoot(base)) return true;
+  return fs.existsSync(path.join(base, '.git'));
+}
+
+/**
+ * Resolve the project root an MCP server should serve as its DEFAULT project
+ * (#1606). Up-walk first (`findNearestCodeGraphRoot` — the common case, and
+ * cheap). When nothing is indexed at or above `searchFrom`, run the bounded
+ * sub-project down-scan `planFrontload` already uses, behind the workspace
+ * gate above: EXACTLY ONE indexed sub-project is unambiguous and is adopted
+ * as the root; zero or several yield no root, with the candidates carried so
+ * the caller can name them instead of failing silently (#1607).
+ *
+ * `opts.subprojectScan: false` skips the down-scan entirely (the per-tool-call
+ * retry path throttles it; the up-walk always runs).
+ */
+export function resolveServerRoot(
+  searchFrom: string,
+  opts: { subprojectScan?: boolean } = {},
+): ServerRootResolution {
+  const up = findNearestCodeGraphRoot(searchFrom);
+  if (up) return { root: up, viaSubScan: false, candidates: [] };
+  if (opts.subprojectScan === false) return { root: null, viaSubScan: false, candidates: [] };
+  const base = path.resolve(searchFrom);
+  if (!eligibleForSubprojectScan(base)) return { root: null, viaSubScan: false, candidates: [] };
+  const subs = findIndexedSubprojectRoots(base);
+  if (subs.length === 1) return { root: subs[0]!, viaSubScan: true, candidates: subs };
+  return { root: null, viaSubScan: false, candidates: subs };
+}
+
+/**
+ * Unicode-aware word-boundary emulation for the keyword lists below. JS's `\b`
+ * is ASCII-only — it fires only at `[A-Za-z0-9_]` edges — so it can never bound
+ * a keyword whose first or last character is accented or non-Latin: `/\boù\b/`
+ * NEVER matches "où est …" (ù isn't an ASCII word char, so no boundary exists
+ * next to it). That is the #994 CJK mechanism resurfaced for Latin scripts and
+ * Cyrillic (#1126). A lookaround — "not flanked by a letter, digit, or
+ * underscore" — is the script-independent equivalent.
+ */
+const NOT_WORD_BEFORE = /(?<![\p{L}\p{N}_])/u.source;
+const NOT_WORD_AFTER = /(?![\p{L}\p{N}_])/u.source;
+
+/**
+ * Structural keywords matched as EXACT words (boundary on both sides): short
+ * or ambiguous tokens where prefix matching would false-positive ("flow" in
+ * "flower", "path" in "pathological"). Grouped by language; a term appears once
+ * even when several languages share it. Ambiguous everyday words like PT/ES
+ * "como" and DE "wie" are excluded: the hook instead requires another strong
+ * keyword, a verified code token, or indexed prose segments (#1654).
+ */
+const STRUCTURAL_WORDS = [
+  // English — the pre-#1126 list minus what moved to STRUCTURAL_STEMS: the
+  // bare-stem entries never matched their own derived forms (`\barchitect\b`
+  // can't match "architecture"), and "what calls" is subsumed by the "call" stem.
+  'how', 'where', 'tracing', 'flows?', 'paths?', 'reach(?:es|ed)?', 'wired?', 'breaks?', 'why does',
+  // French (où=where, flux=flow, chemin=path, casse=breaks)
+  'comment', 'où', 'flux', 'chemins?', 'casse',
+  // Spanish (cómo=how, dónde/donde=where, flujo=flow, ruta/camino=path,
+  // rompe=breaks, llaman / quién llama = call(s) — bare "llama" is excluded:
+  // it's also the animal/model name in English prompts)
+  'cómo', 'dónde', 'donde', 'flujos?', 'rutas?', 'caminos?', 'rompe', 'llaman', 'quién llama', 'quien llama',
+  // Portuguese (onde=where, fluxo=flow, caminho=path)
+  'onde', 'fluxos?', 'caminhos?',
+  // German (wo/woher/wohin=where, Pfad=path, Fluss/Ablauf=flow,
+  // bricht/kaputt=breaks, ruft=calls, hängt=depends — "hängt … von X ab"
+  // splits the separable verb "abhängen", so the "abhäng" stem can't catch it)
+  'wo', 'woher', 'wohin', 'pfade?', 'fluss', 'ablauf', 'bricht', 'kaputt', 'ruft', 'hängt',
+  // Italian (dove=where, flusso=flow, percorso/i=path)
+  'dove', 'flusso', 'percors[oi]',
+  // Russian (как=how, где=where, путь/пути=path, работает=works)
+  'как', 'где', 'путь', 'пути', 'работает',
+  // Ukrainian (як=how, де=where, потік=flow — обліque cases reuse the RU
+  // "поток" stem; працює=works)
+  'як', 'де', 'потік', 'працює',
+  // Dutch (hoe=how, waar=where, roept=calls, werkt=works, aangeroepen=called —
+  // the ge- participle escapes the "aanroep" stem)
+  'hoe', 'waar', 'roept', 'werkt', 'aangeroepen',
+  // Polish + Czech (jak=how — shared; gdzie/kde=where, cesta=path)
+  'jak', 'gdzie', 'kde', 'cesta',
+  // Romanian (cum=how, unde=where; flux is shared with French)
+  'cum', 'unde',
+  // Hungarian (hogyan=how, hol=where)
+  'hogyan', 'hol',
+  // Turkish (nasıl=how, mimari=architecture, takip=trace/follow)
+  'nasıl', 'mimari', 'takip',
+  // Indonesian/Malay (bagaimana=how, di mana/dimana=where, alur=flow, jalur=path)
+  'bagaimana', 'di mana', 'dimana', 'alur', 'jalur',
+  // Vietnamese — spaced Latin with heavy diacritics, the exact class ASCII `\b`
+  // breaks (làm sao/thế nào=how, ở đâu=where, gọi=call, phụ thuộc=depend,
+  // ảnh hưởng=affect, kiến trúc=architecture, cấu trúc=structure, luồng=flow,
+  // đường dẫn=path, hoạt động=works, giải thích=explain, theo dõi=trace)
+  'làm sao', 'thế nào', 'ở đâu', 'gọi', 'phụ thuộc', 'ảnh hưởng', 'kiến trúc',
+  'cấu trúc', 'luồng', 'đường dẫn', 'hoạt động', 'giải thích', 'theo dõi',
+  // Swedish / Danish / Norwegian (hur/hvordan=how, hvor=where, beror=depends,
+  // flöde=flow)
+  'hur', 'hvordan', 'hvor', 'beror', 'flöde',
+  // Finnish (miten=how, missä=where, toimii=works)
+  'miten', 'missä', 'toimii',
+  // Greek (πώς=how, πού=where — accented forms only: unaccented πως/που are
+  // ubiquitous conjunctions; καλεί=calls, δομή=structure, ροή=flow)
+  'πώς', 'πού', 'καλεί', 'δομή', 'ροή',
+  // Hindi (कैसे=how, कहाँ/कहां=where, कॉल=call, निर्भर=depends,
+  // संरचना=structure, प्रवाह=flow)
+  'कैसे', 'कहाँ', 'कहां', 'कॉल', 'निर्भर', 'संरचना', 'प्रवाह',
+];
+
+/**
+ * Structural keyword STEMS matched as word PREFIXES (boundary on the left
+ * only), so derived forms match without enumerating each: "architect" fires on
+ * architecture/architectural, "depend" on depends/dependency/dependencies,
+ * "вызыва" on вызывает/вызывается. Mid-word occurrences stay excluded —
+ * "restructure"/"independent" don't fire — so precision stays close to the
+ * exact-word class. Add a stem only when every plausible completion is still a
+ * structural word; a stem with ordinary-English completions must instead
+ * enumerate its structural suffixes and re-assert the right boundary (see the
+ * four bounded English entries below, #1138).
+ */
+const STRUCTURAL_STEMS = [
+  // English + the Latin-script languages that share the spelling (French
+  // architecture/structure/trace/impact, Spanish depende/implementa/impacto, …).
+  // call/trace/affect/connect are NOT safe as open prefixes — callus,
+  // calligraphy, Connecticut, connective, affectionate, Tracey are ordinary
+  // words that would false-fire the full-explore tier (#1138) — so they carry
+  // an enumerated suffix set + right boundary. "tracing" lives in
+  // STRUCTURAL_WORDS (the e is dropped, so no trace-prefix form matches it).
+  'architect', 'structur', 'depend', 'implement', 'impact', 'explain',
+  `call(?:s|ing|ed|ers?|backs?|able|sites?)?${NOT_WORD_AFTER}`,
+  `trace(?:s|d|rs?)?${NOT_WORD_AFTER}`,
+  `affect(?:s|ed|ing)?${NOT_WORD_AFTER}`,
+  `connect(?:s|ed|ing|ions?|ors?|ivity)?${NOT_WORD_AFTER}`,
+  // French (appel(le)=call, dépend=depends, implément(e)=implement,
+  // connex(ion)=connection, expliqu(e)=explain, fonctionn(e/ement)=works)
+  'appel', 'dépend', 'implément', 'connex', 'expliqu', 'fonctionn',
+  // Spanish (llamad(a)=call, afect(a)=affect, conect(a)/conexi(ón)=connect,
+  // arquitec(tura)=architecture, estructur(a)=structure, funcion(a)=works,
+  // traza(r)=trace, explica=explain)
+  'llamad', 'afect', 'conect', 'conexi', 'arquitec', 'estructur', 'funcion', 'traza', 'explica',
+  // Portuguese (chama(da)=call, afeta=affect, arquitet(ura)=architecture,
+  // estrutur(a)=structure, quebra(do)=breaks)
+  'chama', 'afeta', 'arquitet', 'estrutur', 'quebra',
+  // German (abhäng(t)=depend, Auswirkung=impact, beeinfluss(t)=affect,
+  // verbind(et)=connect, Architektur, Struktur, funktionier(t)=works,
+  // Aufruf/aufgerufen=call, erklär(t)=explain, verfolg(en)=trace)
+  'abhäng', 'auswirkung', 'beeinfluss', 'verbind', 'architekt', 'struktur', 'funktionier', 'aufruf', 'aufgerufen', 'erklär', 'verfolg',
+  // Italian (chiam(a/ata)=call, dipend(e/enza)=depend, impatt(o)=impact,
+  // connett(e)/conness(ione)=connect, architett(ura), struttur(a),
+  // funzion(a/amento)=works, tracci(a)=trace, spiega(mi)=explain)
+  'chiam', 'dipend', 'impatt', 'connett', 'conness', 'architett', 'struttur', 'funzion', 'tracci', 'spiega',
+  // Russian (вызыва(ет)=calls, завис(ит)=depends, влия(ет)=affects,
+  // реализ(ация)=implementation, структур(а), архитектур(а),
+  // трассир(овка)=trace, лома(ет)=breaks, объясн(и)=explain, поток=flow)
+  'вызыва', 'завис', 'влия', 'реализ', 'структур', 'архитектур', 'трассир', 'лома', 'объясн', 'поток',
+  // Ukrainian — і/и spellings diverge from Russian (виклика(є)=calls,
+  // залеж(ить)=depends, вплива(є)=affects, архітектур(а), реаліз(ація),
+  // поясн(и)=explain, шлях(у)=path; структур(а) is shared with Russian)
+  'виклика', 'залеж', 'вплива', 'архітектур', 'реаліз', 'поясн', 'шлях',
+  // Dutch (aanroep(en)=call, afhankelijk(heid)=depends, beïnvloed(t)=affects,
+  // structuur — "structur" can't reach the uu; uitleg(gen)=explain)
+  'aanroep', 'afhankelijk', 'beïnvloed', 'structuur', 'uitleg',
+  // Polish (wywoł(uje)=calls, zależ(y)=depends, wpływ(a)=affects/impact,
+  // przepływ=flow, ścieżk(a)=path, działa(nie)=works, wyjaśni(j)=explain,
+  // śledz(enie)=trace; architektura/struktura fire via the German stems)
+  'wywoł', 'zależ', 'wpływ', 'przepływ', 'ścieżk', 'działa', 'wyjaśni', 'śledz',
+  // Czech (volá(ní)=calls, závis(í)=depends, ovlivň(uje)=affects,
+  // funguj(e)=works, vysvětl(i)=explain)
+  'volá', 'závis', 'ovlivň', 'funguj', 'vysvětl',
+  // Romanian (apel(ează)=calls, depind(e)=depends — i not e, so "depend" misses
+  // it; arhitectur(a) — no c; funcțion(ează)=works, explică=explain)
+  'apel', 'depind', 'arhitectur', 'funcțion', 'explică',
+  // Hungarian (hív(ja)=calls, függ(őség)=depends, működ(ik)=works,
+  // struktúr(a) — ú escapes "struktur"; magyaráz(d)=explain;
+  // architektúra fires via the German stem)
+  'hív', 'függ', 'működ', 'struktúr', 'magyaráz',
+  // Turkish — agglutinative, so stems beat exact words (nere(de/ye/den)=where,
+  // çağır/çağrı=call, bağıml(ı)=depends, bağlant(ı)=connection, akış(ı)=flow,
+  // etkile(r)/etkisi=affects/impact)
+  'nere', 'çağır', 'çağrı', 'bağıml', 'bağlant', 'akış', 'etkile', 'etkisi',
+  // Indonesian/Malay — me-/di-/ber- prefixes block a bare stem, so affixed
+  // forms are listed too (panggil(an)/memanggil/dipanggil=call,
+  // bergantung/tergantung=depends, pengaruh/mempengaruhi/memengaruhi=affect,
+  // arsitektur=architecture, fungsi/berfungsi=works,
+  // jelaskan/menjelaskan=explain)
+  'panggil', 'memanggil', 'dipanggil', 'bergantung', 'tergantung', 'pengaruh',
+  'mempengaruhi', 'memengaruhi', 'arsitektur', 'fungsi', 'berfungsi', 'jelaskan', 'menjelaskan',
+  // Swedish / Danish / Norwegian (anrop(ar)=calls, påverk(ar)/påvirk(er)=affects,
+  // afhæng(er)/avheng(er)=depends, förklar(a)/forklar=explain,
+  // arkitektur — k not ch; funger(ar/er)=works)
+  'anrop', 'påverk', 'påvirk', 'afhæng', 'avheng', 'förklar', 'forklar', 'arkitektur', 'funger',
+  // Finnish (kutsu(u)=calls, riippu(u)=depends, arkkitehtuur(i),
+  // rakente(en)=structure, selit(ä)=explain)
+  'kutsu', 'riippu', 'arkkitehtuur', 'rakente', 'selit',
+  // Greek — accented and unaccented stem spellings both occur
+  // (εξαρτ(άται)=depends, επηρε(άζει)=affects, αρχιτεκτονικ(ή),
+  // διαδρομ(ή)=path, εξηγ/εξήγ(ησε)=explain)
+  'εξαρτ', 'επηρε', 'αρχιτεκτονικ', 'διαδρομ', 'εξηγ', 'εξήγ',
+  // Hindi (समझा(ओ/इए)=explain, आर्किटेक्चर=architecture)
+  'समझा', 'आर्किटेक्चर',
+];
+
+const STRUCTURAL_WORDS_RE = new RegExp(`${NOT_WORD_BEFORE}(?:${STRUCTURAL_WORDS.join('|')})${NOT_WORD_AFTER}`, 'iu');
+const STRUCTURAL_STEMS_RE = new RegExp(`${NOT_WORD_BEFORE}(?:${STRUCTURAL_STEMS.join('|')})`, 'iu');
+
+/**
+ * Structural keywords matched as bare SUBSTRINGS, for languages where a
+ * boundary can't be relied on: scripts with no word separators (Chinese —
+ * simplified AND traditional; the original #994 set was simplified-only —
+ * Japanese, Thai), Korean (spaced, but particles attach directly to the noun:
+ * 구조가/구조를), and Arabic / Farsi / Hebrew (spaced, but proclitics attach to
+ * the word: وكيف "and-how", והמבנה "and-the-structure"). JS's `\b` can never
+ * fire between Han characters, which was issue #994: the English-only gate
+ * silently no-op'd every Chinese prompt, so non-English users got no front-load
+ * nudge and no error to explain why. The sets mirror the English intent
+ * (如何/怎么/怎麼/どうやって/どのように/어떻게/كيف/چگونه/چطور/איך/อย่างไร/ยังไง=how,
+ * 在哪/哪里/哪裡/어디/أين/كجا/איפה/ที่ไหน=where, 流程/流向/流れ/흐름/تدفق/זרימה=flow,
+ * 路径/路徑/経路/경로/مسار/مسیر/נתיב/เส้นทาง=path,
+ * 调用/調用/呼び出/호출/يستدعي/استدعاء/فراخوان/קורא/เรียกใช้=call,
+ * 依赖/依賴/依存/의존/يعتمد/تعتمد/وابسته/תלוי/ขึ้นอยู่กับ=depend,
+ * 影响/影響/영향/يؤثر/تأثير/تأثیر/משפיע/ผลกระทบ=impact/affect,
+ * 实现/實現/実装/구현=implement,
+ * 架构/架構/アーキテクチャ/아키텍처/معماري/معماری/ארכיטקטור/สถาปัตยกรรม=architecture,
+ * 结构/結構/構造/구조/بنية/هيكل/ساختار/מבנה/โครงสร้าง=structure,
+ * 追踪/跟踪/追蹤/追跡/トレース/추적/تتبع/ติดตาม=trace,
+ * يعمل/تعمل/ทำงาน=works) plus structural-overview words with no single clean
+ * English equivalent (介绍/介紹/解析/分析/原理/机制/機制/仕組み/説明/설명/動作/동작/작동/
+ * اشرح/شرح/توضیح/הסבר/อธิบาย=explain).
+ *
+ * KNOWN, ACCEPTED false-positive class (#1140): substring matching cannot see
+ * homograph compounds — Korean 구조 (structure) also fires inside 구조대
+ * (rescue squad). Verified unfixable at this layer: ICU word segmentation
+ * (Intl.Segmenter) returns 구조대 and the particle form 구조가 (which the gate
+ * MUST keep matching) as equally opaque single segments, and a 구조대 denylist
+ * would break 구조대로 ("according to the structure" — 구조 + the 대로
+ * particle), a legitimate structural prompt. The miss rate this design avoids
+ * (silently no-op'ing every prompt in these languages, #994) outweighs the
+ * occasional off-domain fire.
+ */
+const STRUCTURAL_UNSEGMENTED = /如何|怎么|怎麼|在哪|哪里|哪裡|追踪|跟踪|追蹤|追跡|トレース|流程|流向|流れ|路径|路徑|経路|调用|調用|呼び出|依赖|依賴|依存|影响|影響|实现|實現|実装|架构|架構|アーキテクチャ|结构|結構|構造|介绍|介紹|解析|分析|原理|机制|機制|仕組み|説明|動作|どうやって|どのように|어떻게|어디|호출|흐름|경로|의존|영향|구현|구조|아키텍처|추적|동작|작동|설명|كيف|أين|اين|يستدعي|استدعاء|يعتمد|تعتمد|يؤثر|تأثير|معماري|بنية|هيكل|تدفق|مسار|تتبع|يعمل|تعمل|اشرح|شرح|چگونه|چطور|کجا|فراخوان|وابسته|تأثیر|معماری|ساختار|مسیر|توضیح|איך|איפה|קורא|תלוי|משפיע|ארכיטקטור|מבנה|זרימה|נתיב|הסבר|อย่างไร|ยังไง|ที่ไหน|เรียกใช้|ขึ้นอยู่กับ|ผลกระทบ|สถาปัตยกรรม|โครงสร้าง|เส้นทาง|ติดตาม|ทำงาน|อธิบาย/;
+
+/** Doc/data/asset file extensions — a `name.ext` of this kind is a file
+ *  reference, not a code symbol, so it must not trip the member-access signal. */
+const DOC_DATA_EXT = /\.(md|markdown|txt|rst|json|ya?ml|toml|lock|csv|tsv|log|ini|cfg|conf|env|xml|html?|png|jpe?g|gif|svg|pdf)$/i;
+
+/**
+ * Does `prompt` contain an explicit structural keyword? A keyword is a strong,
+ * self-contained signal, so the front-load hook fires on it directly — no graph
+ * check needed. (A *code-token* match, by contrast, is only a candidate the
+ * hook verifies against the graph first; see {@link extractCodeTokens}.)
+ * Coverage is multilingual (#994, #1126): the ~29 languages with the largest
+ * developer populations, across Latin, Cyrillic, Greek, CJK, Hangul, Arabic,
+ * Hebrew, Thai, and Devanagari scripts. Languages beyond the keyword table
+ * still fire through the language-agnostic code-token path.
+ */
+export function hasStructuralKeyword(prompt: string): boolean {
+  return (
+    !!prompt &&
+    (STRUCTURAL_WORDS_RE.test(prompt) || STRUCTURAL_STEMS_RE.test(prompt) || STRUCTURAL_UNSEGMENTED.test(prompt))
+  );
+}
+
+/**
+ * Identifier-shaped tokens in `prompt` — camelCase / PascalCase-with-inner-cap,
+ * snake_case, a `name(` call, or the two sides of an `a.b` member access. Naming
+ * a symbol is a code question whatever the surrounding human language, and these
+ * shapes almost never occur in ordinary prose, so they catch the common
+ * "<symbol> 的调用链?" / "where is <symbol> 定義" prompts no keyword list would.
+ *
+ * These are *candidates*, not a verdict: a tech brand like `JavaScript` or
+ * `GitHub` is identifier-shaped too, so the front-load hook checks each token
+ * against the actual index ({@link getNodesByName}) and only fires when one is a
+ * real symbol here — otherwise a brand-name prompt would inject ~16KB of
+ * low-relevance context (issue #994 follow-up). A doc/data filename ("README.md")
+ * is excluded from the member-access form since it's a file reference, not a symbol.
+ */
+export function extractCodeTokens(prompt: string): string[] {
+  if (!prompt) return [];
+  const out = new Set<string>();
+  // camelCase / PascalCase-with-inner-cap (getUserId, parseToken, UserService) or
+  // snake_case (article_publish, get_user) — a whole identifier run that has an
+  // inner lower→upper transition or an underscore flanked by alphanumerics.
+  for (const m of prompt.matchAll(/[A-Za-z_$][\w$]*/g)) {
+    const w = m[0];
+    if (/[a-z][A-Z]/.test(w) || /[A-Za-z0-9]_[A-Za-z0-9]/.test(w)) out.add(w);
+  }
+  // call form: an identifier directly before '(' — parseToken(, render(). No
+  // whitespace before '(' so prose like "the function (entry point)" doesn't trip it.
+  for (const m of prompt.matchAll(/([A-Za-z_$][\w$]*)\(/g)) out.add(m[1]!);
+  // member access on identifiers (user.login) — but not a doc/data filename.
+  for (const m of prompt.matchAll(/([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)/g)) {
+    if (!DOC_DATA_EXT.test(m[0])) { out.add(m[1]!); out.add(m[2]!); }
+  }
+  return [...out];
+}
+
+/**
+ * Cheap, graph-free candidate gate for the front-load hook: could `prompt` be a
+ * structural / flow / impact / "where-how" question worth front-loading context
+ * for? True on an explicit keyword in any covered language (#994, #1126) OR an
+ * identifier-shaped token. A keyword is sufficient to fire on its own; a
+ * token-only match is only a candidate the hook then verifies against the graph
+ * (a brand name like `JavaScript` is token-shaped but isn't a symbol). Every
+ * non-candidate prompt ("fix this typo", in any language) stays a zero-cost no-op.
+ */
+export function isStructuralPrompt(prompt: string): boolean {
+  return hasStructuralKeyword(prompt) || extractCodeTokens(prompt).length > 0;
+}
+
+/**
+ * Claude Code persists `UserPromptSubmit` hook stdout above this many
+ * characters to a file and shows the model a ~2 KB preview instead (#1694).
+ * Measured on Claude Code 2.1.261; documented in the hooks reference as a
+ * 10,000-character cap on hook output strings.
+ */
+export const CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT = 10_000;
+
+/**
+ * Max characters of explore text injected by `codegraph prompt-hook` before
+ * truncation. Must stay under {@link CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT} so
+ * the host delivers the payload inline. 9,000 leaves ~1k for the
+ * `<codegraph_context>` wrapper and the `projectPath` nudge lines appended
+ * after the cap is applied.
+ */
+export const PROMPT_HOOK_INJECTION_MAX = 9_000;
+
+/**
+ * Cap explore text for the prompt-hook injection, preserving the existing
+ * "call codegraph_explore for the rest" notice when truncated.
+ */
+export function capPromptHookInjection(text: string, max = PROMPT_HOOK_INJECTION_MAX): string {
+  return text.length > max
+    ? `${text.slice(0, max)}\n…(truncated; call codegraph_explore for the rest)`
+    : text;
+}
+
+/**
+ * What the front-load hook should do for a prompt issued from a directory.
+ */
+export interface FrontloadPlan {
+  /** Open + explore this project and inject its source as context. `null` when
+   *  there's no single project to front-load (none indexed, or several indexed
+   *  sub-projects with no clear match — see {@link nudgeProjects}). */
+  exploreRoot: string | null;
+  /** Indexed sub-projects to surface in a "pass `projectPath`" nudge: the rest
+   *  of a monorepo's indexed projects alongside `exploreRoot`, or — when no one
+   *  project clearly matches — the full list (with `exploreRoot` null). */
+  nudgeProjects: string[];
+  /** True when the plan came from scanning DOWN into sub-projects (cwd itself
+   *  is not under any index) — the monorepo case, where a follow-up
+   *  `codegraph_explore` needs an explicit `projectPath`. */
+  viaSubScan: boolean;
+}
+
+/**
+ * Decide what the front-load hook injects for a `prompt` issued from `cwd`,
+ * shaped by where the `.codegraph/` index(es) actually are:
+ *   1. **cwd (or an ancestor) is indexed** → front-load that project. The
+ *      normal single-project / nested-file case.
+ *   2. **cwd isn't indexed but looks like a workspace root** → the indexes live
+ *      in sub-projects (the monorepo case behind #964). One indexed
+ *      sub-project → front-load it; several → front-load the one the prompt
+ *      names (by relative path like `packages/api`, or package directory name)
+ *      and nudge about the rest; several with no match → nudge the full list so
+ *      the agent passes `projectPath`, rather than guessing wrong.
+ *   3. **nothing indexed reachable** → do nothing (the agent's own tools apply).
+ */
+export function planFrontload(cwd: string, prompt: string): FrontloadPlan {
+  const none: FrontloadPlan = { exploreRoot: null, nudgeProjects: [], viaSubScan: false };
+
+  // 1. up-walk — nearest indexed ancestor (incl. cwd). Cheap; covers the common
+  //    single-project case without a down-scan.
+  let dir = path.resolve(cwd);
+  for (let i = 0; i < 6; i++) {
+    if (isInitialized(dir)) return { exploreRoot: dir, nudgeProjects: [], viaSubScan: false };
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
   }
 
-  // Create main directory (if it doesn't exist)
-  fs.mkdirSync(codegraphDir, { recursive: true });
+  // 2. down-scan — only from something that looks like a workspace root, so a
+  //    non-project cwd (e.g. $HOME) is a cheap no-op, not a deep crawl.
+  const base = path.resolve(cwd);
+  if (!looksLikeProjectRoot(base)) return none;
+  const subs = findIndexedSubprojectRoots(base);
+  if (subs.length === 0) return none;
+  if (subs.length === 1) return { exploreRoot: subs[0]!, nudgeProjects: [], viaSubScan: true };
 
-  // Create .gitignore inside .codegraph (if it doesn't exist)
-  const gitignorePath = path.join(codegraphDir, '.gitignore');
-  if (!fs.existsSync(gitignorePath)) {
-    const gitignoreContent = `# CodeGraph data files — local to each machine, not for committing.
+  // Several indexed sub-projects — pick the one the prompt points at, if any.
+  const p = prompt.toLowerCase();
+  let best: { root: string; score: number; relLen: number } | null = null;
+  for (const s of subs) {
+    const rel = path.relative(base, s);
+    const relLc = rel.split(path.sep).join('/').toLowerCase();
+    const name = path.basename(s).toLowerCase();
+    let score = 0;
+    if (relLc && p.includes(relLc)) score = 10;                         // "packages/api"
+    else if (name.length >= 3 && new RegExp(`\\b${escapeRegExp(name)}\\b`).test(p)) score = 5; // "api"
+    if (score > 0 && (!best || score > best.score || (score === best.score && rel.length < best.relLen))) {
+      best = { root: s, score, relLen: rel.length };
+    }
+  }
+  if (best) {
+    return { exploreRoot: best.root, nudgeProjects: subs.filter((s) => s !== best!.root), viaSubScan: true };
+  }
+  // No clear match — nudge the full list rather than front-load a guess.
+  return { exploreRoot: null, nudgeProjects: subs, viaSubScan: true };
+}
+
+/**
+ * Contents of `.codegraph/.gitignore`. A single wildcard ignore keeps every
+ * transient file in the index dir — the database, `daemon.pid`, the socket,
+ * logs, cache, and anything future versions add — out of git, without having
+ * to enumerate each name (issues #788, #492, #484). Older versions wrote an
+ * explicit allowlist that never listed `daemon.pid` or the socket, so those
+ * runtime files were silently committed.
+ */
+const GITIGNORE_CONTENT = `# CodeGraph data files — local to each machine, not for committing.
 # Ignore everything in .codegraph/ except this file itself, so transient
 # files (the database, daemon.pid, sockets, logs) never show up in git.
 *
 !.gitignore
 `;
 
-    fs.writeFileSync(gitignorePath, gitignoreContent, 'utf-8');
+/** Header line that prefixes every .gitignore CodeGraph has auto-generated. */
+const GITIGNORE_MARKER = '# CodeGraph data files';
+
+/**
+ * Is `content` a stale CodeGraph-generated `.gitignore` that should be
+ * regenerated in place? True when it carries our header but predates the
+ * wildcard ignore (it has no bare `*` line) — i.e. one of the old explicit
+ * allowlists (`*.db`, `cache/`, `.dirty`, …) that never ignored `daemon.pid`
+ * or the socket (issue #788). A file WITHOUT our header is user-authored and
+ * is left untouched; one that already has the wildcard is current. Matching
+ * on the header (not a byte-exact list of past defaults) heals every old
+ * variant — v0.7.x through 0.9.9 — and is idempotent once upgraded.
+ */
+function isStaleDefaultGitignore(content: string): boolean {
+  if (!content.trimStart().startsWith(GITIGNORE_MARKER)) return false;
+  return !content.split('\n').some((line) => line.trim() === '*');
+}
+
+/**
+ * Write `.codegraph/.gitignore` if it's absent, or upgrade a stale
+ * CodeGraph-generated default in place; a user-customized file is left alone.
+ * Best-effort — returns `false` only if a needed write failed.
+ */
+function ensureGitignore(gitignorePath: string): boolean {
+  let existing: string | null;
+  try {
+    existing = fs.readFileSync(gitignorePath, 'utf-8');
+  } catch {
+    existing = null; // absent (ENOENT) or unreadable — (re)create below
   }
+  // Current default or a user-authored file: nothing to do.
+  if (existing !== null && !isStaleDefaultGitignore(existing)) return true;
+  try {
+    fs.writeFileSync(gitignorePath, GITIGNORE_CONTENT, 'utf-8');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Create the .codegraph directory structure
+ * Note: Only throws if codegraph.db already exists, not just if .codegraph/ exists.
+ */
+export function createDirectory(projectRoot: string): void {
+  const codegraphDir = getCodeGraphDir(projectRoot);
+
+  // Only throw if CodeGraph is actually initialized (db with a schema).
+  // .codegraph/ folder alone — or a schema-less codegraph.db left by an
+  // interrupted init (#1895) — is fine: initialize() adds the schema to it.
+  if (isInitialized(projectRoot)) {
+    throw new Error(`CodeGraph already initialized in ${projectRoot}`);
+  }
+
+  // Create main directory (if it doesn't exist)
+  fs.mkdirSync(codegraphDir, { recursive: true });
+
+  // Write .gitignore inside .codegraph (create if absent, upgrade a stale
+  // pre-wildcard default left by an older version — issue #788).
+  ensureGitignore(path.join(codegraphDir, '.gitignore'));
 }
 
 /**
@@ -230,20 +1088,78 @@ export function validateDirectory(projectRoot: string): {
     return { valid: false, errors };
   }
 
-  // Auto-repair missing .gitignore (non-critical file)
+  // Auto-repair / upgrade .gitignore (non-critical file). A missing one is
+  // recreated; a stale pre-wildcard default that never ignored daemon.pid is
+  // regenerated in place (issue #788); a user-authored file is left alone.
   const gitignorePath = path.join(codegraphDir, '.gitignore');
-  if (!fs.existsSync(gitignorePath)) {
-    try {
-      const gitignoreContent = `# CodeGraph data files — local to each machine, not for committing.\n# Ignore everything in .codegraph/ except this file itself, so transient\n# files (the database, daemon.pid, sockets, logs) never show up in git.\n*\n!.gitignore\n`;
-      fs.writeFileSync(gitignorePath, gitignoreContent, 'utf-8');
-    } catch {
-      // Non-fatal: warn but don't block
-      errors.push('.gitignore missing in .codegraph directory and could not be created');
-    }
+  const existedBefore = fs.existsSync(gitignorePath);
+  if (!ensureGitignore(gitignorePath) && !existedBefore) {
+    // Only a missing-and-uncreatable file is surfaced; a failed in-place
+    // upgrade of an existing file is non-fatal — the index still works.
+    errors.push('.gitignore missing in .codegraph directory and could not be created');
   }
 
   return {
     valid: errors.length === 0,
     errors,
   };
+}
+
+/**
+ * Claude Code injects `<task-notification>…</task-notification>` blocks as
+ * `user` messages when a background agent finishes, and UserPromptSubmit
+ * hooks receive them exactly like typed prompts (#1832). The whole prompt
+ * must be that single envelope; a user question that merely mentions the
+ * marker is still a prompt.
+ */
+export function isTaskNotification(prompt: string): boolean {
+  return /^\s*<task-notification>[\s\S]*<\/task-notification>\s*$/.test(prompt);
+}
+
+/**
+ * Claude Code hands a subagent's report back to the parent session as a
+ * `<agent-message from="…">…</agent-message>` prompt, which UserPromptSubmit
+ * hooks also receive (#2184). Same rule as {@link isTaskNotification}: only a
+ * prompt that is entirely that envelope is skipped.
+ */
+export function isAgentMessage(prompt: string): boolean {
+  return /^\s*<agent-message(?:\s[^>]*)?>[\s\S]*<\/agent-message>\s*$/.test(prompt);
+}
+
+/**
+ * A message another local Claude Code session sends to this one arrives as a
+ * `<cross-session-message from="…">…</cross-session-message>` prompt, which
+ * UserPromptSubmit hooks also receive (#2635). Same rule as
+ * {@link isTaskNotification}: only a prompt that is entirely that envelope is
+ * skipped.
+ */
+export function isCrossSessionMessage(prompt: string): boolean {
+  return /^\s*<cross-session-message(?:\s[^>]*)?>[\s\S]*<\/cross-session-message>\s*$/.test(prompt);
+}
+
+const SYSTEM_REMINDER_CLOSE = '</system-reminder>';
+/** One complete reminder block. The attribute run stops at `<`, so a tag left
+ *  open in pasted text can't make the scan quadratic. */
+const SYSTEM_REMINDER_BLOCK = /<system-reminder(?:\s[^<>]*)?>[\s\S]*?<\/system-reminder>/g;
+
+/**
+ * The prompt the user typed, without the `<system-reminder>…</system-reminder>`
+ * blocks Claude Code's desktop app puts in front of it, such as which other
+ * local sessions are linked. UserPromptSubmit hooks receive them as
+ * part of the prompt (#2635), but they are the host's status, not the user's
+ * words: gated and explored on, they made every turn, a bare "yes" included,
+ * inject context about the reminder, and they hid a task notification, a
+ * subagent hand-back or a cross-session message behind them from
+ * {@link isTaskNotification}, {@link isAgentMessage} and
+ * {@link isCrossSessionMessage}. Every complete block is removed and the rest
+ * trimmed; a `<system-reminder>` the user only mentions, with no closing tag,
+ * stays.
+ */
+export function stripSystemReminders(prompt: string): string {
+  // Only the text up to the last closing tag can hold a complete block, and
+  // bounding the scan there keeps an unclosed tag from rescanning the tail.
+  const end = prompt.lastIndexOf(SYSTEM_REMINDER_CLOSE);
+  if (end < 0) return prompt.trim();
+  const head = prompt.slice(0, end + SYSTEM_REMINDER_CLOSE.length);
+  return (head.replace(SYSTEM_REMINDER_BLOCK, '\n') + prompt.slice(head.length)).trim();
 }

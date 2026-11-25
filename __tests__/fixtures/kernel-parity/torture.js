@@ -1,0 +1,142 @@
+/**
+ * JS-grammar torture fixture (javascript variant: no type machinery, JS class
+ * fields use `field_definition` with a `property` field).
+ */
+import { EventEmitter } from 'node:events';
+const { promisify } = require('node:util');
+
+/** Legacy prototype-style helper. */
+function legacyHelper(a, b) {
+  return a + b;
+}
+
+const arrow = (x) => legacyHelper(x, 1);
+
+class Widget extends EventEmitter {
+  static registry = new Map();
+  static hooks = { tick: legacyHelper };
+  #privateField = 1;
+  label = 'w';
+  onTick = () => {
+    this.render();
+  };
+  wrapped = debounce(function () {
+    expensive();
+  }, 50);
+
+  constructor(opts) {
+    super();
+    this.opts = opts;
+    register(this.onTick);
+  }
+
+  render() {
+    paint(this.label);
+  }
+
+  static create(opts) {
+    return new Widget(opts);
+  }
+}
+
+// AMD-style wrapper — anonymous, but inner functions must still surface.
+(function () {
+  function hiddenInner() {
+    return 7;
+  }
+  hiddenInner();
+})();
+
+module.exports.makeWidget = function makeWidget(opts) {
+  return Widget.create(opts);
+};
+
+// Vuex module shape (store-file signals: mutations + actions + getters).
+const mutations = {
+  SET_USER(state, user) {
+    state.user = user;
+  },
+};
+const actions = {
+  async loadUser({ commit }, id) {
+    const user = await fetchUser(id);
+    commit('SET_USER', user);
+  },
+};
+export default {
+  namespaced: true,
+  state: () => ({ user: null }),
+  mutations,
+  actions,
+  getters: {
+    userName(state) {
+      return state.user?.name;
+    },
+  },
+};
+
+// Initializer walks attributed to the declared symbol (#693). A plain call
+// leaked to the FILE node; a non-exported object literal was skipped outright.
+const eagerConfig = loadConfig();
+const handlerMap = { onSave: () => persist(eagerConfig), onLoad: loadConfig() };
+const registry = { legacyHelper, run: arrow, nested: [legacyHelper] };
+const lazyList = [() => persist(eagerConfig)];
+// --- CommonJS export assignments (#1675) -----------------------------------
+exports.getItems = async (req, res) => { res.json(await findItems()); };
+module.exports.deleteItem = function (req, res) { removeItem(req.params.id); res.end(); };
+exports.plain = 42;
+handlers.onSave = () => { persist(); };
+// --- call-expression receivers (#1683) ----------------------------------------
+function bucketChains(d, k, v) {
+  d.setdefault(k, []).append(v);
+  make().run();
+  (0, make)().run();
+  arr[0]().go();
+  obj.make().run().again();
+}
+// --- expression receivers ----------------------------------------------------
+async function exprReceivers(x) {
+  (await list()).map(g);
+  (x).run();
+  (a ?? b).map(g);
+  f().list.map(g);
+  (() => 1).call(null);
+  this.a.b.run();
+  new Runner().go();
+  new RegExp(p).exec(s);
+  (new ns.Widget(1)).draw();
+  new (pick())().go();
+  new this.constructor().copy(x);
+}
+// --- component wrappers walked under the component ------------------------------
+const PANEL_GAP = 8;
+const Panel = styled(Widget)`
+  gap: ${PANEL_GAP}px;
+  color: ${(props) => colorOf(props.theme)};
+`;
+const Row = styled.div.attrs((props) => ({ role: roleOf(props) }))`
+  ${Panel} { margin: 0; }
+`;
+const MemoPanel = React.memo(Panel, legacyHelper);
+// --- callees that name nothing, and wrappers that keep one -----------------------
+function calleeShapes(handlers, type, fn, ns) {
+  (() => { legacyHelper(1, 2); })();
+  (function () { arrow(3); })();
+  connect(mapState)(Widget);
+  breakpoint('tablet')`padding: 0;`;
+  handlers[type](1);
+  (0, fn)();
+  (fn)();
+  (ns.fn)();
+}
+// --- parameter defaults are the function's code (#2588) -----------------------
+function defaultsOf(note = legacyHelper(1), { a = arrow(2), b: { c = new Widget() } = {} } = {}, [x = legacyHelper(3), , y = arrow(4)] = [], { [legacyHelper(5)]: keyed } = {}) {
+  return [note, a, c, x, y, keyed];
+}
+class DefaultsHolder {
+  constructor(o = new Widget()) { this.o = o; }
+  pick(item = legacyHelper(6)) { return item; }
+  onPick = (item = arrow(7)) => item;
+}
+const defaultsApi = { load(note = legacyHelper(8)) { return note; } };
+export default function (note = arrow(9)) { return note; }

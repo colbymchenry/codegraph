@@ -19,7 +19,7 @@ export type Location = 'global' | 'local';
  * lookup. New targets add a value here when they're added to the
  * registry. Keep these short and lowercase.
  */
-export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro';
+export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro' | 'copilot-vscode' | 'copilot-cli' | 'copilot-jetbrains';
 
 /**
  * Result of `target.detect(location)`.
@@ -68,6 +68,13 @@ export interface InstallOptions {
    * target has no permissions concept this option is a no-op.
    */
   autoAllow: boolean;
+  /**
+   * Front-load prompt hook (Claude `UserPromptSubmit`) that injects
+   * codegraph_explore context for structural prompts. `true` installs it,
+   * `false` removes any prior install (so opt-out round-trips), `undefined`
+   * leaves it untouched. Targets without a prompt-hook concept ignore it.
+   */
+  promptHook?: boolean;
 }
 
 export interface AgentTarget {
@@ -80,12 +87,19 @@ export interface AgentTarget {
   /**
    * Whether this target supports the given install location.
    *
-   * Some agents (Codex CLI as of 2026-05) have no project-local
-   * config concept — only a single `~/.codex/` dir. Returning false
-   * for an unsupported (target, location) pair lets the orchestrator
-   * skip cleanly with a clear message.
+   * Some agents (GitHub Copilot CLI, the Copilot JetBrains plugin)
+   * have no project-local config concept — only a single per-user
+   * config dir. Returning false for an unsupported (target, location)
+   * pair lets the orchestrator skip cleanly with a clear message.
    */
   supportsLocation(loc: Location): boolean;
+  /**
+   * Read-only, and quiet. Every target is detected on every run —
+   * including agents codegraph was never installed into — and
+   * `install --refresh` skips the unconfigured ones on the strength of
+   * this answer, so a target that writes or warns here touches a config
+   * it has no business touching (issue #1870).
+   */
   detect(loc: Location): DetectionResult;
   install(loc: Location, opts: InstallOptions): WriteResult;
   /**
