@@ -61,9 +61,7 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   r: rExtractor,
   luau: luauExtractor,
   objc: objcExtractor,
-<<<<<<< HEAD
   groovy: groovyExtractor,
-=======
   cfscript: cfscriptExtractor,
   cfquery: cfqueryExtractor,
   cobol: cobolExtractor,
@@ -73,5 +71,4 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   terraform: terraformExtractor,
   arkts: arktsExtractor,
   nix: nixExtractor,
->>>>>>> origin/main
 };
