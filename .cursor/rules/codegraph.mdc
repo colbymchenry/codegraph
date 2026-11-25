@@ -20,5 +20,5 @@ Reach for `codegraph_explore` before grep/find or Read for any **structural** qu
 
 ### If `.codegraph/` doesn't exist
 
-The MCP server returns "not initialized." Ask the user: *"I notice this project doesn't have CodeGraph initialized. Want me to run `codegraph init -i` to build the index?"*
+The MCP tools say the project isn't indexed. Indexing is the user's decision: tell them they can run `codegraph init` to build the index, but don't run it yourself.
 <!-- CODEGRAPH_END -->

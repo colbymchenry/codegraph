@@ -217,6 +217,10 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 - **Saved trails stay inside your project.** When `.codegraph/ui` was a link to a folder somewhere else, saving a trail wrote it into that folder, even though the save then reported an error, and a trail file that was itself a link to a file outside the project was listed and opened like one of yours. Both are now refused, and links that stay inside the project keep working. Thanks @danusha2345.
 
+- **`codegraph ui` won't open a sensitive folder by another name.** A link or junction to a folder like `~/.ssh` or `~/.config`, a differently capitalized name on Windows and macOS, or a `\\?\` spelling on Windows got past the check that keeps such a folder from being opened, and the viewer then showed the files inside. They are now refused like the folder itself. Thanks @mixxer for finding it.
+
+- **A file with `%` in its name opens as itself.** The viewer decoded a file's name a second time before reading it, so `100%.ts` was refused, and `a%20b.ts` was shown as changed on disk, with no lines, because `a b.ts` was read in its place. Every file now opens as the file it names. Thanks @shrankr.
+
 - **Saved trails record the right author when one process serves several projects.** An app embedding the viewer for more than one project wrote the first project's git user name on every trail it saved; each project now uses its own. Thanks @danusha2345.
 
 - **`codegraph ui` on Windows moves on from a port another program holds.** Windows refuses a port that another program keeps for itself, or one inside a range it reserves, with a different error than a port that is simply in use, so the viewer gave up at the first such port instead of trying the next one, and blamed ports below 1024 needing elevated privileges — a rule Windows doesn't have. It now moves on to the next free port, and when none is left, or the port you pinned with `--port` is refused, it says what Windows did and how to list the reserved ranges. Thanks @ijbranch for the report and @sx4im. (#2299)

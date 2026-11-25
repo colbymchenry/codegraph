@@ -78,6 +78,61 @@ describe('Go method calls on a receiver the extractor names no variable for (#25
     ]);
   });
 
+  it('types local values from method chains continued after a dot (#3455)', async () => {
+    const graph = await index({
+      'main.go': `package main
+
+type Route struct{}
+type Router struct{}
+
+func NewRoute() *Route { return &Route{} }
+func (r *Route) Host(name string) *Route { return r }
+func (r *Route) Subrouter() *Router { return &Router{} }
+func (r *Route) Path(p string) {}
+func (r *Router) Path(p string) {}
+
+func oneLine() {
+    sub := NewRoute().Host("x").Subrouter()
+    sub.Path("/a")
+}
+
+func shortDeclaration() {
+    sub := NewRoute().
+        Host("x").  // A selector can continue after a line comment.
+        Subrouter()
+    sub.Path("/a")
+}
+
+func varDeclaration() {
+    route := NewRoute()
+    var sub = route.Host("x").
+        Subrouter()
+    sub.Path("/a")
+}
+
+func headerDeclaration() {
+    if sub := NewRoute().
+        Host("x").Subrouter(); sub != nil {
+        sub.Path("/a")
+    }
+}
+`,
+    });
+
+    const paths = (name: string) => callees(graph, name).filter((edge) => edge.endsWith('::Path'));
+    expect({
+      oneLine: paths('oneLine'),
+      shortDeclaration: paths('shortDeclaration'),
+      varDeclaration: paths('varDeclaration'),
+      headerDeclaration: paths('headerDeclaration'),
+    }).toEqual({
+      oneLine: ['calls method Router::Path'],
+      shortDeclaration: ['calls method Router::Path'],
+      varDeclaration: ['calls method Router::Path'],
+      headerDeclaration: ['calls method Router::Path'],
+    });
+  });
+
   it("calls the composite literal's own type's method", async () => {
     const graph = await index({
       'main.go': `package main
@@ -364,7 +419,8 @@ func useLiteral() {
 func main() { use(holder{}); useLiteral() }
 `,
     });
-    expect(callees(graph, 'use')).toEqual([]);
+    // A func-typed field's call gives the result its type declares: `h.get()` is an A.
+    expect(callees(graph, 'use')).toEqual(['calls method A::Run']);
     expect(callees(graph, 'useLiteral')).toEqual([]);
   });
 });

@@ -28,7 +28,6 @@
  * converge on whichever the daemon bound with zero coordination.
  */
 
-import * as crypto from 'crypto';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
@@ -45,7 +44,9 @@ const POSIX_SOCKET_PATH_LIMIT = 100;
  * a proxy probes a pipe the running daemon never bound (see that function).
  */
 function projectHash(projectRoot: string): string {
-  return crypto.createHash('sha256').update(canonicalProjectRoot(projectRoot)).digest('hex').slice(0, 16);
+  // `crypto` is the slowest builtin to load, and every CLI command loads this file.
+  const { createHash } = require('crypto') as typeof import('crypto');
+  return createHash('sha256').update(canonicalProjectRoot(projectRoot)).digest('hex').slice(0, 16);
 }
 
 /**
@@ -93,6 +94,13 @@ export function getDaemonSocketCandidates(projectRoot: string): string[] {
 export function getDaemonSocketPath(projectRoot: string): string {
   // The candidate list is never empty (≥1 on every platform), so [0] is safe.
   return getDaemonSocketCandidates(projectRoot)[0]!;
+}
+
+/** Whether `CODEGRAPH_NO_DAEMON` was set to a truthy value. */
+export function daemonOptOutSet(): boolean {
+  const raw = process.env.CODEGRAPH_NO_DAEMON;
+  if (!raw) return false;
+  return raw !== '0' && raw.toLowerCase() !== 'false';
 }
 
 /** Absolute path to the daemon pid lockfile for `projectRoot`. */

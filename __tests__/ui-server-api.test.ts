@@ -1233,6 +1233,54 @@ describe('GET /api/nodes', () => {
   });
 });
 
+// #2009: the source of `100%.ts` was refused, and `a%20b.ts` was read from
+// `a b.ts` and so shown as changed on disk with no lines.
+describe('GET /api/source and /api/file/<path> — file names with % in them', () => {
+  it('serves each file as itself', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-ui-percent-'));
+    const files: Record<string, string> = {
+      'src/a%20b.ts': 'export function percentNamed() { return "A"; }',
+      'src/a b.ts': 'export function spaceNamed() { return "B"; }',
+      'src/100%.ts': 'export function hundredPercent() { return "C"; }',
+    };
+    fs.mkdirSync(path.join(root, 'src'));
+    for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(root, name), `${text}\n`);
+    const indexed = await CodeGraph.init(root, { index: true });
+    indexed.close();
+
+    const percentApi = createGraphApi({ projectRoot: root });
+    const percentServer = await startUiServer({
+      projectRoot: root,
+      viewerDir,
+      port: 0,
+      api: percentApi.handler,
+    });
+    try {
+      for (const [name, text] of Object.entries(files)) {
+        // The query a browser sends for this name: `%` itself arrives encoded.
+        const res = await requestOn(percentServer.port, `/api/source?${new URLSearchParams({ file: name })}`);
+        expect(res.status, name).toBe(200);
+        const body = JSON.parse(res.body);
+        expect(body.file, name).toBe(name);
+        expect(body.drift, name).toBe(false);
+        expect(body.lines, name).toEqual([text]);
+
+        // The File view carries the path in the URL path instead of the query.
+        const encodedPath = name.split('/').map(encodeURIComponent).join('/');
+        const fileView = await requestOn(percentServer.port, `/api/file/${encodedPath}`);
+        expect(fileView.status, name).toBe(200);
+        const view = JSON.parse(fileView.body);
+        expect(view.file.path, name).toBe(name);
+        expect(view.drift, name).toBe(false);
+      }
+    } finally {
+      percentApi.close();
+      await percentServer.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('an index that is not there', () => {
   it('answers with the same guidance the CLI prints, not a stack trace', async () => {
     const emptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-ui-noindex-'));

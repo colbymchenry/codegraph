@@ -38,7 +38,15 @@ export const REGEX_START_BEFORE = /(?:^|[=(:,)!&|?;{}\[\]+*%~^<>-]|\b(?:return|t
  * closing `/` of every span read as a regex literal (left as is).
  */
 export function blankStringContents(text: string, regexLiterals?: number[]): string {
-  const out = text.split('');
+  // Blanked runs are spaces, and the text between them is copied by the
+  // slice, as BlankedText does for the strippers.
+  const parts: string[] = [];
+  let copied = 0;
+  const blank = (start: number, end: number): void => {
+    if (end <= start) return;
+    parts.push(text.slice(copied, start), ' '.repeat(end - start));
+    copied = end;
+  };
   let i = 0;
   const n = text.length;
   while (i < n) {
@@ -63,23 +71,117 @@ export function blankStringContents(text: string, regexLiterals?: number[]): str
     if (c === '"' || c === "'" || c === '`') {
       const quote = c;
       i++;
+      // An escape blanks both its characters, an escaped newline too; a
+      // template's own newlines stay.
+      let run = i;
       while (i < n && text[i] !== quote) {
         if (text[i] === '\\' && i + 1 < n) {
-          out[i] = ' ';
-          out[i + 1] = ' ';
           i += 2;
           continue;
         }
         if (quote !== '`' && text[i] === '\n') break;
-        if (text[i] !== '\n') out[i] = ' ';
+        if (text[i] === '\n') {
+          blank(run, i);
+          run = i + 1;
+        }
         i++;
       }
+      blank(run, i);
       if (i < n && text[i] === quote) i++;
       continue;
     }
     i++;
   }
-  return out.join('');
+  if (copied === 0) return text;
+  parts.push(text.slice(copied));
+  return parts.join('');
+}
+
+/** A keyword after which a `/` opens a regex literal, at the end of the text before it. */
+const REGEX_AFTER_KEYWORD = /(?:^|[^\w$])(?:return|throw|case|yield|await|else|do|typeof|void|delete|new|in|of|instanceof)$/;
+
+/**
+ * Whether the `/` at `at` opens a regex literal: it does where an expression
+ * starts, and divides after a value — a `)`, `]`, string, name or number.
+ */
+function slashOpensRegex(src: string, at: number): boolean {
+  let j = at - 1;
+  while (j >= 0 && (src[j] === ' ' || src[j] === '\t' || src[j] === '\n' || src[j] === '\r')) j--;
+  if (j < 0) return true;
+  const before = src[j]!;
+  if (before === ')' || before === ']' || before === '"' || before === "'" || before === '`') return false;
+  if (/[\w$]/.test(before)) return REGEX_AFTER_KEYWORD.test(src.slice(Math.max(0, j - 10), j + 1));
+  return true;
+}
+
+/**
+ * Where JS/TS template-literal text lies in `src`: a test of whether offset
+ * `at` falls in a template's literal text — not its `${…}` code — or null when
+ * a template never closes, so the scan vouches for nothing. Offsets match
+ * {@link stripCommentsForRegex}'s output, which keeps them.
+ *
+ * Unlike {@link blankStringContents} it follows `${…}` nesting (a template in
+ * an interpolation, a brace in a regex there) and skips comments, strings and
+ * regex literals, which may hold a backtick (`/[`]/`).
+ */
+export function templateLiteralTextAt(src: string): ((at: number) => boolean) | null {
+  /** Template text spans, `[start, end)` pairs in order. */
+  const spans: number[] = [];
+  /** Innermost last: an open template's current text start, or an open `${…}`'s unclosed braces. */
+  const open: Array<{ text: number } | { braces: number }> = [];
+  const n = src.length;
+  for (let i = 0; i < n; i++) {
+    const c = src[i];
+    const top = open[open.length - 1];
+    if (top && 'text' in top) {
+      if (c === '\\') i++;
+      else if (c === '`') {
+        spans.push(top.text, i);
+        open.pop();
+      } else if (c === '$' && src[i + 1] === '{') {
+        spans.push(top.text, i);
+        open.push({ braces: 0 });
+        i++;
+      }
+      continue;
+    }
+    if (c === '`') open.push({ text: i + 1 });
+    else if (c === '"' || c === "'") {
+      for (i++; i < n && src[i] !== c && src[i] !== '\n'; i++) if (src[i] === '\\') i++;
+    } else if (c === '/' && src[i + 1] === '/') {
+      while (i < n && src[i] !== '\n') i++;
+    } else if (c === '/' && src[i + 1] === '*') {
+      const close = src.indexOf('*/', i + 2);
+      i = close < 0 ? n : close + 1;
+    } else if (c === '/' && slashOpensRegex(src, i)) {
+      let inClass = false;
+      for (let j = i + 1; j < n && src[j] !== '\n'; j++) {
+        if (src[j] === '\\') j++;
+        else if (src[j] === '[') inClass = true;
+        else if (src[j] === ']') inClass = false;
+        else if (src[j] === '/' && !inClass) {
+          i = j;
+          break;
+        }
+      }
+    } else if (top && c === '{') top.braces++;
+    else if (top && c === '}' && top.braces-- === 0) {
+      open.pop();
+      (open[open.length - 1] as { text: number }).text = i + 1;
+    }
+  }
+  if (open.length > 0) return null;
+  return (at) => {
+    // The first span ending after `at`, then whether it starts at or before it.
+    let lo = 0;
+    let hi = spans.length / 2;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (spans[2 * mid + 1]! <= at) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo < spans.length / 2 && spans[2 * lo]! <= at;
+  };
 }
 
 export type CommentLang =
@@ -125,19 +227,42 @@ export function stripCommentsForRegex(content: string, lang: CommentLang): strin
 }
 
 /**
- * Replace every char in a slice with spaces, but keep newlines so line
- * numbers computed downstream remain valid.
+ * A source with ranges blanked, keeping newlines so line numbers computed
+ * downstream remain valid. The strippers scan forward, so ranges arrive in
+ * order and the text between them is copied by the slice: a file used to be
+ * split into an array of characters and joined back, which made stripping one
+ * of the larger costs of resolving a big repo.
  */
-function blankRange(buf: string[], start: number, end: number, src: string): void {
-  for (let i = start; i < end; i++) {
-    buf[i] = src[i] === '\n' ? '\n' : ' ';
+class BlankedText {
+  private readonly parts: string[] = [];
+  /** Where the text not yet in `parts` starts. */
+  private copied = 0;
+
+  constructor(private readonly src: string) {}
+
+  blank(start: number, end: number): void {
+    if (end <= start) return;
+    const { src, parts } = this;
+    parts.push(src.slice(this.copied, start));
+    let at = start;
+    for (let nl = src.indexOf('\n', at); nl >= 0 && nl < end; nl = src.indexOf('\n', at)) {
+      parts.push(' '.repeat(nl - at), '\n');
+      at = nl + 1;
+    }
+    parts.push(' '.repeat(end - at));
+    this.copied = end;
+  }
+
+  text(): string {
+    this.parts.push(this.src.slice(this.copied));
+    return this.parts.join('');
   }
 }
 
 // ---------- Python ----------
 
 function stripPython(src: string): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
 
@@ -162,7 +287,7 @@ function stripPython(src: string): string {
         }
         i++;
       }
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -186,20 +311,20 @@ function stripPython(src: string): string {
     if (c === '#') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
     i++;
   }
 
-  return out.join('');
+  return out.text();
 }
 
 // ---------- Ruby ----------
 
 function stripRuby(src: string): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
   let atLineStart = true;
@@ -226,7 +351,7 @@ function stripRuby(src: string): string {
         }
         i++;
       }
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       atLineStart = i > 0 && src[i - 1] === '\n';
       continue;
     }
@@ -252,7 +377,7 @@ function stripRuby(src: string): string {
     if (c === '#') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       atLineStart = false;
       continue;
     }
@@ -271,13 +396,13 @@ function stripRuby(src: string): string {
     i++;
   }
 
-  return out.join('');
+  return out.text();
 }
 
 // ---------- C-style (JS/TS/Java/C#/Swift) ----------
 
 function stripCStyle(src: string, allowSingleQuoteStrings: boolean): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
 
@@ -291,7 +416,7 @@ function stripCStyle(src: string, allowSingleQuoteStrings: boolean): string {
       i += 2;
       while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
       if (i < n) i += 2;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -299,7 +424,7 @@ function stripCStyle(src: string, allowSingleQuoteStrings: boolean): string {
     if (c === '/' && c2 === '/') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -323,13 +448,13 @@ function stripCStyle(src: string, allowSingleQuoteStrings: boolean): string {
     i++;
   }
 
-  return out.join('');
+  return out.text();
 }
 
 // ---------- PHP ----------
 
 function stripPhp(src: string): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
 
@@ -343,7 +468,7 @@ function stripPhp(src: string): string {
       i += 2;
       while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
       if (i < n) i += 2;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -351,7 +476,7 @@ function stripPhp(src: string): string {
     if (c === '/' && c2 === '/') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -359,7 +484,7 @@ function stripPhp(src: string): string {
     if (c === '#') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -383,13 +508,13 @@ function stripPhp(src: string): string {
     i++;
   }
 
-  return out.join('');
+  return out.text();
 }
 
 // ---------- Go ----------
 
 function stripGo(src: string): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
 
@@ -403,7 +528,7 @@ function stripGo(src: string): string {
       i += 2;
       while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
       if (i < n) i += 2;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -411,7 +536,7 @@ function stripGo(src: string): string {
     if (c === '/' && c2 === '/') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -456,13 +581,13 @@ function stripGo(src: string): string {
     i++;
   }
 
-  return out.join('');
+  return out.text();
 }
 
 // ---------- Rust ----------
 
 function stripRust(src: string): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
 
@@ -486,7 +611,7 @@ function stripRust(src: string): string {
           i++;
         }
       }
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -494,7 +619,7 @@ function stripRust(src: string): string {
     if (c === '/' && c2 === '/') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
-      blankRange(out, start, i, src);
+      out.blank(start, i);
       continue;
     }
 
@@ -531,7 +656,7 @@ function stripRust(src: string): string {
     i++;
   }
 
-  return out.join('');
+  return out.text();
 }
 
 // ---------- Erlang ----------
@@ -543,7 +668,7 @@ function stripRust(src: string): string {
  * comment text is blanked.
  */
 function stripErlang(src: string): string {
-  const out = src.split('');
+  const out = new BlankedText(src);
   let i = 0;
   const n = src.length;
 
@@ -575,7 +700,7 @@ function stripErlang(src: string): string {
     if (c === '%') {
       let end = i;
       while (end < n && src[end] !== '\n') end++;
-      blankRange(out, i, end, src);
+      out.blank(i, end);
       i = end;
       continue;
     }
@@ -583,5 +708,5 @@ function stripErlang(src: string): string {
     i++;
   }
 
-  return out.join('');
+  return out.text();
 }

@@ -15,6 +15,7 @@ import { escapeRegExp } from '../../utils';
 import { FN_KINDS, makeLineAt } from '../synth-utils';
 import { isTestPath } from '../../search/query-utils';
 import { matchBracket, skipString } from './object-literal';
+import { inReferencingFolder } from './component-folder';
 
 /** The languages React components, hooks and contexts are written and used in. */
 const REACT_SCRIPT_LANGUAGES: ReadonlySet<string> = new Set(['typescript', 'javascript', 'tsx', 'jsx']);
@@ -829,7 +830,7 @@ function loadedPage(value: Loaded | null): { spec: string; member: string } | nu
 }
 
 /** A declarator's own source text: `B = lazy(…)` in `const A = lazy(…), B = lazy(…)`. */
-function declarationText(node: Node, context: ResolutionContext): string {
+export function declarationText(node: Node, context: ResolutionContext): string {
   const lines = (context.getFileLines?.(node.filePath) ?? context.readFile(node.filePath)?.split(/\r?\n/) ?? [])
     .slice(node.startLine - 1, node.endLine);
   if (lines.length === 0) return '';
@@ -1760,7 +1761,7 @@ function declare(body: string, at: number, scope: Map<string, Loaded | null>): n
 }
 
 /** Where a declarator's initializer starts, past its `: Type` and `=`; -1 when it has none. */
-function initializerAt(body: string, at: number): number {
+export function initializerAt(body: string, at: number): number {
   for (let i = at; i < body.length; i++) {
     const ch = body[i]!;
     if (ch === '"' || ch === "'" || ch === '`') {
@@ -2425,9 +2426,8 @@ function resolveComponent(
   const components = candidates.filter((n) => COMPONENT_KINDS.has(n.kind));
   if (components.length === 0) return null;
 
-  // Prefer same directory
-  const fromDir = fromFile.substring(0, fromFile.lastIndexOf('/'));
-  const sameDir = components.filter((n) => n.filePath.startsWith(fromDir));
+  // Prefer the referencing file's folder, or one below it
+  const sameDir = inReferencingFolder(fromFile, components, (n) => n.filePath);
   if (sameDir.length > 0) return sameDir[0]!.id;
 
   // Prefer component directories

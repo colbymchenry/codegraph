@@ -37,8 +37,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { isSourceFile, buildScopeIgnore, type ScopeIgnore } from '../extraction';
 import { loadExtensionOverrides, PROJECT_CONFIG_FILENAME } from '../project-config';
-import { logDebug, logWarn } from '../errors';
-import { normalizePath } from '../utils';
+import { LockUnavailableError, logDebug, logWarn } from '../errors';
+import { escapesRoot, normalizePath } from '../utils';
 import { isCodeGraphDataDir } from '../directory';
 import { watchDisabledReason } from './watch-policy';
 
@@ -83,6 +83,18 @@ const SCOPED_SYNC_MAX_PENDING = 500;
 const EXHAUSTION_REASON =
   'OS watch/file limit exhausted; auto-sync disabled. Run `codegraph sync` ' +
   '(or install git sync hooks) to refresh the graph after changes.';
+
+/** The project folder itself went away while watched (see armGoneCheck). */
+const ROOT_GONE_REASON =
+  'The project folder was deleted or moved away while watched; auto-sync disabled. ' +
+  'Run `codegraph sync` once it is back to refresh the graph.';
+
+/**
+ * How long after a watched folder first reports itself gone (see
+ * armGoneCheck) its stream is checked. Short, because the stream spins until
+ * it is closed; a delay at all, so a burst costs one check.
+ */
+const GONE_CHECK_DELAY_MS = 200;
 
 /**
  * Actionable, NON-fatal warning for Linux inotify watch-count exhaustion.
@@ -129,6 +141,22 @@ function isInotifyWatchExhaustion(err: unknown): boolean {
  */
 function supportsRecursiveWatch(): boolean {
   return process.platform === 'darwin' || process.platform === 'win32';
+}
+
+function isDirectory(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function realpathOrNull(p: string): string | null {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -216,19 +244,7 @@ export interface WatchOptions {
   inertForTests?: boolean;
 }
 
-/**
- * Thrown by a `syncFn` to signal that the underlying sync couldn't acquire
- * the cross-process write lock (#449). The watcher treats this as "no
- * progress" — preserves `pendingFiles`, skips `onSyncComplete`, and the
- * `finally` block reschedules. Quiet (debug-only) because a long-running
- * external indexer can hit this every debounce cycle.
- */
-export class LockUnavailableError extends Error {
-  constructor(message = 'CodeGraph file lock unavailable; another process is writing') {
-    super(message);
-    this.name = 'LockUnavailableError';
-  }
-}
+export { LockUnavailableError };
 
 /**
  * Per-file pending entry — tracks a source file the watcher saw an event for
@@ -306,6 +322,8 @@ export class FileWatcher {
   private watchedRealDirs = new Map<string, string>();
   private treeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The pending check per stream (keyed by its directory) that it is gone; see armGoneCheck. */
+  private goneChecks = new Map<string, ReturnType<typeof setTimeout>>();
   /**
    * True when the pending set does NOT exactly describe the change (a
    * directory removal's children are unknown from the event, #1285) — the
@@ -589,7 +607,14 @@ export class FileWatcher {
       this.scheduleTreeRefresh();
       return;
     }
-    const full = path.join(dir, String(filename));
+    const name = String(filename);
+    // Names are relative to the watched folder. An absolute one is the folder
+    // itself, reported gone (see armGoneCheck); this is all a normal event pays.
+    if (path.isAbsolute(name)) {
+      this.armGoneCheck(dir);
+      return;
+    }
+    const full = path.join(dir, name);
     const rel = normalizePath(path.relative(this.projectRoot, full));
     if (!rel || rel === '.') {
       this.scheduleTreeRefresh();
@@ -622,7 +647,7 @@ export class FileWatcher {
    * — it drops node_modules/dist/.git churn before any sync is scheduled.
    */
   private handleChange(rel: string): void {
-    if (!rel || rel === '.' || rel.startsWith('..')) return;
+    if (!rel || rel === '.' || escapesRoot(rel)) return;
     // `.git/info/exclude` is otherwise always-ignored with the rest of `.git/`,
     // but it feeds `buildScopeIgnore` — allow it through as a scope refresh
     // when the platform delivers the event (recursive watchers may; Linux
@@ -740,8 +765,49 @@ export class FileWatcher {
     this.scheduleSync();
   }
 
+  /**
+   * On Windows, libuv reports a watched folder that is being deleted by the
+   * folder's own absolute path (`\\?\D:\…`) and re-arms the read, which fails
+   * the same way at once: thousands of events a second until the stream is
+   * closed, holding a core for good. A directory link in the project whose
+   * target outside it is deleted does exactly that (#2487). The project
+   * folder itself can't be deleted while its index is open there, but gets
+   * the same guard.
+   *
+   * The first such event on a stream arms ONE check a moment later; the rest
+   * of the burst finds it armed. The check closes a linked folder's stream
+   * when the link no longer leads to the folder it watched (deleted, or
+   * pointed elsewhere) and re-reads the tree: its full sync drops what the
+   * folder held, and a link that leads somewhere live is watched anew. A
+   * project folder that is gone degrades the watcher, closing every stream.
+   */
+  private armGoneCheck(dir: string): void {
+    if (this.stopped || this.goneChecks.has(dir)) return;
+    const isRoot = dir === this.projectRoot;
+    if (!isRoot && !this.dirWatchers.has(dir)) return; // its stream is already closed
+    const timer = setTimeout(() => {
+      this.goneChecks.delete(dir);
+      if (this.stopped) return;
+      if (isRoot) {
+        if (!isDirectory(this.projectRoot)) this.degrade(ROOT_GONE_REASON, { projectRoot: this.projectRoot });
+        return;
+      }
+      if (realpathOrNull(dir) === this.watchedRealDirs.get(dir)) return;
+      logDebug('Watched link no longer leads to its folder; closing its stream', { dir });
+      this.unwatchDir(dir);
+      this.scheduleTreeRefresh();
+    }, GONE_CHECK_DELAY_MS);
+    timer.unref?.();
+    this.goneChecks.set(dir, timer);
+  }
+
   /** Close and forget the watch for a directory that errored/was removed. */
   private unwatchDir(dir: string): void {
+    const check = this.goneChecks.get(dir);
+    if (check) {
+      clearTimeout(check);
+      this.goneChecks.delete(dir);
+    }
     const w = this.dirWatchers.get(dir);
     if (w) {
       try {
@@ -769,10 +835,25 @@ export class FileWatcher {
    */
   private shouldIgnoreDir(dirPath: string): boolean {
     const rel = normalizePath(path.relative(this.projectRoot, dirPath));
-    if (!rel || rel === '.' || rel.startsWith('..')) return false; // root / outside
+    if (!rel || rel === '.' || escapesRoot(rel)) return false; // root / outside
     if (this.isAlwaysIgnored(rel)) return true;
     if (!this.ignoreMatcher) return false;
     return this.ignoreMatcher.ignores(rel + '/');
+  }
+
+  /**
+   * Call one of the host's {@link WatchOptions} callbacks. They are diagnostics:
+   * one that throws is logged and changes nothing here. A sync runs from a timer,
+   * so a throw would have no caller and end the host's process as an unhandled
+   * rejection. It would also read as a failed sync, or skip the stop that a
+   * degrade owes.
+   */
+  private callHost(name: string, call: () => void): void {
+    try {
+      call();
+    } catch (err) {
+      logWarn(`File watcher ${name} callback threw`, { error: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   /**
@@ -788,7 +869,7 @@ export class FileWatcher {
     this.degradedByLock = byLock;
     this.recoveringFromLock = false;
     logWarn('File watcher disabled', { projectRoot: this.projectRoot, reason, ...context });
-    this.onDegraded?.(reason);
+    this.callHost('onDegraded', () => this.onDegraded?.(reason));
     this.stop();
   }
 
@@ -863,6 +944,8 @@ export class FileWatcher {
     this.stopped = true;
     if (this.treeRefreshTimer) clearTimeout(this.treeRefreshTimer);
     this.treeRefreshTimer = null;
+    for (const check of this.goneChecks.values()) clearTimeout(check);
+    this.goneChecks.clear();
     this.knownDirs.clear();
     this.watchedRealDirs.clear();
     this.recoveringFromLock = false;
@@ -1034,7 +1117,7 @@ export class FileWatcher {
           this.pendingFiles.delete(filePath);
         }
       }
-      this.onSyncComplete?.(result);
+      this.callHost('onSyncComplete', () => this.onSyncComplete?.(result));
     } catch (err) {
       if (!scoped) this.needsFullScan = true;
       if (err instanceof LockUnavailableError) {
@@ -1065,7 +1148,7 @@ export class FileWatcher {
           error: error.message,
           retryCount: this.syncFailureRetryCount,
         });
-        this.onSyncError?.(error);
+        this.callHost('onSyncError', () => this.onSyncError?.(error));
         // A persistent (deterministic) sync failure — a broken extractor on a
         // specific file, DB corruption, SQLITE_FULL, an OOM in resolution —
         // would otherwise retry forever at the debounce cadence, spamming logs

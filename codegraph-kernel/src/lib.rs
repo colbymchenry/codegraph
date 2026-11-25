@@ -42,6 +42,7 @@ mod java;
 mod kotlin;
 mod langs;
 mod lua;
+mod parse_budget;
 mod php;
 mod rlang;
 mod ruby;
@@ -230,12 +231,19 @@ pub fn cfnptr_strip_c(text: String) -> String {
 }
 
 #[napi]
-pub fn extract_file(file_path: String, content: String, language: String) -> Result<ExtractBuffers> {
+pub fn extract_file(
+    file_path: String,
+    content: String,
+    language: String,
+    parse_budget_ms: Option<u32>,
+) -> Result<ExtractBuffers> {
     // The whole walk runs under the stack guard (stack.rs, #1581): a file
     // nested deeply enough to overflow this thread's stack comes back as a
     // `defer:` error — the TS side's routine "take the wasm path" signal —
-    // instead of a SIGSEGV that kills the entire indexer process.
-    let out = stack::run_guarded(|| match language.as_str() {
+    // instead of a SIGSEGV that kills the entire indexer process. And its
+    // parse is cancelled past `parse_budget_ms` (parse_budget.rs, #3274), a
+    // `timeout:` error, instead of a thread that spins until the process dies.
+    let out = parse_budget::with_budget(parse_budget_ms, || stack::run_guarded(|| match language.as_str() {
         "java" => java::extract(&file_path, &content),
         "python" => python::extract(&file_path, &content),
         "go" => go::extract(&file_path, &content),
@@ -251,7 +259,7 @@ pub fn extract_file(file_path: String, content: String, language: String) -> Res
         "scala" => scala::extract(&file_path, &content),
         "dart" => dart::extract(&file_path, &content),
         _ => tsjs::extract(&file_path, &content, &language),
-    })
+    }))
     .map_err(Error::from_reason)?;
     Ok(ExtractBuffers {
         meta: out.meta.into(),

@@ -82,6 +82,20 @@ beforeAll(async () => {
       '  put(x: string): void { this.#items.add(x); }\n' +
       '}\n'
   );
+  // Two apps declare the same service; the caller is equally near both.
+  // Code-unit order and locale collation disagree on `Beta` vs `alpha`.
+  for (const app of ['Beta', 'alpha']) {
+    fs.mkdirSync(path.join(dir, 'src', 'apps', app), { recursive: true });
+    w(`apps/${app}/service.ts`, 'export class UserService {\n  load(): string { return "x"; }\n}\n');
+  }
+  fs.mkdirSync(path.join(dir, 'src', 'shared'));
+  w(
+    'shared/hub.ts',
+    'export class Hub {\n' +
+      '  constructor(private readonly users: UserService) {}\n' +
+      '  run(): string { return this.users.load(); }\n' +
+      '}\n'
+  );
   cg = CodeGraph.initSync(dir);
   await cg.indexAll();
 });
@@ -111,6 +125,13 @@ describe('this.<field>.<method>() (#1496)', () => {
     // `this.items.push()` — `string[]` names no project type; the wrapper `push`
     // must not become its own callee.
     expect(calleesOf('Notifier::push')).toEqual([]);
+  });
+
+  it('breaks an equal-proximity tie by code-unit path order, the same on every host locale', () => {
+    // localeCompare depends on the host's ICU locale (en puts `alpha` first);
+    // code-unit order puts `Beta` first everywhere.
+    const callee = cg.getCallees(method('Hub::run').id).map(({ node }) => node.filePath);
+    expect(callee).toEqual(['src/apps/Beta/service.ts']);
   });
 
   it('resolves a field typed `typeof <objectLiteral>` onto the literal\'s member', () => {

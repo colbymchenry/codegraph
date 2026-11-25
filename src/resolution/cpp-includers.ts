@@ -112,6 +112,30 @@ function includesByStem(context: ResolutionContext, memo: Memo): Map<string, Inc
 }
 
 /**
+ * Past this many, a project's `#include`s are left to the threads that ask
+ * about them: reading them all up front would hold the main thread for seconds,
+ * and a Linux-sized project's threads ask about few.
+ */
+const INCLUDES_READ_UP_FRONT = 100_000;
+
+/** Every `#include` of the project, by its import node, as the indexed file it names (ProjectScans). */
+export function cppIncludeTargets(context: ResolutionContext): Map<string, string | null> {
+  const memo = memoFor(context);
+  const byName = includesByName(context, memo);
+  let count = 0;
+  for (const includes of byName.values()) count += includes.length;
+  if (count > INCLUDES_READ_UP_FRONT) return memo.targets;
+  for (const includes of byName.values()) {
+    for (const include of includes) includedFile(include, context, memo);
+  }
+  return memo.targets;
+}
+
+export function adoptCppIncludeTargets(context: ResolutionContext, targets: Map<string, string | null>): void {
+  memoFor(context).targets = targets;
+}
+
+/**
  * The headers in `filePath`'s folder named like it (`field_def.c` →
  * `field_def.h`) that it includes, directly or through other headers. upb's
  * reflection/field_def.c includes only reflection/internal/field_def.h, which
@@ -132,6 +156,25 @@ export function cppIncludedHeadersBeside(filePath: string, context: ResolutionCo
 /** The indexed file the `#include` an import node records names, or null. */
 export function cppIncludedFile(include: Node, context: ResolutionContext): string | null {
   return include.kind === 'import' && isCFamily(include.language) ? includedFile(toInclude(include), context, memoFor(context)) : null;
+}
+
+/**
+ * The indexed files an `#include` names under a source file's name
+ * (`#include "impl.c"`, `"unity.cc"`, `"tables.inc"`), sorted. Each is part of
+ * the file including it, which a header is by nature and these only by this
+ * directive. Names with no extension are the standard library's (`<vector>`).
+ */
+export function cppIncludedSources(context: ResolutionContext): string[] {
+  const memo = memoFor(context);
+  const found = new Set<string>();
+  for (const [name, includes] of includesByName(context, memo)) {
+    if (!name.includes('.') || /\.(?:h|hh|hpp|hxx)$/i.test(name)) continue;
+    for (const include of includes) {
+      const file = includedFile(include, context, memo);
+      if (file !== null) found.add(file);
+    }
+  }
+  return [...found].sort();
 }
 
 /**

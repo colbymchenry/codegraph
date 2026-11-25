@@ -129,8 +129,16 @@ export interface ResolutionContext {
   fileExists(filePath: string): boolean;
   /** Read file content */
   readFile(filePath: string): string | null;
+  /** Record a project-relative file resolution read its answer from, for sync to watch (see `getModuleConfigSnapshot`). */
+  noteModuleConfigFile?(filePath: string): void;
   /** `readFile(filePath)?.includes(needle) ?? false` for an ASCII `needle`, without decoding a file that lacks it. */
   fileContains?(filePath: string, needle: string): boolean;
+  /**
+   * An indexed file's text for a walk over all of them, which keeps none: it
+   * stays out of the content cache, and each byte is a character, so anything
+   * outside ASCII reads wrongly. Null when the file can't be read.
+   */
+  scanFile?(filePath: string): string | null;
   /**
    * `readFile(filePath)` split into lines, LRU-cached per file. Receiver-type
    * inference scans source lines for EVERY `receiver.method()` ref; splitting
@@ -249,6 +257,13 @@ export interface ResolutionContext {
    */
   getNearestAliases?(fromFile: string): import('./path-aliases').AliasMap | null;
   /**
+   * The folder `$_SERVER['DOCUMENT_ROOT']` names for a PHP include in
+   * `fromFile` (#3298): the project's `codegraph.json` `webRoot`, else the one
+   * the project's own includes agree on (see php-web-root.ts), else null.
+   * Project-relative, `/`-separated, '' for the project root.
+   */
+  getPhpWebRoot?(fromFile: string): string | null;
+  /**
    * The project-relative directory (`/`-separated, `.` for the root) of
    * the Go package an import path names, when it is a package of one of the
    * project's own modules — the `go.mod` at the root or any `go.mod` above
@@ -289,6 +304,12 @@ export interface ResolutionContext {
    * relative resolution fails. Optional so existing callers compile.
    */
   getCppIncludeDirs?(): string[];
+  /**
+   * The crates of the project's Cargo workspace, each spelling of a name →
+   * its member's directory. Optional so minimal contexts compile; they read
+   * the manifests themselves (see getCargoWorkspaceCrateMap).
+   */
+  getCargoCrates?(): Map<string, string>;
   /**
    * The import node of every C / C++ `#include`, narrowed to the path it
    * spells and where it is written: what ./cpp-includers builds the include

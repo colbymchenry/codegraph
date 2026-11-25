@@ -6,9 +6,16 @@
  * 2-CPU container) and memory-blind sizing (six ~1GB workers OOM-killing a
  * 7GB container at true 8-core concurrency).
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import * as os from 'os';
-import { ResolverPool, ADAPTIVE_ENGAGE_MIN_REFS, shouldEngageAdaptively } from '../src/resolution/resolver-pool';
+import {
+  ResolverPool,
+  ADAPTIVE_ENGAGE_MIN_REFS,
+  nearGatePoolMin,
+  poolStartBeforeFirstBatch,
+  resolveWorkersWorthStarting,
+  shouldEngageAdaptively,
+} from '../src/resolution/resolver-pool';
 import {
   cgroupMemoryAvailable,
   darwinMemoryAvailable,
@@ -28,9 +35,10 @@ function size(opts: Partial<Parameters<typeof ResolverPool.resolvePoolSize>[0]>)
 }
 
 describe('ResolverPool.resolvePoolSize', () => {
-  it('big dev box: CPU-capped at the long-standing 6', () => {
-    expect(size({})).toBe(6);
-    expect(size({ availableParallelism: 11 })).toBe(6);
+  it('big dev box: no more workers than the main thread can keep busy, whatever the core count', () => {
+    expect(size({})).toBe(4);
+    expect(size({ availableParallelism: 5 })).toBe(4);
+    expect(size({ availableParallelism: 64 })).toBe(4);
   });
 
   it('true 2-core box gets NO pool — sequential measured faster there (§7a.1: 853s vs 1150s)', () => {
@@ -39,17 +47,16 @@ describe('ResolverPool.resolvePoolSize', () => {
   });
 
   it('kernel-scale DB in a 7GB container: memory term shrinks the pool below the OOM line', () => {
-    // 4.6GB DB → ~940MB/worker estimate; 5.5GB headroom × 0.7 ≈ 3.85GB → 4 workers.
-    const s = size({ availableParallelism: 8, memoryBudget: 5.5 * GB, dbSizeBytes: 4.6 * GB });
-    expect(s).toBe(4);
-    expect(s!).toBeLessThan(6);
+    // 4.6GB DB → ~940MB/worker estimate; 4GB headroom × 0.7 ≈ 2.8GB → 3 workers.
+    const s = size({ availableParallelism: 8, memoryBudget: 4 * GB, dbSizeBytes: 4.6 * GB });
+    expect(s).toBe(3);
   });
 
   it('per-worker estimate is floored (small DBs) and capped (huge DBs)', () => {
     // Small DB: floor 256MB/worker — memory cap = 16GB*0.7/256MB = 43 → CPU wins.
-    expect(size({ dbSizeBytes: 10 * MB })).toBe(6);
-    // Monster DB: cap 1.5GB/worker — 16GB*0.7/1.5GB = 7 → CPU still wins at 6.
-    expect(size({ dbSizeBytes: 40 * GB })).toBe(6);
+    expect(size({ dbSizeBytes: 10 * MB })).toBe(4);
+    // Monster DB: cap 1.5GB/worker — 16GB*0.7/1.5GB = 7 → CPU still wins at 4.
+    expect(size({ dbSizeBytes: 40 * GB })).toBe(4);
     // Same monster DB, tight memory: 4GB*0.7/1.5GB = 1 → below 2 → no pool.
     expect(size({ dbSizeBytes: 40 * GB, memoryBudget: 4 * GB })).toBeNull();
   });
@@ -58,11 +65,26 @@ describe('ResolverPool.resolvePoolSize', () => {
     expect(size({ memoryBudget: 512 * MB, dbSizeBytes: 4 * GB })).toBeNull();
   });
 
+  it('takes the workers the work is worth, from 2 up to what the machine can carry', () => {
+    expect(size({ worth: 3 })).toBe(3);
+    expect(size({ worth: 1 })).toBe(2);
+    expect(size({ worth: 50 })).toBe(4);
+    expect(size({ worth: 4, availableParallelism: 3, memoryBudget: 6 * GB })).toBe(2);
+    expect(size({ worth: 4, availableParallelism: 2, memoryBudget: 6 * GB })).toBeNull();
+  });
+
+  it('a worker has to be worth its start, by what a run projects resolving would take alone', () => {
+    // tokio projects 6.7 s alone, caddy 2.9 s.
+    expect(resolveWorkersWorthStarting(6700)).toBe(4);
+    expect(resolveWorkersWorthStarting(2900)).toBe(2);
+  });
+
   it('CODEGRAPH_RESOLVE_WORKERS overrides everything: 0 disables, values clamp at 16', () => {
     expect(size({ explicit: '0' })).toBeNull();
     expect(size({ explicit: '3', memoryBudget: 512 * MB })).toBe(3); // override skips the memory term
+    expect(size({ explicit: '5', worth: 2 })).toBe(5); // and what the work is worth
     expect(size({ explicit: '64' })).toBe(16);
-    expect(size({ explicit: 'nonsense' })).toBe(6); // unparseable → computed path
+    expect(size({ explicit: 'nonsense' })).toBe(4); // unparseable → computed path
   });
 });
 
@@ -118,5 +140,40 @@ describe('adaptive pool engagement needs a real amount of work left', () => {
     // tokio-class: ~55k Rust refs at ~36 µs each.
     expect(shouldEngageAdaptively(1_980, 55_000, 400)).toBe(true);
     expect(shouldEngageAdaptively(399, 55_000, 400)).toBe(false);
+  });
+});
+
+describe('the pool starts before the first batch', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('at the gate, whatever the run', () => {
+    expect(poolStartBeforeFirstBatch(150_000, true)).toBe('up-front');
+    expect(poolStartBeforeFirstBatch(150_000, false)).toBe('up-front');
+  });
+
+  it('near it in a full index: from two thirds of the gate, where any measured rate clears the adaptive bar', () => {
+    expect(nearGatePoolMin()).toBe(100_000);
+    // ktor once #3419's grammar stopped minting misparsed refs: 151,423 became 142,215.
+    expect(poolStartBeforeFirstBatch(142_215, true)).toBe('near-gate');
+    expect(poolStartBeforeFirstBatch(100_000, true)).toBe('near-gate');
+    expect(poolStartBeforeFirstBatch(99_999, true)).toBeNull();
+    // At 100,000 refs Go's 4 µs a ref projects the adaptive check's bar.
+    expect(shouldEngageAdaptively((100_000 * 4) / 1000, 100_000, 400)).toBe(true);
+  });
+
+  it('never near it in a sync, whose workers would each detect the frameworks again', () => {
+    expect(poolStartBeforeFirstBatch(142_215, false)).toBeNull();
+  });
+
+  it('moves with an override of the gate', () => {
+    vi.stubEnv('CODEGRAPH_PARALLEL_RESOLVE_MIN', '30');
+    expect(nearGatePoolMin()).toBe(20);
+    expect(poolStartBeforeFirstBatch(25, true)).toBe('near-gate');
+    expect(poolStartBeforeFirstBatch(25, false)).toBeNull();
+    expect(poolStartBeforeFirstBatch(30, false)).toBe('up-front');
+    vi.stubEnv('CODEGRAPH_PARALLEL_RESOLVE_MIN', '0');
+    expect(poolStartBeforeFirstBatch(0, false)).toBe('up-front');
   });
 });

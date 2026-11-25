@@ -219,7 +219,8 @@ interface NativeBinding {
   file: string;
 }
 
-const bindingMemo = new WeakMap<ResolutionContext, Map<string, NativeBinding | null>>();
+/** Per context, renewed with the route list (whose identity changes when the resolver's caches do). */
+const bindingMemo = new WeakMap<ResolutionContext, { source: readonly Node[]; memo: Map<string, NativeBinding | null> }>();
 
 /**
  * What `name` is bound to in `file`: `const X = requireNativeModule('N')`
@@ -228,8 +229,10 @@ const bindingMemo = new WeakMap<ResolutionContext, Map<string, NativeBinding | n
  * whose whole body is `export default requireNativeModule<CameraNativeModule>('ExpoCamera')`.
  */
 function nativeBinding(name: string, file: string, context: ResolutionContext): NativeBinding | null {
-  let memo = bindingMemo.get(context);
-  if (!memo) bindingMemo.set(context, (memo = new Map()));
+  const source = context.getNodesByKind('route');
+  let entry = bindingMemo.get(context);
+  if (!entry || entry.source !== source) bindingMemo.set(context, (entry = { source, memo: new Map() }));
+  const memo = entry.memo;
   const key = `${file}\0${name}`;
   if (memo.has(key)) return memo.get(key)!;
   let found: NativeBinding | null = null;

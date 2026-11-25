@@ -179,6 +179,29 @@ int total(struct box *x) { return x->count + 1; }
     expect(edges.length).toBe(0);
   });
 
+  it('links registrations only to C/C++ functions, never a same-named function in another language', async () => {
+    write('ops.h', `struct ops { int (*read)(int); int (*probe)(int); };\n`);
+    write('impl.c', `int impl_read(int fd) { return fd; }\n`);
+    write('ops.c', `
+#include "ops.h"
+int impl_read(int fd);
+static struct ops the_ops = { .read = impl_read, .probe = gen_probe };
+int use(struct ops *o, int fd) { return o->read(fd) + o->probe(fd); }
+`);
+    write('aaa/gen.py', `def impl_read():\n    return 1\n\ndef gen_probe():\n    return 2\n`);
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const rows: { tgt: string; file: string }[] = (cg as any).db.db
+      .prepare(
+        `SELECT t.name tgt, t.file_path file FROM edges e JOIN nodes t ON t.id = e.target
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'fn-pointer-dispatch'`
+      )
+      .all();
+    cg.close?.();
+    expect(rows.filter((r) => r.tgt === 'impl_read').map((r) => r.file)).toEqual(['impl.c']);
+    expect(rows.some((r) => r.file.endsWith('.py'))).toBe(false);
+  });
+
   it('is a no-op on a project with no C/C++ (clean control)', async () => {
     write('app.js', `
 const handlers = { add: (x) => x + 1, rm: (x) => x - 1 };

@@ -19,10 +19,11 @@ import {
 } from '../types';
 import { safeJsonParse } from '../utils';
 import { isTestFile, kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
-import { parseQuery, boundedEditDistance } from '../search/query-parser';
+import { parseQuery, boundedEditDistance, type ParsedQuery } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
 import { isModuleKey, referenceNameTail, MEMBER_TAIL_SQL, MODULE_PARKED_SQL } from './reference-tail';
+import { ParameterFlowQueries } from './parameter-flow-queries';
 import { NAME_SUBSTRING_KINDS, buildNameSubstringIndex, searchNameSubstring, type NameSubstringIndex, type ScanOrder } from './name-substring-index';
 
 /**
@@ -221,6 +222,146 @@ function rowToNode(row: NodeRow): Node {
 }
 
 /**
+ * rowToNode for rows that arrive as arrays, whose columns are in `columns` order.
+ * Name and id lookups are most of what resolving a reference spends in SQLite,
+ * and a row as an array costs about a third less to read than one as an object.
+ */
+function arrayToNode(columns: string[]): (row: unknown[]) => Node {
+  const at = (column: keyof NodeRow): number => columns.indexOf(column);
+  const id = at('id');
+  const kind = at('kind');
+  const name = at('name');
+  const qualifiedName = at('qualified_name');
+  const filePath = at('file_path');
+  const language = at('language');
+  const startLine = at('start_line');
+  const endLine = at('end_line');
+  const startColumn = at('start_column');
+  const endColumn = at('end_column');
+  const docstring = at('docstring');
+  const signature = at('signature');
+  const visibility = at('visibility');
+  const isExported = at('is_exported');
+  const isAsync = at('is_async');
+  const isStatic = at('is_static');
+  const isAbstract = at('is_abstract');
+  const decorators = at('decorators');
+  const typeParameters = at('type_parameters');
+  const returnType = at('return_type');
+  const updatedAt = at('updated_at');
+  return (row) => ({
+    id: row[id] as string,
+    kind: row[kind] as NodeKind,
+    name: row[name] as string,
+    qualifiedName: row[qualifiedName] as string,
+    filePath: row[filePath] as string,
+    language: row[language] as Language,
+    startLine: row[startLine] as number,
+    endLine: row[endLine] as number,
+    startColumn: row[startColumn] as number,
+    endColumn: row[endColumn] as number,
+    docstring: (row[docstring] ?? undefined) as string | undefined,
+    signature: (row[signature] ?? undefined) as string | undefined,
+    visibility: row[visibility] as Node['visibility'],
+    isExported: row[isExported] === 1,
+    isAsync: row[isAsync] === 1,
+    isStatic: row[isStatic] === 1,
+    isAbstract: row[isAbstract] === 1,
+    decorators: row[decorators] ? safeJsonParse(row[decorators] as string, undefined) : undefined,
+    typeParameters: row[typeParameters] ? safeJsonParse(row[typeParameters] as string, undefined) : undefined,
+    returnType: (row[returnType] ?? undefined) as string | undefined,
+    updatedAt: row[updatedAt] as number,
+  });
+}
+
+/** A prepared `SELECT * FROM nodes …`, whose rows come back as nodes. */
+interface NodeStatement {
+  all(...params: unknown[]): Node[];
+  get(...params: unknown[]): Node | undefined;
+  iterate(...params: unknown[]): IterableIterator<Node>;
+}
+
+function prepareNodeStatement(db: SqliteDatabase, sql: string): NodeStatement {
+  const stmt = db.prepare(sql);
+  const columns = stmt.rowsAsArrays();
+  const toNode = (columns ? arrayToNode(columns) : rowToNode) as (row: unknown) => Node;
+  return {
+    all: (...params) => (stmt.all(...params) as unknown[]).map(toNode),
+    get: (...params) => {
+      const row = stmt.get(...params);
+      return row === undefined ? undefined : toNode(row);
+    },
+    *iterate(...params) {
+      for (const row of stmt.iterate(...params)) yield toNode(row);
+    },
+  };
+}
+
+/**
+ * A search's `path:` and `name:` filters, lowercased once. The values of one
+ * family are OR'd and the two families AND'd, and each value is a literal,
+ * case-insensitive substring of the file path or the symbol's name, as the
+ * query parser documents. JavaScript decides each row a statement returns,
+ * since `toLowerCase` folds Unicode, where SQLite's `lower()` and LIKE fold
+ * ASCII only, and LIKE would read a `%` or `_` in the value as a wildcard; the
+ * statement's own SQL only narrows the rows (see fieldFilterSql).
+ */
+interface FieldFilters {
+  paths: string[];
+  names: string[];
+}
+
+/** The query's `path:`/`name:` filters, or undefined when it has none. */
+function fieldFiltersOf(parsed: ParsedQuery): FieldFilters | undefined {
+  if (parsed.pathFilters.length === 0 && parsed.nameFilters.length === 0) return undefined;
+  return {
+    paths: parsed.pathFilters.map((p) => p.toLowerCase()),
+    names: parsed.nameFilters.map((n) => n.toLowerCase()),
+  };
+}
+
+function passesNameFilters(name: string, filters: FieldFilters): boolean {
+  if (filters.names.length === 0) return true;
+  const lowered = name.toLowerCase();
+  return filters.names.some((n) => lowered.includes(n));
+}
+
+function passesFieldFilters(name: string, filePath: string, filters: FieldFilters): boolean {
+  if (filters.paths.length > 0) {
+    const lowered = filePath.toLowerCase();
+    if (!filters.paths.some((p) => lowered.includes(p))) return false;
+  }
+  return passesNameFilters(name, filters);
+}
+
+const PRINTABLE_ASCII = /^[ -~]*$/;
+
+/**
+ * WHERE terms (each starting with ` AND `) that keep every `nodes` row the
+ * filters could pass, so that SQLite drops most of the others before they
+ * reach JavaScript, which still decides (see passesFieldFilters). On text of
+ * printable ASCII alone, SQLite's `lower()` and `instr()` agree exactly with
+ * `toLowerCase()` and `includes()`, so a printable ASCII value is tested in
+ * SQL. Text holding any other character goes on to JavaScript whatever it
+ * holds, and that is the only text a value with another character can match.
+ */
+function fieldFilterSql(filters: FieldFilters, params: (string | number)[]): string {
+  let sql = '';
+  for (const [column, values] of [['nodes.file_path', filters.paths], ['nodes.name', filters.names]] as const) {
+    if (values.length === 0) continue;
+    const terms: string[] = [];
+    for (const value of values) {
+      if (!PRINTABLE_ASCII.test(value)) continue;
+      terms.push(`instr(lower(${column}), ?) > 0`);
+      params.push(value);
+    }
+    terms.push(`${column} GLOB '*[^ -~]*'`);
+    sql += ` AND (${terms.join(' OR ')})`;
+  }
+  return sql;
+}
+
+/**
  * Convert database row to Edge object
  */
 /** A failed python ref through one attribute (`self.c.send`) or a call receiver (`make().send`). */
@@ -324,21 +465,25 @@ export class QueryBuilder {
   // (#2620). See memoizedRead().
   private readMemos = new Map<string, { stamp: string; value: unknown }>();
 
+  // The parameter-flow pass's reads, asked once per method a flow gets to.
+  private flowQueries?: ParameterFlowQueries;
+
   // Prepared statements (lazily initialized)
   private stmts: {
     insertNode?: SqliteStatement;
     updateNode?: SqliteStatement;
     deleteNode?: SqliteStatement;
     deleteNodesByFile?: SqliteStatement;
-    getNodeById?: SqliteStatement;
-    getNodesByFile?: SqliteStatement;
-    getNodesByKind?: SqliteStatement;
+    getNodeById?: NodeStatement;
+    getNodesByFile?: NodeStatement;
+    getNodesByKind?: NodeStatement;
     insertEdge?: SqliteStatement;
     upsertFile?: SqliteStatement;
     deleteEdgesBySource?: SqliteStatement;
     deleteEdgesByTarget?: SqliteStatement;
     getEdgesBySource?: SqliteStatement;
     getEdgesByTarget?: SqliteStatement;
+    getDependentEdgesByTarget?: SqliteStatement;
     getUnresolvedFromNode?: SqliteStatement;
     getUnresolvedInFile?: SqliteStatement;
     insertFile?: SqliteStatement;
@@ -350,16 +495,17 @@ export class QueryBuilder {
     insertUnresolved?: SqliteStatement;
     deleteUnresolvedByNode?: SqliteStatement;
     getUnresolvedByName?: SqliteStatement;
-    getNodesByName?: SqliteStatement;
+    getNodesByName?: NodeStatement;
     getNodesByNamePrefix?: SqliteStatement;
     fileHasExportedNode?: SqliteStatement;
     existingNodeIdsFull?: SqliteStatement;
     getExportedNodesByFile?: SqliteStatement;
-    getNodesByFileAndName?: SqliteStatement;
+    getNodesByFileAndName?: NodeStatement;
     getNodeIdentitiesByFile?: SqliteStatement;
     getFileNodesByNamePrefix?: SqliteStatement;
-    getNodesByQualifiedNameExact?: SqliteStatement;
-    getNodesByLowerName?: SqliteStatement;
+    getPhpDocumentRootIncludes?: SqliteStatement;
+    getNodesByQualifiedNameExact?: NodeStatement;
+    getNodesByLowerName?: NodeStatement;
     hasFilesOfLanguage?: SqliteStatement;
     getCobolIncludesByMember?: SqliteStatement;
     getCobolFilesByStem?: SqliteStatement;
@@ -461,11 +607,39 @@ export class QueryBuilder {
     this.stmts = {};
     this.batchStmts.clear();
     this.edgeKindStmts.clear();
+    this.flowQueries = undefined;
     // The change stamp is per connection, and fresh connections to two
     // different databases report the same one — the memo goes with the old
     // connection, or a worker following a rebuilt index keeps its answer (#1864).
     this.dominantFileMemo = undefined;
     this.readMemos.clear();
+    this.presentSchema.clear();
+  }
+
+  /**
+   * Tables (`name`) and columns (`table.column`) that later migrations added,
+   * found in this connection's database. See {@link hasSchema}.
+   */
+  private presentSchema = new Set<string>();
+
+  /**
+   * Whether the database holds `table`, or its `column`. An index an older
+   * release built lacks what later migrations add until a writer's open
+   * migrates it, and a read-only open migrates nothing: the CLI's read
+   * commands and the prompt hook open read-only so that a running rebuild is
+   * left alone (#2913). A read that needs a newer table or column checks for
+   * it here and, without it, answers as the migration's defaults would.
+   * Found once and remembered, since a schema only grows; a missing one is
+   * looked for again, so a writer's later migration is seen.
+   */
+  private hasSchema(table: string, column?: string): boolean {
+    const key = column ? `${table}.${column}` : table;
+    if (this.presentSchema.has(key)) return true;
+    const found = column
+      ? this.db.prepare('SELECT 1 FROM pragma_table_info(?) WHERE name = ?').get(table, column) !== undefined
+      : this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) !== undefined;
+    if (found) this.presentSchema.add(key);
+    return found;
   }
 
   /**
@@ -617,8 +791,9 @@ export class QueryBuilder {
   }
 
   /** Which node kinds contribute their name to the segment vocabulary — the
-   *  single gate shared by insertNode, updateNode, and the rebuild page query
-   *  (getDistinctNodeNames), so the write paths can't drift apart. */
+   *  single gate shared by insertNode, updateNode, the rebuild page query
+   *  (getDistinctNodeNames) and the prune (pruneNameSegmentVocab), so the
+   *  write paths can't drift apart. */
   private isSegmentableKind(kind: string): boolean {
     return kind !== 'file' && kind !== 'import';
   }
@@ -874,17 +1049,35 @@ export class QueryBuilder {
   // Name-segment vocabulary (prompt-hook graph-derived gate)
   // ===========================================================================
 
-  /** Wipe the segment vocabulary. A full index calls this at its start; the
-   *  node write path repopulates it as files (re-)index, so the end state is
-   *  exactly the current names with no orphan rows. */
+  /** Wipe the segment vocabulary. A full index of a fresh database calls this
+   *  at its start; the node write path repopulates it as files index, so the
+   *  end state is exactly the current names with no orphan rows. */
   clearNameSegmentVocab(): void {
     this.db.exec('DELETE FROM name_segment_vocab');
+    this.segmentedNames.clear();
+  }
+
+  /**
+   * Drop the rows of names that no symbol carries any more, deleted or renamed
+   * since they were written. A full index over an existing graph calls this
+   * once it has stored everything, instead of clearing the table up front: it
+   * never rewrites the names of its unchanged files, so a clear lost those
+   * until a rebuild (#2252). The session's dedupe set goes too, so a dropped
+   * name that comes back later is written again rather than skipped as
+   * already seen.
+   */
+  pruneNameSegmentVocab(): void {
+    this.db.exec(
+      "DELETE FROM name_segment_vocab WHERE name NOT IN (SELECT name FROM nodes WHERE kind NOT IN ('file', 'import'))"
+    );
     this.segmentedNames.clear();
   }
 
   /** True when the vocab has no rows — an index built before the table existed.
    *  `sync` uses this to heal such databases (see rebuildNameSegmentVocabFrom). */
   isNameSegmentVocabEmpty(): boolean {
+    // Before schema v7 there is no table, which its migration creates empty (#2913).
+    if (!this.hasSchema('name_segment_vocab')) return true;
     const row = this.db.prepare('SELECT 1 FROM name_segment_vocab LIMIT 1').get();
     return row === undefined;
   }
@@ -931,7 +1124,7 @@ export class QueryBuilder {
     minWords: number,
     limit: number,
   ): Array<{ name: string; matches: number }> {
-    if (variants.length === 0) return [];
+    if (variants.length === 0 || !this.hasSchema('name_segment_vocab')) return [];
     const placeholders = variants.map(() => '?').join(', ');
     const whens = variants.map(() => 'WHEN ? THEN ?').join(' ');
     const rows = this.db
@@ -956,7 +1149,7 @@ export class QueryBuilder {
   /** How many distinct names each segment appears in — the rarity signal that
    *  separates a discriminative word ("checkout") from a ubiquitous one ("state"). */
   getSegmentNameCounts(segments: string[]): Map<string, number> {
-    if (segments.length === 0) return new Map();
+    if (segments.length === 0 || !this.hasSchema('name_segment_vocab')) return new Map();
     const placeholders = segments.map(() => '?').join(', ');
     const rows = this.db
       .prepare(
@@ -969,6 +1162,7 @@ export class QueryBuilder {
 
   /** Names containing the given segment (rare-single-word tier). */
   getNamesForSegment(segment: string, limit: number): string[] {
+    if (!this.hasSchema('name_segment_vocab')) return [];
     const rows = this.db
       .prepare('SELECT name FROM name_segment_vocab WHERE segment = ? ORDER BY length(name) ASC LIMIT ?')
       .all(segment, limit) as Array<{ name: string }>;
@@ -989,14 +1183,13 @@ export class QueryBuilder {
     }
 
     if (!this.stmts.getNodeById) {
-      this.stmts.getNodeById = this.db.prepare('SELECT * FROM nodes WHERE id = ?');
+      this.stmts.getNodeById = prepareNodeStatement(this.db, 'SELECT * FROM nodes WHERE id = ?');
     }
-    const row = this.stmts.getNodeById.get(id) as NodeRow | undefined;
-    if (!row) {
+    const node = this.stmts.getNodeById.get(id);
+    if (!node) {
       return null;
     }
 
-    const node = rowToNode(row);
     this.cacheNode(node);
     return node;
   }
@@ -1126,11 +1319,12 @@ export class QueryBuilder {
   /** The nodes of a file with one name, in {@link getNodesByFile} order, decoding only those rows. */
   getNodesByFileAndName(filePath: string, name: string): Node[] {
     if (!this.stmts.getNodesByFileAndName) {
-      this.stmts.getNodesByFileAndName = this.db.prepare(
+      this.stmts.getNodesByFileAndName = prepareNodeStatement(
+        this.db,
         'SELECT * FROM nodes WHERE file_path = ? AND name = ? ORDER BY start_line, id'
       );
     }
-    return (this.stmts.getNodesByFileAndName.all(filePath, name) as NodeRow[]).map(rowToNode);
+    return this.stmts.getNodesByFileAndName.all(filePath, name);
   }
 
   /**
@@ -1138,12 +1332,12 @@ export class QueryBuilder {
    */
   getNodesByFile(filePath: string): Node[] {
     if (!this.stmts.getNodesByFile) {
-      this.stmts.getNodesByFile = this.db.prepare(
+      this.stmts.getNodesByFile = prepareNodeStatement(
+        this.db,
         'SELECT * FROM nodes WHERE file_path = ? ORDER BY start_line, id'
       );
     }
-    const rows = this.stmts.getNodesByFile.all(filePath) as NodeRow[];
-    return rows.map(rowToNode);
+    return this.stmts.getNodesByFile.all(filePath);
   }
 
   /**
@@ -1431,10 +1625,9 @@ export class QueryBuilder {
    */
   getNodesByKind(kind: NodeKind): Node[] {
     if (!this.stmts.getNodesByKind) {
-      this.stmts.getNodesByKind = this.db.prepare('SELECT * FROM nodes WHERE kind = ? ORDER BY file_path, start_line, id');
+      this.stmts.getNodesByKind = prepareNodeStatement(this.db, 'SELECT * FROM nodes WHERE kind = ? ORDER BY file_path, start_line, id');
     }
-    const rows = this.stmts.getNodesByKind.all(kind) as NodeRow[];
-    return rows.map(rowToNode);
+    return this.stmts.getNodesByKind.all(kind);
   }
 
   /**
@@ -1450,10 +1643,7 @@ export class QueryBuilder {
     // Synthesis uses first/last-match precedence and caps: insertion order
     // changes on sync. idx_nodes_kind streams this canonical order without
     // materializing/sorting all of a large project's methods in memory.
-    const stmt = this.db.prepare('SELECT * FROM nodes WHERE kind = ? ORDER BY file_path, start_line, id');
-    for (const row of stmt.iterate(kind)) {
-      yield rowToNode(row as NodeRow);
-    }
+    yield* prepareNodeStatement(this.db, 'SELECT * FROM nodes WHERE kind = ? ORDER BY file_path, start_line, id').iterate(kind);
   }
 
   /**
@@ -1475,6 +1665,20 @@ export class QueryBuilder {
     for (const row of stmt.iterate(...kinds, ...languages)) {
       yield rowToNode(row as NodeRow);
     }
+  }
+
+  /**
+   * The `signature` of each top-level node of these kinds and languages whose
+   * text holds one of `names`. A sync asks this about the definitions it changed,
+   * so no node is built and nothing is sorted; `names` is the caller's to keep short.
+   */
+  getTopLevelSignaturesMentioning(kinds: readonly NodeKind[], languages: readonly string[], names: readonly string[]): string[] {
+    const marks = (n: number): string => new Array(n).fill('?').join(', ');
+    const rows = this.db.prepare(
+      `SELECT signature FROM nodes WHERE kind IN (${marks(kinds.length)}) AND language IN (${marks(languages.length)})
+       AND qualified_name = name AND (${names.map(() => 'instr(signature, ?) > 0').join(' OR ')})`
+    ).all(...kinds, ...languages, ...names) as Array<{ signature: string }>;
+    return rows.map((row) => row.signature);
   }
 
   /**
@@ -1516,6 +1720,13 @@ export class QueryBuilder {
     return new Set(rows.map((r) => r.language));
   }
 
+  /** Whether any function of `language` carries `decorator`: a project's marker for a framework it uses. */
+  hasDecoratedFunction(language: Language, decorator: string): boolean {
+    return !!this.db.prepare(
+      `SELECT 1 FROM nodes WHERE kind = 'function' AND language = ? AND decorators LIKE ? LIMIT 1`
+    ).get(language, `%"${decorator}"%`);
+  }
+
   /**
    * Get nodes by exact name match (uses idx_nodes_name index).
    *
@@ -1536,12 +1747,12 @@ export class QueryBuilder {
    */
   getNodesByName(name: string): Node[] {
     if (!this.stmts.getNodesByName) {
-      this.stmts.getNodesByName = this.db.prepare(
+      this.stmts.getNodesByName = prepareNodeStatement(
+        this.db,
         'SELECT * FROM nodes WHERE name = ? ORDER BY file_path, start_line, id'
       );
     }
-    const rows = this.stmts.getNodesByName.all(name) as NodeRow[];
-    return rows.map(rowToNode);
+    return this.stmts.getNodesByName.all(name);
   }
 
   /**
@@ -1556,6 +1767,20 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getNodesByNamePrefix.all(prefix, prefix + '￿', limit) as NodeRow[];
     return rows.map(rowToNode);
+  }
+
+  /**
+   * The PHP includes built from `$_SERVER['DOCUMENT_ROOT']` (#3298): the import
+   * nodes the extractors name `prefix` + the path appended to the web root,
+   * each with its file. By index range scan, ordered for a stable reading.
+   */
+  getPhpDocumentRootIncludes(prefix: string): Array<{ filePath: string; name: string }> {
+    if (!this.stmts.getPhpDocumentRootIncludes) {
+      this.stmts.getPhpDocumentRootIncludes = this.db.prepare(
+        "SELECT file_path AS filePath, name FROM nodes WHERE name >= ? AND name < ? AND kind = 'import' AND language = 'php' ORDER BY name, file_path"
+      );
+    }
+    return this.stmts.getPhpDocumentRootIncludes.all(prefix, prefix + '￿') as Array<{ filePath: string; name: string }>;
   }
 
   /** File nodes whose basename starts with `prefix`, without a result cap. */
@@ -1577,12 +1802,12 @@ export class QueryBuilder {
    */
   getNodesByQualifiedNameExact(qualifiedName: string): Node[] {
     if (!this.stmts.getNodesByQualifiedNameExact) {
-      this.stmts.getNodesByQualifiedNameExact = this.db.prepare(
+      this.stmts.getNodesByQualifiedNameExact = prepareNodeStatement(
+        this.db,
         'SELECT * FROM nodes WHERE qualified_name = ? ORDER BY file_path, start_line, id'
       );
     }
-    const rows = this.stmts.getNodesByQualifiedNameExact.all(qualifiedName) as NodeRow[];
-    return rows.map(rowToNode);
+    return this.stmts.getNodesByQualifiedNameExact.all(qualifiedName);
   }
 
   /**
@@ -1601,12 +1826,12 @@ export class QueryBuilder {
    */
   getNodesByLowerName(name: string): Node[] {
     if (!this.stmts.getNodesByLowerName) {
-      this.stmts.getNodesByLowerName = this.db.prepare(
+      this.stmts.getNodesByLowerName = prepareNodeStatement(
+        this.db,
         'SELECT * FROM nodes WHERE lower(name) = lower(?)'
       );
     }
-    const rows = this.stmts.getNodesByLowerName.all(name) as NodeRow[];
-    return rows.map(rowToNode);
+    return this.stmts.getNodesByLowerName.all(name);
   }
 
   /** Does the index hold any file of this language? One seek on idx_files_language. */
@@ -1679,8 +1904,15 @@ export class QueryBuilder {
       parsed.languages.length > 0
         ? Array.from(new Set([...(options.languages ?? []), ...parsed.languages]))
         : options.languages;
-    const pathFilters = parsed.pathFilters;
-    const nameFilters = parsed.nameFilters;
+    // `path:` and `name:` are hard filters, and every candidate source below
+    // applies them before its own limit and offset. Applied only to the final
+    // list, they found nothing whenever the rows that filled the limit all
+    // lay elsewhere, so a match was shown only at a larger limit (#2254).
+    const filters = fieldFiltersOf(parsed);
+    // When no symbol's name passes `name:`, or no symbol's file passes `path:`,
+    // nothing can: answer now, rather than let every source below read all
+    // its candidates to find none.
+    if (filters && !this.fieldFiltersCanMatch(filters)) return [];
     // The text portion drives FTS/LIKE; if all the user typed was
     // filters (`kind:function`), we still need *some* candidate set,
     // so synthesise an empty-text path that returns everything matching
@@ -1691,16 +1923,14 @@ export class QueryBuilder {
 
     // First try FTS5 with prefix matching (skip if FTS5 not available, #1532)
     let results = text
-      ? (this._fts5Available !== false ? this.searchNodesFTS(text, { kinds, languages, limit, offset }) : [])
-      // Over-fetch by 5× when running filter-only (no text). The
-      // post-scoring path: + name: filters can be very selective, so
-      // a smaller multiplier risks returning fewer than `limit`
-      // results despite the DB having plenty of matches.
-      : this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
+      ? (this._fts5Available !== false ? this.searchNodesFTS(text, { kinds, languages, limit, offset }, filters) : [])
+      // Over-fetch by 5× when running filter-only (no text): the pool is
+      // re-ranked below, and the extra rows give that ranking room to work.
+      : this.searchAllByFilters({ kinds, languages, limit: limit * 5, offset }, filters);
 
     // If no FTS results, try LIKE-based substring search
     if (results.length === 0 && text.length >= 2) {
-      results = this.searchNodesLike(text, { kinds, languages, limit, offset });
+      results = this.searchNodesLike(text, { kinds, languages, limit, offset }, filters);
     }
 
     // Final fuzzy fallback: scan all known names and keep those within
@@ -1708,7 +1938,7 @@ export class QueryBuilder {
     // returned nothing AND there's a text portion long enough to be
     // worth fuzzing (1-char queries would match too much).
     if (results.length === 0 && text.length >= 3) {
-      results = this.searchNodesFuzzy(text, { kinds, languages, limit });
+      results = this.searchNodesFuzzy(text, { kinds, languages, limit }, filters);
     }
 
     // Supplement: ensure exact name matches are always candidates.
@@ -1745,8 +1975,10 @@ export class QueryBuilder {
           sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
           params.push(...languages);
         }
-        sql += ' LIMIT 20';
-        const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+        if (filters) sql += fieldFilterSql(filters, params);
+        const rows = filters
+          ? this.readFilteredPage<NodeRow>(sql, params, filters, 20, 0)
+          : this.db.prepare(`${sql} LIMIT 20`).all(...params) as NodeRow[];
         for (const row of rows) {
           if (!existingIds.has(row.id)) {
             results.push({ node: rowToNode(row), score: maxFtsScore });
@@ -1754,6 +1986,13 @@ export class QueryBuilder {
           }
         }
       }
+    }
+
+    // The filters once more, before the cut below: every source above has
+    // applied them already, so this only guards against a candidate source
+    // that someday doesn't.
+    if (filters) {
+      results = results.filter((r) => passesFieldFilters(r.node.name, r.node.filePath, filters));
     }
 
     // Apply multi-signal scoring
@@ -1786,40 +2025,51 @@ export class QueryBuilder {
       }
     }
 
-    // Apply path: + name: filters AFTER scoring. Scoring already uses
-    // path/name as a soft signal; the explicit filters here are a hard
-    // gate. Done last so the FTS limit fetched plenty of candidates to
-    // narrow from.
-    if (pathFilters.length > 0) {
-      const lowered = pathFilters.map((p) => p.toLowerCase());
-      results = results.filter((r) => {
-        const fp = r.node.filePath.toLowerCase();
-        return lowered.some((p) => fp.includes(p));
-      });
-    }
-    if (nameFilters.length > 0) {
-      const lowered = nameFilters.map((n) => n.toLowerCase());
-      results = results.filter((r) => {
-        const nm = r.node.name.toLowerCase();
-        return lowered.some((n) => nm.includes(n));
-      });
-    }
-
     return results;
+  }
+
+  /**
+   * One page of the rows `sql` returns that pass `filters`: up to `limit` of
+   * them, after skipping the first `offset` that pass, so a source's limit and
+   * offset count only what the filters let through. `sql` has no LIMIT or
+   * OFFSET of its own. Its rows are streamed and the read stops once the page
+   * is full, so a selective filter holds none of the rows it rejects. Searches
+   * without these filters keep SQLite's LIMIT and OFFSET instead, whose
+   * reading of a negative limit (no limit) this follows.
+   */
+  private readFilteredPage<T extends { name: string; file_path: string }>(
+    sql: string,
+    params: (string | number)[],
+    filters: FieldFilters,
+    limit: number,
+    offset: number,
+  ): T[] {
+    const page: T[] = [];
+    if (limit === 0) return page;
+    let skipped = 0;
+    for (const row of this.db.prepare(sql).iterate(...params) as IterableIterator<T>) {
+      if (!passesFieldFilters(row.name, row.file_path, filters)) continue;
+      if (skipped < offset) {
+        skipped++;
+        continue;
+      }
+      page.push(row);
+      if (page.length === limit) break;
+    }
+    return page;
   }
 
   /**
    * Match-everything path used when the user supplied only field
    * filters (`kind:function lang:typescript`) with no text. Returns
-   * candidates ordered by name; the caller's filter pass narrows to
-   * what was asked for.
+   * candidates ordered by name, a page of those the `path:`/`name:`
+   * filters let through when there are any.
    */
-  private searchAllByFilters(options: {
-    kinds?: NodeKind[];
-    languages?: Language[];
-    limit: number;
-  }): SearchResult[] {
-    const { kinds, languages, limit } = options;
+  private searchAllByFilters(
+    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number; offset: number },
+    filters?: FieldFilters,
+  ): SearchResult[] {
+    const { kinds, languages, limit, offset } = options;
     let sql = 'SELECT * FROM nodes WHERE 1=1';
     const params: (string | number)[] = [];
     if (kinds && kinds.length > 0) {
@@ -1830,9 +2080,11 @@ export class QueryBuilder {
       sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
       params.push(...languages);
     }
-    sql += ' ORDER BY name LIMIT ?';
-    params.push(limit);
-    const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+    if (filters) sql += fieldFilterSql(filters, params);
+    sql += ' ORDER BY name';
+    const rows = filters
+      ? this.readFilteredPage<NodeRow>(sql, params, filters, limit, offset)
+      : this.db.prepare(`${sql} LIMIT ? OFFSET ?`).all(...params, limit, offset) as NodeRow[];
     return rows.map((row) => ({ node: rowToNode(row), score: 1 }));
   }
 
@@ -1846,7 +2098,8 @@ export class QueryBuilder {
    */
   private searchNodesFuzzy(
     text: string,
-    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number }
+    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number },
+    filters?: FieldFilters,
   ): SearchResult[] {
     const { kinds, languages, limit } = options;
     const lowered = text.toLowerCase();
@@ -1873,14 +2126,19 @@ export class QueryBuilder {
     // separate `SELECT * FROM nodes WHERE name = ?`; without this cap
     // a project with many similar names (`getUser1`, `getUser2`...)
     // could fan out far beyond `limit` queries before the inner-loop
-    // limit kicks in.
+    // limit kicks in. With `path:`/`name:` filters the cap could be spent on
+    // names whose symbols all lie outside them, ahead of the one that
+    // matches (#2254), so a filtered search looks names up until it has
+    // `limit` results, skipping without a lookup each name `name:` rules out.
+    // Every lookup is an index seek on one name.
     const FUZZY_FOLLOWUP_CAP = Math.max(limit * 2, 50);
-    const cappedCandidates = candidates.slice(0, FUZZY_FOLLOWUP_CAP);
+    const cappedCandidates = filters ? candidates : candidates.slice(0, FUZZY_FOLLOWUP_CAP);
 
     const results: SearchResult[] = [];
     const seen = new Set<string>();
     for (const c of cappedCandidates) {
       if (results.length >= limit) break;
+      if (filters && !passesNameFilters(c.name, filters)) continue;
       let sql = 'SELECT * FROM nodes WHERE name = ?';
       const params: (string | number)[] = [c.name];
       if (kinds && kinds.length > 0) {
@@ -1891,8 +2149,10 @@ export class QueryBuilder {
         sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
         params.push(...languages);
       }
-      sql += ' LIMIT 5';
-      const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+      if (filters) sql += fieldFilterSql(filters, params);
+      const rows = filters
+        ? this.readFilteredPage<NodeRow>(sql, params, filters, 5, 0)
+        : this.db.prepare(`${sql} LIMIT 5`).all(...params) as NodeRow[];
       for (const row of rows) {
         if (seen.has(row.id)) continue;
         seen.add(row.id);
@@ -1916,32 +2176,34 @@ export class QueryBuilder {
 
     // EXISTS uses FTS postings and the segment primary key, never source scans.
     // Vocab rows can outlive deleted definitions, so verify them against nodes.
+    // An index from before schema v7 has no vocab: FTS alone answers (#2913).
+    const vocab = this.hasSchema('name_segment_vocab');
     const rows = this.db.prepare(`
       WITH words(word, pattern) AS (VALUES ${checked.map(() => '(?, ?)').join(', ')})
       SELECT word, (
-        EXISTS (SELECT 1 FROM nodes_fts WHERE nodes_fts MATCH pattern)
+        EXISTS (SELECT 1 FROM nodes_fts WHERE nodes_fts MATCH pattern)${vocab ? `
         OR EXISTS (
           SELECT 1 FROM name_segment_vocab v WHERE v.segment = word
           AND EXISTS (SELECT 1 FROM nodes n WHERE n.name = v.name AND n.kind NOT IN ('file', 'import'))
-        )
+        )` : ''}
       ) AS matched FROM words
     `).all(...checked.flatMap(w => [w, `{name qualified_name signature docstring} : "${w}"*`])) as
       Array<{ word: string; matched: number }>;
 
-    const names = this.db.prepare(`
+    const names = this.db.prepare(`${vocab ? `
       SELECT name FROM (
         SELECT v.name FROM name_segment_vocab v
         WHERE v.segment IN (${checked.map(() => '?').join(', ')})
         AND EXISTS (SELECT 1 FROM nodes n WHERE n.name = v.name AND n.kind NOT IN ('file', 'import'))
         LIMIT 12
       )
-      UNION ALL
+      UNION ALL` : ''}
       SELECT name FROM (
         SELECT n.name FROM nodes_fts JOIN nodes n ON n.rowid = nodes_fts.rowid
         WHERE nodes_fts MATCH ? AND n.kind NOT IN ('file', 'import')
         LIMIT 12
       )
-    `).all(...checked, `name : (${checked.map(w => `"${w}"*`).join(' OR ')})`) as Array<{ name: string }>;
+    `).all(...(vocab ? checked : []), `name : (${checked.map(w => `"${w}"*`).join(' OR ')})`) as Array<{ name: string }>;
     return {
       matched: rows.filter(r => r.matched).map(r => r.word),
       unmatched: rows.filter(r => !r.matched).map(r => r.word),
@@ -1989,7 +2251,7 @@ export class QueryBuilder {
   /**
    * FTS5 search with prefix matching
    */
-  private searchNodesFTS(query: string, options: SearchOptions): SearchResult[] {
+  private searchNodesFTS(query: string, options: SearchOptions, filters?: FieldFilters): SearchResult[] {
     const { kinds, languages, limit = 100, offset = 0 } = options;
 
     // Add prefix wildcard for better matching (e.g., "auth" matches "AuthService", "authenticate")
@@ -1999,9 +2261,14 @@ export class QueryBuilder {
     // so treat it as whitespace before the strip step. Otherwise queries
     // like `stage_apply::run` collapse to `stage_applyrun` (the colons
     // are stripped without splitting) and find nothing. See #173.
+    //
+    // The other FTS5 syntax characters separate words too, as they do in
+    // the index, which splits text at anything but letters and digits:
+    // `leaf(entry)` is stored as `leaf` and `entry`. Dropping them glued a
+    // pasted call into one word no symbol has (`leafentry`, #2971).
     const ftsQuery = query
       .replace(/::/g, ' ') // Rust/C++/Ruby qualifier separator
-      .replace(/['"*():^]/g, '') // Remove FTS5 special chars
+      .replace(/['"*():^]/g, ' ') // FTS5 syntax characters separate words
       .split(/\s+/)
       .filter(term => term.length > 0)
       // Strip FTS5 boolean operators to prevent query manipulation
@@ -2047,11 +2314,18 @@ export class QueryBuilder {
       params.push(...languages);
     }
 
-    sql += ' ORDER BY score LIMIT ? OFFSET ?';
-    params.push(ftsLimit, offset);
+    if (filters) sql += fieldFilterSql(filters, params);
+    sql += ' ORDER BY score';
 
     try {
-      const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
+      let rows: (NodeRow & { score: number })[];
+      if (filters) {
+        rows = this.readFilteredPage(sql, params, filters, ftsLimit, offset);
+      } else {
+        sql += ' LIMIT ? OFFSET ?';
+        params.push(ftsLimit, offset);
+        rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
+      }
       return rows.map((row) => ({
         node: rowToNode(row),
         score: Math.abs(row.score), // bm25 returns negative scores
@@ -2066,7 +2340,7 @@ export class QueryBuilder {
    * LIKE-based substring search for cases where FTS doesn't match
    * Useful for camelCase matching (e.g., "signIn" finds "signInWithGoogle")
    */
-  private searchNodesLike(query: string, options: SearchOptions): SearchResult[] {
+  private searchNodesLike(query: string, options: SearchOptions, filters?: FieldFilters): SearchResult[] {
     const { kinds, languages, limit = 100, offset = 0 } = options;
 
     // This runs when FTS found nothing, and a word FTS can't find is usually
@@ -2126,10 +2400,17 @@ export class QueryBuilder {
       params.push(...languages);
     }
 
-    sql += ' ORDER BY score DESC, length(name) ASC LIMIT ? OFFSET ?';
-    params.push(limit, offset);
+    if (filters) sql += fieldFilterSql(filters, params);
+    sql += ' ORDER BY score DESC, length(name) ASC';
 
-    const rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
+    let rows: (NodeRow & { score: number })[];
+    if (filters) {
+      rows = this.readFilteredPage(sql, params, filters, limit, offset);
+    } else {
+      sql += ' LIMIT ? OFFSET ?';
+      params.push(limit, offset);
+      rows = this.db.prepare(sql).all(...params) as (NodeRow & { score: number })[];
+    }
 
     return rows.map((row) => ({
       node: rowToNode(row),
@@ -2472,8 +2753,8 @@ export class QueryBuilder {
    * Get outgoing edges from a node. Preserve the source/kind index order
    * (calls before imports/references), then break ties deterministically.
    */
-  getOutgoingEdges(sourceId: string, kinds?: EdgeKind[], provenance?: string): Edge[] {
-    if ((kinds && kinds.length > 0) || provenance) {
+  getOutgoingEdges(sourceId: string, kinds?: EdgeKind[], provenance?: string, limit?: number): Edge[] {
+    if ((kinds && kinds.length > 0) || provenance || limit !== undefined) {
       let sql = 'SELECT * FROM edges WHERE source = ?';
       const params: (string | number)[] = [sourceId];
 
@@ -2488,6 +2769,10 @@ export class QueryBuilder {
       }
 
       sql += ' ORDER BY kind, target, line, col';
+      if (limit !== undefined) {
+        sql += ' LIMIT ?';
+        params.push(Math.max(0, Math.floor(limit)));
+      }
       const rows = this.edgeKindStmt(sql).all(...params) as EdgeRow[];
       return rows.map(rowToEdge);
     }
@@ -2500,15 +2785,43 @@ export class QueryBuilder {
   }
 
   /**
+   * Incoming edges to a node except `contains`: the edges that make their
+   * source depend on the target, in {@link getIncomingEdges} order.
+   *
+   * Impact traversal runs this once per visited node, so it stays one index
+   * search with no LIMIT. A kind list searches the index once per kind, and a
+   * LIMIT under this ORDER BY made each read markedly slower (#3248).
+   */
+  getIncomingEdgesExceptContains(targetId: string): Edge[] {
+    if (!this.stmts.getDependentEdgesByTarget) {
+      this.stmts.getDependentEdgesByTarget = this.db.prepare(
+        "SELECT * FROM edges WHERE target = ? AND kind != 'contains' ORDER BY kind, source, line, col"
+      );
+    }
+    const rows = this.stmts.getDependentEdgesByTarget.all(targetId) as EdgeRow[];
+    return rows.map(rowToEdge);
+  }
+
+  /**
    * Get incoming edges to a node. Kind must precede opaque source IDs:
    * file IDs sort before function IDs, so source-first ordering lets imports
    * displace actual calls in capped caller lists. Keep deterministic ties
    * without changing the target/kind index's established kind precedence.
    */
-  getIncomingEdges(targetId: string, kinds?: EdgeKind[]): Edge[] {
-    if (kinds && kinds.length > 0) {
-      const sql = `SELECT * FROM edges WHERE target = ? AND kind IN (${kinds.map(() => '?').join(',')}) ORDER BY kind, source, line, col`;
-      const rows = this.edgeKindStmt(sql).all(targetId, ...kinds) as EdgeRow[];
+  getIncomingEdges(targetId: string, kinds?: EdgeKind[], limit?: number): Edge[] {
+    if ((kinds && kinds.length > 0) || limit !== undefined) {
+      let sql = 'SELECT * FROM edges WHERE target = ?';
+      const params: (string | number)[] = [targetId];
+      if (kinds && kinds.length > 0) {
+        sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+        params.push(...kinds);
+      }
+      sql += ' ORDER BY kind, source, line, col';
+      if (limit !== undefined) {
+        sql += ' LIMIT ?';
+        params.push(Math.max(0, Math.floor(limit)));
+      }
+      const rows = this.edgeKindStmt(sql).all(...params) as EdgeRow[];
       return rows.map(rowToEdge);
     }
 
@@ -2647,9 +2960,12 @@ export class QueryBuilder {
   ): Array<{ node: Node; generated: boolean }> {
     if (kinds.length === 0 || limit <= 0) return [];
     const placeholders = kinds.map(() => '?').join(',');
+    // Before schema v9 no file carries the flag, as its migration's default
+    // leaves them (#2913).
+    const generated = this.hasSchema('files', 'generated') ? 'COALESCE(f.generated, 0)' : '0';
     const rows = this.db
       .prepare(
-        `SELECT n.*, COALESCE(f.generated, 0) AS file_generated
+        `SELECT n.*, ${generated} AS file_generated
            FROM nodes n
            LEFT JOIN files f ON f.path = n.file_path
           WHERE n.kind IN (${placeholders})
@@ -2687,22 +3003,29 @@ export class QueryBuilder {
     const unique = [...new Set(names)].filter((name) => name.length > 0);
     const found = new Set<string>();
     if (unique.length === 0) return found;
+    // Before schema v8 a reference had no tail and was never parked, and the
+    // migration leaves every row pending with an empty tail: only the name
+    // can match (#2913).
+    const parked = this.hasSchema('unresolved_refs', 'status');
 
     for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
       const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
-      const rows = this.db
-        .prepare(
-          `SELECT DISTINCT reference_name AS name FROM unresolved_refs
-            WHERE reference_name IN (${placeholders})
+      const byName = `SELECT DISTINCT reference_name AS name FROM unresolved_refs
+            WHERE reference_name IN (${placeholders})`;
+      const rows = (parked
+        ? this.db
+          .prepare(
+            `${byName}
             UNION
            SELECT DISTINCT name_tail AS name FROM unresolved_refs
             WHERE name_tail IN (${placeholders})
             UNION
            SELECT DISTINCT ${MEMBER_TAIL_SQL} AS name FROM unresolved_refs
             WHERE ${MODULE_PARKED_SQL} AND ${MEMBER_TAIL_SQL} IN (${placeholders})`
-        )
-        .all(...chunk, ...chunk, ...chunk) as Array<{ name: string }>;
+          )
+          .all(...chunk, ...chunk, ...chunk)
+        : this.db.prepare(byName).all(...chunk)) as Array<{ name: string }>;
       for (const row of rows) found.add(row.name);
     }
     return found;
@@ -3183,16 +3506,8 @@ export class QueryBuilder {
   /**
    * Every ordered pair of files where one reaches into the other, once each.
    *
-   * The input a cycle finder wants: file-level circular dependencies are the
-   * strongly connected components of this graph. One query instead of the
-   * dependency lookup per file that {@link GraphQueryManager.findCircularDependencies}
-   * does — which matters because a cycle report is only interesting on a large
-   * repo, and that is exactly where a query per file stops being affordable.
-   *
    * `contains` is excluded (a file "contains" its own symbols, which is not a
-   * dependency), and so are same-file edges and low-confidence name matches:
-   * a cycle conjured by a common method name is a false alarm a reader cannot
-   * check.
+   * dependency), and so are same-file edges and low-confidence name matches.
    */
   getCrossFileDependencyPairs(minConfidence: number): Array<{ source: string; target: string }> {
     return this.db
@@ -3206,6 +3521,29 @@ export class QueryBuilder {
             AND COALESCE(json_extract(e.metadata, '$.confidence'), 1) >= ?`
       )
       .all(minConfidence) as Array<{ source: string; target: string }>;
+  }
+
+  /**
+   * Every ordered pair of files where one imports the other, once each: the
+   * graph circular imports are read from. See `src/graph/file-cycles.ts`.
+   *
+   * Only `imports` edges, which the import resolver made from a statement in
+   * the file. Every other cross-file edge says something ran or was mentioned
+   * there, and a loop of those is not a circular import: an interface's call
+   * fans out to a test's fake that implements it, two pages link to each other,
+   * and the files of one Go package call each other freely.
+   */
+  getFileImportPairs(): Array<{ source: string; target: string }> {
+    return this.db
+      .prepare(
+        `SELECT DISTINCT sn.file_path AS source, tn.file_path AS target
+           FROM edges e
+           JOIN nodes sn ON sn.id = e.source
+           JOIN nodes tn ON tn.id = e.target
+          WHERE e.kind = 'imports'
+            AND sn.file_path <> tn.file_path`
+      )
+      .all() as Array<{ source: string; target: string }>;
   }
 
   /**
@@ -3236,6 +3574,76 @@ export class QueryBuilder {
       line: row.line,
       column: row.col,
       candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+      rowId: row.id,
+    }));
+  }
+
+  /**
+   * The references named `tail` that the resolver gave up on — `h.ServeHTTP(…)`
+   * through an interface, `x.update()` on a receiver it could not type — at most
+   * `limit` of them in file and line order, and how many there are in all.
+   * Excludes `kinds` (a failed import of a same-named package export is someone
+   * else's symbol). One probe of `idx_unresolved_failed_tail` each.
+   */
+  getFailedReferencesByTail(
+    tail: string,
+    excludeKinds: readonly string[],
+    limit: number,
+  ): { refs: UnresolvedReference[]; total: number } {
+    if (!tail) return { refs: [], total: 0 };
+    const kindFilter = excludeKinds.length > 0
+      ? ` AND reference_kind NOT IN (${excludeKinds.map(() => '?').join(',')})`
+      : '';
+    const where = `WHERE status = 'failed' AND name_tail = ?${kindFilter}`;
+    const total = (this.db
+      .prepare(`SELECT COUNT(*) AS n FROM unresolved_refs ${where}`)
+      .get(tail, ...excludeKinds) as { n: number }).n;
+    if (total === 0 || limit <= 0) return { refs: [], total };
+    const rows = this.db
+      .prepare(`SELECT * FROM unresolved_refs ${where} ORDER BY file_path, line, col LIMIT ?`)
+      .all(tail, ...excludeKinds, limit) as UnresolvedRefRow[];
+    return {
+      total,
+      refs: rows.map((row) => ({
+        fromNodeId: row.from_node_id,
+        referenceName: row.reference_name,
+        referenceKind: row.reference_kind as EdgeKind,
+        line: row.line,
+        column: row.col,
+        filePath: row.file_path,
+        language: row.language as Language,
+        rowId: row.id,
+      })),
+    };
+  }
+
+  /**
+   * The references the resolver gave up on that are written exactly as one of
+   * `names` (`binding.Query`), at most `limit`, in file and line order. One
+   * probe of `idx_unresolved_name` per chunk.
+   */
+  getFailedReferencesByNames(names: readonly string[], limit: number): UnresolvedReference[] {
+    const unique = [...new Set(names)].filter((n) => n.length > 0);
+    if (unique.length === 0 || limit <= 0) return [];
+    const rows: UnresolvedRefRow[] = [];
+    for (let i = 0; i < unique.length && rows.length < limit; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      rows.push(...this.db
+        .prepare(
+          `SELECT * FROM unresolved_refs WHERE reference_name IN (${placeholders}) AND status = 'failed'
+            ORDER BY file_path, line, col LIMIT ?`
+        )
+        .all(...chunk, limit - rows.length) as UnresolvedRefRow[]);
+    }
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
       filePath: row.file_path,
       language: row.language as Language,
       rowId: row.id,
@@ -3342,15 +3750,22 @@ export class QueryBuilder {
    * decorates — exactly what {@link GraphTraverser.getImpactRadius} traverses.
    * `contains` is excluded: a parent containing a symbol does not *depend* on
    * it. One indexed query (idx_nodes_file_path + idx_edges_target_kind).
+   *
+   * `skipTiers` leaves out the edges the tier pass links across a process
+   * boundary (their metadata carries `tier`): a client's HTTP call onto its
+   * server's route, a queue job onto its consumer, an event onto its handler.
+   * Test selection wants that: a frontend's tests mock the backend they call,
+   * so a backend change doesn't affect them (#3320).
    */
-  getDependentFilePaths(filePath: string): string[] {
+  getDependentFilePaths(filePath: string, opts: { skipTiers?: boolean } = {}): string[] {
     const sql = `SELECT DISTINCT src.file_path AS fp
       FROM edges e
       JOIN nodes tgt ON tgt.id = e.target
       JOIN nodes src ON src.id = e.source
       WHERE tgt.file_path = ?
         AND e.kind != 'contains'
-        AND src.file_path != ?`;
+        AND src.file_path != ?${opts.skipTiers ? `
+        AND (e.metadata IS NULL OR json_extract(e.metadata, '$.tier') IS NULL)` : ''}`;
     const rows = this.db.prepare(sql).all(filePath, filePath) as Array<{ fp: string }>;
     return rows.map((r) => r.fp);
   }
@@ -3612,6 +4027,31 @@ export class QueryBuilder {
   }
 
   /**
+   * The module edges (`imports` edges into a file node) into declaration
+   * files, with the source file and language a resurrection needs: where an
+   * import of a package lands while a `declare module` of it is all there is.
+   */
+  getModuleImportsIntoDeclarationFiles(): Array<Edge & { edgeId: number; targetFilePath: string; sourceFilePath: string; sourceLanguage: Language }> {
+    const rows = this.db
+      .prepare(
+        `SELECT e.*, tgt.file_path AS target_file_path, src.file_path AS source_file_path, src.language AS source_language
+           FROM nodes tgt
+           JOIN edges e ON e.target = tgt.id AND e.kind = 'imports'
+           JOIN nodes src ON src.id = e.source
+          WHERE tgt.kind = 'file'
+            AND (tgt.file_path LIKE '%.d.ts' OR tgt.file_path LIKE '%.d.mts' OR tgt.file_path LIKE '%.d.cts')`
+      )
+      .all() as Array<EdgeRow & { target_file_path: string; source_file_path: string; source_language: Language }>;
+    return rows.map((row) => ({
+      ...rowToEdge(row),
+      edgeId: row.id,
+      targetFilePath: row.target_file_path,
+      sourceFilePath: row.source_file_path,
+      sourceLanguage: row.source_language,
+    }));
+  }
+
+  /**
    * The module edges (`imports` edges into a file node) into the files an
    * import of `dir/name` can find instead of a file added there: `dir/name.*`
    * under another extension, and the folder's own entry, `dir/name/index.*`
@@ -3745,6 +4185,9 @@ export class QueryBuilder {
     const unique = [...new Set(filePaths)];
     const found = new Set<string>();
     if (unique.length === 0) return found;
+    // An index from before schema v9 has no flag, which its migration adds
+    // as 0 everywhere: the path convention alone decides (#2913).
+    if (!this.hasSchema('files', 'generated')) return found;
 
     for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
       const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
@@ -3893,6 +4336,8 @@ export class QueryBuilder {
 
   /** How many indexed files carry the generated flag. Surfaced by `status`. */
   countGeneratedFiles(): number {
+    // Before schema v9 no file carries the flag (#2913).
+    if (!this.hasSchema('files', 'generated')) return 0;
     const row = this.db
       .prepare('SELECT COUNT(*) AS n FROM files WHERE generated = 1')
       .get() as { n: number } | undefined;
@@ -4125,6 +4570,47 @@ export class QueryBuilder {
     }));
   }
 
+  /** The `#include`s of C and C++ files the graph holds: the file writing each, and the indexed file it names. */
+  getCppIncludeEdges(): Array<{ source: string; target: string }> {
+    return this.db.prepare(
+      `SELECT s.file_path AS source, t.file_path AS target FROM edges e
+       JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+       WHERE e.kind = 'imports' AND s.kind = 'file' AND t.kind = 'file' AND s.language IN ('c', 'cpp')`
+    ).all() as Array<{ source: string; target: string }>;
+  }
+
+  /**
+   * The failed C++ calls and function values with a qualifier outside `std`
+   * (`Txn::Put`, `T::T/2`), calls on a variable (`shard.Clear`), and what
+   * values are constructed as, which may go through a template parameter
+   * (cpp-template-instantiations.ts), of the files named, one at a time: there
+   * can be a great many, few of which do. (`+status` walks the table: what is
+   * left unresolved is nearly all of it, and the index on status only adds pages.)
+   */
+  *iterateFailedCppTypeReferences(files: readonly string[]): IterableIterator<UnresolvedReference> {
+    const rows = this.db.prepare(
+      `SELECT from_node_id, reference_name, reference_kind, line, col, file_path FROM unresolved_refs
+       WHERE +status = 'failed' AND language = 'cpp' AND file_path IN (SELECT value FROM json_each(?))
+         AND (reference_kind = 'instantiates'
+         OR (reference_kind IN ('calls', 'function_ref') AND reference_name GLOB '*::*' AND reference_name NOT GLOB 'std::*')
+         OR (reference_kind = 'calls' AND reference_name GLOB '*.*' AND reference_name NOT GLOB '*(*'))`
+    ).iterate(JSON.stringify(files)) as IterableIterator<Pick<UnresolvedRefRow, 'from_node_id' | 'reference_name' | 'reference_kind' | 'line' | 'col' | 'file_path'>>;
+    for (const row of rows) {
+      yield {
+        fromNodeId: row.from_node_id,
+        referenceName: row.reference_name,
+        referenceKind: row.reference_kind as EdgeKind,
+        line: row.line,
+        column: row.col,
+        filePath: row.file_path,
+        language: 'cpp',
+      };
+    }
+    // The walk reads the whole table, which would stay in this connection's page
+    // cache through the end of synthesis, where an index peaks in memory.
+    this.db.exec('PRAGMA shrink_memory');
+  }
+
   /**
    * Get the count of PENDING (never-attempted) references without loading
    * them into memory. Rows marked status='failed' — attempted by a completed
@@ -4134,6 +4620,13 @@ export class QueryBuilder {
    */
   getUnresolvedReferencesCount(): number {
     if (!this.stmts.getUnresolvedCount) {
+      // An index built before schema v8 (1.4.0 and older) has no `status`,
+      // and the v8 migration marks every one of its rows pending. A read-only
+      // open migrates nothing (`codegraph status`, #2913), so count them all
+      // until a writer's open has migrated it.
+      if (!this.hasSchema('unresolved_refs', 'status')) {
+        return (this.db.prepare('SELECT COUNT(*) as count FROM unresolved_refs').get() as { count: number }).count;
+      }
       this.stmts.getUnresolvedCount = this.db.prepare(
         "SELECT COUNT(*) as count FROM unresolved_refs WHERE status = 'pending'"
       );
@@ -4247,6 +4740,37 @@ export class QueryBuilder {
       return { names, lowered: lowered.join('\n') + '\n', starts };
     };
     return this.memoizedRead('fuzzyNames', read) ?? read();
+  }
+
+  /**
+   * The distinct file paths of the nodes, lowercased and newline-joined. Read
+   * once until the database changes (fresh inside a transaction), as
+   * {@link fuzzyNames} is.
+   */
+  private loweredNodePaths(): string {
+    const read = (): string => {
+      const rows = this.db.prepare('SELECT DISTINCT file_path FROM nodes').all() as Array<{ file_path: string }>;
+      return rows.map((row) => row.file_path.toLowerCase()).join('\n') + '\n';
+    };
+    return this.memoizedRead('loweredNodePaths', read) ?? read();
+  }
+
+  /**
+   * False when no symbol's name passes the `name:` filters, or no symbol's
+   * file passes the `path:` ones, so that no symbol can pass both. A value
+   * found anywhere in the joined lists counts, so true only means a match
+   * may exist.
+   */
+  private fieldFiltersCanMatch(filters: FieldFilters): boolean {
+    if (filters.names.length > 0) {
+      const names = this.fuzzyNames().lowered;
+      if (!filters.names.some((n) => names.includes(n))) return false;
+    }
+    if (filters.paths.length > 0) {
+      const paths = this.loweredNodePaths();
+      if (!filters.paths.some((p) => paths.includes(p))) return false;
+    }
+    return true;
   }
 
   /**
@@ -5176,6 +5700,11 @@ export class QueryBuilder {
     }));
   }
 
+  /** What the parameter-flow pass reads and writes. */
+  get parameterFlows(): ParameterFlowQueries {
+    return (this.flowQueries ??= new ParameterFlowQueries(this.db, this));
+  }
+
   /**
    * The python files whose failed attribute-chain refs (`self.client.send`,
    * `make().send`) an edit to `filePaths` can affect. Such an answer is read
@@ -5326,10 +5855,40 @@ export class QueryBuilder {
       const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
       const placeholders = chunk.map(() => '?').join(',');
       const rows = this.db
-        .prepare(`SELECT DISTINCT file_path, name FROM nodes WHERE file_path IN (${placeholders})`)
-        .all(...chunk) as Array<{ file_path: string; name: string }>;
+        .prepare(`SELECT file_path, name, SUM(language = 'python' AND kind IN ('function', 'method')) AS python_defs
+                    FROM nodes WHERE file_path IN (${placeholders}) GROUP BY file_path, name`)
+        .all(...chunk) as Array<{ file_path: string; name: string; python_defs: number }>;
       // NUL-joined: a path or a symbol name can contain a space, never a NUL.
-      for (const row of rows) pairs.add(`${row.file_path}\0${row.name}`);
+      // A Python name a file defines more than once (typing.overload stubs and
+      // the def below them) also counts its defs, behind a \u0001 in the file's
+      // half: adding or removing the implementation moves every call to the
+      // name (#2963) while the set of names stays the same.
+      for (const row of rows) {
+        const file = row.python_defs > 1 ? `${row.file_path}\u0001${row.python_defs}` : row.file_path;
+        pairs.add(`${file}\0${row.name}`);
+      }
+    }
+    return pairs;
+  }
+
+  /**
+   * The `file\0statement` pairs of the `export … from` statements in
+   * `filePaths` (#2978). Each is an import node named by the module it names,
+   * with the statement as its signature, so a re-export pointed at another
+   * module, taken away, added, or passing other names on changes a pair, and a
+   * plain `import` does not. Same shape as {@link getNodeNamePairsByFiles}.
+   */
+  getReExportStatementsByFiles(filePaths: string[]): Set<string> {
+    const pairs = new Set<string>();
+    if (filePaths.length === 0) return pairs;
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(`SELECT DISTINCT file_path, signature FROM nodes
+                   WHERE kind = 'import' AND file_path IN (${placeholders}) AND signature LIKE 'export%'`)
+        .all(...chunk) as Array<{ file_path: string; signature: string }>;
+      for (const row of rows) pairs.add(`${row.file_path}\0${row.signature}`);
     }
     return pairs;
   }
@@ -5349,6 +5908,30 @@ export class QueryBuilder {
     return this.db
       .prepare('SELECT (SELECT COUNT(*) FROM nodes) AS nodes, (SELECT COUNT(*) FROM edges) AS edges')
       .get() as { nodes: number; edges: number };
+  }
+
+  /**
+   * For each language, how many files it has and how many yielded a symbol: a
+   * node other than the file's own. More than one stored node settles a row, so
+   * `nodes` is only probed for the few it can't, such as a file whose one symbol
+   * came from a framework pass. Probing every row costs as much as the whole of
+   * getStats() on a 14,000-file index; this costs a tenth of that. Not part of
+   * getStats() either way, because every explore runs that.
+   */
+  getParsedFileCounts(): Array<{ language: Language; files: number; parsed: number }> {
+    return this.db
+      .prepare(`
+        SELECT f.language AS language, COUNT(*) AS files,
+          SUM(CASE
+            WHEN f.node_count > 1 THEN 1
+            WHEN EXISTS (SELECT 1 FROM nodes n WHERE n.file_path = f.path AND n.kind <> 'file') THEN 1
+            ELSE 0
+          END) AS parsed
+        FROM files f
+        GROUP BY f.language
+        ORDER BY f.language
+      `)
+      .all() as Array<{ language: Language; files: number; parsed: number }>;
   }
 
   /**

@@ -511,3 +511,33 @@ describe('what the hierarchy feeds', () => {
     expect(ancestors('leveldb::DBIter', 'db/db_iter.cc')).toEqual(['extends leveldb::Iterator (include/leveldb/iterator.h)']);
   });
 });
+
+describe('an alias two headers declare differently', () => {
+  // rocksdb's `using DBWithTTLImplBase = …;` in each arm of an `#if`: the base
+  // is the first declaration, by file in code-unit order. localeCompare put
+  // `a/…` before `B/…` on an English host, and a host locale decides how it
+  // orders other paths, so two machines could link different bases.
+  let root: string;
+  let g: CodeGraph;
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-alias-twins-'));
+    const write = (rel: string, lines: string[]) => {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), lines.join('\n') + '\n');
+    };
+    write('B/config_b.h', ['#pragma once', 'namespace n {', 'class FastStore { public: void flush() {} };', '#ifdef USE_FAST', 'typedef FastStore Store;', '#endif', '}']);
+    write('a/config_a.h', ['#pragma once', 'namespace n {', 'class SafeStore { public: void flush() {} };', '#ifndef USE_FAST', 'typedef SafeStore Store;', '#endif', '}']);
+    write('main.cpp', ['#include "B/config_b.h"', '#include "a/config_a.h"', 'namespace n {', 'class Derived : public Store {};', '}']);
+    g = await CodeGraph.init(root, { index: true });
+  });
+  afterAll(() => {
+    g?.close?.();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+  });
+
+  it('takes the first declaration by file in code-unit order, the same on every host', () => {
+    const derived = g.getNodesByName('Derived').find((n) => n.qualifiedName === 'n::Derived')!;
+    const bases = g.getOutgoingEdgesFrom([derived.id], ['extends']).map((e) => g.getNode(e.target)?.filePath);
+    expect(bases).toEqual(['B/config_b.h']);
+  });
+});

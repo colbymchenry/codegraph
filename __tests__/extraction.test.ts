@@ -3490,8 +3490,11 @@ include_once("io.php");
     });
 
     it('should skip dynamic include/require with no static path (#660)', () => {
+      // `__DIR__ . '/x.php'` names a file (php-dir-includes.test.ts), and so
+      // does `$_SERVER['DOCUMENT_ROOT'] . '/x.php'` under a `webRoot`
+      // (php-web-root-includes.test.ts) (#3298).
       const code = `<?php
-require_once(__DIR__ . '/dyn.php');
+require_once($base . '/dyn.php');
 include $file;
 include "tpl/{$name}.php";
 `;
@@ -5337,6 +5340,12 @@ import 'package:flutter/material.dart';
       ['{% liquid\n  capture bare\n    echo "Hi"\n  endcapture\n%}', 'bare', 2, 2],
       ['{% liquid\r\n  capture crlf # a note\r\n  endcapture\r\n%}', 'crlf', 2, 2],
       ["{%- liquid\n  capture 'quoted_line'\n  endcapture\n-%}", 'quoted_line', 2, 2],
+      // A name with `-` in it is one name; the `-` of `-%}` trims whitespace.
+      ['{% capture title-text %}Hi{% endcapture %}', 'title-text', 1, 0],
+      ['{% capture title-text-%}Hi{% endcapture %}', 'title-text', 1, 0],
+      ['{%- capture title-text -%}Hi{%- endcapture -%}', 'title-text', 1, 0],
+      ["{% capture 'hero-alt' %}Hi{% endcapture %}", 'hero-alt', 1, 0],
+      ['{% liquid\n  capture hero-alt\n  endcapture\n%}', 'hero-alt', 2, 2],
     ] as const)('reads a capture declaration from %j', (code, name, line, column) => {
       const result = extractFromSource('sections/card.liquid', code);
       const variables = result.nodes.filter((n) => n.kind === 'variable');
@@ -5360,10 +5369,27 @@ import 'package:flutter/material.dart';
       expect(result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name)).toEqual(['text']);
     });
 
-    it('never cuts a capture name short', () => {
-      // Liquid allows `-` and `.` in a name, which the assign rule doesn't read
-      // either; such a name gets no node rather than a wrong one.
-      const code = ['{% capture ghost-name %}x{% endcapture %}', '{% capture ghost.name %}x{% endcapture %}'].join('\n');
+    it('reads an assign name with `-` in it whole', () => {
+      const code = [
+        "{% assign title-text = 'Sale' %}",
+        '{%- assign page-title=page.title -%}',
+        '{% liquid',
+        '  assign hero-image = section.settings.image',
+        '%}',
+      ].join('\n');
+      const variables = extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable');
+      expect(variables.map((n) => [n.name, n.startLine])).toEqual([['title-text', 1], ['page-title', 2], ['hero-image', 4]]);
+    });
+
+    it('never cuts a name short', () => {
+      // Liquid allows `.` in a name too, which neither rule reads; such a name
+      // gets no node rather than a wrong one.
+      const code = [
+        '{% capture ghost.name %}x{% endcapture %}',
+        '{% capture ghost-name.x %}x{% endcapture %}',
+        '{% assign ghost.name = 1 %}',
+        '{% assign ghost-name.x = 1 %}',
+      ].join('\n');
       expect(extractFromSource('sections/card.liquid', code).nodes.filter((n) => n.kind === 'variable')).toEqual([]);
     });
 
@@ -7282,6 +7308,113 @@ describe('Razor / Blazor markup extraction', () => {
   afterEach(() => {
     if (cg) cg.close();
     if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  /** The files of everything that calls or references the named function. */
+  const dependents = async (name: string): Promise<string[]> => {
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    const target = cg.getNodesByKind('function').find((n) => n.name === name);
+    expect(target, name).toBeDefined();
+    return [...cg.getImpactRadius(target!.id, 1).nodes.values()].map((n) => n.filePath ?? '').filter((p) => !p.endsWith('.js') && !p.endsWith('.ts'));
+  };
+
+  it('links what a view\'s inline script calls to the JavaScript that defines it', async () => {
+    fs.writeFileSync(path.join(tempDir, 'site.js'), 'export function showToast(msg) { return msg; }\n');
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'Views/Order.cshtml'),
+      "@model OrderViewModel\n<div>Order</div>\n<script>\n  import { showToast } from '../site.js';\n  function save() { showToast('saved'); }\n</script>\n"
+    );
+    expect(await dependents('showToast')).toContain('Views/Order.cshtml');
+    const ref = cg.getOutgoingEdges(cg.getNodesByName('Order')[0]!.id).find((e) => e.kind === 'calls');
+    expect(ref?.line, 'a reference keeps its line in the view').toBe(5);
+  });
+
+  it('reads a global helper called from a script that holds Razor', async () => {
+    fs.writeFileSync(path.join(tempDir, 'common.js'), 'function displayNotice(text) { return text; }\nvar AjaxCart = { add: function add(url) { return url; } };\n');
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'Views/Cart.cshtml'), [
+      '@model CartModel',
+      '<script asp-location="Footer">',
+      '    var id = @Model.Id;',
+      "    var url = '@Url.Action(\"Add\", \"Cart\")';",
+      '    var data = @Html.Raw(Json.Serialize(Model.Items));',
+      '    @* displayNotice("a comment"); *@',
+      '    @if (Model.ShowNotice)',
+      '    {',
+      '        <text>',
+      '        displayNotice("@T("Added").Text");',
+      '        </text>',
+      '    }',
+      '    else',
+      '    {',
+      '        var hidden = Model.Compute();',
+      '    }',
+      '    $(function () { AjaxCart.add(url); });',
+      '</script>',
+    ].join('\n'));
+    expect(await dependents('displayNotice')).toContain('Views/Cart.cshtml');
+    const refs = (cg as any).db.db.prepare(`SELECT reference_name n FROM unresolved_refs WHERE file_path = 'Views/Cart.cshtml' AND language = 'javascript'`).all().map((r: { n: string }) => r.n);
+    for (const name of refs) expect(name, 'Razor reads as no JavaScript').not.toMatch(/Html|Json|Model|Url\.Action/);
+  });
+
+  it('leaves template, data and sourced script blocks alone, and calls no block\'s own function another file\'s', async () => {
+    fs.writeFileSync(path.join(tempDir, 'lib.js'), 'function fromTemplate() {}\nfunction ownName() {}\nfunction fromSrc() {}\n');
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'Views/Page.cshtml'), [
+      '<script type="text/html" id="row"><div onclick="fromTemplate()"></div></script>',
+      '<script type="application/json">{ "fromTemplate": 1 }</script>',
+      '<script src="~/js/fromSrc.js"></script>',
+      '@* <script>fromTemplate();</script> *@',
+      '<script>',
+      '  function ownName() { return 1; }',
+      '  ownName();',
+      '</script>',
+      '<script>',
+      '  ownName();',
+      '</script>',
+    ].join('\n'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    for (const name of ['fromTemplate', 'ownName', 'fromSrc']) {
+      const target = cg.getNodesByKind('function').find((n) => n.name === name)!;
+      expect(cg.getCallers(target.id).map((c) => c.node.name), name).toEqual([]);
+    }
+    expect(cg.getNodesInFile('Views/Page.cshtml').filter((n) => n.kind === 'function'), 'a view stays one component node').toEqual([]);
+  });
+
+  it('leaves a global two bundles define for the page to decide', async () => {
+    fs.mkdirSync(path.join(tempDir, 'wwwroot/js'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'wwwroot/js/admin.common.js'), 'function setLocation(url) { return url; }\nfunction onlyAdmin() {}\n');
+    fs.writeFileSync(path.join(tempDir, 'wwwroot/js/public.common.js'), 'function setLocation(url) { return url; }\n');
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'Views/Page.cshtml'), "<script>\n  setLocation('/x');\n  onlyAdmin();\n</script>\n");
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    const callees = cg.getOutgoingEdges(cg.getNodesByName('Page')[0]!.id).filter((e) => e.kind === 'calls').map((e) => cg.getNode(e.target)?.name);
+    expect(callees).toEqual(['onlyAdmin']);
+  });
+
+  it('reads a block as TypeScript when it says so', async () => {
+    fs.writeFileSync(path.join(tempDir, 'helper.ts'), 'export function typedHelper(n: number) { return n; }\n');
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'Views/Typed.cshtml'),
+      "<script lang=\"ts\">\n  import { typedHelper } from '../helper';\n  const n: number = typedHelper(1);\n</script>\n"
+    );
+    expect(await dependents('typedHelper')).toContain('Views/Typed.cshtml');
+  });
+
+  it('keeps a view\'s script links through a sync that re-reads only the view', async () => {
+    fs.writeFileSync(path.join(tempDir, 'site.js'), 'function firstHelper() {}\nfunction secondHelper() {}\n');
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'Views/Page.cshtml'), '<script>\n  firstHelper();\n</script>\n');
+    expect(await dependents('firstHelper')).toContain('Views/Page.cshtml');
+    fs.writeFileSync(path.join(tempDir, 'Views/Page.cshtml'), '<script>\n  secondHelper();\n</script>\n');
+    await cg.sync();
+    const second = cg.getNodesByKind('function').find((n) => n.name === 'secondHelper')!;
+    expect(cg.getCallers(second.id).map((c) => c.node.filePath)).toEqual(['Views/Page.cshtml']);
   });
 
   it('links @model and Blazor component tags to their C# types; ignores HTML elements', async () => {
@@ -10080,6 +10213,66 @@ const value = 42;
       (e) => e.source === componentNode!.id && e.kind === 'contains'
     );
     expect(containEdges.length).toBeGreaterThan(0);
+  });
+
+  it('should not let a self-closing <script /> swallow the next script (#2989)', () => {
+    const code = `---
+import { formatDate } from '../utils/format';
+const inlineScript = 'window.example = true';
+---
+<script is:inline set:html={inlineScript} />
+<time>{formatDate(new Date())}</time>
+<script>
+  const ready = true;
+  console.log(ready);
+</script>
+`;
+    const result = extractFromSource('Page.astro', code);
+
+    expect(result.errors).toEqual([]);
+    const ready = result.nodes.find((n) => n.name === 'ready');
+    expect(ready).toBeDefined();
+    expect(ready?.startLine).toBe(8);
+    // The markup between the two scripts is still scanned.
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'formatDate' && ref.line === 6
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('should not let a self-closing <style /> hide the markup after it (#2989)', () => {
+    const code = `<style is:global />
+<p>{formatDate(date)}</p>
+<style>.a { color: red; }</style>
+`;
+    const result = extractFromSource('Styled.astro', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'formatDate' && ref.line === 2
+    );
+    expect(call).toBeDefined();
+  });
+
+  it("still reads a call in a self-closing <script />'s attributes (#2989)", () => {
+    // A self-closing tag has no body for the template scan to skip:
+    // `set:html={…}` runs when the page renders, like any attribute expression.
+    const code = `---
+import { serializeJsonLd } from '../lib/jsonld';
+const schema = {};
+---
+<script type="application/ld+json" set:html={serializeJsonLd(schema)} />
+<script>
+  const ready = true;
+</script>
+`;
+    const result = extractFromSource('Schema.astro', code);
+
+    expect(result.errors).toEqual([]);
+    expect(result.nodes.find((n) => n.name === 'ready')?.startLine).toBe(7);
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'serializeJsonLd' && ref.line === 5
+    );
+    expect(call).toBeDefined();
   });
 });
 
@@ -13949,6 +14142,246 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     }
   });
 
+  it('blankCUnbalancedConditionalBranches opens a damaged #if group, one branch kept only when they do not balance, offsets kept', async () => {
+    const { blankCUnbalancedConditionalBranches } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void f(int id)',
+      '{',
+      '    if (id == 1) {',
+      '        a(id);',
+      '    }',
+      '#if defined(USE_V) || \\',
+      '    defined(USE_W)',
+      '    else if (id == 2) { // "{" in a comment',
+      '        b(id);',
+      '    }',
+      '#else',
+      '    else if (id == 3) {',
+      '        c(id);',
+      '    }',
+      '#endif',
+      '#ifdef USE_X',
+      '    d(id);',
+      '#else',
+      '    e(id);',
+      '#endif',
+      '}',
+      '#if 0',
+      'void dead(void) {',
+      '#else',
+      'void live(void) {',
+      '#endif',
+      '}',
+    ].join('\n');
+    const out = blankCUnbalancedConditionalBranches(src);
+    expect(out.length).toBe(src.length);
+    expect(out.split('\n').length).toBe(src.split('\n').length);
+    const lines = out.split('\n');
+    // The `else`-led group's branches each balance, so both stay, read in a
+    // row (`else if (id == 2) {…} else if (id == 3) {…}` is still C); only
+    // its directive lines, continuation included, become spaces.
+    expect(lines[5]).toBe(' '.repeat(src.split('\n')[5]!.length));
+    expect(lines[6]).toBe(' '.repeat(src.split('\n')[6]!.length));
+    expect(lines[7]).toBe('    else if (id == 2) { // "{" in a comment');
+    expect(lines[8]).toBe('        b(id);');
+    expect(lines[10]).toBe('     ');
+    expect(lines[11]).toBe('    else if (id == 3) {');
+    expect(lines[12]).toBe('        c(id);');
+    expect(lines[14]).toBe('      ');
+    // A balanced group is untouched, directives included.
+    expect(lines[15]).toBe('#ifdef USE_X');
+    expect(lines[16]).toBe('    d(id);');
+    expect(lines[18]).toBe('    e(id);');
+    expect(lines[19]).toBe('#endif');
+    // `#if 0` keeps the live branch instead.
+    expect(out).not.toContain('dead');
+    expect(lines[24]).toBe('void live(void) {');
+    // `#if 1` is live as written: its first branch stays, not its `#else`.
+    const on = blankCUnbalancedConditionalBranches(
+      ['void g(int id) {', '  if (id) { a(); }', '#if 1', '  else if (id == 2) { live(); }', '#else', '  else if (id == 3) { dead(); }', '#endif', '}'].join('\n')
+    );
+    expect(on).toContain('else if (id == 2) { live(); }');
+    expect(on).not.toContain('dead');
+    // Arms that close the block above and open their own (`} else if (…) {`)
+    // balance too: under a flag, both builds' arms stay (betaflight's
+    // `#if ENABLE_RESCUE_PLAN` in failsafe.c), so neither one's calls are lost.
+    const arms = blankCUnbalancedConditionalBranches(
+      ['void f(int a) {', '  if (a == 1) {', '    one();', '#if ENABLE_X', '  } else if (a == 2) {', '    two();', '#else', '  } else if (a == 3) {', '    three();', '#endif', '  }', '}'].join('\n')
+    ).split('\n');
+    expect(arms[3]).toBe(' '.repeat('#if ENABLE_X'.length));
+    expect(arms[5]).toBe('    two();');
+    expect(arms[8]).toBe('    three();');
+    // A brace inside a block comment is not code. Lua's loadlib.c opens a
+    // banner with `** {====` inside a multi-line comment and closes it with
+    // `/* }==== */`: the group is whole, and every platform's functions stay.
+    const lua = [
+      '#if defined(LUA_DL_DLOPEN)',
+      'static void *ll_load (const char *path) { return dlopen(path); }',
+      '#elif defined(LUA_DL_DLL)',
+      '/*',
+      '** {======================================================',
+      '** This is an implementation of loadlib for Windows',
+      '** =======================================================',
+      '*/',
+      'static void *ll_load (const char *path) { return LoadLibraryA(path); }',
+      '/* }====================================================== */',
+      '#else',
+      'static void *ll_load (const char *path) { return NULL; }',
+      '#endif',
+    ].join('\n');
+    expect(blankCUnbalancedConditionalBranches(lua)).toBe(lua);
+    // A `\` ending a line inside a block comment still continues the
+    // `#define` (jemalloc's tsd.h): the macro body is not code of the group.
+    const guarded = [
+      '#ifndef GUARD_H',
+      '#define GUARD_H',
+      '#define O(n)\t\t\t\t\\',
+      'static int n##_get(void) {\t\t\\',
+      '\t/*\t\t\t\t\t\\',
+      '\t * a comment inside the body\t\\',
+      '\t */\t\t\t\t\t\\',
+      '\treturn 0;\t\t\t\t\\',
+      '}',
+      'O(a)',
+      '#endif',
+    ].join('\n');
+    expect(blankCUnbalancedConditionalBranches(guarded)).toBe(guarded);
+    // No conditional group at all: identity.
+    const plain = 'int g(void) {\n#define X 1\n    return X;\n}\n';
+    expect(blankCUnbalancedConditionalBranches(plain)).toBe(plain);
+  });
+
+  it('blankCUnbalancedConditionalBranches: two function heads under #ifdef/#else keep the #else head; expression fragments keep their only branch', async () => {
+    const { blankCUnbalancedConditionalBranches } = await import('../src/extraction/languages/c-cpp');
+    // jq's main.c: `umain` for WIN32, `main` otherwise — `main` must survive.
+    const heads = [
+      '#ifdef WIN32',
+      'int umain(int argc, char* argv[]) {',
+      '#else /*}*/',
+      'int main(int argc, char* argv[]) {',
+      '#endif',
+      '  return run(argc, argv);',
+      '}',
+    ].join('\n');
+    const h = blankCUnbalancedConditionalBranches(heads).split('\n');
+    expect(h[1]).toBe(' '.repeat('int umain(int argc, char* argv[]) {'.length));
+    expect(h[3]).toBe('int main(int argc, char* argv[]) {');
+    expect(h[0]).toBe('            ');
+    // `#ifndef` is the inverse: its first branch is the default build.
+    const inv = heads.replace('#ifdef WIN32', '#ifndef POSIX');
+    expect(blankCUnbalancedConditionalBranches(inv).split('\n')[1]).toBe('int umain(int argc, char* argv[]) {');
+    // A directive right under the kept branch's own is a line of that branch:
+    // only the `#if`/`#else` line itself (and its `\` continuations) goes.
+    const withIncludes = [
+      '#if defined(FEATURE) && \\',
+      '    defined(OTHER)',
+      '#include "feature.h"',
+      'int f(int x) {',
+      '#else',
+      '#include "plain.h"',
+      'int g(int x) {',
+      '#endif',
+      '  return x;',
+      '}',
+    ];
+    const inc = blankCUnbalancedConditionalBranches(withIncludes.join('\n')).split('\n');
+    expect(inc[1]).toBe(' '.repeat(withIncludes[1]!.length));
+    expect(inc[2]).toBe(' '.repeat(withIncludes[2]!.length));
+    expect(inc[5]).toBe('#include "plain.h"');
+    expect(inc[6]).toBe('int g(int x) {');
+    // A branch that is a fragment of an `if (…)` condition (STM32 HAL), or
+    // that opens with `} else if` (betaflight cli.c): directives blanked, the
+    // only branch kept, so the statement parses as written for that build.
+    const frag = [
+      'int check(op_t *h1, op_t *h4)',
+      '{',
+      '  if ((h1 == NULL)',
+      '#if defined(STM32G474xx)',
+      '      || (h4 == NULL)',
+      '#endif',
+      '     )',
+      '  {',
+      '    return 1;',
+      '  }',
+      '  if (',
+      '#if !defined(USE_FLASH)',
+      '      isEmpty(h1) ||',
+      '#endif',
+      '      strncasecmp(h1, "rom", 3) == 0) {',
+      '    reboot(1);',
+      '#if defined(USE_FLASH)',
+      '  } else if (isEmpty(h1)) {',
+      '    reboot(2);',
+      '#endif',
+      '  } else {',
+      '    reboot(0);',
+      '  }',
+      '  return 0;',
+      '}',
+    ].join('\n');
+    const f = blankCUnbalancedConditionalBranches(frag).split('\n');
+    expect(f[3]).toBe(' '.repeat('#if defined(STM32G474xx)'.length));
+    expect(f[4]).toBe('      || (h4 == NULL)');
+    expect(f[5]).toBe('      ');
+    expect(f[12]).toBe('      isEmpty(h1) ||');
+    expect(f[17]).toBe('  } else if (isEmpty(h1)) {');
+    expect(f[16]).toBe(' '.repeat('#if defined(USE_FLASH)'.length));
+  });
+
+  it('a #if branch beginning with `else` no longer files the rest of the file under the enclosing function', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-c-ifelse-'));
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'current.c'),
+        [
+          'void currentMeterRead(int id, meter_t *meter)',
+          '{',
+          '    if (id == 1) {',
+          '        adcRead(meter);',
+          '    }',
+          '#ifdef USE_VIRTUAL',
+          '    else if (id == 2) {',
+          '        virtualRead(meter);',
+          '    }',
+          '#endif',
+          '    else {',
+          '        resetMeter(meter);',
+          '    }',
+          '}',
+          '',
+          'static bool markBusy(void)',
+          '{',
+          '    ATOMIC_BLOCK(NVIC_PRIO_MAX) {',
+          '        busy = true;',
+          '    }',
+          '    return true;',
+          '}',
+          '',
+          'int after(void)',
+          '{',
+          '    return 1;',
+          '}',
+          '',
+        ].join('\n')
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'current.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['after', 'currentMeterRead', 'markBusy']);
+        expect(byName.currentMeterRead!.endLine).toBe(14);
+        expect(byName.markBusy!.qualifiedName).toBe('markBusy');
+        expect(byName.markBusy!.endLine).toBe(22);
+        expect(byName.after!.qualifiedName).toBe('after');
+        expect(byName.after!.startLine).toBe(24);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
     const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
     const src = [
@@ -13961,7 +14394,8 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     ].join('\n');
     const out = blankCStatementMacroCalls(src);
     expect(out.length).toBe(src.length);
-    expect(out).not.toContain('list_for_each_entry');
+    expect(out).toContain('list_for_each_entry;');
+    expect(out).not.toContain('head, member');
     expect(out).toContain('use(pos);');
     // A real call statement ends with `;` — untouched.
     expect(out).toContain('use(pos);');
@@ -14168,7 +14602,7 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     ].join('\n');
     const out = blankCStatementMacroCalls(src);
     expect(out.length).toBe(src.length);
-    expect(out).not.toContain('hlist_for_each_entry_rcu');
+    expect(out).toContain('hlist_for_each_entry_rcu;');
     expect(out).not.toContain('lockdep_is_held');
     expect(out).toContain('use(p);');
     // A wrapped REAL call ends in `;` — untouched.

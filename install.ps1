@@ -97,11 +97,38 @@ $arch = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture 
 $target = "win32-$arch"
 
 # 2. Resolve the version (latest release unless pinned).
-$version = $env:CODEGRAPH_VERSION
-if (-not $version) {
-  $version = (Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest").tag_name
+# >>> Resolve-CodeGraphVersion
+function Resolve-CodeGraphVersion([string]$Pinned, [string]$Repository, [string]$WebBase = 'https://github.com', [string]$ApiBase = 'https://api.github.com') {
+  # "Latest" is where github.com/<repo>/releases/latest redirects to
+  # (.../releases/tag/vX.Y.Z), read from a HEAD that doesn't follow it, as
+  # install.sh and `codegraph upgrade` do. The GitHub API allows 60
+  # unauthenticated requests an hour per IP, then answers 403 -- routine on
+  # shared networks and CI (#325) -- so it is only the fallback.
+  $version = $Pinned
+  if (-not $version) {
+    try {
+      $req = [System.Net.HttpWebRequest]::Create("$WebBase/$Repository/releases/latest")
+      $req.Method = 'HEAD'
+      $req.AllowAutoRedirect = $false
+      $req.UserAgent = 'codegraph-install'
+      $req.Timeout = 15000
+      $resp = $req.GetResponse()
+      try {
+        if ($resp.Headers['Location'] -match '/releases/tag/([^/?#]+)') { $version = [Uri]::UnescapeDataString($Matches[1]) }
+      } finally { $resp.Close() }
+    } catch {}
+  }
+  if (-not $version) {
+    try { $version = (Invoke-RestMethod "$ApiBase/repos/$Repository/releases/latest").tag_name } catch {}
+  }
+  if (-not $version) { throw 'codegraph: could not resolve the latest version from GitHub; set CODEGRAPH_VERSION (e.g. v1.6.2) and run the installer again.' }
+  # Release tags are vX.Y.Z; accept a bare X.Y.Z too.
+  $version = "$version".Trim()
+  if ($version -notmatch '^v') { $version = "v$version" }
+  $version
 }
-if (-not $version) { throw "codegraph: could not resolve latest version; set CODEGRAPH_VERSION." }
+# <<< Resolve-CodeGraphVersion
+$version = Resolve-CodeGraphVersion $env:CODEGRAPH_VERSION $repo
 
 # 3. Download the bundle and unpack it next to the stable 'current' dir (same
 # volume, so moving it in is renames, not copies), then move it into 'current'.

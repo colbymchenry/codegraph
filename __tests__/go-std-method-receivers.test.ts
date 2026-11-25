@@ -310,19 +310,22 @@ describe('Go standard method names on a receiver nothing types', () => {
   it.each([
     // `for _, id := range ids`
     ['idsText', 'types/id.go::ID::String instance-method@0.65'],
-    // `urlsMap := types.NewURLsMap()`
-    ['urls', 'types/id.go::URLsMap::String instance-method@0.65'],
   ])('still guesses for %s through a receiver named after the owner type', (fn, target) => {
     expect(calls(fn)).toEqual([target]);
+  });
+
+  // `urlsMap := types.NewURLsMap()`: the type the package's function returns.
+  it('links urls through the type the call it is assigned from returns', () => {
+    expect(calls('urls')).toEqual(['types/id.go::URLsMap::String instance-method@0.9']);
   });
 
   it.each([
     // `var ( query promql.Query )`, read past the table's `query string`;
     // `Exec`, no standard name, is typed by that declaration too.
     ['runQueries', ['promql/engine.go::Query::Exec instance-method@0.9', 'promql/engine.go::Query::String instance-method@0.9']],
-    // `version, _ := ParseVersion(…)` says no type, and the table's
-    // `version string` is another declaration: nothing is ruled out.
-    ['versionText', ['server/version.go::Version::Major instance-method@0.8', 'server/version.go::Version::String instance-method@0.8']],
+    // `version, _ := ParseVersion(…)` is what ParseVersion returns; the
+    // table's `version string` is another declaration.
+    ['versionText', ['server/version.go::Version::Major instance-method@0.9', 'server/version.go::Version::String instance-method@0.9']],
   ])('reads %s by the declaration in scope, not a test table field of the name', (fn, targets) => {
     expect(calls(fn)).toEqual(targets);
   });

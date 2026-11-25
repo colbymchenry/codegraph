@@ -7,11 +7,31 @@
 import type { ResolutionContext } from './types';
 import { stripCommentsForRegex } from './strip-comments';
 
-const CPP_NS_MACROS = new WeakMap<ResolutionContext, { openers: Map<string, string[]>; openerFns: Set<string>; closers: Map<string, number>; aliases: Map<string, string> }>();
+/** The project's namespace-opening macros (cppNamespaceMacros). */
+interface CppNamespaceMacros {
+  openers: Map<string, string[]>;
+  openerFns: Set<string>;
+  closers: Map<string, number>;
+  aliases: Map<string, string>;
+}
+
+const CPP_NS_MACROS = new WeakMap<ResolutionContext, CppNamespaceMacros>();
 const CPP_NS_FRAMES = new WeakMap<ResolutionContext, Map<string, Array<{ start: number; end: number; path: string[] }>>>();
 /** A closing macro's body: `}` / `} }`, maybe beside a pragma macro (`PYBIND11_WARNING_POP }`). */
 const CPP_CLOSER_BODY = /^(?:[A-Za-z_]\w*\s+)*\}(?:\s*\})*\s*;?$/;
 const CPP_NS_ALIASES = new WeakMap<ResolutionContext, Map<string, string>>();
+
+/** The files that can declare a namespace alias, as far as the project's aliases are read. */
+const CPP_NS_ALIAS_FILE = /\.(?:h|hh|hpp|hxx|inl|c|cc|cpp|cxx)$/i;
+
+/** Add what a file declares. The first declaration of a name stands. */
+function addNamespaceAliases(file: string, source: string, aliases: Map<string, string>): void {
+  // (Few files declare one, and this looks for it without looking at every line.)
+  if (!CPP_NS_ALIAS_FILE.test(file) || !/\bnamespace[ \t]+\w+[ \t]*=/.test(source)) return;
+  for (const m of source.matchAll(/^[ \t]*namespace[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*(?:::)?([A-Za-z_][\w:]*)[ \t]*;/gm)) {
+    if (!aliases.has(m[1]!)) aliases.set(m[1]!, m[2]!);
+  }
+}
 
 /** The project's namespace aliases: `namespace py = pybind11;`. */
 export function cppNamespaceAliases(context: ResolutionContext): Map<string, string> {
@@ -19,15 +39,27 @@ export function cppNamespaceAliases(context: ResolutionContext): Map<string, str
   if (hit) return hit;
   const aliases = new Map<string, string>();
   for (const file of context.getAllFiles()) {
-    if (!/\.(?:h|hh|hpp|hxx|inl|c|cc|cpp|cxx)$/i.test(file)) continue;
-    const source = context.readFile(file);
-    if (!source || !source.includes('namespace')) continue;
-    for (const m of source.matchAll(/^[ \t]*namespace[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*(?:::)?([A-Za-z_][\w:]*)[ \t]*;/gm)) {
-      if (!aliases.has(m[1]!)) aliases.set(m[1]!, m[2]!);
-    }
+    const source = CPP_NS_ALIAS_FILE.test(file) ? context.readFile(file) : null;
+    if (source) addNamespaceAliases(file, source, aliases);
   }
   CPP_NS_ALIASES.set(context, aliases);
   return aliases;
+}
+
+/**
+ * For a walk over `getAllFiles` in its order, which holds every file's text
+ * anyway: reads the aliases from that text, so that nothing reads every file
+ * for them again. Null when they are known. The text may be latin1: what the
+ * aliases read is ASCII, on lines latin1 breaks where UTF-8 does (only U+2028
+ * and U+2029 end a line in one and not the other).
+ */
+export function cppNamespaceAliasWalk(context: ResolutionContext): { add(file: string, source: string): void; finish(): void } | null {
+  if (CPP_NS_ALIASES.has(context)) return null;
+  const aliases = new Map<string, string>();
+  return {
+    add: (file, source) => addNamespaceAliases(file, source, aliases),
+    finish: () => { CPP_NS_ALIASES.set(context, aliases); },
+  };
 }
 
 /**
@@ -37,7 +69,7 @@ export function cppNamespaceAliases(context: ResolutionContext): Map<string, str
  * rapidjson`) — as the namespace path each opens (inline namespaces are
  * transparent), and the closing macros as how many scopes each closes.
  */
-function cppNamespaceMacros(context: ResolutionContext): { openers: Map<string, string[]>; openerFns: Set<string>; closers: Map<string, number>; aliases: Map<string, string> } {
+function cppNamespaceMacros(context: ResolutionContext): CppNamespaceMacros {
   const hit = CPP_NS_MACROS.get(context);
   if (hit) return hit;
   const openers = new Map<string, string[]>();
@@ -117,6 +149,31 @@ export function cppMacroNamespaceFrames(file: string, context: ResolutionContext
   }
   memo.set(file, frames);
   return frames;
+}
+
+/** The files the scans above read: every C and C++ source and header. */
+const CPP_SCANNED_FILE = /\.(?:h|hh|hpp|hxx|h\+\+|inl|ipp|tcc|c|cc|cpp|cxx)$/i;
+
+/** How many files a thread reading the scans above has to read. */
+export function cppScannedFileCount(context: ResolutionContext): number {
+  let count = 0;
+  for (const file of context.getAllFiles()) if (CPP_SCANNED_FILE.test(file)) count++;
+  return count;
+}
+
+/** What the scans of every source file above found, for a thread that hasn't read them (ProjectScans). */
+export interface CppNamespaceScans {
+  aliases: Map<string, string>;
+  macros: CppNamespaceMacros;
+}
+
+export function cppNamespaceScans(context: ResolutionContext): CppNamespaceScans {
+  return { aliases: cppNamespaceAliases(context), macros: cppNamespaceMacros(context) };
+}
+
+export function adoptCppNamespaceScans(context: ResolutionContext, scans: CppNamespaceScans): void {
+  CPP_NS_ALIASES.set(context, scans.aliases);
+  CPP_NS_MACROS.set(context, scans.macros);
 }
 
 /** Drop the per-context namespace memos (see ReferenceResolver.clearCaches). */

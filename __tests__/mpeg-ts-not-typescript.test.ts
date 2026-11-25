@@ -196,6 +196,23 @@ describe('MPEG-TS video named .ts is skipped, real TypeScript is indexed (#1910)
     }
   });
 
+  it('counts the clip as skipped, so a full index is complete, not PARTIAL', async () => {
+    const dir = createProject();
+    fs.writeFileSync(path.join(dir, 'clip.ts'), makeMpegTs(40));
+    fs.writeFileSync(path.join(dir, 'app.ts'), 'export const a = 1;\n');
+    const cg = await CodeGraph.init(dir);
+    try {
+      const result = await cg.indexAll();
+      // Every file the scan found is accounted for: indexed, skipped or errored.
+      expect(result.filesDiscovered).toBe(2);
+      expect(result.filesIndexed + result.filesSkipped + result.filesErrored).toBe(2);
+      expect(result.errors.filter((e) => e.code === 'index_partial')).toEqual([]);
+      expect(cg.getIndexState()).toBe('complete');
+    } finally {
+      await cg.close();
+    }
+  });
+
   it('indexes past a 900 KB clip in well under two seconds', async () => {
     const dir = createProject();
     fs.mkdirSync(path.join(dir, 'testdata'));

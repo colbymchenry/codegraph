@@ -7,8 +7,10 @@
  * into workspace member crates.
  */
 
+import * as path from 'path';
 import picomatch from 'picomatch';
 import { ResolutionContext } from '../types';
+import { escapesRoot } from '../../utils';
 
 const GLOB_CHARS = /[*?[\]{}!]/;
 const SKIP_DIRS = new Set(['target', 'node_modules', '.git', 'dist', 'build']);
@@ -139,7 +141,7 @@ function getArrayValue(section: string, key: string): string | null {
   return null;
 }
 
-function parseWorkspaceMembers(cargoToml: string): string[] {
+export function parseWorkspaceMembers(cargoToml: string): string[] {
   const workspaceSection = getSection(cargoToml, 'workspace');
   if (!workspaceSection) return [];
   const membersValue = getArrayValue(workspaceSection, 'members');
@@ -147,11 +149,37 @@ function parseWorkspaceMembers(cargoToml: string): string[] {
   return extractQuotedValues(membersValue);
 }
 
-function parsePackageName(cargoToml: string): string | null {
+/** A manifest's `[package]` name, wherever the section writes it (after a `categories = [...]` too). */
+export function parsePackageName(cargoToml: string): string | null {
   const packageSection = getSection(cargoToml, 'package');
   if (!packageSection) return null;
   const packageNameMatch = packageSection.match(/name\s*=\s*["']([^"'\n]+)["']/);
   return packageNameMatch?.[1]?.trim() ?? null;
+}
+
+/**
+ * The target roots a manifest names with a `path` of their own: `[lib] path =
+ * "…"`, each `[[bin]] path = "…"` (ripgrep's `crates/core/main.rs`), and each
+ * `[[example]]`, `[[test]]` and `[[bench]]` one (dioxus's
+ * `examples/07-fullstack/handling_errors.rs`), as written — relative to the
+ * manifest's directory.
+ */
+export function parseTargetPaths(cargoToml: string): { lib?: string; bins: string[]; others: string[] } {
+  const out: { lib?: string; bins: string[]; others: string[] } = { bins: [], others: [] };
+  let table: 'lib' | 'bin' | 'other' | null = null;
+  for (const raw of cargoToml.split(/\r?\n/)) {
+    const line = raw.replace(/#.*$/, '').trim();
+    if (line.startsWith('[')) {
+      table = line === '[lib]' ? 'lib' : line === '[[bin]]' ? 'bin' : /^\[\[(?:example|test|bench)\]\]$/.test(line) ? 'other' : null;
+      continue;
+    }
+    const at = table && /^path\s*=\s*["']([^"'\n]+)["']/.exec(line)?.[1]?.replace(/\\/g, '/');
+    if (!at) continue;
+    if (table === 'lib') out.lib = at;
+    else if (table === 'bin') out.bins.push(at);
+    else out.others.push(at);
+  }
+  return out;
 }
 
 function addCrateAlias(map: Map<string, string>, crateName: string, memberPath: string): void {
@@ -201,6 +229,8 @@ function expandMembers(members: string[], context: ResolutionContext): string[] 
   const expanded: string[] = [];
   const seen = new Set<string>();
   for (const member of members) {
+    // A member outside the project (`../shared`, an absolute path) is neither read nor listed.
+    if (escapesRoot(path.posix.normalize(member.replace(/\\/g, '/')))) continue;
     const candidates = GLOB_CHARS.test(member)
       ? expandGlobMember(member, context)
       : [member];
@@ -214,6 +244,11 @@ function expandMembers(members: string[], context: ResolutionContext): string[] 
   return expanded;
 }
 
+/** The workspace's crates (readCargoWorkspaceCrateMap), as the resolver keeps them. */
+export function getCargoWorkspaceCrateMap(context: ResolutionContext): Map<string, string> {
+  return context.getCargoCrates?.() ?? readCargoWorkspaceCrateMap(context);
+}
+
 /**
  * Build a map from crate-name aliases to workspace member directory paths.
  * Example: "mytool-core" and "mytool_core" -> "crates/mytool-core"
@@ -221,7 +256,7 @@ function expandMembers(members: string[], context: ResolutionContext): string[] 
  * Supports glob members (e.g. `members = ["crates/*"]`) via picomatch
  * when the context exposes `listDirectories`.
  */
-export function getCargoWorkspaceCrateMap(context: ResolutionContext): Map<string, string> {
+export function readCargoWorkspaceCrateMap(context: ResolutionContext): Map<string, string> {
   const result = new Map<string, string>();
   const rootCargoToml = context.readFile('Cargo.toml');
   if (!rootCargoToml) return result;

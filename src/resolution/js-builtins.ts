@@ -7,6 +7,18 @@ export const JS_BUILT_INS = new Set([
   'fetch', 'require', 'module', 'exports', '__dirname', '__filename',
 ]);
 
+/**
+ * The browser's host objects a script reaches by name: the global object under
+ * its names (`window`, `self`, `globalThis`) and the members of it that code
+ * calls straight on. A call on one of them — `window.open()`,
+ * `localStorage.getItem()`, `history.back()` — is the browser's, unless the
+ * file binds or imports the name itself.
+ */
+export const JS_BROWSER_HOST_GLOBALS = new Set([
+  'window', 'self', 'globalThis', 'document', 'localStorage', 'sessionStorage',
+  'location', 'history', 'navigator', 'screen', 'performance',
+]);
+
 /** Method names that require receiver evidence before linking to project code. */
 export const JS_BUILTIN_METHODS = new Set([
   // Array / typed arrays and collections.
@@ -46,6 +58,38 @@ export const JS_ARRAY_METHODS = new Set([
   'toReversed', 'toSorted', 'toSpliced', 'unshift', 'values', 'with',
   'toString', 'toLocaleString', 'valueOf', 'hasOwnProperty', 'isPrototypeOf',
   'propertyIsEnumerable',
+]);
+
+/**
+ * The standard globals a script reaches by name in every JavaScript runtime
+ * it commonly runs on: ECMAScript's own (`parseInt`, `Uint8Array`, `Proxy`),
+ * and the web platform's that browsers, Node, Deno and workers share
+ * (`Response`, `URL`, `TextEncoder`, `structuredClone`), plus the browser's
+ * common constructors and functions. A call or `new` of one in an ES module
+ * that neither declares nor imports the name is the global (#3238).
+ */
+export const JS_STANDARD_GLOBALS = new Set([
+  // ECMAScript.
+  'AggregateError', 'Array', 'ArrayBuffer', 'Atomics', 'BigInt', 'BigInt64Array', 'BigUint64Array',
+  'Boolean', 'DataView', 'Date', 'decodeURI', 'decodeURIComponent', 'encodeURI', 'encodeURIComponent',
+  'Error', 'escape', 'eval', 'EvalError', 'FinalizationRegistry', 'Float32Array', 'Float64Array',
+  'Function', 'Int8Array', 'Int16Array', 'Int32Array', 'Intl', 'isFinite', 'isNaN', 'Iterator', 'JSON',
+  'Map', 'Math', 'Number', 'Object', 'parseFloat', 'parseInt', 'Promise', 'Proxy', 'RangeError',
+  'ReferenceError', 'Reflect', 'RegExp', 'Set', 'SharedArrayBuffer', 'String', 'Symbol', 'SyntaxError',
+  'TypeError', 'Uint8Array', 'Uint8ClampedArray', 'Uint16Array', 'Uint32Array', 'unescape', 'URIError',
+  'WeakMap', 'WeakRef', 'WeakSet',
+  // The web platform, as browsers, Node, Deno and workers all have it.
+  'AbortController', 'AbortSignal', 'atob', 'Blob', 'BroadcastChannel', 'btoa',
+  'ByteLengthQueuingStrategy', 'clearInterval', 'clearTimeout', 'CompressionStream',
+  'CountQueuingStrategy', 'CustomEvent', 'DecompressionStream', 'DOMException', 'Event', 'EventTarget',
+  'fetch', 'File', 'FormData', 'Headers', 'MessageChannel', 'MessageEvent', 'MessagePort',
+  'queueMicrotask', 'ReadableStream', 'Request', 'Response', 'setInterval', 'setTimeout',
+  'structuredClone', 'TextDecoder', 'TextDecoderStream', 'TextEncoder', 'TextEncoderStream',
+  'TransformStream', 'URL', 'URLSearchParams', 'WebAssembly', 'WebSocket', 'WritableStream',
+  // The browser's.
+  'alert', 'cancelAnimationFrame', 'ClipboardItem', 'confirm', 'DOMParser', 'FileReader', 'getComputedStyle',
+  'Image', 'IntersectionObserver', 'matchMedia', 'MutationObserver', 'prompt', 'requestAnimationFrame',
+  'requestIdleCallback', 'ResizeObserver', 'Worker', 'XMLHttpRequest', 'XMLSerializer',
 ]);
 
 /**

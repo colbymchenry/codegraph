@@ -79,6 +79,9 @@ export function routeRoots(cg: CodeGraph, routes: readonly Node[]): Map<string, 
   const targets = cg.getNodesByIds(edges.map((e) => e.target));
   const byRoute = new Map<string, typeof edges>();
   for (const e of edges) {
+    // The proxy a Next route passes through runs before the route's code; its
+    // `calls` edge says nothing about where that code starts (`nextProxyEdges`).
+    if ((e.metadata as Record<string, unknown> | undefined)?.synthesizedBy === 'next-proxy') continue;
     const list = byRoute.get(e.source) ?? [];
     list.push(e);
     byRoute.set(e.source, list);

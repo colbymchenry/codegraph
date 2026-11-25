@@ -24,6 +24,10 @@
  *     inline table): those are reported as a conflict instead (#2562).
  */
 
+import * as fs from 'fs';
+import { atomicWriteFileSync, removeFileUnlessLinked } from './shared';
+import type { WriteResult } from './types';
+
 /**
  * Serialize a record into the body lines of a TOML table. Values
  * supported: string, string[]. Other types throw — the codex MCP
@@ -170,6 +174,82 @@ export function removeTomlTable(
 export function tomlDefinesTable(fileContent: string, header: string): boolean {
   const layout = layoutOf(fileContent, header.split('.'));
   return layout.tables.length > 0 || layout.subTables.length > 0 || layout.defined !== null;
+}
+
+/** What a write or removal did to the file, and what the user should know about it. */
+interface TomlFileResult {
+  file: WriteResult['files'][number];
+  note?: string;
+}
+
+/**
+ * Write the `[header]` table `block` into `file`, creating the file if needed.
+ * With `keepExisting`, a `[header]` table already there is left as it is: it's
+ * the user's, however it differs from `block`.
+ *
+ * Never appends a second definition: a table defined twice makes the whole
+ * file invalid TOML, and the agent then loads none of it (#2562). A definition
+ * in another form is left as written, with a note. A parent that rules the
+ * table out throws, with nothing changed.
+ */
+export function writeTomlTable(
+  file: string,
+  header: string,
+  block: string,
+  options: { keepExisting?: boolean } = {},
+): TomlFileResult {
+  // Single read — `existing === ''` derives both "is the file empty or absent"
+  // and "what was its content," avoiding a TOCTOU window between two
+  // `fs.existsSync` calls.
+  const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
+  const created = existing.length === 0;
+  const result = upsertTomlTable(existing, header, block);
+
+  if (result.action === 'conflict') {
+    const { conflict } = result;
+    if (conflict.kind === 'defined') {
+      // The user's own entry, in a form CodeGraph doesn't rewrite: it already
+      // configures the agent, so it is left exactly as written.
+      return {
+        file: { path: file, action: 'unchanged' },
+        note: `Left the ${header} entry in ${file} as you wrote it (${conflict.form}, line ${conflict.line}): CodeGraph only rewrites a [${header}] table.`,
+      };
+    }
+    throw new Error(
+      `${file} sets ${conflict.key} as ${conflict.form} (line ${conflict.line}), so a [${header}] table can't be added without breaking the file. ` +
+      `Nothing was changed: add CodeGraph's server to ${conflict.key} yourself, or rewrite it as [${conflict.key}.<name>] tables, then run this again.`,
+    );
+  }
+  if (result.action === 'unchanged' || (result.action === 'replaced' && options.keepExisting)) {
+    return { file: { path: file, action: 'unchanged' } };
+  }
+  atomicWriteFileSync(file, result.content);
+  return { file: { path: file, action: created ? 'created' : 'updated' } };
+}
+
+/**
+ * Take every definition of the table out of `file`. A file left with nothing
+ * in it is deleted, or emptied through a symbolic link (#2721). A definition
+ * that can't be edited stays, with a note saying so.
+ */
+export function deleteTomlTable(file: string, header: string): TomlFileResult {
+  if (!fs.existsSync(file)) return { file: { path: file, action: 'not-found' } };
+  const content = fs.readFileSync(file, 'utf-8');
+  const result = removeTomlTable(content, header);
+  if (result.action === 'conflict') {
+    const { conflict } = result;
+    return {
+      file: { path: file, action: 'not-found' },
+      note: `${file} sets ${header} inside ${conflict.key} (${conflict.form}, line ${conflict.line}), which CodeGraph can't edit safely. Remove it from there yourself.`,
+    };
+  }
+  if (result.action === 'not-found') return { file: { path: file, action: 'not-found' } };
+  if (result.content.trim() === '') {
+    removeFileUnlessLinked(file, '');
+  } else {
+    atomicWriteFileSync(file, result.content.trimEnd() + tomlLineBreak(content));
+  }
+  return { file: { path: file, action: 'removed' } };
 }
 
 /** The line break `content` uses (its first one); `\n` when it has none. */

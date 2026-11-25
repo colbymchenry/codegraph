@@ -16,6 +16,9 @@ export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
 export { DatabaseOpenError } from './open-error';
 export { NodeSqliteUnavailableError } from './node-sqlite';
 
+/** SQLite's memory-mapped window on the database file: 256 MB. */
+const MMAP_SIZE_BYTES = 268435456;
+
 /**
  * Apply connection-level PRAGMAs. Shared by `initialize` and `open` so the two
  * paths can't drift.
@@ -37,7 +40,7 @@ function configureConnection(db: SqliteDatabase, readOnly = false): void {
   db.pragma('synchronous = NORMAL');     // safe with WAL mode
   db.pragma('cache_size = -64000');      // 64 MB page cache
   db.pragma('temp_store = MEMORY');      // temp tables in memory
-  db.pragma('mmap_size = 268435456');    // 256 MB memory-mapped I/O
+  db.pragma(`mmap_size = ${MMAP_SIZE_BYTES}`); // memory-mapped I/O
   // Without a journal_size_limit the -wal file never shrinks below its
   // high-water mark while a connection lives: checkpoints fold frames back but
   // leave the file at full size, so one giant deferred-sync WAL stays giant
@@ -954,6 +957,19 @@ export class DatabaseConnection {
         try { this.db.exec(p); } catch { /* ignore */ }
       }
     }
+  }
+
+  /**
+   * Give back what this connection holds only to read faster: its page cache,
+   * and the file mapping, whose touched pages count toward the process until
+   * they are unmapped. The next reads fill both again. It stays the same
+   * connection, so its prepared statements stay, and so do the answers
+   * remembered against its change stamp.
+   */
+  releaseMemory(): void {
+    this.db.exec('PRAGMA shrink_memory');
+    this.db.pragma('mmap_size = 0');
+    this.db.pragma(`mmap_size = ${MMAP_SIZE_BYTES}`);
   }
 
   /**

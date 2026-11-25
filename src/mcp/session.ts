@@ -15,23 +15,51 @@
 import * as path from 'path';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
-import { tools } from './tools';
-import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server-instructions';
+import { NOT_STARTED, tools, type ToolDefinition } from './tools';
+import { PROMPT_EXPLORE_BUSY, PROMPT_EXPLORE_METHOD } from './prompt-explore';
+import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX, openCodeInstructions } from './server-instructions';
+import { isOpenCodeClient, withOpenCodeToolNames } from './opencode-tool-names';
 import { CodeGraphPackageVersion } from './version';
 import { resolveServerRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { ExploreSessionState } from './explore-session-state';
+import { IndexVersionWarningState } from './index-version-warning';
+
+/**
+ * The site's favicon on a light tile: the bare mark is dark ink on nothing,
+ * which a dark UI loses. Written out rather than as base64 so a reader can see
+ * it is two lines of shapes and nothing else.
+ */
+const SERVER_ICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke="#16150f" stroke-width="2">' +
+  '<rect width="32" height="32" rx="6" fill="#f7f6f2" stroke="none"/>' +
+  '<line x1="16" y1="8" x2="8" y2="23"/><line x1="16" y1="8" x2="24" y2="23"/><line x1="8" y1="23" x2="24" y2="23"/>' +
+  '<circle cx="16" cy="8" r="3.4" fill="#16150f"/><circle cx="8" cy="23" r="3.4" fill="#f7f6f2"/><circle cx="24" cy="23" r="3.4" fill="#f7f6f2"/>' +
+  '</svg>';
 
 /**
  * MCP Server Info — kept on the session because some clients log it. The
  * version tracks the real package version (was a hard-coded '0.1.0').
+ *
+ * `title` and `icons` are what a host may show in place of `name`. They are
+ * newer than the protocol version this server claims, so a host that doesn't
+ * know them passes over them. The icon has no `sizes`: it is optional and says
+ * nothing about an SVG, and a host on an SDK that typed it as a string, as 1.18
+ * did, would fail the whole handshake on the array the spec settled on.
  */
 // Exported so the proxy can answer `initialize` locally with the IDENTICAL
 // payload the daemon would send — no drift between the two handshake paths.
 export const SERVER_INFO = {
   name: 'codegraph',
+  title: 'CodeGraph',
   version: CodeGraphPackageVersion,
+  icons: [
+    {
+      src: `data:image/svg+xml;base64,${Buffer.from(SERVER_ICON_SVG).toString('base64')}`,
+      mimeType: 'image/svg+xml',
+    },
+  ],
 };
 
 /**
@@ -55,14 +83,70 @@ export function initializeInstructions(base: string, notice: string | null = get
   );
 }
 
+/** Every tool this server defines, by name: the names a client's rewrite may touch. */
+const TOOL_NAMES: readonly string[] = tools.map((t) => t.name);
+
+/**
+ * The instructions `initialize` answers a client with: {@link initializeInstructions}
+ * of `base`, which an OpenCode client gets with our tool names the way OpenCode
+ * lists them (#1267). Exported so the proxy's local handshake gives the same
+ * client the IDENTICAL text; every other client gets today's bytes.
+ */
+export function instructionsForClient(base: string, clientName: string | undefined): string {
+  return initializeInstructions(isOpenCodeClient(clientName) ? openCodeInstructions(base, TOOL_NAMES) : base);
+}
+
+/**
+ * The `tools/list` answer for a client: `defs` as they are, except that an
+ * OpenCode client gets every description naming our tools the way OpenCode
+ * lists them (#1267). Each tool keeps its `name`, since OpenCode adds the
+ * prefix itself. Copies, never edits: the daemon serves every client from one
+ * tool handler, and `defs` may be the module's own definitions. Exported for
+ * the proxy, like {@link instructionsForClient}.
+ */
+export function toolsForClient(defs: ToolDefinition[], clientName: string | undefined): ToolDefinition[] {
+  if (!isOpenCodeClient(clientName)) return defs;
+  const rename = (text: string): string => withOpenCodeToolNames(text, TOOL_NAMES);
+  return defs.map((tool) => ({
+    ...tool,
+    description: rename(tool.description),
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: Object.fromEntries(
+        Object.entries(tool.inputSchema.properties).map(([key, prop]) => [key, { ...prop, description: rename(prop.description) }]),
+      ),
+    },
+  }));
+}
+
 /** MCP Protocol Version (latest the server claims). */
 export const PROTOCOL_VERSION = '2024-11-05';
+
+/** The invalid-params message for {@link toolCallArguments}' null. */
+export const TOOL_ARGUMENTS_NOT_OBJECT = 'Tool arguments must be an object';
+
+/**
+ * The arguments a `tools/call` passes, or null when they are not an object.
+ * A string, number or array there is a malformed request, the client's to
+ * fix, so it is answered with a JSON-RPC invalid-params error, as a call that
+ * names no tool is, and never run: run, a string made the tool handler throw,
+ * which came back as an internal codegraph error to retry (#2981). Exported so
+ * the proxy, serving in process while the daemon is unavailable, answers it
+ * the same way. No arguments (missing, null or another empty value) are none.
+ */
+export function toolCallArguments(params: { arguments?: unknown }): Record<string, unknown> | null {
+  const args = params.arguments || {};
+  return typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : null;
+}
 
 /**
  * How long to wait for the client's `roots/list` response before giving up
  * and falling back to the process cwd.
  */
 const ROOTS_LIST_TIMEOUT_MS = 5000;
+
+// The prompt hook's request (#3284); defined apart so the hook loads no server code.
+export { PROMPT_EXPLORE_METHOD, PROMPT_EXPLORE_BUSY } from './prompt-explore';
 
 /**
  * Convert a file:// URI to a filesystem path. Handles URL encoding and
@@ -120,6 +204,8 @@ export class MCPSession {
    * the session — a reconnecting client starts clean.
    */
   private readonly exploreSession = new ExploreSessionState();
+  /** One-time stale-index warnings already delivered to this MCP client. */
+  private readonly indexVersionWarnings = new IndexVersionWarningState();
 
   constructor(
     private transport: JsonRpcTransport,
@@ -173,6 +259,9 @@ export class MCPSession {
         break;
       case 'tools/call':
         if (isRequest) await this.handleToolsCall(message as JsonRpcRequest);
+        break;
+      case PROMPT_EXPLORE_METHOD:
+        if (isRequest) await this.handlePromptExplore(message as JsonRpcRequest);
         break;
       case 'ping':
         if (isRequest) this.transport.sendResult((message as JsonRpcRequest).id, {});
@@ -246,6 +335,8 @@ export class MCPSession {
     // sub-projects indexed) and never surfaced the tools after a mid-session
     // `codegraph init`. When no explicit path is known yet (roots/list dance
     // pending), cwd is the best predictor of where the default will resolve.
+    // A root in a sensitive folder resolves to null here as in the engine, so
+    // that session gets the no-default-project variant too.
     const indexed = resolveServerRoot(explicitPath ?? process.cwd()).root !== null;
 
     // Respond to the handshake BEFORE doing any heavy init — see issue #172.
@@ -253,7 +344,7 @@ export class MCPSession {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
-      instructions: initializeInstructions(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX),
+      instructions: instructionsForClient(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX, this.clientInfo?.name),
     });
 
     if (explicitPath) {
@@ -276,9 +367,10 @@ export class MCPSession {
     // safe: a call against an un-indexed path returns SUCCESS-shaped guidance
     // ("pass projectPath / run codegraph init"), never `isError`, so it can't
     // teach the agent to abandon codegraph. `getTools()` returns the default
-    // surface even before a project is open.
+    // surface even before a project is open. The handler is shared by every
+    // client of a daemon; `toolsForClient` copies what it changes (#1267).
     this.transport.sendResult(request.id, {
-      tools: this.engine.getToolHandler().getTools(),
+      tools: toolsForClient(this.engine.getToolHandler().getTools(), this.clientInfo?.name),
     });
   }
 
@@ -294,7 +386,11 @@ export class MCPSession {
     }
 
     const toolName = params.name;
-    const toolArgs = params.arguments || {};
+    const toolArgs = toolCallArguments(params);
+    if (!toolArgs) {
+      this.transport.sendError(request.id, ErrorCodes.InvalidParams, TOOL_ARGUMENTS_NOT_OBJECT);
+      return;
+    }
 
     const tool = tools.find((t) => t.name === toolName);
     if (!tool) {
@@ -307,15 +403,38 @@ export class MCPSession {
     }
 
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} pre-init\n`);
+    // Before any init or dispatch, so a direct session's liveness watchdog
+    // covers this call from its start (#3250). Optional: an engine stand-in
+    // that predates the hook still serves calls.
+    this.engine.noteToolCall?.();
     await this.retryInitIfNeeded();
 
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} dispatch\n`);
-    const result = await this.engine.getToolHandler().execute(toolName, toolArgs, this.exploreSession);
+    const result = await this.engine.getToolHandler().execute(
+      toolName,
+      toolArgs,
+      this.exploreSession,
+      this.indexVersionWarnings,
+    );
     if (process.env.CODEGRAPH_MCP_DEBUG) process.stderr.write(`[mcp-debug] toolsCall ${toolName} id=${String(request.id)} done\n`);
     this.transport.sendResult(request.id, result);
     // After the reply is on the wire — telemetry must never delay a tool
     // response (in-memory increment only; see src/telemetry).
     getTelemetry().recordUsage('mcp_tool', toolName, !result.isError, this.clientInfo);
+  }
+
+  private async handlePromptExplore(request: JsonRpcRequest): Promise<void> {
+    const query = (request.params as { query?: unknown } | undefined)?.query;
+    if (typeof query !== 'string') {
+      this.transport.sendError(request.id, ErrorCodes.InvalidParams, 'Missing query');
+      return;
+    }
+    await this.retryInitIfNeeded();
+    // Start now or say busy: the hook has its own explore to fall back on, so
+    // it should never wait behind the catch-up, a queue of agent calls or a
+    // daemon on its way out, nor inject what such a wait answers with.
+    const result = await this.engine.getToolHandler().execute('codegraph_explore', { query }, undefined, undefined, { startNow: true });
+    this.transport.sendResult(request.id, result === NOT_STARTED ? PROMPT_EXPLORE_BUSY : result);
   }
 
   /**

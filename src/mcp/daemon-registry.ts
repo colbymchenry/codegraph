@@ -21,7 +21,6 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import * as crypto from 'crypto';
 import { canonicalProjectRoot } from '../directory';
 import {
   getDaemonPidPath,
@@ -69,7 +68,9 @@ export function getRegistryDir(): string {
  * `list` over-lists while `stop --all` misses one.
  */
 function recordPath(root: string): string {
-  const hash = crypto.createHash('sha256').update(canonicalProjectRoot(root)).digest('hex').slice(0, 16);
+  // Loaded here, not at the top: every CLI command loads this file (see daemon-paths.ts).
+  const { createHash } = require('crypto') as typeof import('crypto');
+  const hash = createHash('sha256').update(canonicalProjectRoot(root)).digest('hex').slice(0, 16);
   return path.join(getRegistryDir(), `${hash}.json`);
 }
 
@@ -98,10 +99,21 @@ export function registerDaemon(rec: DaemonRecord): void {
   }
 }
 
-/** Best-effort: drop this daemon's record on graceful shutdown. */
-export function deregisterDaemon(root: string): void {
+/**
+ * Best-effort: drop this daemon's record on graceful shutdown. With `pid`, a
+ * record that names another daemon is left alone: one record per project, and
+ * a daemon that finds another has taken its project over must not hide the
+ * live one from `list` and `stop --all` on its way out (#3245).
+ */
+export function deregisterDaemon(root: string, pid?: number): void {
+  const file = recordPath(root);
   try {
-    fs.unlinkSync(recordPath(root));
+    if (pid !== undefined) {
+      let named: unknown;
+      try { named = (JSON.parse(fs.readFileSync(file, 'utf8')) as { pid?: unknown } | null)?.pid; } catch { named = undefined; }
+      if (typeof named === 'number' && named !== pid) return;
+    }
+    fs.unlinkSync(file);
   } catch {
     /* already gone */
   }

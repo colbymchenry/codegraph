@@ -736,6 +736,357 @@ def main():
     });
   });
 
+  // A runner's folder is first on `sys.path` for the tests it loads from a
+  // folder below it (redis's modules/vector-sets/test.py and tests/). No root
+  // says so, so the names the importer takes are what prove the module.
+  describe('a module in a folder above a script', () => {
+    const runner = `class TestCase:
+    def run(self):
+        return 1
+
+
+def generate_vector(n):
+    return [0] * n
+`;
+
+    it('binds the names it imports from a module in a parent folder', async () => {
+      write({
+        'modules/vs/test.py': runner,
+        'modules/vs/tests/with_a.py': `from test import TestCase, generate_vector
+
+
+class WithA(TestCase):
+    pass
+
+
+def go():
+    return generate_vector(3)
+
+
+def inherited():
+    WithA.run(None)
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('go', 'modules/vs/tests/with_a.py', 'calls')).toEqual(['generate_vector@modules/vs/test.py']);
+      expect(targets('with_a.py', 'modules/vs/tests/with_a.py', 'imports').sort()).toEqual([
+        'TestCase@modules/vs/test.py', 'generate_vector@modules/vs/test.py', 'test.py@modules/vs/test.py',
+      ]);
+      // The check for a base from outside the project agrees: this one isn't.
+      expect(targets('inherited', 'modules/vs/tests/with_a.py', 'calls')).toEqual(['run@modules/vs/test.py']);
+    });
+
+    it('walks up more than one folder, and takes the nearest module that has the names', async () => {
+      write({
+        'tools/helper.py': 'def assist(n):\n    return n\n',
+        'tools/sub/helper.py': 'def other(n):\n    return n\n',
+        'tools/sub/deep/er/run.py': `from helper import assist
+
+
+def go():
+    return assist(1)
+`,
+        'lib/a/common.py': 'def shared():\n    return 1\n',
+        'lib/common.py': 'def shared():\n    return 2\n',
+        'lib/a/b/use.py': `from common import shared
+
+
+def go2():
+    return shared()
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('go', 'tools/sub/deep/er/run.py', 'calls')).toEqual(['assist@tools/helper.py']);
+      expect(targets('go2', 'lib/a/b/use.py', 'calls')).toEqual(['shared@lib/a/common.py']);
+    });
+
+    it('binds nothing when the module lacks a name the importer takes from it', async () => {
+      write({
+        // Named like the stdlib's: only the name it lacks keeps the import off it.
+        'tools/time.py': 'def clock():\n    return 0\n',
+        'tools/sub/wait.py': `from time import sleep
+
+
+def nap():
+    sleep(1)
+`,
+        'tools/helper.py': 'def assist(n):\n    return n\n',
+        'tools/sub/partly.py': `from helper import assist, missing
+
+
+def go():
+    return assist(missing)
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('nap', 'tools/sub/wait.py', 'calls')).toEqual([]);
+      expect(targets('wait.py', 'tools/sub/wait.py', 'imports')).toEqual([]);
+      expect(targets('partly.py', 'tools/sub/partly.py', 'imports')).toEqual([]);
+    });
+
+    it('binds nothing for a plain import, which takes no names to prove the module', async () => {
+      write({
+        'tools/utils.py': 'def assist(n):\n    return n\n',
+        'tools/sub/plain.py': `import utils
+
+
+def go():
+    return utils.assist(1)
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('go', 'tools/sub/plain.py', 'calls')).toEqual([]);
+      expect(targets('plain.py', 'tools/sub/plain.py', 'imports')).toEqual([]);
+    });
+
+    it('binds nothing through a star import, whose names it cannot read', async () => {
+      write({
+        'tools/helper.py': 'def assist(n):\n    return n\n',
+        'tools/sub/star.py': `from helper import *
+
+
+def go():
+    return assist(1)
+`,
+        'other/assist.py': 'def other(n):\n    return n\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('star.py', 'tools/sub/star.py', 'imports')).toEqual([]);
+    });
+
+    it('looks in no sibling folder and no package above the script', async () => {
+      write({
+        'tools/other/helper.py': 'def assist(n):\n    return n\n',
+        'tools/sub/run.py': `from helper import assist
+
+
+def go():
+    return assist(1)
+`,
+        'pkg/__init__.py': '',
+        'pkg/shared.py': 'def share(n):\n    return n\n',
+        'pkg/scripts/run.py': `from shared import share
+
+
+def go2():
+    return share(1)
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('run.py', 'tools/sub/run.py', 'imports')).toEqual([]);
+      expect(targets('run.py', 'pkg/scripts/run.py', 'imports')).toEqual([]);
+    });
+
+    it('leaves a module a root provides to the root', async () => {
+      write({
+        'helper.py': 'def assist(n):\n    return "root"\n',
+        'tools/helper.py': 'def assist(n):\n    return "above"\n',
+        'tools/sub/run.py': `from helper import assist
+
+
+def go():
+    return assist(1)
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('go', 'tools/sub/run.py', 'calls')).toEqual(['assist@helper.py']);
+    });
+  });
+
+  // A script's folder is first on `sys.path` whether or not it holds an
+  // `__init__.py`: rocksdb's tools/block_cache_analyzer/block_cache_pysim_test.py
+  // and the block_cache_pysim.py beside it. A file of a real package reaches
+  // a bare name through the roots instead, so the names it takes must prove it.
+  describe('a module beside a script in a package folder', () => {
+    const pysim = `class HashTable:
+    def size(self):
+        return 0
+
+
+def run(n):
+    return n
+
+
+kLimit = 3
+`;
+
+    it('binds the names a script imports from the module beside it', async () => {
+      write({
+        'tools/an/__init__.py': '',
+        'tools/an/pysim.py': pysim,
+        'tools/an/pysim_test.py': `from pysim import HashTable, kLimit, run
+
+
+def test_all():
+    table = HashTable()
+    return run(kLimit)
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('test_all', 'tools/an/pysim_test.py', 'calls')).toEqual(['run@tools/an/pysim.py']);
+      expect(targets('pysim_test.py', 'tools/an/pysim_test.py', 'imports').sort()).toEqual([
+        'HashTable@tools/an/pysim.py', 'kLimit@tools/an/pysim.py', 'pysim.py@tools/an/pysim.py', 'run@tools/an/pysim.py',
+      ]);
+    });
+
+    it('leaves a bare name to the top-level module a root provides', async () => {
+      write({
+        'utils.py': 'def load(n):\n    return "top"\n',
+        'pkg/__init__.py': '',
+        'pkg/utils.py': 'def load(n):\n    return "beside"\n',
+        'pkg/mod.py': `from utils import load
+
+
+def go():
+    return load(1)
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('go', 'pkg/mod.py', 'calls')).toEqual(['load@utils.py']);
+    });
+
+    it('binds nothing when the module beside it lacks a name the file imports', async () => {
+      write({
+        'pkg/__init__.py': '',
+        'pkg/yaml.py': 'def dump(x):\n    return x\n',
+        'pkg/mod.py': `from yaml import dump, safe_load
+
+
+def go():
+    return safe_load(dump(1))
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('go', 'pkg/mod.py', 'calls')).toEqual([]);
+      expect(targets('mod.py', 'pkg/mod.py', 'imports')).toEqual([]);
+    });
+
+    it('never takes a file for the package it is named after', async () => {
+      write({
+        'pkg/__init__.py': '',
+        // A wrapper of the same name: its import is the real package's.
+        'pkg/client.py': `from client import Client
+
+
+class Client(Client):
+    pass
+
+
+def make():
+    return Client()
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('client.py', 'pkg/client.py', 'imports')).toEqual([]);
+    });
+
+    it('leaves a name to the package a wrapper beside the file wraps', async () => {
+      write({
+        'pkg/__init__.py': '',
+        'pkg/yaml.py': `import yaml
+
+
+def load(text):
+    return yaml.safe_load(text)
+`,
+        'pkg/mod.py': `from yaml import load
+
+
+def go():
+    return load("a: 1")
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('go', 'pkg/mod.py', 'calls')).toEqual([]);
+      expect(targets('mod.py', 'pkg/mod.py', 'imports')).toEqual([]);
+    });
+
+    // As `from html import escape` reads in django/utils/text.py, beside
+    // django/utils/html.py and its own `escape`.
+    it.each([
+      ['beside the file', 'pkg/__init__.py', 'pkg/html.py', 'pkg/text.py'],
+      ['in a folder above the file', 'tools/other.py', 'tools/html.py', 'tools/sub/text.py'],
+    ])('leaves a stdlib name to the stdlib, with a module of that name %s', async (_label, other, module, importer) => {
+      write({
+        [other]: '',
+        [module]: 'def escape(text):\n    return text\n',
+        [importer]: `from html import escape
+
+
+def go():
+    return escape("a")
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('go', importer, 'calls')).toEqual([]);
+      expect(targets(importer.slice(importer.lastIndexOf('/') + 1), importer, 'imports')).toEqual([]);
+    });
+
+    it('takes a dotted name below its own folder, the module proved the same way', async () => {
+      write({
+        'pkg/__init__.py': '',
+        'pkg/sub/__init__.py': '',
+        'pkg/sub/helper.py': 'def assist(n):\n    return n\n',
+        'pkg/run.py': `from sub.helper import assist
+
+
+def go():
+    return assist(1)
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('go', 'pkg/run.py', 'calls')).toEqual(['assist@pkg/sub/helper.py']);
+    });
+
+    it('binds nothing for a plain import, which takes no names to prove the module', async () => {
+      write({
+        'pkg/__init__.py': '',
+        'pkg/helper.py': 'def assist(n):\n    return n\n',
+        'pkg/mod.py': `import helper
+
+
+def go():
+    return helper.assist(1)
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('go', 'pkg/mod.py', 'calls')).toEqual([]);
+      expect(targets('mod.py', 'pkg/mod.py', 'imports')).toEqual([]);
+    });
+
+    it('looks in no package above the file, only in its own folder', async () => {
+      write({
+        'pkg/__init__.py': '',
+        'pkg/helper.py': 'def assist(n):\n    return n\n',
+        'pkg/sub/__init__.py': '',
+        'pkg/sub/mod.py': `from helper import assist
+
+
+def go():
+    return assist(1)
+`,
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(targets('go', 'pkg/sub/mod.py', 'calls')).toEqual([]);
+    });
+  });
+
   describe('sync', () => {
     /** Every Python calls/imports edge, as a sorted list of readable triples. */
     function pythonEdges(graph: CodeGraph): string[] {
@@ -948,6 +1299,219 @@ def main():
           { 'pkg/__init__.py': 'from .impl2 import thing\n' },
           'calls main@main.py -> function:thing@pkg/impl2.py'
         ));
+    });
+
+    describe('a module in a folder above a script', () => {
+      const importer = `from helper import assist
+
+
+def go():
+    return assist(1)
+`;
+
+      it('links it when the module is added, and unlinks it when removed', async () => {
+        write({ 'tools/sub/run.py': importer, 'tools/other.py': 'def other():\n    return 0\n' });
+        cg = await CodeGraph.init(tempDir, { index: true });
+        expect(pythonEdges(cg).join('\n')).not.toContain('assist');
+
+        write({ 'tools/helper.py': 'def assist(n):\n    return n\n' });
+        await cg.sync();
+        let fresh = await freshEdges();
+        expect(fresh).toContain('calls go@tools/sub/run.py -> function:assist@tools/helper.py');
+        expect(pythonEdges(cg)).toEqual(fresh);
+
+        fs.rmSync(path.join(tempDir, 'tools/helper.py'));
+        await cg.sync();
+        fresh = await freshEdges();
+        expect(fresh.join('\n')).not.toContain('assist');
+        expect(pythonEdges(cg)).toEqual(fresh);
+      });
+
+      it('follows an edit that gives the module the name, or takes it away', async () => {
+        write({ 'tools/sub/run.py': importer, 'tools/helper.py': 'def other():\n    return 0\n' });
+        cg = await CodeGraph.init(tempDir, { index: true });
+        expect(pythonEdges(cg).join('\n')).not.toContain('assist');
+
+        write({ 'tools/helper.py': 'def assist(n):\n    return n\n' });
+        await cg.sync();
+        let fresh = await freshEdges();
+        expect(fresh).toContain('calls go@tools/sub/run.py -> function:assist@tools/helper.py');
+        expect(pythonEdges(cg)).toEqual(fresh);
+
+        write({ 'tools/helper.py': 'def other():\n    return 0\n' });
+        await cg.sync();
+        fresh = await freshEdges();
+        expect(fresh.join('\n')).not.toContain('assist');
+        expect(pythonEdges(cg)).toEqual(fresh);
+      });
+
+      it.each([
+        ['a module in a folder below it', 'from lib.helper import assist', 'tools/lib/helper.py', 'tools/lib/other.py'],
+        // A package directly below `tools` would make it a root.
+        ['a package below it', 'from x.lib import assist', 'tools/x/lib/__init__.py', 'tools/x/lib/other.py'],
+      ])('follows an edit of %s', async (_label, line, moduleFile, otherFile) => {
+        write({
+          'tools/sub/run.py': `${line}\n\n\ndef go():\n    return assist(1)\n`,
+          [otherFile]: '',
+          [moduleFile]: 'def other():\n    return 0\n',
+        });
+        cg = await CodeGraph.init(tempDir, { index: true });
+        expect(pythonEdges(cg).join('\n')).not.toContain('assist');
+
+        write({ [moduleFile]: 'def assist(n):\n    return n\n' });
+        await cg.sync();
+        let fresh = await freshEdges();
+        expect(fresh).toContain(`calls go@tools/sub/run.py -> function:assist@${moduleFile}`);
+        expect(pythonEdges(cg)).toEqual(fresh);
+
+        write({ [moduleFile]: 'def other():\n    return 0\n' });
+        await cg.sync();
+        fresh = await freshEdges();
+        expect(fresh.join('\n')).not.toContain('assist');
+        expect(pythonEdges(cg)).toEqual(fresh);
+      });
+
+      it('re-opens nothing when an edited module has no importer below it that spells it', async () => {
+        write({
+          'tools/helper.py': 'def assist(n):\n    return n\n',
+          'tools/sub/run.py': 'def go():\n    return 1\n',
+          'other/run.py': 'from helper import assist\n\n\ndef go():\n    return assist(1)\n',
+        });
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const spy = spyReopen(cg);
+
+        write({ 'tools/helper.py': 'def assist(n):\n    return n + 1\n' });
+        await cg.sync();
+
+        expect(spy.narrow).not.toHaveBeenCalled();
+      });
+
+      it('re-opens nothing when a root answers the import, not a script\'s folder', async () => {
+        write({
+          'svc/pyproject.toml': '[project]\nname = "svc"\n',
+          'svc/helper.py': 'def assist(n):\n    return n\n',
+          'svc/sub/run.py': 'from helper import assist\n\n\ndef go():\n    return assist(1)\n',
+        });
+        cg = await CodeGraph.init(tempDir, { index: true });
+        expect(pythonEdges(cg)).toContain('calls go@svc/sub/run.py -> function:assist@svc/helper.py');
+        const spy = spyReopen(cg);
+
+        write({ 'svc/helper.py': 'def assist(n):\n    return n + 1\n' });
+        await cg.sync();
+
+        expect(spy.narrow).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('a module beside a script in a package folder', () => {
+      const importer = `from helper import assist
+
+
+def go():
+    return assist(1)
+`;
+
+      it('follows an edit that gives the module the name, or takes it away', async () => {
+        write({
+          'pkg/__init__.py': '',
+          'pkg/run.py': importer,
+          'pkg/helper.py': 'def other():\n    return 0\n',
+        });
+        cg = await CodeGraph.init(tempDir, { index: true });
+        expect(pythonEdges(cg).join('\n')).not.toContain('assist');
+
+        write({ 'pkg/helper.py': 'def assist(n):\n    return n\n' });
+        await cg.sync();
+        let fresh = await freshEdges();
+        expect(fresh).toContain('calls go@pkg/run.py -> function:assist@pkg/helper.py');
+        expect(pythonEdges(cg)).toEqual(fresh);
+
+        write({ 'pkg/helper.py': 'def other():\n    return 0\n' });
+        await cg.sync();
+        fresh = await freshEdges();
+        expect(fresh.join('\n')).not.toContain('assist');
+        expect(pythonEdges(cg)).toEqual(fresh);
+      });
+
+      it('links it when the module is added, and unlinks it when removed', async () => {
+        write({ 'pkg/__init__.py': '', 'pkg/run.py': importer });
+        cg = await CodeGraph.init(tempDir, { index: true });
+        expect(pythonEdges(cg).join('\n')).not.toContain('assist');
+
+        write({ 'pkg/helper.py': 'def assist(n):\n    return n\n' });
+        await cg.sync();
+        let fresh = await freshEdges();
+        expect(fresh).toContain('calls go@pkg/run.py -> function:assist@pkg/helper.py');
+        expect(pythonEdges(cg)).toEqual(fresh);
+
+        fs.rmSync(path.join(tempDir, 'pkg/helper.py'));
+        await cg.sync();
+        fresh = await freshEdges();
+        expect(fresh.join('\n')).not.toContain('assist');
+        expect(pythonEdges(cg)).toEqual(fresh);
+      });
+
+      // The name below the folder, and what the folder's own `__init__.py` holds.
+      it.each([
+        ['a module in a package below it', 'from sub.helper import assist', 'pkg/sub/helper.py', 'pkg/sub/__init__.py'],
+        ['a package below it', 'from sub import assist', 'pkg/sub/__init__.py', 'pkg/sub/mod.py'],
+      ])('follows an edit of %s', async (_label, line, moduleFile, otherFile) => {
+        write({
+          'pkg/__init__.py': '',
+          [otherFile]: '',
+          'pkg/run.py': `${line}\n\n\ndef go():\n    return assist(1)\n`,
+          [moduleFile]: 'def other():\n    return 0\n',
+        });
+        cg = await CodeGraph.init(tempDir, { index: true });
+        expect(pythonEdges(cg).join('\n')).not.toContain('assist');
+
+        write({ [moduleFile]: 'def assist(n):\n    return n\n' });
+        await cg.sync();
+        let fresh = await freshEdges();
+        expect(fresh).toContain(`calls go@pkg/run.py -> function:assist@${moduleFile}`);
+        expect(pythonEdges(cg)).toEqual(fresh);
+
+        write({ [moduleFile]: 'def other():\n    return 0\n' });
+        await cg.sync();
+        fresh = await freshEdges();
+        expect(fresh.join('\n')).not.toContain('assist');
+        expect(pythonEdges(cg)).toEqual(fresh);
+      });
+
+      it('re-opens nothing when an edited module has no such importer', async () => {
+        write({
+          'pkg/__init__.py': '',
+          'pkg/helper.py': 'def assist(n):\n    return n\n',
+          'pkg/run.py': 'from .helper import assist\n\n\ndef go():\n    return assist(1)\n',
+          // Spelled the same, but from a folder that doesn't hold the module.
+          'other/run.py': 'from helper import assist\n\n\ndef go():\n    return assist(1)\n',
+          // Beside it, but neither a Python import nor an import at all.
+          'pkg/widget.ts': "import { assist } from 'helper';\nexport const go = assist;\n",
+          'pkg/named.py': 'def helper():\n    return 0\n',
+        });
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const spy = spyReopen(cg);
+
+        write({ 'pkg/helper.py': 'def assist(n):\n    return n\n\n\ndef more():\n    return 2\n' });
+        await cg.sync();
+
+        expect(spy.narrow).not.toHaveBeenCalled();
+      });
+
+      it('re-opens nothing for a module named after the stdlib module its neighbours import', async () => {
+        write({
+          'pkg/__init__.py': '',
+          'pkg/types.py': 'class Thing:\n    pass\n',
+          'pkg/run.py': 'from types import ModuleType\nfrom .types import Thing\n\n\ndef go():\n    return Thing()\n',
+        });
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const spy = spyReopen(cg);
+
+        write({ 'pkg/types.py': 'class Thing:\n    pass\n\n\nclass More:\n    pass\n' });
+        await cg.sync();
+
+        expect(spy.narrow).not.toHaveBeenCalled();
+      });
     });
 
     it('re-opens nothing on a sync that changes nothing', async () => {

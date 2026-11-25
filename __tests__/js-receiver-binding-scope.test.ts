@@ -139,4 +139,106 @@ describe('a receiver is read by its binding in scope at the call', () => {
     ]);
     expect(methodCalls(graph, 'src/later.jsx')).toEqual(['stop -> Gauge::close']);
   }, 120_000);
+
+  it('sees a nearer binding in a later declarator or beside a destructuring default (#3293)', async () => {
+    const OUTER = 'import type { Root } from "react-dom/client";\nimport { makeOther, Other } from "./Other";\n' +
+      'declare function make(): any;\ndeclare function log(...a: any[]): void;\nlet ob: Root | null = null;\n';
+    const graph = await index({
+      'package.json': JSON.stringify({ name: 'app', dependencies: { 'react-dom': '^19.0.0' } }),
+      'src/Other.ts': 'export class Other { paint() { return 2; } }\nexport function makeOther() { return new Other(); }\n',
+      // The issue's reproduction: every nearer `ob` holds an Other.
+      'src/shadow.ts': OUTER +
+        'export function firstDeclarator() { const ob = makeOther(); ob.paint(); }\n' +
+        'export function laterDeclarator() { let n = 0, ob = makeOther(); ob.paint(); }\n' +
+        'export function declaratorBelow() {\n  const a = 1,\n    ob = makeOther();\n  ob.paint();\n}\n' +
+        'export function destructured(o: any) { const { ob } = { ob: makeOther() }; ob.paint(); }\n' +
+        'export function destructDefault(o: any) { const { ob = makeOther() } = o; ob.paint(); }\n',
+      // More shapes of a declarator after the first, and of a destructuring with defaults.
+      'src/shapes.ts': OUTER +
+        'export function typedLater() { let n = 0, ob: Other = make(); ob.paint(); }\n' +
+        'export function newLater() { const n = 1, ob = new Other(); ob.paint(); }\n' +
+        'export function commaFirst() {\n  var n = 0\n    , ob = makeOther()\n  ob.paint()\n}\n' +
+        'export function afterFunction() { const f = () => { return 1; }, ob = makeOther(); ob.paint(); }\n' +
+        'export function afterTypeArgs() { const m = new Map<string, number>(), ob = makeOther(); ob.paint(); }\n' +
+        'export function defaultFirst(o: any) {\n  const {\n    x = 1,\n    ob,\n  } = o;\n  ob.paint();\n}\n' +
+        'export function nestedDefault(o: any) { const { a: [ob = makeOther()] } = o; ob.paint(); }\n' +
+        'export function forHead(list: Other[]) { for (let i = 0, ob = list[0]; i < 1; i++) ob.paint(); }\n',
+      // Commas that declare nothing: the outer `ob`, react-dom's, still decides.
+      'src/outer.tsx': OUTER +
+        'export function commaExpr() {\n  const n = 1\n  log(n), ob!.paint()\n}\n' +
+        'export function jsxText() { const el = <p>Hi, ob, there</p>; log(el); ob!.paint(); }\n' +
+        'export function objectType() { const o: { a: number, ob: string } = make(); log(o); ob!.paint(); }\n' +
+        'export function typeArgs() { const m = new Map<string, typeof ob>(); log(m); ob!.paint(); }\n' +
+        'export function inString() { const s = "a, ob = 1"; log(s); ob!.paint(); }\n' +
+        'export function defaultUse(o: any) { const { a = ob } = o; log(a); ob!.paint(); }\n' +
+        'export function renamedKey(o: any) { const { ob: other = 1 } = o; log(other); ob!.paint(); }\n' +
+        'export function innerOnly() { function inner() { let a = 0, ob = makeOther(); return ob; } log(inner); ob!.paint(); }\n',
+    });
+    expect(methodCalls(graph, 'src/shadow.ts')).toEqual([
+      'declaratorBelow -> Other::paint',
+      'destructDefault -> Other::paint',
+      'destructured -> Other::paint',
+      'firstDeclarator -> Other::paint',
+      'laterDeclarator -> Other::paint',
+    ]);
+    expect(methodCalls(graph, 'src/shapes.ts')).toEqual([
+      'afterFunction -> Other::paint',
+      'afterTypeArgs -> Other::paint',
+      'commaFirst -> Other::paint',
+      'defaultFirst -> Other::paint',
+      'forHead -> Other::paint',
+      'nestedDefault -> Other::paint',
+      'newLater -> Other::paint',
+      'typedLater -> Other::paint',
+    ]);
+    expect(methodCalls(graph, 'src/outer.tsx')).toEqual([]);
+  }, 120_000);
+
+  it("keeps a later declarator's var in scope through its function for a bare call (#3293, #3352)", async () => {
+    const graph = await index({
+      'globals.d.ts':
+        'declare function describe(name: string, fn: () => void): void;\n' +
+        'declare function it(name: string, fn: () => void): void;\n' +
+        'declare const ready: boolean;\n',
+      'a.test.ts':
+        "describe('first', () => {\n" +
+        '  if (ready) {\n' +
+        '    var n = 0, setup = (): number => n;\n' +
+        '  }\n' +
+        "  it('uses first', () => { setup(); });\n" +
+        '});\n' +
+        "describe('second', () => {\n" +
+        '  const setup = (): number => 2;\n' +
+        "  it('uses second', () => { setup(); });\n" +
+        '});\n',
+    });
+    // Two `setup`s in callbacks, which are no nodes: the call on line 5 is in
+    // the scope of the first, a `var`, which holds through its function, not
+    // only the `if` block it is written in.
+    const calls: string[] = [];
+    for (const node of graph.getNodesInFile('a.test.ts')) {
+      for (const e of graph.getOutgoingEdges(node.id)) {
+        const target = graph.getNode(e.target)!;
+        if (e.kind === 'calls' && e.line === 5 && target.name === 'setup') calls.push(`setup@${target.startLine}`);
+      }
+    }
+    expect(calls).toEqual(['setup@3']);
+  }, 120_000);
+
+  it('reads long and malformed declarations in bounded time (#3293)', async () => {
+    const many = Array.from({ length: 3000 }, (_, i) => `a${i} = ${i}`).join(', ');
+    const deep = '['.repeat(200) + ']'.repeat(200);
+    const graph = await index({
+      'package.json': JSON.stringify({ name: 'app', dependencies: { 'react-dom': '^19.0.0' } }),
+      'src/Other.ts': 'export class Other { paint() { return 2; } }\nexport function makeOther() { return new Other(); }\n',
+      'src/long.ts':
+        'import type { Root } from "react-dom/client";\nimport { makeOther } from "./Other";\nlet ob: Root | null = null;\n' +
+        `export function many() { let ${many}, ob = makeOther(); ob.paint(); }\n` +
+        `export function deep() { const d = ${deep}, ob = makeOther(); ob.paint(); }\n` +
+        // Many declarations of one statement each, and one never closed.
+        Array.from({ length: 2000 }, (_, i) => `const c${i} = [${i}, { k: ${i} }, (x: number) => x + ${i}];\n`).join('') +
+        'export function unclosed() { const u = [1, 2, (3, ob = 4; ob!.paint(); }\n',
+    });
+    expect(methodCalls(graph, 'src/long.ts')).toEqual(['deep -> Other::paint', 'many -> Other::paint']);
+  }, 120_000);
 });

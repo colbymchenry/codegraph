@@ -978,6 +978,87 @@ describe('FileWatcher', () => {
 
       watcher.stop();
     });
+
+    // These run from a timer, with no caller to catch a throw: out of flush() it
+    // is an unhandled rejection, which ends the host's process.
+    describe('one that throws', () => {
+      const unhandled: unknown[] = [];
+      const recordUnhandled = (reason: unknown) => { unhandled.push(reason); };
+      const hostBug = () => { throw new Error('host bug'); };
+      const warned = (spy: { mock: { calls: unknown[][] } }, text: string) =>
+        spy.mock.calls.some((c) => typeof c[0] === 'string' && c[0].includes(text));
+
+      beforeEach(() => {
+        unhandled.length = 0;
+        process.on('unhandledRejection', recordUnhandled);
+      });
+
+      afterEach(() => {
+        process.off('unhandledRejection', recordUnhandled);
+      });
+
+      it('leaves a failed sync to its retry when onSyncError throws', async () => {
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const syncFn = vi.fn()
+          .mockRejectedValueOnce(new Error('disk full'))
+          .mockResolvedValue({ filesChanged: 1, durationMs: 1 });
+        const onSyncComplete = vi.fn();
+        const onSyncError = vi.fn(hostBug);
+        const watcher = newWatcher(syncFn, { debounceMs: 25, onSyncComplete, onSyncError });
+
+        watcher.start();
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/retry.ts');
+
+        await waitFor(() => onSyncComplete.mock.calls.length > 0, 8000, 10);
+        expect(onSyncError).toHaveBeenCalledTimes(1);
+        expect(syncFn).toHaveBeenCalledTimes(2);
+        expect(unhandled).toEqual([]);
+        expect(warned(warnSpy, 'onSyncError')).toBe(true);
+      });
+
+      it('still stops a degrading watcher when onDegraded throws', async () => {
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const syncFn = vi.fn().mockRejectedValue(new LockUnavailableError());
+        const onDegraded = vi.fn(hostBug);
+        const watcher = newWatcher(syncFn, { debounceMs: 25, onDegraded });
+
+        watcher.start();
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/long-lock.ts');
+
+        await waitFor(() => onDegraded.mock.calls.length > 0, 8000, 10);
+        await waitFor(() => !watcher.isActive(), 1000, 10);
+        const syncs = syncFn.mock.calls.length;
+        await new Promise((resolve) => setTimeout(resolve, 150));
+
+        expect(watcher.isDegraded()).toBe(true);
+        expect(syncFn).toHaveBeenCalledTimes(syncs); // stopped means no more retries
+        expect(onDegraded).toHaveBeenCalledTimes(1);
+        expect(unhandled).toEqual([]);
+        expect(warned(warnSpy, 'onDegraded')).toBe(true);
+      });
+
+      it('keeps a sync that worked a sync that worked when onSyncComplete throws', async () => {
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 1 });
+        const onSyncComplete = vi.fn(hostBug);
+        const onSyncError = vi.fn();
+        const watcher = newWatcher(syncFn, { debounceMs: 25, onSyncComplete, onSyncError });
+
+        watcher.start();
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/ok.ts');
+
+        await waitFor(() => onSyncComplete.mock.calls.length > 0, 8000, 10);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        expect(onSyncError).not.toHaveBeenCalled();
+        expect(syncFn).toHaveBeenCalledTimes(1);
+        expect(watcher.isActive()).toBe(true);
+        expect(warned(warnSpy, 'onSyncComplete')).toBe(true);
+      });
+    });
   });
 
   describe('CodeGraph integration', () => {
@@ -1330,6 +1411,121 @@ describe('FileWatcher', () => {
       expect(close).toHaveBeenCalledTimes(3);
     });
 
+    // On Windows, libuv reports a watched folder that is being deleted by the
+    // folder's own absolute path (`\\?\D:\…`), thousands of times a second,
+    // until the stream is closed: a link whose target was deleted held a core
+    // for good (#2487). These drive that event shape through a fake fs.watch.
+    type FakeStream = { listener: (event: string, name: string | null) => void; closed: number };
+    const fakeStreams = () => {
+      const streams = new Map<string, FakeStream>();
+      const opened: string[] = [];
+      __setFsWatchForTests(((dir: fs.PathLike, _opts: unknown, listener: FakeStream['listener']) => {
+        const stream: FakeStream = { listener, closed: 0 };
+        streams.set(String(dir), stream);
+        opened.push(String(dir));
+        const w = new EventEmitter() as fs.FSWatcher;
+        w.close = () => { stream.closed += 1; };
+        return w;
+      }) as unknown as typeof fs.watch);
+      return { streams, opened };
+    };
+    const selfName = (dir: string) => (process.platform === 'win32' ? `\\\\?\\${dir}` : dir);
+
+    it('closes a linked folder\'s stream once its target is deleted, with one check per burst (#2487)', async () => {
+      const dir = external();
+      fs.writeFileSync(path.join(dir, 'lib.ts'), 'export const lib = 1;');
+      const linked = path.join(testDir, 'libs');
+      link(dir, linked);
+      const { streams, opened } = fakeStreams();
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const onDegraded = vi.fn();
+      const watcher = new FileWatcher(testDir, syncFn, { debounceMs: 100, onDegraded });
+      watchers.push(watcher);
+      expect(watcher.start()).toBe(true);
+      const stream = streams.get(linked)!;
+      expect(stream).toBeDefined();
+
+      // While the link still leads to its folder, the stream stays.
+      stream.listener('rename', selfName(linked));
+      await new Promise(resolve => setTimeout(resolve, 500));
+      expect(stream.closed).toBe(0);
+
+      fs.rmSync(dir, { recursive: true, force: true });
+      const fsCalls = ['statSync', 'lstatSync', 'realpathSync', 'existsSync'].map(name =>
+        vi.spyOn(fs, name as 'statSync'));
+      for (let i = 0; i < 10_000; i++) stream.listener('rename', selfName(linked));
+      expect(fsCalls.reduce((n, spy) => n + spy.mock.calls.length, 0)).toBe(0);
+      expect(syncFn).not.toHaveBeenCalled();
+
+      await waitFor(() => stream.closed === 1, 8000);
+      // The tree is re-read: the dangling link is not watched again, and a full
+      // sync drops what the folder held. The project itself stays watched.
+      await waitFor(() => syncFn.mock.calls.some(([paths]) => paths === undefined), 8000);
+      expect(opened.filter(d => d === linked)).toHaveLength(1);
+      expect(streams.get(testDir)?.closed ?? 0).toBe(0);
+      expect(watcher.isActive()).toBe(true);
+      expect(watcher.isDegraded()).toBe(false);
+      expect(onDegraded).not.toHaveBeenCalled();
+      for (let i = 0; i < 100; i++) stream.listener('rename', selfName(linked)); // already closed
+      await new Promise(resolve => setTimeout(resolve, 400));
+      expect(stream.closed).toBe(1);
+    });
+
+    it('degrades once, closing its stream, when the project folder itself is deleted (#2487)', async () => {
+      const root = external();
+      const { streams } = fakeStreams();
+      const onDegraded = vi.fn();
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const watcher = new FileWatcher(root, vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 }), {
+        debounceMs: 100,
+        onDegraded,
+      });
+      watchers.push(watcher);
+      expect(watcher.start()).toBe(true);
+      const stream = streams.get(root)!;
+      expect(stream).toBeDefined();
+
+      fs.rmSync(root, { recursive: true, force: true });
+      for (let i = 0; i < 10_000; i++) stream.listener('rename', selfName(root));
+      await waitFor(() => watcher.isDegraded(), 8000);
+      expect(watcher.getDegradedReason()).toContain('project folder was deleted');
+      expect(onDegraded).toHaveBeenCalledTimes(1);
+      expect(stream.closed).toBe(1);
+      expect(watcher.isActive()).toBe(false);
+      for (let i = 0; i < 100; i++) stream.listener('rename', selfName(root));
+      await new Promise(resolve => setTimeout(resolve, 400));
+      expect(onDegraded).toHaveBeenCalledTimes(1);
+    });
+
+    it.runIf(process.platform === 'win32')('ends the event storm of a real junction whose target is deleted (#2487)', async () => {
+      const dir = external();
+      fs.writeFileSync(path.join(dir, 'lib.ts'), 'export const lib = 1;');
+      const linked = path.join(testDir, 'libs');
+      link(dir, linked);
+      let linkEvents = 0;
+      const realWatch = fs.watch;
+      __setFsWatchForTests(((p: fs.PathLike, opts: fs.WatchOptions, listener: fs.WatchListener<string>) =>
+        realWatch(p, opts, (event, name) => {
+          if (String(p) === linked) linkEvents += 1;
+          listener(event, name);
+        })) as typeof fs.watch);
+      const watcher = new FileWatcher(testDir, vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 }), {
+        debounceMs: 100,
+      });
+      watchers.push(watcher);
+      expect(watcher.start()).toBe(true);
+
+      fs.rmSync(dir, { recursive: true, force: true });
+      // Quiet: no event at all on the link's stream for a whole half second.
+      let last = -1;
+      await waitFor(() => {
+        const quiet = linkEvents === last;
+        last = linkEvents;
+        return quiet;
+      }, 10_000, 500);
+      expect(watcher.isActive()).toBe(true);
+      expect(watcher.isDegraded()).toBe(false);
+    }, 20_000);
   });
 
   describe('scoped sync fast path (#watcher-scoped)', () => {

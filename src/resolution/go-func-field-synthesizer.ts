@@ -250,7 +250,10 @@ function pkgDir(filePath: string): string {
  * several cites.
  */
 function wiringOrder(a: FieldValue, b: FieldValue): number {
-  return Number(a.test) - Number(b.test) || a.site.localeCompare(b.site, 'en', { numeric: true }) || a.target.id.localeCompare(b.target.id);
+  // The last tie-break is by code unit: a bare localeCompare follows the
+  // host's locale (Danish sorts an id's `aa` after `z`).
+  return Number(a.test) - Number(b.test) || a.site.localeCompare(b.site, 'en', { numeric: true }) ||
+    (a.target.id < b.target.id ? -1 : a.target.id > b.target.id ? 1 : 0);
 }
 
 /** Store `value` under `key` in a memo that drops its oldest entry past `max`, so a whole-repo walk stays bounded. */

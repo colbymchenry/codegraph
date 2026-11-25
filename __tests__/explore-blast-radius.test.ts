@@ -6,13 +6,26 @@
  * files cover it, so the agent knows what to update/verify before editing
  * without a separate impact call. Symbols with no dependents are skipped, and
  * the section is omitted entirely when nothing qualifies.
+ *
+ * A query that names ONE symbol now gets that symbol's own answer instead —
+ * its definition and every line that depends on it (#3407), pinned in
+ * explore-one-symbol.test.ts. The blast radius is the general answer's, which a
+ * one-name query still reaches when the name has several definitions, so this
+ * file turns the one-symbol answer off.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { ToolHandler } from '../src/mcp/tools';
+
+const oneSymbolSetting = process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL;
+beforeAll(() => { process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL = '0'; });
+afterAll(() => {
+  if (oneSymbolSetting === undefined) delete process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL;
+  else process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL = oneSymbolSetting;
+});
 
 describe('codegraph_explore — blast radius', () => {
   let testDir: string;
@@ -111,5 +124,129 @@ describe('codegraph_explore — blast radius', () => {
     const text = res.content[0].text;
     // lonelyLeaf has zero callers — it must never appear under a blast-radius bullet.
     expect(text).not.toMatch(/Blast radius[\s\S]*`lonelyLeaf`/);
+  });
+});
+
+describe('codegraph_explore — views in the blast radius', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-blast-views-'));
+    const src = path.join(testDir, 'src');
+    const views = path.join(testDir, 'Views');
+    fs.mkdirSync(src, { recursive: true });
+    fs.mkdirSync(views, { recursive: true });
+    fs.writeFileSync(path.join(src, 'helper.js'), 'export function fmt(x) { return x + 1; }\n');
+    // More code callers than the cap: under one flat cap, no view would show.
+    for (const n of ['a', 'b', 'c', 'd', 'e']) {
+      fs.writeFileSync(path.join(src, `${n}.js`), `import { fmt } from './helper';\nexport function use_${n}() { return fmt(1); }\n`);
+    }
+    for (const n of ['Index', 'Edit']) {
+      fs.writeFileSync(path.join(views, `${n}.cshtml`), `<script>\nimport { fmt } from '../src/helper';\nfmt(2);\n</script>\n`);
+    }
+    cg = CodeGraph.initSync(testDir);
+    await cg.indexAll();
+  });
+
+  afterEach(() => {
+    if (cg) cg.destroy();
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('lists views in their own slot, past the cap on code callers', async () => {
+    const res = await new ToolHandler(cg).execute('codegraph_explore', { query: 'fmt' });
+    const text = res.content[0]!.text;
+    expect(text).toMatch(/\+1 more; 2 views: `Views\/(?:Edit|Index)\.cshtml`, `Views\/(?:Edit|Index)\.cshtml`/);
+  });
+
+  it('reads the same when only views depend on a symbol', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'only.js'), 'export function onlyViews() { return 1; }\n');
+    fs.writeFileSync(path.join(testDir, 'Views', 'Solo.cshtml'), "<script>\nimport { onlyViews } from '../src/only';\nonlyViews();\n</script>\n");
+    await cg.sync();
+    const res = await new ToolHandler(cg).execute('codegraph_explore', { query: 'onlyViews' });
+    expect(res.content[0]!.text).toMatch(/1 caller in 1 view: `Views\/Solo\.cshtml`/);
+  });
+});
+
+describe('codegraph_explore — Rust unit tests in the blast radius (#3265)', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-blast-rust-'));
+    const src = path.join(testDir, 'src');
+    fs.mkdirSync(path.join(src, 'store'), { recursive: true });
+    fs.writeFileSync(path.join(testDir, 'Cargo.toml'), '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n');
+    fs.writeFileSync(path.join(src, 'lib.rs'), 'pub mod store;\npub mod api;\n');
+    fs.writeFileSync(
+      path.join(src, 'store.rs'),
+      'pub fn create_note() -> u32 { 1 }\n' +
+      'pub fn inline_target() -> u32 { 2 }\n' +
+      'pub fn prod_only_target() -> u32 { 3 }\n' +
+      'pub fn not_test_target() -> u32 { 4 }\n' +
+      '\n' +
+      '#[cfg(test)]\n' +
+      'mod tests;\n' +
+      '\n' +
+      '#[cfg(test)]\n' +
+      'mod inline_tests {\n' +
+      '    use super::*;\n' +
+      '    #[test]\n' +
+      '    fn checks_inline() { let n = inline_target(); assert_eq!(n, 2); }\n' +
+      '}\n' +
+      '\n' +
+      '#[cfg(not(test))]\n' +
+      'mod real {\n' +
+      '    use super::*;\n' +
+      '    pub fn uses_not_test() -> u32 { not_test_target() }\n' +
+      '}\n',
+    );
+    // The out-of-line layout: `src/store/tests.rs`, declared by `#[cfg(test)] mod tests;`.
+    fs.writeFileSync(
+      path.join(src, 'store', 'tests.rs'),
+      'use super::*;\n' +
+      '#[test]\n' +
+      'fn checks_create_note() { let n = create_note(); assert_eq!(n, 1); }\n',
+    );
+    fs.writeFileSync(
+      path.join(src, 'api.rs'),
+      'use crate::store::{create_note, prod_only_target};\n' +
+      'pub fn handler() -> u32 { create_note() + prod_only_target() }\n',
+    );
+    cg = CodeGraph.initSync(testDir);
+    await cg.indexAll();
+  });
+
+  afterEach(() => {
+    if (cg) cg.destroy();
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  const lineFor = async (name: string): Promise<string> => {
+    const res = await new ToolHandler(cg).execute('codegraph_explore', { query: name });
+    const text = res.content[0]!.text as string;
+    return text.split('\n').find((l) => l.startsWith(`- \`${name}\``)) ?? '';
+  };
+
+  it('counts a tests.rs file a #[cfg(test)] mod declares as a test', async () => {
+    const line = await lineFor('create_note');
+    expect(line).toMatch(/in `src\/api\.rs`/);
+    expect(line).toMatch(/tests: `src\/store\/tests\.rs`/);
+  });
+
+  it('counts a caller inside an inline #[cfg(test)] module as a test', async () => {
+    const line = await lineFor('inline_target');
+    expect(line).toMatch(/tests: `src\/store\.rs`/);
+    expect(line).not.toMatch(/no tests found/);
+  });
+
+  it('keeps production callers and #[cfg(not(test))] modules out of the tests', async () => {
+    const prod = await lineFor('prod_only_target');
+    expect(prod).toMatch(/in `src\/api\.rs`/);
+    expect(prod).not.toMatch(/tests:/);
+    const notTest = await lineFor('not_test_target');
+    expect(notTest).toMatch(/in `src\/store\.rs`/);
+    expect(notTest).not.toMatch(/tests:/);
   });
 });

@@ -95,6 +95,13 @@ describe('which languages classify', () => {
     expect(regions?.[0]?.language).toBe('typescript');
   });
 
+  it('skips a self-closing <script /> instead of reading on to the next script (#2989)', () => {
+    const source = '<script is:inline set:html={x} />\n<p>hi</p>\n<script>\nconst ready = true;\n</script>\n';
+    const regions = syntaxRegionsFor(source, 'astro');
+    expect(regions).toHaveLength(1);
+    expect(source.slice(regions![0]!.start, regions![0]!.end)).toBe('\nconst ready = true;\n');
+  });
+
   it('has no grammar for the formats that only have file-level extraction', () => {
     for (const language of ['yaml', 'xml', 'properties', 'twig', 'unknown']) {
       expect(grammarFor(language)).toBeNull();

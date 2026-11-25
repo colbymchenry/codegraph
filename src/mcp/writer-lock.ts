@@ -258,8 +258,11 @@ export class RebuildInProgressError extends Error {
 }
 
 export function assertNoRebuild(root: string): void {
+  if (isRebuildInProgress(root)) throw new RebuildInProgressError();
+}
+
+/** Whether another live process holds the project's rebuild lock (`codegraph index`). */
+export function isRebuildInProgress(root: string): boolean {
   const lock = readWriterLock(root, 'rebuild.pid');
-  if (lock && lock.pid !== process.pid && isProcessAlive(lock.pid)) {
-    throw new RebuildInProgressError();
-  }
+  return !!lock && lock.pid !== process.pid && isProcessAlive(lock.pid);
 }

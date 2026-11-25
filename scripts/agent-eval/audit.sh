@@ -49,6 +49,8 @@ fi
 
 # 3. Wipe + re-index with THIS version (the index must be built by the same
 #    binary that serves it — different versions extract differently).
+#    Keep -i: <version> may predate 0.9.8, where `init` built the index only
+#    with it. Newer versions index by default and still accept the flag.
 echo "→ [3/4] wiping .codegraph and re-indexing with $ACTUAL"
 rm -rf "$REPO/.codegraph"
 ( cd "$REPO" && codegraph init -i ) || { echo "indexing failed"; exit 1; }

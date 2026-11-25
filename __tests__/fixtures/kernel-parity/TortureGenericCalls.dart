@@ -1,6 +1,6 @@
-// Generic calls tree-sitter-dart parses as two comparisons — `ref.read<Repo>(p)`
-// comes out as `(ref.read < Repo) > (p)` — recovered as calls, and the
-// comparisons that look like them.
+// Generic calls tree-sitter-dart d4d8f3e parsed as two comparisons —
+// `ref.read<Repo>(p)` came out as `(ref.read < Repo) > (p)` — recovered as
+// calls, and the comparisons that look like them. 0038280 parses them as calls.
 import 'package:app/app.dart' as p;
 
 // Initializers: a constant's, a top-level variable's, a field's.

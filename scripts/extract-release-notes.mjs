@@ -13,6 +13,10 @@
  * Repo-level CHANGELOG.md viewing is unaffected (CommonMark treats
  * newlines as spaces there).
  *
+ * GitHub refuses a release body over 125,000 characters, so notes that
+ * would be longer are cut before the first entry that doesn't fit, and
+ * end with a link to the full list in CHANGELOG.md.
+ *
  * Usage:
  *   extract-release-notes.mjs <version>     # read CHANGELOG.md
  *   extract-release-notes.mjs --stdin       # read from stdin (any text)
@@ -27,10 +31,11 @@ if (!arg) {
 }
 
 let block;
+let version = null;
 if (arg === '--stdin') {
   block = readFileSync(0, 'utf8').replace(/\r\n?/g, '\n').split('\n');
 } else {
-  const version = arg;
+  version = arg;
   const escaped = version.replace(/\./g, '\\.');
   const headerRe = new RegExp(`^## \\[${escaped}\\]`);
   const anyHeaderRe = /^## \[/;
@@ -126,5 +131,46 @@ for (const line of block) {
 }
 flushBuf();
 
-process.stdout.write(out.join('\n'));
-if (!out[out.length - 1]?.endsWith('\n')) process.stdout.write('\n');
+// GitHub answers a release body over 125,000 characters with HTTP 422, and
+// the Release workflow pushes the promoted CHANGELOG before it creates the
+// release, so oversized notes would stop a release halfway, before npm.
+// Counted in UTF-8 bytes, which is never less than GitHub's character count,
+// with room to spare.
+const MAX_BODY_BYTES = 120_000;
+const topLevelEntryRe = /^([-*]|\d+\.)\s+/;
+
+function fitToReleaseBody(lines) {
+  const size = (line) => Buffer.byteLength(line, 'utf8') + 1;
+  if (lines.reduce((n, line) => n + size(line), 0) <= MAX_BODY_BYTES) return lines;
+  // Cut only where an entry or a heading starts, outside a code fence, so no
+  // entry is shown in part.
+  const before = [0];
+  const cuts = [];
+  let fenced = false;
+  lines.forEach((line, i) => {
+    if (!fenced && (topLevelEntryRe.test(line) || /^#/.test(line))) cuts.push(i);
+    if (fenceRe.test(line)) fenced = !fenced;
+    before.push(before[i] + size(line));
+  });
+  const entriesFrom = (i) =>
+    lines.slice(i).filter((line) => topLevelEntryRe.test(line)).length;
+  const repo = process.env.GITHUB_REPOSITORY || 'colbymchenry/codegraph';
+  const ref = version && /^\d+\.\d+\.\d+/.test(version) ? `v${version}` : 'main';
+  const pointer = (n) =>
+    `_…and ${n} more ${n === 1 ? 'entry' : 'entries'}: the full list is in ` +
+    `[CHANGELOG.md](https://github.com/${repo}/blob/${ref}/CHANGELOG.md)._`;
+  for (let c = cuts.length - 1; c >= 0; c--) {
+    const kept = lines.slice(0, cuts[c]);
+    // A heading left with nothing under it goes too.
+    while (kept.length > 0 && (/^\s*$/.test(kept[kept.length - 1]) || /^#/.test(kept[kept.length - 1]))) {
+      kept.pop();
+    }
+    const note = pointer(entriesFrom(kept.length));
+    if (before[kept.length] + size('') + size(note) <= MAX_BODY_BYTES) return [...kept, '', note];
+  }
+  return [pointer(entriesFrom(0))];
+}
+
+const body = fitToReleaseBody(out);
+process.stdout.write(body.join('\n'));
+if (!body[body.length - 1]?.endsWith('\n')) process.stdout.write('\n');

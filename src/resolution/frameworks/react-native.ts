@@ -423,7 +423,8 @@ function buildRNMaps(context: ResolutionContext): { byJsName: Map<string, Native
           if (RN_EMITTER_BUILTINS.has(ext.jsName)) continue;
           const candidates = (swiftMethodsByName.get(ext.nativeSelectorFirstKw) ?? [])
             .filter((c) => c.qualifiedName.split('::').includes(ext.className))
-            .sort((a, b) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine);
+            // By file in code-unit order: localeCompare follows the host's locale.
+            .sort((a, b) => (a.filePath < b.filePath ? -1 : a.filePath > b.filePath ? 1 : 0) || a.startLine - b.startLine);
           const node = candidates[0];
           if (!node) continue;
           const entry: NativeMethod = { moduleName: ext.moduleName, jsName: ext.jsName, node };

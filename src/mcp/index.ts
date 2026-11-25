@@ -60,6 +60,7 @@ import {
 } from './writer-lock';
 import {
   canProbeDaemonIdentity,
+  daemonOptOutSet,
   decodeLockInfo,
   getDaemonPidPath,
   getDaemonSocketCandidates,
@@ -211,11 +212,12 @@ export async function connectAnyDaemonCandidate(
 /**
  * Probe for a daemon every `retryDelayMs` until one answers or `budgetMs` of
  * wall time is spent. `probe` gets the deadline, and caps its own hello wait to
- * it. Resolves the socket, or null once the budget is spent or a daemon of
- * another version answers. The clock is injectable for tests.
+ * it. Resolves the socket, or null once the budget is spent, a daemon of
+ * another version answers, or one can't prove it runs as this user. The clock
+ * is injectable for tests.
  */
 export async function pollForDaemon<S>(
-  probe: (deadline: number) => Promise<S | 'older-version' | 'version-mismatch' | null>,
+  probe: (deadline: number) => Promise<S | 'older-version' | 'version-mismatch' | 'unproven' | null>,
   budgetMs: number = DAEMON_CONNECT_BUDGET_MS,
   retryDelayMs: number = DAEMON_CONNECT_RETRY_DELAY_MS,
   clock: { now(): number; sleep(ms: number): Promise<void> } = { now: Date.now, sleep },
@@ -226,17 +228,11 @@ export async function pollForDaemon<S>(
     if (clock.now() >= deadline) return null;
     const answer = await probe(deadline);
     // Another version answering, older or not, waits for the next retry: one
-    // replacement per attempt, so this can never loop.
-    if (answer === 'older-version' || answer === 'version-mismatch') return null;
+    // replacement per attempt, so this can never loop. One that can't prove it
+    // runs as this user gets no session; it serves in-process.
+    if (answer === 'older-version' || answer === 'version-mismatch' || answer === 'unproven') return null;
     if (answer) return answer;
   }
-}
-
-/** Whether `CODEGRAPH_NO_DAEMON` was set to a truthy value. */
-function daemonOptOutSet(): boolean {
-  const raw = process.env.CODEGRAPH_NO_DAEMON;
-  if (!raw) return false;
-  return raw !== '0' && raw.toLowerCase() !== 'false';
 }
 
 /** Whether this process was spawned to BE the detached daemon. */
@@ -304,6 +300,10 @@ export function watchdogProgressPaths(root: string | null): { progressPaths?: st
  * spawned `process.cwd()` is already realpath'd) and one that passed a
  * symlinked `rootUri` would otherwise hash to different sockets and silently
  * fail to share the daemon.
+ *
+ * A root in a sensitive folder (`~/.ssh`, `~/.config`, `/etc`, …) resolves to
+ * null like a missing one: the session runs in-process with no default
+ * project, and no daemon, lock or socket is set up in that folder.
  */
 function resolveDaemonRoot(explicitPath: string | null): string | null {
   const candidate = explicitPath ?? process.cwd();
@@ -465,6 +465,8 @@ export class MCPServer {
   // Worker-thread liveness watchdog (#850). Long-lived modes only; SIGKILLs the
   // process if the main thread wedges in a non-yielding sync loop.
   private livenessWatchdog: WatchdogHandle | null = null;
+  // Direct mode arms the watchdog when work begins (#3250); set once it has.
+  private livenessWatchdogArmed = false;
   // PPID watchdog baseline — from the CLI entry's earliest-possible capture
   // (early-ppid.ts). Capturing here (construction) already lost the race when
   // the launcher was killed during module loading (#1185).
@@ -600,7 +602,15 @@ export class MCPServer {
       this.writerLockRoot = writerRoot;
     }
 
-    this.engine = new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
+    this.engine = new MCPEngine({
+      queryPool: true,
+      queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX,
+      // The liveness watchdog is a process of its own. Start it when this
+      // session first opens a project or serves a tool call, not at launch:
+      // a client that only lists the tools, which is what most sessions in a
+      // folder with no index do, never needs one (#3250).
+      onWorkBegins: () => this.armLivenessWatchdog(),
+    });
     const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
     this.session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.projectPath,
@@ -635,6 +645,18 @@ export class MCPServer {
     this.mode = 'direct';
     this.installSignalHandlers();
     this.installPpidWatchdog();
+  }
+
+  /**
+   * Arm the direct session's liveness watchdog, the first time its engine
+   * starts work (#3250). A launch with `--path` gets here during startup,
+   * because its engine opens the project at once; a launch in a folder with
+   * no index, on its first tool call or when the client names an indexed
+   * project.
+   */
+  private armLivenessWatchdog(): void {
+    if (this.livenessWatchdogArmed || this.stopped) return;
+    this.livenessWatchdogArmed = true;
     this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(resolveDaemonRoot(this.projectPath)));
   }
 
@@ -651,6 +673,14 @@ export class MCPServer {
     // In daemon mode stderr IS `.codegraph/daemon.log`; stamp every line so
     // kills/restarts can be placed in time (#1431 — the log was undatable).
     timestampStderrLines();
+    // A launcher never starts a daemon for a sensitive folder (see
+    // resolveDaemonRoot). One started by hand for such a folder leaves rather
+    // than take the folder's locks and serve it.
+    const refusal = resolveServerRoot(this.projectPath ?? process.cwd()).refusal;
+    if (refusal) {
+      process.stderr.write(`[CodeGraph daemon] ${refusal}; exiting.\n`);
+      process.exit(0);
+    }
     const root = resolveDaemonRoot(this.projectPath) ?? this.projectPath ?? process.cwd();
     // Read once and dropped, so nothing this daemon spawns inherits it.
     const handoverPid = Number(process.env[DAEMON_HANDOVER_ENV]);
@@ -743,6 +773,10 @@ export class MCPServer {
       // Fast path: a daemon may already be listening (on either candidate).
       const probe = await connectAnyCandidate();
       if (probe === 'version-mismatch') return null; // definitive — serve in-process, don't poll for 6s
+      // Something of this version answers where the daemon listens but can't
+      // prove it runs as this user: no session goes through it, and none is
+      // spawned to fight it for the socket. Serve in-process.
+      if (probe === 'unproven') return null;
       if (probe && probe !== 'older-version') return probe;
       // A daemon of an older release answered — or none did, while the project
       // lock may still name one on a socket we don't probe (on Windows, daemons

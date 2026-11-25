@@ -277,7 +277,7 @@ describe.each(['native', 'wasm'].filter((backend) => backend === 'wasm' || kerne
     expect(callees(g, 'c')).toEqual([]);
   });
 
-  it('leaves CommonJS exports, prototypes, call arguments, data and minified bundles as they were', async () => {
+  it('leaves prototype literals, call arguments, data and minified bundles as they were', async () => {
     const g = await index({
       'shapes.js': [
         'module.exports = { cjs() { return 1; } };',
@@ -293,10 +293,12 @@ describe.each(['native', 'wasm'].filter((backend) => backend === 'wasm' || kerne
       'iife.js': '(function () { var e; if (!e) { e = { getItem: function () { return 1; } }; } })();\n',
     });
     // …and a plain name reassigned inside a function (a bundle's `e = {…}`) is a local.
-    for (const name of ['cjs', 'proto', 'ephemeral', 'onThis', 'b', 'c', 'd', 'getItem']) {
+    for (const name of ['proto', 'ephemeral', 'onThis', 'b', 'c', 'd', 'getItem']) {
       expect(g.getNodesByName(name), name).toEqual([]);
     }
     expect(node(g, 'data').kind).toBe('constant');
+    // The module's own export object owns its members (#2966).
+    expect(node(g, 'module.exports::cjs').kind).toBe('function');
   });
 
   it('keeps a <script setup> literal\'s members under their owner', async () => {
@@ -316,5 +318,86 @@ describe.each(['native', 'wasm'].filter((backend) => backend === 'wasm' || kerne
     expect(g.getIncomingEdges(member.id).filter((e) => e.kind === 'contains').map((e) => e.source)).toEqual([owner.id]);
     expect(callees(g, 'handlers::onSave')).toEqual(['persist']);
     expect(callees(g, 'save')).toEqual(['handlers::onSave']);
+  });
+
+  // The extractor gives a method of these literals no node, so what the method
+  // declares is qualified under the holder as a member would be (`rule::visit`),
+  // and a bare call of it, between neighbours in that body, was taken for a call
+  // of a member by its name alone.
+  it.each([
+    ['satisfies', 'const rule = {\n  create(context) {\n    function report() {}\n    function visit() { report(); }\n    return { Program: visit };\n  },\n} satisfies Rule;\n'],
+    ['as const', 'const rule = {\n  create(context) {\n    function report() {}\n    function visit() { report(); }\n    return { Program: visit };\n  },\n} as const;\n'],
+    ['a nested object', 'const rule = {\n  rules: {\n    create(context) {\n      function report() {}\n      function visit() { report(); }\n      return { Program: visit };\n    },\n  },\n};\n'],
+    ['a computed key', 'const key = "create";\nconst rule = {\n  plain() {},\n  [key](context) {\n    function report() {}\n    function visit() { report(); }\n    return { Program: visit };\n  },\n};\n'],
+    ['a callback a member passes on', 'declare function wrap(f: unknown): unknown;\nconst rule = {\n  create: wrap(function (context) {\n    function report() {}\n    function visit() { report(); }\n    return { Program: visit };\n  }),\n};\n'],
+    ['a property read off the literal', 'const key = "create";\nconst rule = {\n  create() {\n    function report() {}\n    function visit() { report(); }\n    return { Program: visit };\n  },\n}[key];\n'],
+  ])('reaches a function declared beside the caller in a method of %s', async (_shape, body) => {
+    const g = await index({ 'rule.ts': `${body}export default rule;\n` });
+    expect(callees(g, 'rule::visit')).toEqual(['rule::report']);
+    expect(g.getOutgoingEdges(node(g, 'rule').id).filter((e) => e.kind === 'references')
+      .map((e) => g.getNode(e.target)!.qualifiedName)).toContain('rule::visit');
+  });
+
+  it('reaches a function declared in a method of a literal in a component', async () => {
+    const g = await index({
+      'Panel.vue': [
+        '<template><p>Don\'t {{ msg }}</p></template>',
+        '<script setup lang="ts">',
+        'const rule = {',
+        '  create() {',
+        '    function report() {}',
+        '    function visit() { report(); }',
+        '    return visit;',
+        '  },',
+        '} satisfies Rule;',
+        '</script>',
+        '',
+      ].join('\n'),
+    });
+    expect(callees(g, 'rule::visit')).toEqual(['rule::report']);
+  });
+
+  it('keeps such a function to the block that declares it', async () => {
+    const g = await index({
+      'rule.ts': [
+        'const rule = {',
+        '  create() {',
+        '    function report() {}',
+        '    return report();',
+        '  },',
+        '  check() { return report(); },',
+        '} satisfies Rule;',
+        'export function outside() { return report(); }',
+        'export default rule;',
+        '',
+      ].join('\n'),
+      'other.ts': 'export function elsewhere() { return report(); }\n',
+    });
+    const target = node(g, 'rule::report');
+    const callers = g.getIncomingEdges(target.id).filter((e) => e.kind === 'calls');
+    expect(callers.map((e) => e.line)).toEqual([4]);
+    expect(callees(g, 'outside')).toEqual([]);
+    expect(callees(g, 'elsewhere')).toEqual([]);
+  });
+
+  it('still reaches a member only through its object, a literal nested in a function included', async () => {
+    const g = await index({
+      'app.ts': [
+        'const App = {',
+        '  init() { return 1; },',
+        '  run() {',
+        '    function inner() { return 2; }',
+        '    return inner();',
+        '  },',
+        '};',
+        'export function bare() { return init(); }',
+        'export function through() { return App.init(); }',
+        'export default App;',
+        '',
+      ].join('\n'),
+    });
+    expect(callees(g, 'bare')).toEqual([]);
+    expect(callees(g, 'through')).toEqual(['App::init']);
+    expect(callees(g, 'App::run')).toEqual(['App::run::inner']);
   });
 });

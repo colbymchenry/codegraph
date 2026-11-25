@@ -28,14 +28,14 @@ extern "C" {
 extern "C" {
     fn tree_sitter_scala() -> *const ();
 }
-// Vendored dart grammar (build.rs-compiled C — UserNobody14 d4d8f3e; the
+// Vendored dart grammar (build.rs-compiled C — UserNobody14 0038280; the
 // crates.io crate is a different-lineage fork; see grammars/dart).
 extern "C" {
     fn tree_sitter_dart() -> *const ();
 }
-// Vendored swift grammar (build.rs-compiled C — crate 0.7.3's src/ with a
-// one-line scanner fix the crate's own build lacks on Windows; see
-// grammars/swift and docs/grammars/tree-sitter-swift.md).
+// Vendored swift grammar (build.rs-compiled C — crate 0.7.4's src/ with the
+// scanner patch the wasm needs; see grammars/swift and
+// docs/grammars/tree-sitter-swift.md).
 extern "C" {
     fn tree_sitter_swift() -> *const ();
 }
@@ -71,13 +71,14 @@ pub fn grammar_for(language: &str) -> Option<Language> {
         // R7b: v0.24.2, the full HTML-interleaving variant — LANGUAGE_PHP,
         // NEVER LANGUAGE_PHP_ONLY (which errors on leading HTML).
         "php" => Some(tree_sitter_php::LANGUAGE_PHP.into()),
-        // R7b: crate 0.7.3's src/, the sources the vendored wasm is built
-        // from (table identity by construction; see grammars.ts), compiled in
-        // build.rs with the scanner's `try!` fix (`1ULL << FAKE_TRY_BANG`).
+        // R7b: crate 0.7.4's src/ (#3212), the sources the vendored wasm is
+        // built from (table identity by construction; see grammars.ts),
+        // compiled in build.rs with the same scanner patch.
         "swift" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_swift) }.into())
         }
-        // R7b: fwcd 0.3.8, vendored C compiled in build.rs (crate unusable).
+        // R7b: fwcd main@d6af96d (#3410), vendored C compiled in build.rs
+        // (no crate carries it).
         "kotlin" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_kotlin) }.into())
         }
@@ -97,8 +98,8 @@ pub fn grammar_for(language: &str) -> Option<Language> {
         "scala" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_scala) }.into())
         }
-        // R7b batch 4: UserNobody14 d4d8f3e vendored C compiled in build.rs
-        // (same commit as the byte-copied tree-sitter-wasms 0.1.13 artifact).
+        // UserNobody14 0038280 vendored C compiled in build.rs, the sources
+        // the vendored wasm is built from (#3270).
         "dart" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_dart) }.into())
         }

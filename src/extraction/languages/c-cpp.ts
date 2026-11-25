@@ -46,6 +46,146 @@ export function isConstDeclaration(node: SyntaxNode): boolean {
 /** C and C++ specifiers that define a class-like type, or an enum, when they carry a body (C has no `class_specifier`). */
 const CLASS_LIKE_SPECIFIERS = new Set(['class_specifier', 'struct_specifier', 'union_specifier', 'enum_specifier']);
 
+/** Conditional compilation a class body can hold members in. */
+const MEMBER_CONDITIONALS = new Set(['preproc_if', 'preproc_ifdef', 'preproc_else', 'preproc_elif', 'preproc_elifdef']);
+
+/** A type the program computes (`decltype(x)`, `auto`), which names no declaration. */
+const COMPUTED_TYPE_SPECIFIERS = new Set(['decltype', 'placeholder_type_specifier']);
+
+/**
+ * A name of the C++ standard library, or a type C itself gives a name the
+ * grammars read like any other. A project's copy of one is a compiler shim
+ * (jemalloc's msvc_compat/C99/stdbool.h), which code elsewhere never means.
+ */
+const C_STANDARD_TYPE_NAME = /^(?:(?:::\s*)?std\s*::|(?:_Bool|_Complex|wchar_t|char(?:8|16|32)_t|u?intmax_t|u?int_(?:least|fast)\d+_t|max_align_t|nullptr_t)$)/;
+
+/** What a declarator's next part is: a field where the grammar gives one, the first named child where it doesn't. */
+function innerDeclarator(declarator: SyntaxNode): SyntaxNode | null {
+  return getChildByField(declarator, 'declarator') ?? declarator.namedChild(0);
+}
+
+/**
+ * Whether a member declarator declares a member function (`Status Get(int);`,
+ * `Foo* Make();`, `Slice operator[](int);`), rather than data, which may be a
+ * pointer to a function (`void (*cb)(int);`), whose function declarator wraps
+ * a parenthesized one.
+ */
+function declaresMemberFunction(declarator: SyntaxNode): boolean {
+  let d: SyntaxNode | null = declarator;
+  while (d && (d.type === 'pointer_declarator' || d.type === 'reference_declarator')) d = innerDeclarator(d);
+  return d?.type === 'function_declarator' && getChildByField(d, 'declarator')?.type !== 'parenthesized_declarator';
+}
+
+/** Is this class-like specifier an unnamed member of another (`struct S { union { … } u; };`)? */
+export function isUnnamedMemberType(specifier: SyntaxNode): boolean {
+  return !getChildByField(specifier, 'name') && specifier.parent?.type === 'field_declaration';
+}
+
+/** A type name a declaration writes: the name as references carry it, and the node it is read at. */
+export interface CTypeName {
+  name: string;
+  node: SyntaxNode;
+}
+
+/**
+ * The type names a C or C++ class, struct or union's members are declared
+ * with, in source order: `pause_event` in `pause_event by_value;`, `*p`, `a[3]`
+ * or `(*cb)(pause_event *)`, the `struct` or `enum` a member names by its tag
+ * (`struct client *c`), and whatever a template's arguments name, in
+ * `std::vector<Foo>` too. `specifier` is the class's own, carrying the body;
+ * `ownName` is what the index calls it, which a typedef may decide.
+ *
+ * A name inside an unnamed member (`union { Foo a; }`, `struct { Foo a; } s;`)
+ * is the holder's: its members are members of the holder, and nothing can name
+ * the unnamed type (isUnnamedMemberType). A member function's return type
+ * counts, since a member a macro trails reads the same (`Version* v GUARDED_BY(mu);`),
+ * but not its parameters. Not read: builtins; a type of `std`, though its
+ * template arguments are; the class's own name, which a list's `next` writes;
+ * a type the program computes; a nested definition that declares no member
+ * (`class Rep;`, `struct Node { … };`).
+ *
+ * Mirrored in the kernel (ccpp/mod.rs).
+ */
+export function cMemberTypeNames(specifier: SyntaxNode, ownName: string, source: string): CTypeName[] {
+  const names: CTypeName[] = [];
+  const own = new Set([ownName]);
+  const tag = getChildByField(specifier, 'name');
+  if (tag) own.add(stripCppTemplateArgs(getNodeText(tag, source)));
+  const body = getChildByField(specifier, 'body');
+  if (body) collectMemberTypeNames(body, own, source, names);
+  return names;
+}
+
+/**
+ * The type names a C or C++ alias is declared with: `redisObject` in `typedef
+ * struct redisObject robj;`, `Foo` in `using Foos = std::vector<Foo>;`. Code
+ * names the alias, so this is how a change to the type reaches what holds one.
+ * Skipped as in cMemberTypeNames: `typedef struct dict dict;` names no other type.
+ */
+export function cAliasTypeNames(alias: SyntaxNode, ownName: string, source: string): CTypeName[] {
+  const names: CTypeName[] = [];
+  const own = new Set([ownName]);
+  const type = getChildByField(alias, 'type');
+  if (type) collectCTypeNames(type, own, source, names);
+  for (const declarator of alias.childrenForFieldName('declarator')) {
+    if (declarator) collectDeclaratorTypeNames(declarator, own, source, names);
+  }
+  return names;
+}
+
+function collectMemberTypeNames(list: SyntaxNode, own: ReadonlySet<string>, source: string, names: CTypeName[]): void {
+  for (const child of list.namedChildren) {
+    if (MEMBER_CONDITIONALS.has(child.type)) {
+      collectMemberTypeNames(child, own, source, names);
+      continue;
+    }
+    if (child.type !== 'field_declaration') continue;
+    const type = getChildByField(child, 'type');
+    if (!type) continue;
+    const declarators = child.childrenForFieldName('declarator').filter((d: SyntaxNode | null): d is SyntaxNode => !!d);
+    const unnamedBody = CLASS_LIKE_SPECIFIERS.has(type.type) && !getChildByField(type, 'name')
+      ? getChildByField(type, 'body')
+      : null;
+    if (unnamedBody) collectMemberTypeNames(unnamedBody, own, source, names);
+    else if (declarators.length > 0) collectCTypeNames(type, own, source, names);
+    for (const declarator of declarators) {
+      if (!declaresMemberFunction(declarator)) collectDeclaratorTypeNames(declarator, own, source, names);
+    }
+  }
+}
+
+/** The types a declarator names, past the type written before it: a function pointer's parameters. */
+function collectDeclaratorTypeNames(declarator: SyntaxNode, own: ReadonlySet<string>, source: string, names: CTypeName[]): void {
+  if (declarator.type === 'function_declarator') {
+    const parameters = getChildByField(declarator, 'parameters');
+    if (parameters) collectCTypeNames(parameters, own, source, names);
+  }
+  if (!declarator.type.endsWith('declarator')) return;
+  const inner = innerDeclarator(declarator);
+  if (inner) collectDeclaratorTypeNames(inner, own, source, names);
+}
+
+/** Collects the type names under `node` onto `names`, in source order. */
+function collectCTypeNames(node: SyntaxNode, own: ReadonlySet<string>, source: string, names: CTypeName[]): void {
+  if (COMPUTED_TYPE_SPECIFIERS.has(node.type)) return;
+  if (node.type === 'type_identifier' || node.type === 'qualified_identifier' || node.type === 'template_type') {
+    const name = stripCppTemplateArgs(getNodeText(node, source)).trim();
+    if (name && !own.has(name) && !C_STANDARD_TYPE_NAME.test(name)) names.push({ name, node });
+    collectTemplateArguments(node, own, source, names);
+    return;
+  }
+  const tag = CLASS_LIKE_SPECIFIERS.has(node.type) ? getChildByField(node, 'name') : null;
+  for (const c of tag ? [tag] : node.namedChildren) collectCTypeNames(c, own, source, names);
+}
+
+/** The types the template arguments of a written name name, wherever in the name they are. */
+function collectTemplateArguments(node: SyntaxNode, own: ReadonlySet<string>, source: string, names: CTypeName[]): void {
+  for (const c of node.namedChildren) {
+    if (c.type === 'template_argument_list') collectCTypeNames(c, own, source, names);
+    else if (c.type === 'qualified_identifier' || c.type === 'template_type') collectTemplateArguments(c, own, source, names);
+  }
+}
+
 /**
  * Whether a C/C++ type specifier defines a class, struct, union or enum, as
  * opposed to naming one (`struct Foo *p`, the forward declaration `class Foo;`).
@@ -591,7 +731,7 @@ const CPP_COMMENT_OR_LITERAL_RE =
  * still lines up with the source.
  */
 function maskCppCommentsAndLiterals(source: string): string {
-  return source.replace(CPP_COMMENT_OR_LITERAL_RE, (m) => m.replace(/[^\r\n]/g, ' '));
+  return source.replace(CPP_COMMENT_OR_LITERAL_RE, (m) => (m.includes('\n') || m.includes('\r') ? m.replace(/[^\r\n]/g, ' ') : ' '.repeat(m.length)));
 }
 
 /**
@@ -634,14 +774,18 @@ function pushCppRunTokens(spans: Array<[number, number]>, run: string, start: nu
  */
 function blankCppSpans(source: string, spans: ReadonlyArray<readonly [number, number]>, code?: string): string {
   if (spans.length === 0) return source;
+  const ordered = [...spans].sort((a, b) => a[0] - b[0]);
   const blank = (text: string): string => {
-    const chars = text.split('');
-    for (const [start, end] of spans) {
-      for (let k = start; k < end; k++) {
-        if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
-      }
+    let out = '';
+    let at = 0;
+    for (const [start, end] of ordered) {
+      const from = Math.max(start, at);
+      if (from >= end) continue;
+      const span = text.slice(from, end);
+      out += text.slice(at, from) + (span.includes('\n') || span.includes('\r') ? span.replace(/[^\r\n]/g, ' ') : ' '.repeat(span.length));
+      at = end;
     }
-    return chars.join('');
+    return out + text.slice(at);
   };
   const out = blank(source);
   if (code !== undefined) cppMaskMemo = { source: out, code: blank(code) };
@@ -1168,7 +1312,7 @@ export function blankCppAnnotationMacroCalls(source: string, options: { keepCRet
   if (!/^[ \t]*[A-Z][A-Z0-9_]{2,}\s*\(/m.test(source)) return source;
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
-  const chars = source.split('');
+  let chars: string[] | null = null;
   const re = /^([ \t]*)([A-Z][A-Z0-9_]{2,})(\s*)\(/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(source)) !== null) {
@@ -1202,12 +1346,13 @@ export function blankCppAnnotationMacroCalls(source: string, options: { keepCRet
     // (`;`), init-list item (`,`/`{`), or expression fragment (operator) is not.
     if (!after || !/[A-Za-z_~#]/.test(after)) continue;
     if (options.keepCReturnTypes && macroStart === m.index && isCReturnTypeMacro(source, m.index, open, end, j)) continue;
+    chars ??= source.split('');
     for (let k = macroStart; k < end; k++) {
       if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
     }
     re.lastIndex = end;
   }
-  return rawStrings.restore(chars.join(''));
+  return rawStrings.restore(chars ? chars.join('') : source);
 }
 
 /** A macro argument that reads as a C type: `char *`, `const cJSON *`, `unsigned long`, `git_repository *`. */
@@ -1434,7 +1579,7 @@ export function blankCppInlineAnnotationMacros(source: string): string {
   if (!/\b(?:UMETA|UPARAM|UE_DEPRECATED)/.test(source)) return source;
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
-  const chars = source.split('');
+  let chars: string[] | null = null;
   const re = new RegExp(CPP_INLINE_ANNOTATION_RE.source, 'g');
   let m: RegExpExecArray | null;
   while ((m = re.exec(source)) !== null) {
@@ -1459,12 +1604,13 @@ export function blankCppInlineAnnotationMacros(source: string): string {
       }
     }
     if (end < 0) continue;
+    chars ??= source.split('');
     for (let k = m.index; k < end; k++) {
       if (chars[k] !== '\n' && chars[k] !== '\r') chars[k] = ' ';
     }
     re.lastIndex = end;
   }
-  return rawStrings.restore(chars.join(''));
+  return rawStrings.restore(chars ? chars.join('') : source);
 }
 
 /**
@@ -1895,6 +2041,12 @@ export function blankCCplusplusGuardBodies(source: string): string {
  * statement — valid C — so the body's calls/locals extract normally on both
  * arms instead of riding error recovery.
  *
+ * A statement of a function body keeps the macro's name, as `name;`: the
+ * function still uses the macro (`TEST_CONTEXT("…") {` in redis, `XXH_ASSERT(c)`
+ * in xxhash, which writes no `;`), and that is how a change to the macro reaches
+ * it. Anywhere else (an initializer, a struct body, another macro's arguments)
+ * a `;` would be the very error this avoids, so the whole call goes.
+ *
  * C-ONLY, and matched tightly:
  *  - the call must be INDENTED (statement position; file-scope definitions
  *    start at column 0, and an unbraced file-scope `name(args) { }` is a
@@ -1913,15 +2065,82 @@ export function blankCCplusplusGuardBodies(source: string): string {
 const C_STMT_MACRO_KEYWORDS = new Set([
   'if', 'while', 'for', 'switch', 'return', 'do', 'else', 'sizeof',
 ]);
+
+/** What an open brace holds, for cStatementLines: a `(` or `[` is held as its offset. */
+const C_BLOCK = -1;
+const C_OTHER_BRACES = -2;
+
+/** Can a statement follow this code character, inside a block? (After `)`, a macro without its `;`.) */
+const cStatementFollows = (ch: string | undefined): boolean =>
+  ch === ';' || ch === '{' || ch === '}' || ch === ':' || ch === ')';
+
+/**
+ * Which lines of a C file start a statement of a function body, given the
+ * file's code (maskCppCode: directives and comments are spaces). A brace opens
+ * a block after a function or control head, or where a statement could start
+ * inside another block; `= {`, `struct s {` and `enum {` hold no statements,
+ * and neither do parentheses. A line that is the body of an `if`, a `for`, an
+ * `else` or the like is left out: a `;` there would end the body, and leave the
+ * `else` or `while` after the block with nothing to belong to. A branch of an
+ * `#if` that leaves a bracket open costs at most the rest of its block, which
+ * then reads as no statement.
+ */
+function cStatementLines(code: string): boolean[] {
+  const statements: boolean[] = [];
+  const open: number[] = [];
+  let line = 0;
+  let atLineStart = true;
+  let prev = -1;
+  // Whether the `)` at `prev` closes a control head, whose body comes next.
+  let afterControlHead = false;
+  for (let i = 0; i < code.length; i++) {
+    const ch = code[i];
+    if (ch === '\n') {
+      line++;
+      atLineStart = true;
+      continue;
+    }
+    if (ch === ' ' || ch === '\t' || ch === '\r') continue;
+    const top = open[open.length - 1];
+    if (atLineStart) {
+      atLineStart = false;
+      statements[line] = top === C_BLOCK && !afterControlHead && cStatementFollows(code[prev]);
+    }
+    afterControlHead = false;
+    if (ch === '(' || ch === '[') {
+      open.push(i);
+    } else if (ch === ')' || ch === ']') {
+      if (top !== undefined && top >= 0) {
+        open.pop();
+        afterControlHead = /\b(?:if|for|while|switch)\s*$/.test(code.slice(Math.max(0, top - 10), top));
+      }
+    } else if (ch === '{') {
+      const opensBlock =
+        code[prev] === '(' || // `({ … })`, a GNU statement expression
+        (code[prev] === ')' && top === undefined) ||
+        (top === C_BLOCK && (cStatementFollows(code[prev]) || /(?:^|\W)(?:else|do)$/.test(code.slice(Math.max(0, prev - 4), prev + 1))));
+      open.push(opensBlock ? C_BLOCK : C_OTHER_BRACES);
+    } else if (ch === '}') {
+      while (open.length > 0 && (open.pop() as number) >= 0);
+    }
+    prev = i;
+  }
+  return statements;
+}
+
 export function blankCStatementMacroCalls(source: string): string {
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
   const lines = source.split('\n');
   let changed = false;
+  let statementLines: boolean[] | null = null;
   const content = (l: string): string => l.replace(/\r$/, '').trim();
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] as string;
-    const m = /^[ \t]+([a-z_][a-z0-9_]*)[ \t]*\(/.exec(line);
+    // Lowercase iterator macros, or an all-caps block macro
+    // (`ATOMIC_BLOCK(NVIC_PRIO_MAX) {`, `PG_FOREACH(reg) {` — betaflight);
+    // a PascalCase name is left alone (a constructor, if the file is C++).
+    const m = /^[ \t]+([a-z_][a-z0-9_]*|[A-Z_][A-Z0-9_]*)[ \t]*\(/.exec(line);
     if (!m || C_STMT_MACRO_KEYWORDS.has(m[1] as string)) continue;
     const open = line.indexOf('(', m[0].length - 1);
     let depth = 0;
@@ -2003,13 +2222,15 @@ export function blankCStatementMacroCalls(source: string): string {
       continue;
     }
     const identStart = line.indexOf(m[1] as string);
+    statementLines ??= cStatementLines(maskCppCode(source));
+    const kept = statementLines[i] ? `${m[1] as string};` : '';
     if (endLine === i) {
       lines[i] =
         line.slice(0, identStart) +
-        ' '.repeat(close + 1 - identStart) +
+        kept.padEnd(close + 1 - identStart) +
         line.slice(close + 1);
     } else {
-      lines[i] = line.slice(0, identStart) + line.slice(identStart).replace(/[^\r]/g, ' ');
+      lines[i] = line.slice(0, identStart) + kept + line.slice(identStart + kept.length).replace(/[^\r]/g, ' ');
       for (let j = i + 1; j < endLine; j++) {
         lines[j] = (lines[j] as string).replace(/[^\r]/g, ' ');
       }
@@ -2520,7 +2741,7 @@ export function blankCDesignatedMacroArgs(source: string): string {
   if (source.indexOf('=') === -1) return source;
   const rawStrings = maskCppRawStrings(source);
   source = rawStrings.source;
-  const out = source.split('');
+  let out: string[] | null = null;
   const re = /^[ \t]*([A-Z_][A-Z0-9_]*)\s*\(/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(source))) {
@@ -2538,10 +2759,165 @@ export function blankCDesignatedMacroArgs(source: string): string {
     // A designator at argument depth: `.name =` or `[index] =`.
     if (!/(^|[,{(\s])(\.[A-Za-z_]\w*|\[[^\]]+\])\s*=[^=]/.test(args)) continue;
     if (!/^\s*;/.test(source.slice(close + 1))) continue;
+    out ??= source.split('');
     for (let k = open + 1; k < close; k++) if (out[k] !== '\n') out[k] = ' ';
     re.lastIndex = close;
   }
-  return rawStrings.restore(out.join(''));
+  return rawStrings.restore(out ? out.join('') : source);
+}
+
+/**
+ * Open up a `#if … #elif … #else … #endif` group whose branches are not
+ * self-contained statements. tree-sitter-c keeps EVERY branch of a
+ * conditional group and parses each as a run of block items, so a group is
+ * only harmless when each branch is complete on its own. Three shapes in
+ * real C are not, and each ends in a phantom function (K&R
+ * `if(cond) { … }` reads as an implicit-int function definition named `if`,
+ * and the extractor then files it — and every symbol after it — under the
+ * enclosing function; 265 on a betaflight tree, #1729 follow-up):
+ *
+ *  - a branch that BEGINS with `else` — `} #ifdef X  else if (…) { … } #endif`
+ *    (a conditional arm of an if-chain);
+ *  - a branch that ENDS with a bare `if (…)` / `else if (…)` header whose
+ *    body sits after the `#endif` (the ST HAL's per-device latency tables);
+ *  - a branch whose braces do not balance — a function signature or a `{`
+ *    that differs per configuration, with the body shared.
+ *
+ * The group's directive lines are blanked to spaces (newlines and `\r` kept,
+ * so offsets survive). When every branch's braces and parentheses balance,
+ * all branches stay, read in a row. Otherwise one branch stays verbatim and
+ * the rest become spaces too, which is what the preprocessor would hand a
+ * compiler for that configuration: the `#else` of a feature test, the first
+ * branch of `#ifndef`, the live one of `#if 0` or `#if 1`. Groups whose
+ * branches are whole statements — the vast majority — are untouched. This
+ * pass edits directive lines on purpose, so it runs AFTER
+ * `restoreDirectiveLines` (like the named-variadic pass).
+ * Groups are handled innermost-first; an inner group inside a blanked branch
+ * simply disappears with it.
+ */
+const C_COND_OPEN_RE = /^[ \t]*#[ \t]*(if|ifdef|ifndef)\b[ \t]*(.*)$/;
+const C_COND_NEXT_RE = /^[ \t]*#[ \t]*(elif|else)\b/;
+const C_COND_ENDIF_RE = /^[ \t]*#[ \t]*endif\b/;
+export function blankCUnbalancedConditionalBranches(source: string): string {
+  if (source.indexOf('#') === -1) return source;
+  const lines = source.split('\n');
+  // The same lines with comments and string / char literals as spaces: a `{`
+  // in a block comment over several lines (Lua's `** {======` banners) or a
+  // `#` line inside one is not code. Blanked along with `lines`, so an outer
+  // group reads an inner one as collapsed.
+  const masked = maskCppCommentsAndLiterals(source).split('\n');
+  const stripCr = (l: string): string => (l.endsWith('\r') ? l.slice(0, -1) : l);
+  // Code content of a line.
+  const code = (k: number): string => stripCr(masked[k] as string).trim();
+  const blank = (l: string): string => l.replace(/[^\r]/g, ' ');
+  const blankLine = (k: number): void => {
+    lines[k] = blank(lines[k] as string);
+    masked[k] = blank(masked[k] as string);
+  };
+  // Directive line indices of each open group, innermost last.
+  // `positive`: the group opens on a feature test (`#ifdef X`, `#if defined(X)`,
+  // `#if X`), whose `#else` branch is the default build. `elseAt`: index into
+  // marks of that `#else`, if any. `literal`: `#if 0` or `#if 1`.
+  const stack: Array<{ marks: number[]; dead: boolean; literal: boolean; positive: boolean; elseAt: number }> = [];
+  const directive: boolean[] = [];
+  // Lines that continue the directive above them with a `\`.
+  const continued: boolean[] = [];
+  let changed = false;
+  let continuation = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = stripCr(masked[i] as string);
+    const isDirective: boolean = continuation || /^[ \t]*#/.test(line);
+    directive[i] = isDirective;
+    continued[i] = continuation;
+    const wasContinuation = continuation;
+    // Read on the raw line: a `\` that ends a line splices it even inside a
+    // comment (a multi-line comment in a `#define` body), and masking would
+    // hide it.
+    continuation = isDirective && /\\\s*$/.test(stripCr(lines[i] as string));
+    if (!isDirective || wasContinuation) continue;
+    let m: RegExpExecArray | null;
+    if ((m = C_COND_OPEN_RE.exec(line))) {
+      const cond = (m[2] as string).trim();
+      const dead = m[1] === 'if' && /^0\b/.test(cond);
+      // `#if 1` is the other way round from `#if 0`: its first branch is the live one.
+      const live = m[1] === 'if' && /^1\b/.test(cond);
+      const positive = m[1] === 'ifdef' || (m[1] === 'if' && !dead && !live && !/^!/.test(cond));
+      stack.push({ marks: [i], dead, literal: dead || live, positive, elseAt: -1 });
+      continue;
+    }
+    const top = stack[stack.length - 1];
+    if (!top) continue;
+    if (C_COND_NEXT_RE.test(line)) {
+      if (/^[ \t]*#[ \t]*else\b/.test(line)) top.elseAt = top.marks.length;
+      top.marks.push(i);
+      continue;
+    }
+    if (!C_COND_ENDIF_RE.test(line)) continue;
+    stack.pop();
+    top.marks.push(i);
+    // Which branch survives: never `#if 0`'s; for a feature test with an
+    // `#else`, the `#else` branch — the build without the feature is the one
+    // that defines `main`, not `umain` (jq's `#ifdef WIN32`); otherwise the
+    // first. A kept branch is verbatim; the others become spaces.
+    const keep = top.dead ? 1 : top.positive && top.elseAt > 0 ? top.elseAt : 0;
+    if (keep >= top.marks.length - 1) continue; // `#if 0` with nothing to keep
+    let damaged = false;
+    // Whether each branch's braces and parentheses balance on their own.
+    let balanced = true;
+    for (let b = 0; b < top.marks.length - 1; b++) {
+      const body: string[] = [];
+      for (let k = (top.marks[b] as number) + 1; k < (top.marks[b + 1] as number); k++) {
+        if (directive[k]) continue; // a `\`-continued directive line
+        const c = code(k);
+        if (c) body.push(c);
+      }
+      if (body.length === 0) continue;
+      const first = body[0] as string;
+      const last = body[body.length - 1] as string;
+      let depth = 0;
+      let parens = 0;
+      let dips = false;
+      for (const l of body) {
+        for (const ch of l) {
+          depth += ch === '{' ? 1 : ch === '}' ? -1 : 0;
+          parens += ch === '(' ? 1 : ch === ')' ? -1 : 0;
+          if (depth < 0) dips = true; // closes a block it did not open (`} else if (…) {`)
+        }
+      }
+      if (depth !== 0 || parens !== 0) balanced = false;
+      damaged ||=
+        depth !== 0 ||
+        dips ||
+        /^else\b/.test(first) ||
+        // A fragment of an expression: `|| (h4 == NULL)` inside an `if (…)`,
+        // `isEmpty(s) ||` before the rest of the condition.
+        /^(\|\||&&|,|\)|:|\?)/.test(first) ||
+        /(\|\||&&|,|\(|\?|:)$/.test(last) ||
+        (/^(else[ \t]+)?if[ \t]*\(/.test(last) && /\)$/.test(last));
+    }
+    if (!damaged) continue;
+    // A group on a flag whose branches each balance keeps them all: read in
+    // a row they are still C (`} else if (a) {…} else if (b) {…}`, list
+    // entries, `|| x || y`), and the parser needed only the directive lines
+    // gone. Dropping one would lose real code of a build the project may
+    // well use (betaflight's ENABLE_RESCUE_PLAN arms). A branch that opens or
+    // closes more than it should, or a literal `#if 0` / `#if 1`, keeps one.
+    const keepAll = balanced && !top.literal;
+    for (let b = 0; b < top.marks.length - 1; b++) {
+      const from = top.marks[b] as number;
+      const to = top.marks[b + 1] as number;
+      // The directive line (with its `\`-continuations), then — unless this
+      // is the kept branch — the branch body.
+      // Only its own `\` continuations: a `#define` or `#include` right under
+      // it is a line of the branch, kept with a kept branch.
+      for (let k = from; k < to && (k === from || continued[k]); k++) blankLine(k);
+      if (b === keep || keepAll) continue;
+      for (let k = from + 1; k < to; k++) blankLine(k);
+    }
+    blankLine(i);
+    changed = true;
+  }
+  return changed ? lines.join('\n') : source;
 }
 
 function preParseCSource(source: string): string {
@@ -2571,9 +2947,16 @@ function preParseCSource(source: string): string {
     )
   );
   if (looksLikeCudaSource(blanked)) blanked = blankCudaConstructs(blanked);
-  // The named-variadic `#define` pass runs AFTER the directive restore — it
-  // deliberately edits directive lines (see its doc comment).
-  return rawStrings.restore(blankCNamedVariadicDefineDots(restoreDirectiveLines(source, blanked)));
+  // The named-variadic `#define` pass and the conditional-group collapse run
+  // AFTER the directive restore — they deliberately edit directive lines (see
+  // their doc comments) — and BEFORE the raw-string restore: both are
+  // length-preserving, and the collapse must count braces with raw-string
+  // bodies still masked.
+  return rawStrings.restore(
+    blankCUnbalancedConditionalBranches(
+      blankCNamedVariadicDefineDots(restoreDirectiveLines(source, blanked))
+    )
+  );
 }
 
 /** A constructor prototype carries defaults even when its body is in another file. */

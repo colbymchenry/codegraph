@@ -25,7 +25,10 @@ import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
 import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
-import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
+import {
+  isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier,
+  blankNonAsciiWords, splitAtCjkSwitches, meetsQueryWordFloor,
+} from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
 import { findNamedCopybooks, isCopybookInclude } from '../graph/cobol-copybooks';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
@@ -61,17 +64,21 @@ export const MAX_QUERY_TERMS = 128;
  * - SCREAMING_SNAKE: MAX_RETRIES
  * - dot.notation: app.isPackaged (extracts both sides)
  * - Single words that look like identifiers (no spaces, not common English words)
+ * - Names in other scripts, whole: 로그인, 寻路服务, état (#516, #1262)
  *
  * @param query - Natural language query
  * @returns Array of potential symbol names
  */
-function extractSymbolsFromQuery(query: string): string[] {
+export function extractSymbolsFromQuery(query: string): string[] {
   const symbols = new Set<string>();
+  // The ASCII patterns below would read `état` as `tat`; they see such words
+  // blanked out, and the Unicode pass at the end takes them whole.
+  const asciiView = blankNonAsciiWords(query);
 
   // Extract CamelCase identifiers (2+ chars, starts with letter)
   const camelCasePattern = /\b([A-Z][a-z]+(?:[A-Z][a-z]*)*|[a-z]+(?:[A-Z][a-z]*)+)\b/g;
   let match;
-  while ((match = camelCasePattern.exec(query)) !== null) {
+  while ((match = camelCasePattern.exec(asciiView)) !== null) {
     if (match[1] && match[1].length >= 2) {
       symbols.add(match[1]);
     }
@@ -79,7 +86,7 @@ function extractSymbolsFromQuery(query: string): string[] {
 
   // Extract snake_case identifiers
   const snakeCasePattern = /\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b/gi;
-  while ((match = snakeCasePattern.exec(query)) !== null) {
+  while ((match = snakeCasePattern.exec(asciiView)) !== null) {
     if (match[1] && match[1].length >= 3) {
       symbols.add(match[1]);
     }
@@ -87,7 +94,7 @@ function extractSymbolsFromQuery(query: string): string[] {
 
   // Extract SCREAMING_SNAKE_CASE
   const screamingPattern = /\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b/g;
-  while ((match = screamingPattern.exec(query)) !== null) {
+  while ((match = screamingPattern.exec(asciiView)) !== null) {
     if (match[1]) {
       symbols.add(match[1]);
     }
@@ -95,7 +102,7 @@ function extractSymbolsFromQuery(query: string): string[] {
 
   // Extract ALL_CAPS acronyms (2+ chars, e.g., REST, HTTP, LRU, API)
   const acronymPattern = /\b([A-Z]{2,})\b/g;
-  while ((match = acronymPattern.exec(query)) !== null) {
+  while ((match = acronymPattern.exec(asciiView)) !== null) {
     if (match[1]) {
       symbols.add(match[1]);
     }
@@ -103,7 +110,7 @@ function extractSymbolsFromQuery(query: string): string[] {
 
   // Extract dot.notation and split into parts (e.g., "app.isPackaged" -> ["app", "isPackaged"])
   const dotPattern = /\b([a-zA-Z][a-zA-Z0-9]*(?:\.[a-zA-Z][a-zA-Z0-9]*)+)\b/g;
-  while ((match = dotPattern.exec(query)) !== null) {
+  while ((match = dotPattern.exec(asciiView)) !== null) {
     if (match[1]) {
       // Add both the full path and individual parts
       symbols.add(match[1]);
@@ -119,9 +126,23 @@ function extractSymbolsFromQuery(query: string): string[] {
   // Extract plain lowercase identifiers (3+ chars, not already matched)
   // Catches symbol names like "undo", "redo", "history", "render", "parse"
   const lowercasePattern = /\b([a-z][a-z0-9]{2,})\b/g;
-  while ((match = lowercasePattern.exec(query)) !== null) {
+  while ((match = lowercasePattern.exec(asciiView)) !== null) {
     if (match[1]) {
       symbols.add(match[1]);
+    }
+  }
+
+  // Names with a letter outside ASCII, whole runs only (#2005 keeps partial
+  // Chinese words out of search): `로그인`, `寻路服务`, `état`. A name that
+  // switches between Han, kana or Hangul and another script, or joins words
+  // with `_`, is tried as written (`get用户信息`) and by its words, so
+  // `NavMeshAgent类型` also names `类型`; its ASCII side is the patterns' above.
+  for (const run of query.match(/[\p{L}\p{N}\p{M}_$]+/gu) ?? []) {
+    if (!/[^\x00-\x7F]/.test(run)) continue;
+    const words = run.split(/[_$]+/).flatMap(splitAtCjkSwitches);
+    if (words.length > 1 && meetsQueryWordFloor(run)) symbols.add(run);
+    for (const word of words) {
+      if (/[^\x00-\x7F]/.test(word) && meetsQueryWordFloor(word)) symbols.add(word);
     }
   }
 

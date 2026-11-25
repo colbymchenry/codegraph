@@ -244,6 +244,9 @@ export function resolveStaticAsset(rootDir: string, urlPath: string): string | n
  * — treating it as a separator everywhere is the safe direction, and no built
  * asset name contains one).
  *
+ * For a RAW request path only. A source path handed to
+ * {@link resolveProjectFile} has already been decoded.
+ *
  * @returns the decoded path, or `null` if it is unusable.
  */
 function decodePath(urlPath: string): string | null {
@@ -259,6 +262,18 @@ function decodePath(urlPath: string): string | null {
 }
 
 /**
+ * Whether a project-relative source path is one we would read at all: no raw
+ * control byte (NUL truncates a path in some syscalls), and on Windows no
+ * backslash, a separator there that indexed paths never use. Nothing is
+ * decoded: a `%` in the path is part of a file name.
+ */
+function isUsableSourcePath(relativePath: string): boolean {
+  // eslint-disable-next-line no-control-regex -- rejecting raw control bytes IS the point
+  if (/[\x00-\x1f\x7f]/.test(relativePath)) return false;
+  return !(process.platform === 'win32' && relativePath.includes('\\'));
+}
+
+/**
  * Resolve a project-relative source path to an absolute path that is safe to
  * read and hand to the browser.
  *
@@ -268,6 +283,11 @@ function decodePath(urlPath: string): string | null {
  * what keeps `/api/source?path=../../.ssh/id_rsa` from being a credential leak
  * over a port the user opened to read their own code.
  *
+ * The path is taken as it is stored in the index, or as a query value the URL
+ * parser has already decoded once, and is never decoded again. Decoding it a
+ * second time refused `100%.ts` and read `a b.ts` for `a%20b.ts`, while the
+ * index lookup used the name as given (#2009).
+ *
  * @throws {PathRefusalError} when the root is a sensitive system directory, or
  *   the path escapes the root by traversal or symlink.
  */
@@ -275,8 +295,7 @@ export function resolveProjectFile(projectRoot: string, relativePath: string): s
   if (typeof relativePath !== 'string' || relativePath.trim() === '') {
     throw new PathRefusalError('No file path was given.');
   }
-  const decoded = decodePath(relativePath);
-  if (decoded === null) {
+  if (!isUsableSourcePath(relativePath)) {
     throw new PathRefusalError(`Refusing to read an unusable path: ${relativePath}`);
   }
 
@@ -286,13 +305,13 @@ export function resolveProjectFile(projectRoot: string, relativePath: string): s
   const rootError = validateProjectPath(projectRoot);
   if (rootError) throw new PathRefusalError(rootError);
 
-  if (path.isAbsolute(decoded)) {
-    throw new PathRefusalError(`Refusing to read an absolute path: ${decoded}`);
+  if (path.isAbsolute(relativePath)) {
+    throw new PathRefusalError(`Refusing to read an absolute path: ${relativePath}`);
   }
 
-  const absolute = validatePathWithinRoot(projectRoot, decoded);
+  const absolute = validatePathWithinRoot(projectRoot, relativePath);
   if (!absolute) {
-    throw new PathRefusalError(`Refusing to read a path outside the project: ${decoded}`);
+    throw new PathRefusalError(`Refusing to read a path outside the project: ${relativePath}`);
   }
   return absolute;
 }

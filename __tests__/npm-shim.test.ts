@@ -97,6 +97,55 @@ describe('npm-shim windowsHide (#1092)', () => {
   });
 });
 
+// #3277: how the shim exits after the bundled runtime ends, on every platform.
+// A preloaded stub stands in for the runtime's spawn result, so a death by a
+// signal is exercised on Windows too, where no process ends by one; the
+// POSIX-only cases below kill a real fake bundle.
+describe('npm-shim exit status (#3277)', () => {
+  function runStubbedShim(result: { status: number | null; signal: string | null }) {
+    const pkg = makePkg();
+    const platformPkg = path.join(pkg, 'node_modules', '@colbymchenry', `codegraph-${target}`);
+    // Both layouts the shim resolves: Windows' node.exe + entry, and POSIX's launcher.
+    for (const file of ['node.exe', path.join('lib', 'dist', 'bin', 'codegraph.js'), path.join('bin', 'codegraph')]) {
+      fs.mkdirSync(path.dirname(path.join(platformPkg, file)), { recursive: true });
+      fs.writeFileSync(path.join(platformPkg, file), '');
+    }
+    fs.writeFileSync(path.join(platformPkg, 'package.json'),
+      JSON.stringify({ name: `@colbymchenry/codegraph-${target}`, version: '9.9.9-test' }) + '\n');
+    const stub = path.join(pkg, 'stub-spawn.cjs');
+    fs.writeFileSync(stub, [
+      "const cp = require('child_process');",
+      'cp.spawnSync = () => JSON.parse(process.env.CG_TEST_SPAWN_RESULT);',
+    ].join('\n'));
+    return new Promise<{ status: number | null; stderr: string }>((resolve) => {
+      const child = spawn(process.execPath, ['--require', stub, path.join(pkg, 'npm-shim.js'), 'index'], {
+        env: { ...process.env, CODEGRAPH_INSTALL_DIR: mkTmp('cache'), CG_TEST_SPAWN_RESULT: JSON.stringify(result) },
+      });
+      let stderr = '';
+      child.stderr.on('data', (d) => { stderr += d.toString(); });
+      child.on('close', (status) => resolve({ status, stderr }));
+    });
+  }
+
+  it('names SIGKILL as a likely out-of-memory kill and exits 137', async () => {
+    const r = await runStubbedShim({ status: null, signal: 'SIGKILL' });
+    expect(r.status).toBe(137);
+    expect(r.stderr).toBe('codegraph: the process was killed by SIGKILL; the system may have run out of memory.\n');
+  });
+
+  it('names another signal and exits 128 plus its number', async () => {
+    const r = await runStubbedShim({ status: null, signal: 'SIGTERM' });
+    expect(r.status).toBe(143);
+    expect(r.stderr).toBe('codegraph: the process was stopped by SIGTERM.\n');
+  });
+
+  it('passes the runtime\'s exit code through, with nothing on stderr', async () => {
+    const r = await runStubbedShim({ status: 4, signal: null });
+    expect(r.status).toBe(4);
+    expect(r.stderr).toBe('');
+  });
+});
+
 describe.skipIf(isWindows)('npm-shim launcher', () => {
   it('runs the installed optional-dependency bundle without any download', async () => {
     const pkg = makePkg();
@@ -201,6 +250,42 @@ describe.skipIf(isWindows)('npm-shim launcher', () => {
 
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('HOST_PPID=[424242]');
+  });
+
+  // #3277: a bundled runtime killed by a signal (the kernel's out-of-memory
+  // killer, most often) made the shim exit 1 with nothing on stderr. It names
+  // the signal and exits as a shell would, 128 plus its number.
+  it.each([
+    ['KILL', 137, 'codegraph: the process was killed by SIGKILL; the system may have run out of memory.'],
+    ['TERM', 143, 'codegraph: the process was stopped by SIGTERM.'],
+  ])('reports a bundle killed by SIG%s and exits %i (#3277)', async (signal, code, message) => {
+    const pkg = makePkg();
+    const platformPkg = path.join(pkg, 'node_modules', '@colbymchenry', `codegraph-${target}`);
+    const binDir = path.join(platformPkg, 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(path.join(binDir, 'codegraph'), `#!/bin/sh\nkill -${signal} $$\n`);
+    fs.chmodSync(path.join(binDir, 'codegraph'), 0o755);
+    fs.writeFileSync(path.join(platformPkg, 'package.json'),
+      JSON.stringify({ name: `@colbymchenry/codegraph-${target}`, version: '9.9.9-test' }) + '\n');
+    const r = await runShim(pkg, ['index'], { CODEGRAPH_INSTALL_DIR: mkTmp('cache') });
+
+    expect(r.status).toBe(code);
+    expect(r.stderr).toContain(message);
+  });
+
+  it('passes a bundle\'s own exit code through unchanged (#3277)', async () => {
+    const pkg = makePkg();
+    const platformPkg = path.join(pkg, 'node_modules', '@colbymchenry', `codegraph-${target}`);
+    const binDir = path.join(platformPkg, 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(path.join(binDir, 'codegraph'), '#!/bin/sh\nexit 3\n');
+    fs.chmodSync(path.join(binDir, 'codegraph'), 0o755);
+    fs.writeFileSync(path.join(platformPkg, 'package.json'),
+      JSON.stringify({ name: `@colbymchenry/codegraph-${target}`, version: '9.9.9-test' }) + '\n');
+    const r = await runShim(pkg, [], { CODEGRAPH_INSTALL_DIR: mkTmp('cache') });
+
+    expect(r.status).toBe(3);
+    expect(r.stderr).toBe('');
   });
 });
 

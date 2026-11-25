@@ -269,6 +269,19 @@ fn wiring(mut o: Holder) {
     let (t1, t2) = (cb_a, cb_b);
     invoke_all(arr);
     invoke(foo_single);
+    // Functions passed through their path (#3254); a variant, a constant, a
+    // generic path and one with a comment in it are none.
+    let _ = opt.map(Graph::counts);
+    let _ = v.iter().map(crate::util::helper);
+    register(m::helper2);
+    let p = Self::helper;
+    let q = [m::cb_c, r#mod::r#fn];
+    let s = Holder { cb: other::handler };
+    let _ = zs.map(m ::  spaced);
+    let _ = xs.map(Kind::Wrap);
+    let _ = ys.map(Limits::MAX);
+    let _ = ws.map(Vec::<u8>::new);
+    let _ = us.map(m::/* c */commented);
 }
 
 static CB: fn() = handler;
@@ -297,6 +310,15 @@ fn mount() {
     let r = routes![a::b::index_h, health_h];
     let c = catchers![not_found_h];
     let skipped = rocket::routes![a::x];
+}
+
+// Calls in an expression macro's arguments (#3251); another macro's are not read.
+fn macro_calls(v: &Vis, x: Option<u8>) {
+    println!("{} {}", label(), v.a.b());
+    assert_eq!(count(), m::size::<u8>(2), "{}", Mode::A.flip());
+    let _ = vec![make(); 3];
+    let _ = matches!(x, Some(n) if n.is_power_of_two());
+    other_macro!(not_read(), at_all());
 }
 
 routes![top_level_h];

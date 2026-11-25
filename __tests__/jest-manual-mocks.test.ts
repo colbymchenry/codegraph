@@ -65,14 +65,18 @@ export function View() { return <Chart />; }
   'packages/api/jest.setup.ts': `import { resetMocks } from './__mocks__/acme-shared';
 resetMocks();
 `,
-  // An event bus: production code emits; production code registers `handleReady`, which a mock
-  // declares too, and a test registers the mock's `onSavedMock`.
-  'packages/api/src/bus.ts': `export function start(bus: { emit(e: string): void }) {
+  // An event bus the modules share: production code emits; production code registers
+  // `handleReady`, which a mock declares too, and a test registers the mock's `onSavedMock`.
+  'packages/api/src/bus.ts': `import { EventEmitter } from 'events';
+export const bus = new EventEmitter();
+export function start() {
   bus.emit('ready');
   bus.emit('saved');
 }
 `,
-  'packages/api/src/wire.ts': `export function wire(bus: { on(e: string, f: () => void): void }) {
+  'packages/api/src/wire.ts': `import { bus } from './bus';
+import { handleReady } from './handlers';
+export function wire() {
   bus.on('ready', handleReady);
 }
 `,
@@ -81,7 +85,9 @@ resetMocks();
   'packages/api/__mocks__/handlers.ts': `export function handleReady(): void {}
 export function onSavedMock(): void {}
 `,
-  'packages/api/src/bus.test.ts': `export function listen(bus: { on(e: string, f: () => void): void }) {
+  'packages/api/src/bus.test.ts': `import { bus } from './bus';
+import { onSavedMock } from '../__mocks__/handlers';
+export function listen() {
   bus.on('saved', onSavedMock);
 }
 `,

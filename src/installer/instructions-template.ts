@@ -1,6 +1,6 @@
 /**
  * The marker-fenced agent-instructions block the installer writes into each
- * agent's instructions file (CLAUDE.md / AGENTS.md / GEMINI.md).
+ * agent's instructions file (CLAUDE.md / AGENTS.md / GEMINI.md / QWEN.md).
  *
  * History: pre-#529 the installer wrote a full usage playbook here, which
  * duplicated the MCP `initialize` instructions for the main agent — so it
@@ -24,6 +24,8 @@
  * server instructions — the #529 duplication-cost argument still bounds
  * its size. Command names and the two surfaces, nothing more.
  */
+
+import { openCodeToolName, withOpenCodeToolNames } from '../mcp/opencode-tool-names';
 
 /** Markers used by the marker-based section write/removal. */
 export const CODEGRAPH_SECTION_START = '<!-- CODEGRAPH_START -->';
@@ -49,3 +51,28 @@ In repositories indexed by CodeGraph (a \`.codegraph/\` directory exists at the 
 
 If there is no \`.codegraph/\` directory, skip CodeGraph entirely — indexing is the user's decision.
 ${CODEGRAPH_SECTION_END}`;
+
+/**
+ * OpenCode's block (#1267): the same text, with the MCP tool named the way
+ * OpenCode lists it, and one sentence more. OpenCode registers a direct MCP tool
+ * as `<server key>_<tool name>`, so under the key the installer writes,
+ * `codegraph_explore` is `codegraph_codegraph_explore` there; the plain block
+ * sent its agents (subagents included) after a tool that doesn't exist.
+ *
+ * The sentence names the tool both ways, because the file can be shared: the
+ * project's `AGENTS.md` is read by Codex, Droid, Kimi and Pi as well, and
+ * dotfiles often link several agents' files to one. So this block serves every
+ * agent reading it, and an agent writing the plain block keeps this one where
+ * it finds it (`upsertInstructionsEntry`) rather than trade blocks with
+ * OpenCode on every install. The `codegraph explore` line is the same for all.
+ */
+export const OPENCODE_INSTRUCTIONS_BLOCK = ((): string => {
+  const tool = 'codegraph_explore';
+  const renamed = withOpenCodeToolNames(CODEGRAPH_INSTRUCTIONS_BLOCK, [tool]);
+  const body = renamed.slice(0, renamed.length - CODEGRAPH_SECTION_END.length);
+  return (
+    `${body}\nOpenCode puts the MCP server's key in front of each tool's name, so it lists this tool as ` +
+    `\`${openCodeToolName(tool)}\` where other agents list \`${tool}\`; if the server is registered under ` +
+    `another key, that key replaces the first \`codegraph_\`.\n${CODEGRAPH_SECTION_END}`
+  );
+})();

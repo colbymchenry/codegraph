@@ -183,7 +183,9 @@ function arrivesFromAnotherContext(edge: Edge): boolean {
   // The cross-tier synthesizer marks every edge it makes with the tier it
   // crossed (a client's fetch onto its route, a queue job onto its consumer).
   if (meta.tier !== undefined) return true;
-  return meta.synthesizedBy === 'rn-event-channel';
+  // A Next proxy runs before every route it covers, and no route called it: a
+  // redirect written in the proxy is on no screen.
+  return meta.synthesizedBy === 'rn-event-channel' || meta.synthesizedBy === 'next-proxy';
 }
 
 /** A component rendered by at least this many screens is chrome, not a screen's own behaviour. */

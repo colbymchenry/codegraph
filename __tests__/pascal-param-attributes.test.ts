@@ -78,10 +78,10 @@ describe('Delphi parameter attributes (#2545)', () => {
   it('keeps every class member after a `const [ref]` parameter', () => {
     const { methods, fields, constants } = members(MIN_PAS);
     expect(methods).toEqual([
-      'TMin::After:10',
-      'TMin::Before:8',
-      'TMin::WithRef:9',
-      'TNext::Other:15',
+      'TMin::After:32',
+      'TMin::Before:23',
+      'TMin::WithRef:27',
+      'TNext::Other:37',
     ]);
     // The parameter after the attribute is not a field of the class.
     expect(fields).toEqual([]);
@@ -93,7 +93,7 @@ describe('Delphi parameter attributes (#2545)', () => {
       .replace('procedure WithRef(const [ref] AValue: Integer; const AOther: string);', 'procedure WithRef(const [ref] AValue: Integer);')
       .replace('procedure TMin.WithRef(const [ref] AValue: Integer; const AOther: string);', 'procedure TMin.WithRef(const [ref] AValue: Integer);');
     const { methods } = members(code);
-    expect(methods).toEqual(['TMin::After:10', 'TMin::Before:8', 'TMin::WithRef:9', 'TNext::Other:15']);
+    expect(methods).toEqual(['TMin::After:32', 'TMin::Before:23', 'TMin::WithRef:27', 'TNext::Other:37']);
   });
 
   it('keeps the attribute in the signature, as the source writes it', () => {

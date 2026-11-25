@@ -21,16 +21,6 @@ function inRustScope(id: string, ref: UnresolvedRef, context: ResolutionContext)
   return !node || isRustNameInScope(node, ref, context);
 }
 
-const cargoWorkspaceMapCache = new WeakMap<ResolutionContext, Map<string, string>>();
-
-function getCachedCargoWorkspaceCrateMap(context: ResolutionContext): Map<string, string> {
-  const cached = cargoWorkspaceMapCache.get(context);
-  if (cached) return cached;
-  const map = getCargoWorkspaceCrateMap(context);
-  cargoWorkspaceMapCache.set(context, map);
-  return map;
-}
-
 export const rustResolver: FrameworkResolver = {
   name: 'rust',
   languages: ['rust'],
@@ -341,7 +331,7 @@ function resolveModule(name: string, context: ResolutionContext): ModuleResoluti
   // Rust modules can be either mod.rs in a directory or name.rs
   const localPaths = [`src/${name}.rs`, `src/${name}/mod.rs`];
 
-  const workspaceCrates = getCachedCargoWorkspaceCrateMap(context);
+  const workspaceCrates = getCargoWorkspaceCrateMap(context);
   const cratePath = workspaceCrates.get(name);
   const workspacePaths = cratePath
     ? [`${cratePath}/src/lib.rs`, `${cratePath}/src/main.rs`]

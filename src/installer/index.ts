@@ -3,8 +3,10 @@
  *
  * Multi-target: writes MCP server config + instructions for the
  * agents the user picks (Claude Code, Cursor, Codex CLI, opencode,
- * Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and GitHub
- * Copilot in VS Code / the Copilot CLI / JetBrains IDEs).
+ * Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot in
+ * VS Code / the Copilot CLI / JetBrains IDEs, IBM Bob, Factory Droid,
+ * Windsurf, Qwen Code, DeepSeek Harness, Grok Build, Kimi Code, the
+ * Qoder CLI, and Pi).
  * Defaults to the Claude-only behavior for backwards compatibility
  * when no targets are explicitly chosen and nothing else is detected.
  *
@@ -28,7 +30,7 @@ import type { AgentTarget, Location, TargetId, WriteResult } from './targets/typ
 // installer must stay importable even when native modules can't load).
 import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
-import { getCodeGraphDir } from '../directory';
+import { getCodeGraphDir, unsafeIndexRootReason } from '../directory';
 import { getTelemetry, TELEMETRY_DOCS } from '../telemetry';
 import { maybeOfferBetaSignup } from './beta-signup';
 
@@ -161,16 +163,17 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
-  // Step 4: auto-allow permissions (only meaningful for Claude;
-  // skipped silently by other targets).
+  // Step 4: auto-allow permissions (only meaningful for Claude Code and
+  // Qwen Code; skipped silently by other targets).
+  const autoAllowAgents = targets.filter((t) => t.id === 'claude' || t.id === 'qwen').map((t) => t.displayName);
   let autoAllow: boolean;
   if (opts.autoAllow !== undefined) {
     autoAllow = opts.autoAllow;
   } else if (useDefaults) {
     autoAllow = true;
-  } else if (targets.some((t) => t.id === 'claude')) {
+  } else if (autoAllowAgents.length > 0) {
     const ans = await clack.confirm({
-      message: 'Auto-allow CodeGraph commands? (Skips permission prompts in Claude Code)',
+      message: `Auto-allow CodeGraph commands? (Skips permission prompts in ${autoAllowAgents.join(' and ')})`,
       initialValue: true,
     });
     if (clack.isCancel(ans)) {
@@ -411,7 +414,10 @@ export interface RefreshReport {
  *   - targets that aren't `alreadyConfigured` are skipped untouched;
  *   - permissions are not written (`autoAllow: false`) and the prompt
  *     hook is left as-is (`promptHook: undefined`), so choices the user
- *     made at install time — or by hand since — are preserved.
+ *     made at install time — or by hand since — are preserved;
+ *   - a `local` sweep from a folder that holds no project — the home
+ *     folder, a folder above it, a filesystem root: the folders `init`
+ *     refuses — finds nothing configured there (see below).
  *
  * Every write underneath is the targets' own idempotent upsert, so a
  * re-run on an already-current machine reports `unchanged` everywhere.
@@ -422,12 +428,21 @@ export function refreshTargets(
   targets: readonly AgentTarget[],
   location: Location,
 ): RefreshReport[] {
+  // A local install belongs to the project the command runs in. `codegraph
+  // upgrade` sweeps both locations from wherever the terminal is, and a new
+  // terminal opens in the home folder, where an agent's project file and its
+  // user-wide one are the same file (`./.cursor/mcp.json` is
+  // `~/.cursor/mcp.json`). Detection there takes the global install for a
+  // local one, and re-installing it as local rewrites the user's own setup:
+  // Cursor's server gets pinned to the home folder, and `~/AGENTS.md`,
+  // `~/GEMINI.md` and `~/QWEN.md` appear (#3234). No project, no local install.
+  const noProjectHere = location === 'local' && unsafeIndexRootReason(process.cwd()) !== null;
   return targets.map((target) => {
     const base = { id: target.id, displayName: target.displayName, location };
     if (!target.supportsLocation(location)) {
       return { ...base, status: 'unsupported' as const, changedPaths: [] };
     }
-    if (!target.detect(location).alreadyConfigured) {
+    if (noProjectHere || !target.detect(location).alreadyConfigured) {
       return { ...base, status: 'not-configured' as const, changedPaths: [] };
     }
     let result: WriteResult;
@@ -480,8 +495,8 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot, ~/.config/github-copilot' },
-        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./.vscode, ./opencode.jsonc, ./.gemini, ./.kiro' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot, ~/.config/github-copilot, ~/.bob, ~/.factory, ~/.codeium/windsurf, ~/.qwen, ~/.dsh, ~/.grok, ~/.kimi-code, ~/.qoder, ~/.pi' },
+        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./.vscode, ./opencode.jsonc, ./.gemini, ./.kiro, ./.bob, ./.factory, ./.qwen, ./.grok, ./.kimi-code, ./.qoder, ./.pi' },
       ],
       initialValue: 'global' as const,
     });

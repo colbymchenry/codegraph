@@ -2,24 +2,26 @@
  * Kernel↔wasm Kotlin extraction parity (R7b of the kernel migration).
  *
  * Asserts the native walker (codegraph-kernel/src/kotlin.rs — grammar
- * compiled from the vendored fwcd 0.3.8 C sources, the arc's first
- * vendored-grammar-C language) produces the SAME ExtractionResult as the
+ * compiled from the vendored fwcd/tree-sitter-kotlin C sources, the arc's
+ * first vendored-grammar-C language) produces the SAME ExtractionResult as the
  * wasm TreeSitterExtractor over the checked-in torture fixture (torture.kt:
  * the property hook's scope classification and its initializer walk (a
  * lambda / SAM / anonymous-object RHS attributing its calls to the property),
  * extension-function receiver QNs
  * (`WidgetK::extend`, the qualified `com::qext` bug) + the owner-contains
  * fallback, expect/actual → node DECORATORS (the KMP synthesizer feed),
- * the bodiless-vs-bodied class header asymmetry, comment-glued
+ * a class header's code (constructor defaults, superclass constructor
+ * arguments, a `by` delegate) walked as the class's with or without a body
+ * (kotlin-class-header-code.test.ts), comment-glued
  * import/package extents, KDoc dropped-and-chain-breaking docstrings,
  * `@Marker` decorates vs `@Anno(args)` nothing, zero type-annotation refs,
  * zero instantiates, the #750 capitalized-chain re-encode, paren-then-
  * lambda garbage callees, `${X}`-reads-vs-`$X`-non-reads value refs and the
  * packaged-file target drop) plus a `.kts` script fixture (file-attributed
  * top-level calls), with in-memory CRLF variants (#1329), and two defer
- * fixtures — a `fun interface` file and a PHANTOM error (a one-line class
- * body sets hasError with a complete, ERROR-node-free CST; the kernel
- * trusts the flag).
+ * fixtures — a `fun interface` file and a PHANTOM error (a dangling `x = }`
+ * leaves only a hidden MISSING token: hasError with a complete, ERROR-node-free
+ * CST; the kernel trusts the flag).
  *
  * The full-repo sweep lives in scripts/kernel-parity.mjs (okio/okhttp/
  * kotlinx.coroutines — expected deferrals 23/49/51, grammar-inherent).
@@ -117,20 +119,28 @@ describe.skipIf(!kernelBuilt)('kernel Kotlin extraction parity', () => {
     });
   }
 
-  it('fun-interface files defer to the wasm extractor (grammar-inherent error)', () => {
-    const src = 'package p\n\nfun interface Transformer {\n    fun transform(x: Int): Int\n}\n\nfun after() { work() }\n';
+  it('fun-interface files parse on both paths once `fun` is blanked (preParse)', () => {
+    // tree-sitter-kotlin 0.3.8 had no `fun interface`; the extractor's preParse
+    // blanks the `fun` (offset-preserving), so the kernel no longer deferred
+    // and the declaration after it — here behind a doc comment, the shape
+    // whose error recovery used to swallow it — was extracted too. The grammar
+    // reads `fun interface` itself now; the blanking stays harmless.
+    const src = 'package p\n\nfun interface Transformer {\n    fun transform(x: Int): Int\n}\n\n/** Next. */\ninterface Sink {\n    fun put(x: Int)\n}\n\nfun after() { work() }\n';
+    assertParity('src/FunIface.kt', src, 4);
     process.env.CODEGRAPH_KERNEL_LANGS = 'all';
     delete process.env.CODEGRAPH_KERNEL;
-    expect(tryKernelExtract('src/FunIface.kt', src, 'kotlin')).toBeNull();
-    process.env.CODEGRAPH_KERNEL = '0';
-    const viaWasm = extractFromSource('src/FunIface.kt', src, 'kotlin');
-    delete process.env.CODEGRAPH_KERNEL;
-    // The wasm arm's misparse-recovery hook still mints the interface node.
-    expect(viaWasm.nodes.some((n) => n.kind === 'interface' && n.name === 'Transformer')).toBe(true);
+    const result = tryKernelExtract('src/FunIface.kt', src, 'kotlin')!;
+    expect(result.nodes.some((n) => n.kind === 'interface' && n.name === 'Transformer')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'interface' && n.name === 'Sink')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.qualifiedName.endsWith('Sink::put'))).toBe(true);
   });
 
   it('PHANTOM errors defer too — hasError with a complete, ERROR-node-free CST', () => {
-    const src = 'abstract class A { abstract fun i(): Int }\n';
+    // The assignment's missing right-hand side is a hidden MISSING token: no
+    // ERROR node anywhere, yet hasError is set. (The grammar before d6af96d did
+    // this for a one-line class body, `abstract class A { abstract fun i(): Int }`,
+    // which now parses clean.)
+    const src = 'class A { fun f() { x = } }\n';
     process.env.CODEGRAPH_KERNEL_LANGS = 'all';
     delete process.env.CODEGRAPH_KERNEL;
     expect(tryKernelExtract('src/Phantom.kt', src, 'kotlin')).toBeNull();

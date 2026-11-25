@@ -7,6 +7,7 @@
 import { Node, Edge, Context, Subgraph, EdgeKind } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from './traversal';
+import { findFileCycles } from './file-cycles';
 
 /**
  * Graph query manager for complex queries
@@ -129,9 +130,10 @@ export class GraphQueryManager {
    * Returns all files that import from this file.
    *
    * @param filePath - Path to the file
+   * @param opts - `skipTiers`: leave out links across a process boundary (#3320)
    * @returns Array of file paths that depend on this file
    */
-  getFileDependents(filePath: string): string[] {
+  getFileDependents(filePath: string, opts: { skipTiers?: boolean } = {}): string[] {
     // Previously this only followed `imports` edges into the file node or its
     // exported symbols and returned 0 dependents for *every* file — because an
     // `imports` edge here connects a file to its own local import declarations
@@ -139,7 +141,7 @@ export class GraphQueryManager {
     // dependency signal is the resolved symbol graph (calls/references/
     // instantiates/extends/implements/...), which is what blast-radius /
     // `affected` need. Delegate to the indexed projection of that graph.
-    return this.queries.getDependentFilePaths(filePath);
+    return this.queries.getDependentFilePaths(filePath, opts);
   }
 
   /**
@@ -219,48 +221,12 @@ export class GraphQueryManager {
   }
 
   /**
-   * Find circular dependencies in the graph
+   * Find circular imports between files
    *
-   * @returns Array of cycles, each cycle is an array of node IDs
+   * @returns Groups of files that all reach each other through imports, smallest first
    */
   findCircularDependencies(): string[][] {
-    const files = this.queries.getAllFiles();
-    const cycles: string[][] = [];
-    const visited = new Set<string>();
-    const recursionStack = new Set<string>();
-
-    const dfs = (filePath: string, path: string[]): void => {
-      if (recursionStack.has(filePath)) {
-        // Found a cycle
-        const cycleStart = path.indexOf(filePath);
-        if (cycleStart !== -1) {
-          cycles.push(path.slice(cycleStart));
-        }
-        return;
-      }
-
-      if (visited.has(filePath)) {
-        return;
-      }
-
-      visited.add(filePath);
-      recursionStack.add(filePath);
-
-      const dependencies = this.getFileDependencies(filePath);
-      for (const dep of dependencies) {
-        dfs(dep, [...path, filePath]);
-      }
-
-      recursionStack.delete(filePath);
-    };
-
-    for (const file of files) {
-      if (!visited.has(file.path)) {
-        dfs(file.path, []);
-      }
-    }
-
-    return cycles;
+    return findFileCycles(this.queries.getFileImportPairs());
   }
 
   /**
