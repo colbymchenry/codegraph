@@ -868,6 +868,7 @@ agents learn the `codegraph explore` command:
 - **Kimi Code** (`kimi`) — `$KIMI_CODE_HOME/mcp.json` (default `~/.kimi-code`), or `.kimi-code/mcp.json`, which Kimi Code uses only in a trusted folder
 - **Qoder CLI** (`qoder`) — `$QODER_CONFIG_DIR/settings.json` (default `~/.qoder`), or `.qoder/settings.local.json`; in the Qoder IDE, add the server under Settings > MCP
 - **Pi** (`pi`) — `mcp.json` in Pi's agent directory (default `~/.pi/agent`), or `.pi/mcp.json`, which Pi reads once you trust the project; `exposure: "direct"` keeps `codegraph_explore` on the model's tool list
+- **MiniMax Code** (`minimax`) — global only: `$MINIMAX_DATA_DIR/mcp.json` (default `~/.minimax`)
 
 ## Supported Languages
 

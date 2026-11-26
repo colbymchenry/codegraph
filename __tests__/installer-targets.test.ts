@@ -83,7 +83,7 @@ describe('standalone installer Windows shell guidance (#1294)', () => {
 // `$HOME` (POSIX) / `$USERPROFILE` (Windows) env vars that
 // `os.homedir()` reads first. Same trick the rest of the suite uses
 // when it needs a mock home.
-const AGENT_HOME_OVERRIDES = ['QWEN_HOME', 'DSH_HOME', 'GROK_HOME', 'KIMI_CODE_HOME', 'QODER_CONFIG_DIR', 'PI_CODING_AGENT_DIR'];
+const AGENT_HOME_OVERRIDES = ['QWEN_HOME', 'DSH_HOME', 'GROK_HOME', 'KIMI_CODE_HOME', 'QODER_CONFIG_DIR', 'PI_CODING_AGENT_DIR', 'MINIMAX_DATA_DIR'];
 
 function setHome(dir: string): { restore: () => void } {
   const overrides = AGENT_HOME_OVERRIDES.map((name) => [name, process.env[name]] as const);
@@ -1400,7 +1400,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('copilot-vscode')?.id).toBe('copilot-vscode');
     expect(getTarget('copilot-cli')?.id).toBe('copilot-cli');
     expect(getTarget('copilot-jetbrains')?.id).toBe('copilot-jetbrains');
-    for (const id of ['bob', 'droid', 'windsurf', 'qwen', 'dsh', 'grok', 'kimi', 'qoder', 'pi']) {
+    for (const id of ['bob', 'droid', 'windsurf', 'qwen', 'dsh', 'grok', 'kimi', 'qoder', 'pi', 'minimax']) {
       expect(getTarget(id)?.id).toBe(id);
     }
     expect(getTarget('not-a-real-target')).toBeUndefined();
@@ -2428,6 +2428,7 @@ describe('Installer — install --refresh keeps each agent\'s instructions file 
     ['grok', (home) => path.join(home, '.grok', 'rules', 'codegraph.md')],
     ['kimi', (home) => path.join(home, '.kimi-code', 'AGENTS.md')],
     ['pi', (home) => path.join(home, '.pi', 'agent', 'AGENTS.md')],
+    ['minimax', (home) => path.join(home, '.minimax', 'AGENTS.md')],
   ];
   const USER = `${CODEGRAPH_SECTION_START}\n## CodeGraph\n\n# My notes\n\nAlways run the tests first.\n\n`;
 
@@ -4080,6 +4081,7 @@ const JSON_TARGETS: JsonTargetCase[] = [
   { id: 'kimi', global: ['.kimi-code', 'mcp.json'], local: ['.kimi-code', 'mcp.json'], entry: STDIO_ENTRY, globalInstructions: ['.kimi-code', 'AGENTS.md'], localInstructions: ['AGENTS.md'] },
   { id: 'qoder', global: ['.qoder', 'settings.json'], local: ['.qoder', 'settings.local.json'], entry: STDIO_ENTRY, globalInstructions: null, localInstructions: null },
   { id: 'pi', global: ['.pi', 'agent', 'mcp.json'], local: ['.pi', 'mcp.json'], entry: { ...STDIO_ENTRY, exposure: 'direct' }, globalInstructions: ['.pi', 'agent', 'AGENTS.md'], localInstructions: ['AGENTS.md'] },
+  { id: 'minimax', global: ['.minimax', 'mcp.json'], local: null, entry: STDIO_ENTRY, globalInstructions: ['.minimax', 'AGENTS.md'], localInstructions: null },
 ];
 
 /** Runs each test with a throwaway home and working directory. */
@@ -4282,16 +4284,16 @@ describe('Installer targets — agents with a JSON mcpServers file', () => {
     expect(droid.install('local', { autoAllow: false }).notes?.join(' ')).toMatch(/committed/);
   });
 
-  it('windsurf: global only, with a clear note', () => {
-    const windsurf = getTarget('windsurf')!;
-    expect(windsurf.supportsLocation('local')).toBe(false);
-    expect(windsurf.detect('local')).toEqual({ installed: false, alreadyConfigured: false });
-    expect(windsurf.describePaths('local')).toEqual([]);
-    const result = windsurf.install('local', { autoAllow: false });
+  it.each(['windsurf', 'minimax'])('%s: global only, with a clear note', (id) => {
+    const target = getTarget(id)!;
+    expect(target.supportsLocation('local')).toBe(false);
+    expect(target.detect('local')).toEqual({ installed: false, alreadyConfigured: false });
+    expect(target.describePaths('local')).toEqual([]);
+    const result = target.install('local', { autoAllow: false });
     expect(result.files).toEqual([]);
     expect(result.notes?.join(' ')).toMatch(/no project-local/);
-    expect(windsurf.uninstall('local').files).toEqual([]);
-    expect(windsurf.printConfig('local')).toMatch(/no project-local/);
+    expect(target.uninstall('local').files).toEqual([]);
+    expect(target.printConfig('local')).toMatch(/no project-local/);
   });
 
   it('kimi, pi, qoder: a local install says the folder has to be trusted first', () => {
@@ -4320,6 +4322,7 @@ describe('Installer targets — agents with a JSON mcpServers file', () => {
     ['pi', 'PI_CODING_AGENT_DIR', ['mcp.json', 'AGENTS.md']],
     ['dsh', 'DSH_HOME', ['cordis.patch.yml', 'AGENTS.md']],
     ['grok', 'GROK_HOME', ['config.toml', path.join('rules', 'codegraph.md')]],
+    ['minimax', 'MINIMAX_DATA_DIR', ['mcp.json', 'AGENTS.md']],
   ] as const)('%s: a global install follows %s', (id, name, files) => {
     process.env[name] = path.join(dirs.home(), 'moved');
     try {
