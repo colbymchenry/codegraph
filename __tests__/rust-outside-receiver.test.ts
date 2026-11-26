@@ -165,6 +165,10 @@ fn patched_chain(r: pext::PResp) -> bool {
     r.pkid().p_ok()
 }
 
+fn patched_cross(r: pext::PResp) -> bool {
+    r.code().c_ok()
+}
+
 fn shared_chain(r: shared::Resp) -> bool {
     r.status().code_ok()
 }
@@ -202,14 +206,21 @@ fn shadow_chain(r: ext2::Response) -> bool {
     r.status().shadow_ok()
 }
 `,
-  'app/third_party/pext/Cargo.toml': '[package]\nname = "pext"\nversion = "1.0.0"\nedition = "2021"\n',
+  'app/third_party/pext/Cargo.toml': '[package]\nname = "pext"\nversion = "1.0.0"\nedition = "2021"\n\n[dependencies]\nptypes = { path = "../ptypes" }\n',
   'app/third_party/pext/src/lib.rs': `pub struct PResp;
 pub struct PK;
 impl PResp {
     pub fn pkid(&self) -> PK { PK }
+    pub fn code(&self) -> ptypes::Code { ptypes::Code }
 }
 impl PK {
     pub fn p_ok(&self) -> bool { true }
+}
+`,
+  'app/third_party/ptypes/Cargo.toml': '[package]\nname = "ptypes"\nversion = "1.0.0"\nedition = "2021"\n',
+  'app/third_party/ptypes/src/lib.rs': `pub struct Code;
+impl Code {
+    pub fn c_ok(&self) -> bool { true }
 }
 `,
   'app/core/Cargo.toml': '[package]\nname = "mycore"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -280,6 +291,8 @@ describe('Rust: a call on an outside crate\'s value (#3483)', () => {
     // A path crate's value of another project crate's type.
     expect(callsOf(graph, 'cross_chain')).toEqual(['Kid::kid_ok']);
     expect(callsOf(graph, 'patched_chain')).toEqual(['PK::p_ok']);
+    // …and a crate the patched one depends on.
+    expect(callsOf(graph, 'patched_cross')).toEqual(['Code::c_ok']);
     expect(callsOf(graph, 'shadow_chain')).toEqual(['Shadowed::shadow_ok']);
   });
 });

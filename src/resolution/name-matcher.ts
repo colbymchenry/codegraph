@@ -13056,8 +13056,8 @@ export function isRustCallUnreachable(target: Node, ref: UnresolvedRef, guessed:
  * reading; so does a crate the manifests depend on by `path`, which may be
  * one of the project's own, a module the file declares under the crate's
  * name (`mod ext { … }` beside an `ext` dependency), which Rust reads the
- * path through, and a crate whose own source holds `target` (a `[patch]`
- * or vendored copy indexed with the project): its value is that crate's.
+ * path through, and a `target` in a dependency's source indexed with the
+ * project (a `[patch]`ed or vendored copy, or a crate one depends on).
  */
 function rustReceiverIsOutsideOnly(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const scopes = rustScopesOf(ref.filePath, context);
@@ -13084,6 +13084,7 @@ function rustOutsideOnlyValue(value: string, at: number, scopes: RustScopes, tar
   if (!/^[a-z_]\w*$/.test(v) || v === 'self') return false;
   const found = rustBindingAt(scopes, v, at);
   if (!found || found.ambiguous || found.binding.type === undefined) return false;
+  if (rustInDependencySource(target, context)) return false;
   const { binding } = found;
   const read = rustReadType({ text: binding.type!, file: ref.filePath, at: binding.at }, ref, context);
   if (read.kind !== 'named' || read.args !== '' || read.wrappers.length > 0) return false;
@@ -13093,33 +13094,40 @@ function rustOutsideOnlyValue(value: string, at: number, scopes: RustScopes, tar
   if (root !== undefined) {
     if (rustPathDependencies(context).has(root)) return false;
     if ([...rustUsesOf(ref.filePath, context).modDecls.keys()].some((k) => k.endsWith(`\0${root}`))) return false;
-    if (rustCrateHolds(root, target, context)) return false;
   }
   return rustTypeLookup(read.name, read.path, read.written.file, context, read.written.at).outside;
 }
 
 const RUST_PATH_DEPENDENCIES = new WeakMap<ResolutionContext, Set<string>>();
 
+const RUST_DEPENDENCY_SOURCE = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
 /**
- * Whether `node` lies in the source of the crate code names `key` — the
- * package of the nearest manifest above its file is that crate's, under the
- * name a manifest's dependency on it gives (`core2 = { package = "mycore" }`).
+ * Whether `node` lies in a crate indexed with the project that isn't one of
+ * the project's own — a `[patch]`ed or vendored dependency checked out in
+ * the tree, or one such a crate depends on — by the package of the nearest
+ * manifest above its file. Such a crate's types are what a dependency's
+ * value holds, so a call on that value can reach them.
  */
-function rustCrateHolds(key: string, node: Node, context: ResolutionContext): boolean {
-  let dir = path.posix.dirname(node.filePath.replace(/\\/g, '/'));
-  for (;;) {
-    const manifest = dir === '.' || dir === '' ? 'Cargo.toml' : `${dir}/Cargo.toml`;
-    const text = context.readFile(manifest);
+function rustInDependencySource(node: Node, context: ResolutionContext): boolean {
+  let memo = RUST_DEPENDENCY_SOURCE.get(context);
+  if (!memo) RUST_DEPENDENCY_SOURCE.set(context, (memo = new Map()));
+  const start = path.posix.dirname(node.filePath.replace(/\\/g, '/'));
+  const hit = memo.get(start);
+  if (hit !== undefined) return hit;
+  let found = false;
+  for (let dir = start; ; dir = path.posix.dirname(dir)) {
+    const top = dir === '.' || dir === '' || dir === '/';
+    const text = context.readFile(top ? 'Cargo.toml' : `${dir}/Cargo.toml`);
     if (text) {
       const name = parsePackageName(text)?.replace(/-/g, '_');
-      if (!name) return false;
-      if (name === key) return true;
-      const manifests = ['Cargo.toml', ...[...getCargoWorkspaceCrateMap(context).values()].map((d) => `${d}/Cargo.toml`)];
-      return [...new Set(manifests)].some((m) => rustManifestDependencies(context.readFile(m) ?? '').some((d) => d.key === key && d.pkg === name));
+      found = name !== undefined && !rustProjectCrates(context).has(name);
+      break;
     }
-    if (dir === '.' || dir === '' || dir === '/') return false;
-    dir = path.posix.dirname(dir);
+    if (top) break;
   }
+  memo.set(start, found);
+  return found;
 }
 
 /**
@@ -24195,6 +24203,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_CRATES.delete(context);
   RUST_DEPENDENCIES.delete(context);
   RUST_PATH_DEPENDENCIES.delete(context);
+  RUST_DEPENDENCY_SOURCE.delete(context);
   RUST_CRATE_GRAPHS.delete(context);
   RUST_IMPL_HEADERS.delete(context);
   RUST_SCOPES.delete(context);
