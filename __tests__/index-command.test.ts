@@ -14,12 +14,12 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
-import { DatabaseConnection } from '../src/db';
+import { DatabaseConnection, getDatabasePath } from '../src/db';
 import { encodeLockInfo, getDaemonPidPath } from '../src/mcp/daemon-paths';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
@@ -139,6 +139,40 @@ describe('codegraph index — full re-index keeps the graph populated (#874)', (
 
     expect(afterIndex.nodes).toBe(afterInit.nodes);
     expect(afterIndex.edges).toBe(afterInit.edges);
+  });
+
+  it('refuses a rebuild without interrupting a running initial index', async () => {
+    const builder = CodeGraph.initSync(tempDir);
+    const dbPath = getDatabasePath(tempDir);
+    let attempted = false;
+    try {
+      const built = await builder.indexAll({
+        onProgress: ({ phase }) => {
+          if (phase !== 'parsing' || attempted) return;
+          attempted = true;
+          // The first build already holds the write lock. Pause it here while
+          // the CLI tries to rebuild, without relying on the size of the project.
+          const before = fs.readFileSync(dbPath);
+          const { status, stdout, stderr, error } = spawnSync(process.execPath, [BIN, 'index'], {
+            cwd: tempDir,
+            encoding: 'utf8',
+            timeout: 15_000,
+            env: { ...process.env, CODEGRAPH_NO_DAEMON: '1' },
+          });
+          expect(error).toBeUndefined();
+          expect(status).toBe(1);
+          expect(stdout + stderr).toContain('Could not acquire file lock - another process may be indexing');
+          expect(fs.readFileSync(dbPath).equals(before), 'the running build’s database was changed').toBe(true);
+        },
+      });
+      expect(attempted).toBe(true);
+      expect(built).toMatchObject({ success: true, filesIndexed: 2 });
+    } finally {
+      builder.close();
+    }
+    const after = graphCounts(tempDir);
+    expect(after.nodes).toBeGreaterThan(0);
+    expect(after.edges).toBeGreaterThan(0);
   });
 
   it('refuses to recreate while a live daemon cannot be verified (#1325)', () => {

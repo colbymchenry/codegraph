@@ -205,6 +205,8 @@ export class CodeGraph {
 
   // File lock for preventing concurrent writes across processes (CLI, MCP, git hooks)
   private fileLock: FileLock;
+  // Only recreate() hands us an acquired lock, for the first indexAll() call.
+  private hasRebuildLock: boolean;
 
   // File watcher for auto-sync on file changes
   private watcher: FileWatcher | null = null;
@@ -218,14 +220,16 @@ export class CodeGraph {
   private constructor(
     db: DatabaseConnection,
     queries: QueryBuilder,
-    projectRoot: string
+    projectRoot: string,
+    rebuildLock?: FileLock
   ) {
     this.db = db;
     this.queries = queries;
     this.projectRoot = projectRoot;
-    this.fileLock = new FileLock(
+    this.fileLock = rebuildLock ?? new FileLock(
       path.join(getCodeGraphDir(projectRoot), 'codegraph.lock')
     );
+    this.hasRebuildLock = rebuildLock !== undefined;
     this.wireLayers();
   }
 
@@ -528,6 +532,9 @@ export class CodeGraph {
    * full re-index could never recover the bad state (#1067). Discarding the
    * files is O(1) regardless of size, reclaims the disk, and sidesteps opening
    * (and running migrations against) the poisoned database entirely.
+   *
+   * Takes the write lock before removing any database file. The returned
+   * instance holds it until its first indexAll() finishes or it is closed.
    */
   static async recreate(projectRoot: string): Promise<CodeGraph> {
     await initGrammars();
@@ -540,25 +547,37 @@ export class CodeGraph {
     }
 
     const dbPath = getDatabasePath(resolvedRoot);
+    const lock = new FileLock(path.join(path.dirname(dbPath), 'codegraph.lock'));
     try {
-      removeDatabaseFiles(dbPath);
-    } catch (err) {
-      // POSIX unlinks an open file fine; this fires mainly on Windows when a
-      // live daemon/MCP server still holds the database. Turn the raw EBUSY into
-      // an actionable instruction instead of a generic failure.
-      const reason = err instanceof Error ? err.message : String(err);
-      throw new Error(
-        `Could not rebuild the index — the database file is in use (${reason}). ` +
-          `Stop any running CodeGraph MCP server/daemon for this project and retry, ` +
-          `or remove the ${getCodeGraphDir(resolvedRoot)} directory and run "codegraph init".`
-      );
+      lock.acquire();
+    } catch {
+      throw new LockUnavailableError('Could not acquire file lock - another process may be indexing');
     }
 
-    // Re-create an empty, freshly-schema'd database at the same path.
-    const db = DatabaseConnection.initialize(dbPath);
-    const queries = new QueryBuilder(db.getDb());
+    try {
+      try {
+        removeDatabaseFiles(dbPath);
+      } catch (err) {
+        // POSIX unlinks an open file fine; this fires mainly on Windows when a
+        // live daemon/MCP server still holds the database. Turn the raw EBUSY into
+        // an actionable instruction instead of a generic failure.
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Could not rebuild the index — the database file is in use (${reason}). ` +
+            `Stop any running CodeGraph MCP server/daemon for this project and retry, ` +
+            `or remove the ${path.dirname(dbPath)} directory and run "codegraph init".`
+        );
+      }
 
-    return new CodeGraph(db, queries, resolvedRoot);
+      // Re-create an empty, freshly-schema'd database at the same path.
+      const db = DatabaseConnection.initialize(dbPath);
+      const queries = new QueryBuilder(db.getDb());
+
+      return new CodeGraph(db, queries, resolvedRoot, lock);
+    } catch (err) {
+      lock.release();
+      throw err;
+    }
   }
 
   /**
@@ -633,6 +652,7 @@ export class CodeGraph {
       this.deferredSynthesisTimer = null;
     }
     // Release file lock if held
+    this.hasRebuildLock = false;
     this.fileLock.release();
     this.db.close();
   }
@@ -657,10 +677,11 @@ export class CodeGraph {
     return this.indexMutex.withLock(async () => {
       const startedAt = Date.now();
       try {
-        this.fileLock.acquire();
+        if (!this.hasRebuildLock) this.fileLock.acquire();
       } catch {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
+      this.hasRebuildLock = false;
       // Defer WAL auto-checkpointing for the whole bulk run (#1231): the
       // default 1000-page interval re-writes hot pages into the main DB file
       // over and over — ~95% of all disk I/O during a bulk index, and a
@@ -1192,13 +1213,9 @@ export class CodeGraph {
         );
       }
       if (this.pendingFullReconcile) {
-        // `codegraph index` recreates the file, THEN takes the write lock in
-        // indexAll. A sync landing in that gap would otherwise run a full
-        // reconcile of the empty file and hold the lock the rebuild is about
-        // to ask for. A fresh file with no index_state yet is that rebuild:
-        // step aside (lock contention, the watcher retries) and reconcile in
-        // full once it is done. Bounded, so a rebuild that died before
-        // indexing does not park the watcher forever.
+        // The lock above keeps sync out of a live rebuild. If the rebuild
+        // stopped before indexAll set index_state, give the fresh empty file
+        // a bounded grace period before reconciling it.
         if (this.getIndexState() === null && this.isFreshlyRecreated()) {
           this.fileLock.release();
           throw new LockUnavailableError('A rebuild of this index is in progress; retry when it finishes.');
