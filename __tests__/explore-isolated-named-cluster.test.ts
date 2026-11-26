@@ -247,9 +247,20 @@ describe('a named body in a later cluster is not trimmed for the helpers above i
 
 describe('a named cluster with nothing named below it keeps its incidental context', () => {
   let run: Run;
+  // A query naming only `renderView` now gets that function and its references
+  // (#3407, explore-one-symbol.test.ts). The cluster merge pinned here is the
+  // ranked answer's, which a one-name query still reaches when the name has
+  // several definitions, so this run turns the one-symbol answer off.
+  const oneSymbol = process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL;
 
   beforeAll(async () => {
-    run = await runExplore(true, 'renderView');
+    process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL = '0';
+    try {
+      run = await runExplore(true, 'renderView');
+    } finally {
+      if (oneSymbol === undefined) delete process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL;
+      else process.env.CODEGRAPH_EXPLORE_ONE_SYMBOL = oneSymbol;
+    }
   }, 120_000);
 
   afterAll(() => teardown(run));

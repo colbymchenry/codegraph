@@ -151,6 +151,53 @@ function kotlinFollowingAccessors(node: SyntaxNode): SyntaxNode[] {
   return out;
 }
 
+/** The named child right after the first `token` child of `node`, if any. */
+function namedChildAfter(node: SyntaxNode, token: string): SyntaxNode | null {
+  let seen = false;
+  for (let i = 0; i < node.childCount; i++) {
+    const c = node.child(i);
+    if (!c) continue;
+    if (!c.isNamed) {
+      if (c.type === token) seen = true;
+      continue;
+    }
+    if (seen) return c;
+  }
+  return null;
+}
+
+/**
+ * The code a class, object or enum header holds, in source order: each
+ * constructor parameter's default value (`c: Clock = SystemClock()`), the
+ * arguments of the superclass constructor it calls (`: Base(load())`), and the
+ * expression after `by` it delegates an interface to (`I by Impl()`). The
+ * class walks it as its own code before its body (classHeaderCode). The types
+ * and annotations around it are left alone, as they are for a property.
+ */
+function kotlinClassHeaderCode(node: SyntaxNode): SyntaxNode[] {
+  const out: SyntaxNode[] = [];
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (child?.type === 'primary_constructor') {
+      for (let j = 0; j < child.namedChildCount; j++) {
+        const param = child.namedChild(j);
+        const value = param?.type === 'class_parameter' ? namedChildAfter(param, '=') : null;
+        if (value) out.push(value);
+      }
+    } else if (child?.type === 'delegation_specifier') {
+      const spec = child.namedChild(0);
+      if (spec?.type === 'constructor_invocation') {
+        const args = spec.namedChildren.find((c) => c.type === 'value_arguments');
+        if (args) out.push(args);
+      } else if (spec?.type === 'explicit_delegation') {
+        const delegate = namedChildAfter(spec, 'by');
+        if (delegate) out.push(delegate);
+      }
+    }
+  }
+  return out;
+}
+
 /** Check if a node matches the `fun interface` misparse pattern */
 function isFunInterfaceNode(node: SyntaxNode): boolean {
   let hasFun = false;
@@ -469,6 +516,7 @@ export const kotlinExtractor: LanguageExtractor = {
     }
     return null;
   },
+  classHeaderCode: kotlinClassHeaderCode,
   classifyClassNode: (node) => {
     // Kotlin reuses class_declaration for classes, interfaces, and enums.
     // Detect by checking for keyword children:

@@ -323,6 +323,16 @@ export interface LanguageExtractor {
   resolveBody?: (node: SyntaxNode, bodyField: string) => SyntaxNode | null;
 
   /**
+   * The code a class header holds, in source order: a constructor parameter's
+   * default value, the arguments of a superclass constructor, a delegate
+   * (Kotlin's `class A(c: Clock = SystemClock()) : Base(load()), I by Impl()`).
+   * A class or enum with a body walks these before its body, with itself in
+   * scope, so the calls written there are its own. A bodiless class walks its
+   * whole header as its body and doesn't read this.
+   */
+  classHeaderCode?: (node: SyntaxNode) => SyntaxNode[];
+
+  /**
    * Extract import information from an import node.
    * Return null if the node isn't a recognized import form.
    */
