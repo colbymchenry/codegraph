@@ -33,6 +33,10 @@ pub struct StatusCode(pub u16);
 impl StatusCode {
     pub fn is_success(&self) -> bool { self.0 < 300 }
 }
+pub struct Holder<T>(pub T);
+impl<T> Holder<T> {
+    pub fn get(&self) -> &T { &self.0 }
+}
 `;
 
 const APP = `use ext::blocking::Response;
@@ -102,6 +106,46 @@ impl std::str::FromStr for Parsed {
 
 fn take(_p: &Parsed) {}
 
+pub struct Bk;
+
+impl Bk {
+    pub fn b_ok(&self) -> bool {
+        true
+    }
+}
+
+pub trait Blanket {
+    fn blanket(&self) -> Bk {
+        Bk
+    }
+}
+
+impl<T> Blanket for T {}
+
+fn via_blanket(resp: &Response) -> bool {
+    resp.blanket().b_ok()
+}
+
+pub trait Assoc {
+    type Out;
+    fn assoc(&self) -> Self::Out;
+}
+
+impl Assoc for Response {
+    type Out = LocalResp;
+    fn assoc(&self) -> Self::Out {
+        LocalResp
+    }
+}
+
+fn via_assoc(resp: &Response) -> bool {
+    resp.assoc().is_success()
+}
+
+fn held(h: ext::Holder<LocalResp>) -> bool {
+    h.get().is_success()
+}
+
 fn inferred(s: String) -> bool {
     let v = s.parse().unwrap();
     take(&v);
@@ -109,26 +153,63 @@ fn inferred(s: String) -> bool {
 }
 `;
 
-// Crates inside the indexed directory that the root's manifest names by
-// `path`: one that is no workspace member, and a member under another key.
+// Code indexed with the project that a dependency's name can lead to: crates
+// the root's manifest names by `path` (one that is no workspace member, a
+// member under another key), a `[patch]`ed crate's source, and a module the
+// file declares under a dependency's name.
 const LOCAL_CRATES: Record<string, string> = {
-  'app/Cargo.toml': '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\nmembers = ["core"]\n\n[dependencies]\nshared = { path = "shared" }\ncore2 = { package = "mycore", path = "core" }\n',
-  'app/src/lib.rs': `fn shared_chain(r: shared::Resp) -> bool {
+  'app/Cargo.toml': '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\nmembers = ["core"]\n\n[dependencies]\nshared = { path = "shared" }\ncore2 = { package = "mycore", path = "core" }\next2 = "1"\npext = "1"\n\n[patch.crates-io]\npext = { path = "third_party/pext" }\n',
+  'app/src/lib.rs': `mod shadow;
+
+fn patched_chain(r: pext::PResp) -> bool {
+    r.pkid().p_ok()
+}
+
+fn shared_chain(r: shared::Resp) -> bool {
     r.status().code_ok()
+}
+
+fn cross_chain(r: shared::Resp) -> bool {
+    r.other().kid_ok()
 }
 
 fn renamed_chain(r: core2::CResp) -> bool {
     r.kid().kid_ok()
 }
 `,
-  'app/shared/Cargo.toml': '[package]\nname = "shared"\nversion = "0.1.0"\nedition = "2021"\n',
+  'app/shared/Cargo.toml': '[package]\nname = "shared"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nmycore = { path = "../core" }\n',
   'app/shared/src/lib.rs': `pub struct Resp;
 pub struct Code;
 impl Resp {
     pub fn status(&self) -> Code { Code }
+    pub fn other(&self) -> mycore::Kid { mycore::Kid }
 }
 impl Code {
     pub fn code_ok(&self) -> bool { true }
+}
+`,
+  'app/src/shadow.rs': `pub struct Shadowed;
+impl Shadowed {
+    pub fn shadow_ok(&self) -> bool { true }
+}
+mod ext2 {
+    pub struct Response;
+    impl Response {
+        pub fn status(&self) -> super::Shadowed { super::Shadowed }
+    }
+}
+fn shadow_chain(r: ext2::Response) -> bool {
+    r.status().shadow_ok()
+}
+`,
+  'app/third_party/pext/Cargo.toml': '[package]\nname = "pext"\nversion = "1.0.0"\nedition = "2021"\n',
+  'app/third_party/pext/src/lib.rs': `pub struct PResp;
+pub struct PK;
+impl PResp {
+    pub fn pkid(&self) -> PK { PK }
+}
+impl PK {
+    pub fn p_ok(&self) -> bool { true }
 }
 `,
   'app/core/Cargo.toml': '[package]\nname = "mycore"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -185,11 +266,20 @@ describe('Rust: a call on an outside crate\'s value (#3483)', () => {
     expect(callsOf(graph, 'optional')).toEqual(['LocalResp::is_success']);
     // A generic return a later use fixes: `v` is a `Parsed` by `take(&v)`.
     expect(callsOf(graph, 'inferred')).toEqual(['Parsed::parsed_ok', 'take']);
+    // A project trait every type implements hands out a project value.
+    expect(callsOf(graph, 'via_blanket')).toContain('Bk::b_ok');
+    expect(callsOf(graph, 'via_assoc')).toContain('LocalResp::is_success');
+    // A generic outside type holds what its argument names.
+    expect(callsOf(graph, 'held')).toEqual(['LocalResp::is_success']);
   });
 
-  it('keeps chains through a crate the manifest names by path', async () => {
+  it('keeps chains through code a dependency\'s name leads to in the project', async () => {
     const graph = await index('local');
     expect(callsOf(graph, 'shared_chain')).toEqual(['Code::code_ok']);
     expect(callsOf(graph, 'renamed_chain')).toEqual(['Kid::kid_ok']);
+    // A path crate's value of another project crate's type.
+    expect(callsOf(graph, 'cross_chain')).toEqual(['Kid::kid_ok']);
+    expect(callsOf(graph, 'patched_chain')).toEqual(['PK::p_ok']);
+    expect(callsOf(graph, 'shadow_chain')).toEqual(['Shadowed::shadow_ok']);
   });
 });

@@ -13029,7 +13029,7 @@ export function isRustCallUnreachable(target: Node, ref: UnresolvedRef, guessed:
       isRustProjectNamed(named, RUST_OWNER_TYPE_KINDS, context);
   }
   const trait = rustImplTraitOf(target, context);
-  if (trait === '') return rustTraitOf(target, context) === null && rustReceiverIsOutsideOnly(ref, context);
+  if (trait === '') return rustTraitOf(target, context) === null && rustReceiverIsOutsideOnly(target, ref, context);
   if (isRustProjectNamed(trait, RUST_TRAIT_KIND, context)) return false;
   // The receiver: the last link of a kept chain, else the one written before the name.
   const chain = RUST_CHAINED_CALLS.get(ref);
@@ -13054,9 +13054,12 @@ export function isRustCallUnreachable(target: Node, ref: UnresolvedRef, guessed:
  * written with. A link a project trait could provide (`resp.local()` through
  * `impl Wrap for Response`) may hand out a project value, and ends the
  * reading; so does a crate the manifests depend on by `path`, which may be
- * one of the project's own.
+ * one of the project's own, a module the file declares under the crate's
+ * name (`mod ext { … }` beside an `ext` dependency), which Rust reads the
+ * path through, and a crate whose own source holds `target` (a `[patch]`
+ * or vendored copy indexed with the project): its value is that crate's.
  */
-function rustReceiverIsOutsideOnly(ref: UnresolvedRef, context: ResolutionContext): boolean {
+function rustReceiverIsOutsideOnly(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const scopes = rustScopesOf(ref.filePath, context);
   const lineStart = scopes?.lineStarts[ref.line - 1];
   if (!scopes || lineStart === undefined || ref.column < 0) return false;
@@ -13064,11 +13067,11 @@ function rustReceiverIsOutsideOnly(ref: UnresolvedRef, context: ResolutionContex
   const chain = RUST_CHAINED_CALLS.get(ref);
   const dot = ref.referenceName.lastIndexOf('.');
   const receiver = chain ? rustChainedReceiver(scopes, start, chain, ref.referenceName) : dot > 0 ? ref.referenceName.slice(0, dot) : null;
-  return receiver !== null && rustOutsideOnlyValue(receiver, start, scopes, ref, context, 0);
+  return receiver !== null && rustOutsideOnlyValue(receiver, start, scopes, target, ref, context, 0);
 }
 
 /** Whether a Rust value, as written at `at`, holds only std's or a dependency's types (rustReceiverIsOutsideOnly). */
-function rustOutsideOnlyValue(value: string, at: number, scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number): boolean {
+function rustOutsideOnlyValue(value: string, at: number, scopes: RustScopes, target: Node, ref: UnresolvedRef, context: ResolutionContext, depth: number): boolean {
   if (depth > 6) return false;
   const v = value.trim().replace(/\?$/, '').trimEnd();
   const call = /^([\s\S]+?)\s*\.\s*([a-z_]\w*)\s*\(\s*\)$/.exec(v);
@@ -13076,7 +13079,7 @@ function rustOutsideOnlyValue(value: string, at: number, scopes: RustScopes, ref
     const name = call[2]!;
     const projectTrait = context.getNodesByName(name).some((n) => n.language === 'rust' && n.kind === 'method' && n.name === name &&
       (rustTraitOf(n, context) !== null || isRustTraitImplMethod(n, context)));
-    return !projectTrait && rustOutsideOnlyValue(call[1]!, at, scopes, ref, context, depth + 1);
+    return !projectTrait && rustOutsideOnlyValue(call[1]!, at, scopes, target, ref, context, depth + 1);
   }
   if (!/^[a-z_]\w*$/.test(v) || v === 'self') return false;
   const found = rustBindingAt(scopes, v, at);
@@ -13087,11 +13090,37 @@ function rustOutsideOnlyValue(value: string, at: number, scopes: RustScopes, ref
   const root = read.path.length > 0
     ? rustUsePath(read.path[0]!, ref.filePath, binding.at, context)?.[0] ?? read.path[0]
     : rustUsePath(read.name, ref.filePath, binding.at, context)?.[0];
-  if (root !== undefined && rustPathDependencies(context).has(root)) return false;
+  if (root !== undefined) {
+    if (rustPathDependencies(context).has(root)) return false;
+    if ([...rustUsesOf(ref.filePath, context).modDecls.keys()].some((k) => k.endsWith(`\0${root}`))) return false;
+    if (rustCrateHolds(root, target, context)) return false;
+  }
   return rustTypeLookup(read.name, read.path, read.written.file, context, read.written.at).outside;
 }
 
 const RUST_PATH_DEPENDENCIES = new WeakMap<ResolutionContext, Set<string>>();
+
+/**
+ * Whether `node` lies in the source of the crate code names `key` — the
+ * package of the nearest manifest above its file is that crate's, under the
+ * name a manifest's dependency on it gives (`core2 = { package = "mycore" }`).
+ */
+function rustCrateHolds(key: string, node: Node, context: ResolutionContext): boolean {
+  let dir = path.posix.dirname(node.filePath.replace(/\\/g, '/'));
+  for (;;) {
+    const manifest = dir === '.' || dir === '' ? 'Cargo.toml' : `${dir}/Cargo.toml`;
+    const text = context.readFile(manifest);
+    if (text) {
+      const name = parsePackageName(text)?.replace(/-/g, '_');
+      if (!name) return false;
+      if (name === key) return true;
+      const manifests = ['Cargo.toml', ...[...getCargoWorkspaceCrateMap(context).values()].map((d) => `${d}/Cargo.toml`)];
+      return [...new Set(manifests)].some((m) => rustManifestDependencies(context.readFile(m) ?? '').some((d) => d.key === key && d.pkg === name));
+    }
+    if (dir === '.' || dir === '' || dir === '/') return false;
+    dir = path.posix.dirname(dir);
+  }
+}
 
 /**
  * The crates the project's manifests depend on by a `path` inside the
