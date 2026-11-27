@@ -24120,6 +24120,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   TS_NAMED_CLASSES.delete(context);
   TS_AMBIENT_MODULE_FILES.delete(context);
   TS_GLOBAL_SCOPES.delete(context);
+  JS_DOM_OWN_METHODS.delete(context);
   C_STATIC_MEMO.delete(context);
   CPP_TYPE_DECLS.delete(context);
   CPP_INCLUDE_LINES.delete(context);
@@ -25549,6 +25550,8 @@ interface JsScopeFile {
   bindings: Map<string, JsBindingSite[]>;
   /** Per name, the type guards that test it (jsGuardsOf), read when first asked. */
   guards?: Map<string, JsGuard[]>;
+  /** Where the file turns the TypeScript checker off (jsCheckerOff), read when first asked. */
+  checkerOff?: { file: boolean; offsets: number[] };
   /** Where the body of the arrow at an offset ends (jsFunctionHolds), read when first asked. */
   arrowEnds?: Map<number, number>;
   /** Per callback's parameter list offset, its callee and argument position (jsCallbackCall + jsCalledFunction). */
@@ -27051,8 +27054,218 @@ function jsOutsideValueBinding(name: string, ref: UnresolvedRef, context: Resolu
   JS_DECLARATION_HEAD.lastIndex = site.at;
   const head = JS_DECLARATION_HEAD.exec(file.code);
   if (!head || head[1] !== name) return null;
-  return jsOutsideCallValue(file, site.at + head[0].length, ref, context) ? jsLineOf(file, site.at) : null;
+  const valueAt = site.at + head[0].length;
+  if (jsOutsideCallValue(file, valueAt, ref, context)) return jsLineOf(file, site.at);
+  // In TypeScript, a DOM element, or what literal-only calls on one give
+  // (#3444): the checker fixes a local's type where it is declared, so a later
+  // write can't change it. (Plain JS may give an element methods at runtime,
+  // or a local another value.) A project that gives one of the DOM's own types
+  // a method of the called name (`declare global { interface
+  // HTMLCanvasElement { snapshot(): string } }`, a jsdom-style `class
+  // CanvasRenderingContext2D`) may be calling it: read as before. Adding or
+  // removing such a method re-queues the call by its name.
+  if ((ref.language !== 'typescript' && ref.language !== 'tsx') || !jsDomValue(file, valueAt, ref, context, 0)) return null;
+  // Where the checker is turned off (`// @ts-ignore` in the local's scope,
+  // `// @ts-nocheck`), the local may be given another value.
+  if (jsCheckerOff(file, site, ref, context)) return null;
+  const method = ref.referenceName.slice(ref.referenceName.lastIndexOf('.') + 1);
+  let memo = JS_DOM_OWN_METHODS.get(context);
+  if (!memo) JS_DOM_OWN_METHODS.set(context, (memo = new Map()));
+  let own = memo.get(method);
+  if (own === undefined) memo.set(method, (own = context.getNodesByName(method).some((n) => isDomOwnMethod(n, context))));
+  return own ? null : jsLineOf(file, site.at);
 }
+
+/** Per context, by method name: whether a project method of the name may be a DOM type's own (isDomOwnMethod). */
+const JS_DOM_OWN_METHODS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a project method may be one the project gives a DOM type, so a call
+ * of its name on a canvas keeps the name guess: one in a declaration file, or
+ * on an interface or object type (how a DOM type is augmented, directly or
+ * through one it extends), or on a class named exactly like a canvas DOM type
+ * (a jsdom-style `class CanvasRenderingContext2D`).
+ */
+function isDomOwnMethod(n: Node, context: ResolutionContext): boolean {
+  if (!ESM_FAMILY.has(n.language)) return false;
+  if (/\.d\.[cm]?ts$/.test(n.filePath)) return true;
+  const owner = n.qualifiedName.split('::').slice(-2, -1)[0];
+  if (!owner) return false;
+  return context.getNodesByName(owner).some((o) => o.filePath === n.filePath && o.startLine <= n.startLine && o.endLine >= n.endLine &&
+    (o.kind === 'interface' || o.kind === 'type_alias' ||
+      (o.kind === 'class' && (JS_CANVAS_DOM_TYPE.has(owner) || extendsCanvasDomType(o, context) || canvasExtendsInFile(owner, n.filePath, context)))));
+}
+
+/**
+ * Whether the file augments a canvas DOM type with a class of its own
+ * (`interface HTMLCanvasElement extends Snapshotter {}`), so that class's
+ * methods are the canvas's.
+ */
+function canvasExtendsInFile(owner: string, filePath: string, context: ResolutionContext): boolean {
+  const text = context.getFileLines?.(filePath)?.join('\n') ?? context.readFile(filePath) ?? '';
+  const re = new RegExp(`\\binterface\\s+(?:${[...JS_CANVAS_DOM_TYPE].join('|')})\\b[^{]*?\\bextends\\b[^{]*?(?<![\\w$.])${escapeRegExp(owner)}(?![\\w$])`);
+  return re.test(text);
+}
+
+/**
+ * Whether a TS class's head extends or implements a canvas or one of its
+ * contexts (`class MyCanvas extends HTMLCanvasElement`), read from its
+ * `class` keyword (past any decorators) to its body, past its own type
+ * parameters (`<T extends HTMLElement>` constrains, it doesn't extend).
+ */
+function extendsCanvasDomType(cls: Node, context: ResolutionContext): boolean {
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  const text = stripCommentsForRegex(lines.slice(cls.startLine - 1, Math.max(cls.startLine, Math.min(cls.endLine, cls.startLine + 200))).join('\n'), 'typescript');
+  const start = /\bclass\b/.exec(text)?.index;
+  if (start === undefined) return false;
+  // The head runs to the body's `{` outside any `<…>`, `(…)` or `{…}` of its own; the class's type parameters are skipped.
+  let head = '';
+  for (let i = start, angle = 0, nest = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '<') angle++;
+    else if (c === '>' && text[i - 1] !== '=') angle--;
+    else if (c === '(' || (c === '{' && angle > 0)) nest++;
+    else if (c === ')' || (c === '}' && nest > 0)) nest--;
+    else if (c === '{' && angle <= 0 && nest <= 0) { head = text.slice(start, i); break; }
+  }
+  head = head.replace(/^class\s+[A-Za-z_$][\w$]*\s*<[\s\S]*?>(?=\s*(?:extends|implements|$))/, 'class X');
+  const clause = /\b(?:extends|implements)\b([\s\S]*)/.exec(head)?.[1] ?? '';
+  return [...clause.matchAll(/[A-Za-z_$][\w$]*/g)].some((m) => JS_CANVAS_RETURN.has(m[0]));
+}
+
+/**
+ * Whether the TS value written at `at` is the browser's canvas or one of its
+ * contexts (#3444), as the checker reads it:
+ * - `document.createElement('canvas')` on the browser's own `document`;
+ * - a call of a function in the same file declared to return one of those
+ *   types (JS_CANVAS_RETURN) that the file neither declares nor imports
+ *   (`createCanvas(): HTMLCanvasElement`);
+ * - a method of a `const`/`let`/`var` with no type written whose own value is
+ *   one of these (`canvas.getContext('2d')`), where the checker is on;
+ * each optionally followed by more method calls (`.getContext('2d')`). Every
+ * method call is one that gives a canvas or context (JS_DOM_VALUE_METHODS)
+ * and takes only literals. The reads stay inside the file, so a sync of it
+ * reads them again.
+ */
+function jsDomValue(file: JsScopeFile, at: number, where: UnresolvedRef, context: ResolutionContext, depth: number): boolean {
+  const { code } = file;
+  const text = code.slice(at, at + 300);
+  const lead = /^\s*/.exec(text)![0].length;
+  const called = /^([A-Za-z_$][\w$]*)(?:\s*\.\s*([A-Za-z_$][\w$]*))?\s*\(/.exec(text.slice(lead));
+  if (!called) return false;
+  // The scope text blanks strings and templates; arguments are read from the file at the same offsets.
+  const source = context.readFile(where.filePath);
+  if (source === null || source.length !== code.length) return false;
+  const open = at + lead + called[0].length - 1;
+  const close = jsCloseOf(code, open);
+  if (close < 0) return false;
+  let end = close;
+  for (let link = JS_CHAINED_CALL.exec(code.slice(end + 1, end + 200)); link; link = JS_CHAINED_CALL.exec(code.slice(end + 1, end + 200))) {
+    const linkOpen = end + link[0].length;
+    const linkClose = jsCloseOf(code, linkOpen);
+    if (linkClose < 0 || !jsCanvasValueCall(link[1]!, source.slice(linkOpen + 1, linkClose))) return false;
+    end = linkClose;
+  }
+  if (!JS_WHOLE_VALUE_END.test(code.slice(end + 1, end + 200).replace(/^\s*!/, ''))) return false;
+  const [, head, member] = called;
+  const argText = source.slice(open + 1, close);
+  const local = jsBindingAt(head!, file, at);
+  if (!member) {
+    // `createCanvas()`, declared in this file to return a DOM type. Only this
+    // file is read, so a sync of it reads the answer again.
+    const fn = local?.kind === 'function' ? jsCalledFunction(head!, open, file, where, context) : null;
+    if (!fn || fn.filePath !== where.filePath) return false;
+    const read = tsReturnedType(fn, context, { depth: 0, capped: false });
+    const raw = read?.raw.trim();
+    return !!read && !!raw && JS_CANVAS_RETURN.has(raw) && read.file === where.filePath &&
+      read.from.every((f) => f === where.filePath) &&
+      !context.getNodesInFile(where.filePath).some((n) => n.name === raw && n.kind !== 'file') &&
+      !context.getImportMappings?.(where.filePath, where.language)?.some((m) => m.localName === raw);
+  }
+  if (!local) {
+    return head === 'document' && member === 'createElement' && /^\s*(['"`])canvas\1\s*$/.test(argText) &&
+      isBrowserHostGlobal(head!, where, context);
+  }
+  if (local.kind !== 'declaration' || depth >= JS_DOM_VALUE_DEPTH || !jsCanvasValueCall(member, argText) ||
+      jsBindingReading(head!, local, file)) return false;
+  JS_DECLARATION_HEAD.lastIndex = local.at;
+  const declared = JS_DECLARATION_HEAD.exec(code);
+  if (!declared || declared[1] !== head) return false;
+  const valueAt = local.at + declared[0].length;
+  return !jsCheckerOff(file, local, where, context) && jsDomValue(file, valueAt, where, context, depth + 1);
+}
+
+/** How many locals jsDomValue follows back through their values. */
+const JS_DOM_VALUE_DEPTH = 3;
+
+/** What a same-file factory may be declared to return for jsDomValue: a canvas or one of its contexts. */
+const JS_CANVAS_RETURN = new Set([
+  'HTMLCanvasElement', 'OffscreenCanvas', 'CanvasRenderingContext2D', 'OffscreenCanvasRenderingContext2D',
+  'ImageBitmapRenderingContext', 'WebGLRenderingContext', 'WebGL2RenderingContext', 'GPUCanvasContext',
+]);
+
+/** `.name(`, `!.name(` or `?.name(` after a call: a method of its value, called. Group 1 is the name. */
+const JS_CHAINED_CALL = /^\s*!?\s*\??\.\s*([A-Za-z_$][\w$]*)\s*\(/;
+
+/**
+ * The methods of a canvas that give its context or offscreen canvas
+ * (jsDomValue). Not a lookup (`querySelector`), which may find an element the
+ * project defines, nor what gives a gradient or a string, which a project may
+ * augment.
+ */
+const JS_DOM_VALUE_METHODS = new Set(['getContext', 'transferControlToOffscreen']);
+
+/**
+ * Whether a method call on a canvas gives one of the DOM's own canvas values:
+ * a JS_DOM_VALUE_METHODS call with only literal arguments, and for
+ * `getContext` a context id the DOM defines (`'2d'`, `'webgl'`, …). A project
+ * overload for an id of its own (`getContext('mine')`) may hand back its own
+ * type.
+ */
+function jsCanvasValueCall(method: string, args: string): boolean {
+  if (!JS_DOM_VALUE_METHODS.has(method) || !JS_LITERAL_ARGUMENTS.test(args)) return false;
+  return method !== 'getContext' || /^\s*(['"`])(?:2d|webgl|webgl2|experimental-webgl|bitmaprenderer|webgpu)\1\s*(?:,|$)/.test(args);
+}
+
+/**
+ * Whether the TypeScript checker is off for a binding: the file has
+ * `@ts-nocheck`, or a `@ts-ignore` / `@ts-expect-error` sits in the binding's
+ * scope. The scope text has no comments, so they are read from the file.
+ */
+function jsCheckerOff(file: JsScopeFile, site: JsBindingSite, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!file.checkerOff) {
+    const source = context.readFile(ref.filePath);
+    const offsets: number[] = [];
+    if (source !== null) for (const m of source.matchAll(/@ts-(?:ignore|expect-error)\b/g)) offsets.push(m.index!);
+    file.checkerOff = { file: source === null || /@ts-nocheck\b/.test(source), offsets };
+  }
+  // A directive on the line before the scope's first line covers that line too.
+  const line = jsLineOf(file, Math.max(0, site.from));
+  const from = file.lineStarts[Math.max(0, line - 2)] ?? 0;
+  return file.checkerOff.file || file.checkerOff.offsets.some((at) => at >= from && at <= site.to);
+}
+
+/**
+ * The canvas DOM types a jsdom-style project may write as classes
+ * (isDomOwnMethod): the element and its `HTMLElement` base, and what
+ * `getContext` and `transferControlToOffscreen` give. Not `Node` or
+ * `Element`, which a project's own tree or editor model often names a class.
+ */
+const JS_CANVAS_DOM_TYPE = new Set([
+  'HTMLCanvasElement', 'HTMLElement', 'OffscreenCanvas',
+  'CanvasRenderingContext2D', 'OffscreenCanvasRenderingContext2D', 'ImageBitmapRenderingContext',
+  'WebGLRenderingContext', 'WebGL2RenderingContext', 'GPUCanvasContext',
+]);
+
+
+/** A literal argument: a string with no substitution, a number, `true`, `false`, `null`, `undefined`. */
+const JS_LITERAL_ARGUMENT = String.raw`(?:'[^'\\\n]*'|"[^"\\\n]*"|\x60[^\x60\\$\n]*\x60|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null|undefined)`;
+
+/** A flat object of literal values, `{ alpha: false }`. */
+const JS_LITERAL_OBJECT = String.raw`\{\s*(?:[A-Za-z_$][\w$]*\s*:\s*${JS_LITERAL_ARGUMENT}(?:\s*,\s*[A-Za-z_$][\w$]*\s*:\s*${JS_LITERAL_ARGUMENT})*\s*(?:,\s*)?)?\}`;
+
+/** Arguments that are only literals (`'2d', { alpha: false }`), or none. */
+const JS_LITERAL_ARGUMENTS = new RegExp(String.raw`^\s*(?:(?:${JS_LITERAL_ARGUMENT}|${JS_LITERAL_OBJECT})(?:\s*,\s*(?:${JS_LITERAL_ARGUMENT}|${JS_LITERAL_OBJECT}))*\s*(?:,\s*)?)?$`);
 
 /**
  * The type a declaration's whole value is cast to on its line, `= fn as
