@@ -171,6 +171,9 @@ CREATE TABLE IF NOT EXISTS name_segment_vocab (
 CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
 CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target, kind);
+-- Sync revisits instance-result calls without scanning unrelated edges.
+CREATE INDEX IF NOT EXISTS idx_edges_instance_type_owner ON edges(id)
+    WHERE metadata LIKE '%"instanceTypeOwner"%';
 
 -- Edge identity uniqueness. An edge IS uniquely (source, target, kind, line,
 -- col); insertEdge uses `INSERT OR IGNORE`, but without something UNIQUE to

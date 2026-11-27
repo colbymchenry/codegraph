@@ -622,13 +622,29 @@ function memoFor(context: ResolutionContext): Memo {
   return memo;
 }
 
+// Quick line pre-check before joining & tokenizing: a real TS namespace/module
+// declaration begins after line start, `;`, `{`, `}`, or `*/` (never inside `//`
+// or JSDoc `*` comment lines) with optional `export`/`declare` modifiers.
+const NS_BLOCK_LINE_HINT = /(?:^|[;{}]|\*\/)[ \t]*(?:(?:export|declare)[ \t]+)*(?:namespace|module)(?:[ \t]+[A-Za-z_$]|$)/;
+
 /** The namespace blocks of `file` (scanNamespaceBlocks), read once a resolution pass. */
 export function namespaceBlocks(file: string, context: ResolutionContext): readonly NamespaceBlock[] {
   const memo = memoFor(context);
   let blocks = memo.namespaces.get(file);
   if (!blocks) {
-    const source = context.readFile(file);
-    blocks = source && /\b(?:namespace|module)\s+[A-Za-z_$]/.test(source) ? scanNamespaceBlocks(source, DECLARATION_FILE.test(file)) : [];
+    const lines = context.getFileLines?.(file);
+    if (lines) {
+      const hasKeyword = lines.some((l) => NS_BLOCK_LINE_HINT.test(l));
+      const source = hasKeyword ? lines.join('\n') : null;
+      blocks = source && /\b(?:namespace|module)\s+[A-Za-z_$]/.test(source)
+        ? scanNamespaceBlocks(source, DECLARATION_FILE.test(file))
+        : [];
+    } else {
+      const source = context.readFile(file);
+      blocks = source && NS_BLOCK_LINE_HINT.test(source) && /\b(?:namespace|module)\s+[A-Za-z_$]/.test(source)
+        ? scanNamespaceBlocks(source, DECLARATION_FILE.test(file))
+        : [];
+    }
     memo.namespaces.set(file, blocks);
   }
   return blocks;
