@@ -197,7 +197,8 @@ export type CommentLang =
   | 'rust'
   | 'c'
   | 'cpp'
-  | 'erlang';
+  | 'erlang'
+  | 'zig';
 
 export function stripCommentsForRegex(content: string, lang: CommentLang): string {
   switch (lang) {
@@ -209,6 +210,8 @@ export function stripCommentsForRegex(content: string, lang: CommentLang): strin
       return stripRust(content);
     case 'erlang':
       return stripErlang(content);
+    case 'zig':
+      return stripZig(content);
     case 'php':
       return stripPhp(content);
     case 'go':
@@ -702,6 +705,50 @@ function stripErlang(src: string): string {
       while (end < n && src[end] !== '\n') end++;
       out.blank(i, end);
       i = end;
+      continue;
+    }
+
+    i++;
+  }
+
+  return out.text();
+}
+
+// ---------- Zig ----------
+
+function stripZig(src: string): string {
+  const out = new BlankedText(src);
+  let i = 0;
+  const n = src.length;
+
+  while (i < n) {
+    const c = src[i]!;
+    const c2 = src[i + 1] ?? '';
+
+    if (c === '/' && c2 === '/') {
+      const start = i;
+      while (i < n && src[i] !== '\n') i++;
+      out.blank(start, i);
+      continue;
+    }
+
+    if (c === '\\' && c2 === '\\') {
+      while (i < n && src[i] !== '\n') i++;
+      continue;
+    }
+
+    if (c === '"' || c === "'") {
+      const quote = c;
+      i++;
+      while (i < n && src[i] !== quote) {
+        if (src[i] === '\\' && i + 1 < n) {
+          i += 2;
+          continue;
+        }
+        if (src[i] === '\n') break;
+        i++;
+      }
+      if (i < n && src[i] === quote) i++;
       continue;
     }
 

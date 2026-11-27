@@ -21,6 +21,7 @@ import { moduleReferenceKeys, moduleTail } from '../db/reference-tail';
 import { PHP_DOCUMENT_ROOT } from '../extraction/languages/php';
 import { loadWebRoot } from '../project-config';
 import { underWebRoot } from './php-web-root';
+import { resolveZigBuildModule } from './zig-build-modules';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -86,7 +87,12 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
   nix: ['.nix', '/default.nix'],
+  zig: ['.zig'],
 };
+
+export function isZigPathImportRef(ref: UnresolvedRef): boolean {
+  return ref.language === 'zig' && ref.referenceKind === 'imports';
+}
 
 export function isNixPathImportRef(ref: UnresolvedRef): boolean {
   return (
@@ -460,6 +466,18 @@ function resolveImportPathUncached(
   // misclassified as an external package.
   if (language === 'cobol') {
     return resolveCobolCopybook(importPath, fromFile, context);
+  }
+
+  // Zig `@import(...)`: relative `.zig` paths resolve against the importing file's
+  // directory, while bare named modules (`@import("engine_api")`, `@import("stdx")`)
+  // resolve against the nearest ancestor `build.zig` module table. Built-ins (`std`,
+  // `builtin`, `root`) and unknown/external modules stay null.
+  if (language === 'zig') {
+    if (importPath.startsWith('.') || importPath.endsWith('.zig')) {
+      const fromDir = path.dirname(path.join(context.getProjectRoot(), fromFile));
+      return resolveRelativeImport(importPath, fromDir, 'zig', context);
+    }
+    return resolveZigBuildModule(importPath, fromFile, context);
   }
 
   // Skip external/npm packages — but pass the context so the
@@ -1376,6 +1394,15 @@ export function isExternalImport(
     if (C_CPP_STDLIB_HEADERS.has(withoutExt)) return true;
   }
 
+  if (language === 'zig') {
+    if (!importPath.endsWith('.zig') && !importPath.startsWith('.')) {
+      if (context && options?.fromFile) {
+        return resolveZigBuildModule(importPath, options.fromFile, context) === null;
+      }
+      return true;
+    }
+  }
+
   return false;
 }
 
@@ -2085,9 +2112,63 @@ export function extractImportMappings(
     mappings.push(...extractPHPImports(content));
   } else if (language === 'c' || language === 'cpp') {
     mappings.push(...extractCppImports(content));
+  } else if (language === 'zig') {
+    mappings.push(...extractZigImports(content));
   }
 
   return mappings;
+}
+
+const ZIG_IMPORT_BINDING_RE =
+  /(?:^|[;{}])\s*(?:pub\s+)?const\s+([A-Za-z_]\w*)\s*=\s*@import\(\s*"([^"]+)"\s*\)(?:\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*))?\s*(?=;)/gm;
+
+function extractZigImports(content: string): ImportMapping[] {
+  const mappings: ImportMapping[] = [];
+  const cleaned = stripCommentsForRegex(content, 'zig');
+  ZIG_IMPORT_BINDING_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = ZIG_IMPORT_BINDING_RE.exec(cleaned)) !== null) {
+    const localName = m[1]!;
+    const source = m[2]!;
+    const member = m[3];
+    if (!member) {
+      mappings.push({
+        localName,
+        exportedName: '*',
+        source,
+        isDefault: false,
+        isNamespace: true,
+      });
+    } else {
+      mappings.push({
+        localName,
+        exportedName: member,
+        source,
+        isDefault: false,
+        isNamespace: false,
+      });
+    }
+  }
+  return mappings;
+}
+
+function extractZigReExports(content: string): ReExport[] {
+  const out: ReExport[] = [];
+  const cleaned = stripCommentsForRegex(content, 'zig');
+  const re =
+    /(?:^|[;{}])\s*pub\s+const\s+([A-Za-z_]\w*)\s*=\s*@import\(\s*"([^"]+)"\s*\)(?:\.([A-Za-z_]\w*))?\s*(?=;)/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(cleaned)) !== null) {
+    const exportedName = m[1]!;
+    const source = m[2]!;
+    const originalName = m[3];
+    if (!originalName) {
+      out.push({ kind: 'namespace', exportedName, source });
+    } else {
+      out.push({ kind: 'named', exportedName, originalName, source });
+    }
+  }
+  return out;
 }
 
 /** A JavaScript identifier — `$`, `_` and Unicode letters included. Use with the `u` flag. */
@@ -2664,6 +2745,7 @@ function stripJsComments(content: string): string {
  */
 export function extractReExports(content: string, language: Language): ReExport[] {
   if (language === 'python') return extractPythonReExports(content);
+  if (language === 'zig') return extractZigReExports(content);
   if (
     language !== 'typescript' &&
     language !== 'javascript' &&
@@ -3456,6 +3538,68 @@ export function resolveViaImport(
     return null;
   }
 
+  // Zig `@import("...")`: relative `.zig` paths resolve to their file node;
+  // named/builtin modules (`std`, `builtin`, build.zig modules) stay unresolved
+  // rather than falling back to the generic symbol name-matcher.
+  if (isZigPathImportRef(ref)) {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath) return null;
+
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
+    return null;
+  }
+
+  // Inline Zig `@import("file.zig").symbol` / `@import("file.zig").Type.method`
+  if (ref.language === 'zig' && ref.referenceName.startsWith('@import("')) {
+    const inlineMatch = /^@import\("([^"]+)"\)\.([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)$/.exec(ref.referenceName);
+    if (inlineMatch) {
+      const resolvedPath = resolveImportPath(inlineMatch[1]!, ref.filePath, 'zig', context);
+      if (resolvedPath) {
+        const memberChain = inlineMatch[2]!;
+        const direct = findExportedSymbol(
+          resolvedPath,
+          { isDefault: false, isNamespace: true, exportedName: memberChain.split('.')[0]!, memberName: memberChain },
+          'zig',
+          context,
+          new Set()
+        );
+        if (direct) {
+          return { original: ref, targetNodeId: direct.id, confidence: 0.9, resolvedBy: 'import' };
+        }
+        const dot = memberChain.indexOf('.');
+        if (dot > 0) {
+          const head = memberChain.slice(0, dot);
+          const container = findExportedSymbol(
+            resolvedPath,
+            { isDefault: false, isNamespace: true, exportedName: head, memberName: head },
+            'zig',
+            context,
+            new Set()
+          );
+          if (container) {
+            const memberNode = resolveStaticMember(container, { ...ref, referenceName: memberChain }, head, context);
+            if (memberNode) {
+              return { original: ref, targetNodeId: memberNode.id, confidence: 0.9, resolvedBy: 'import' };
+            }
+          }
+        }
+      }
+      return null;
+    }
+  }
+
   // Use cached import mappings (avoids re-reading and re-parsing per ref)
   let imports = context.getImportMappings(ref.filePath, ref.language);
   if (imports.length === 0 && !context.readFile(ref.filePath)) {
@@ -3565,6 +3709,35 @@ export function resolveViaImport(
 
         const targetNode = findImportedExport(imp.source, resolvedPath, want, ref, context);
         const memberRead = !imp.isNamespace && ref.referenceName.startsWith(imp.localName + '.');
+
+        // Zig namespace import with nested member access (`const mod = @import("m.zig"); mod.Point.init()`):
+        // find the exported container `Point` in `resolvedPath` and descend into `init`.
+        if (!targetNode && imp.isNamespace && memberName && memberName.includes('.') && resolvedPath && ref.language === 'zig') {
+          const head = memberName.split('.')[0]!;
+          const container = findImportedExport(
+            imp.source,
+            resolvedPath,
+            { isDefault: false, isNamespace: true, exportedName: head, memberName: head },
+            ref,
+            context
+          );
+          if (container) {
+            const nested = resolveStaticMember(
+              container,
+              { ...ref, referenceName: memberName },
+              head,
+              context
+            );
+            if (nested) {
+              return {
+                original: ref,
+                targetNodeId: nested.id,
+                confidence: 0.9,
+                resolvedBy: 'import',
+              };
+            }
+          }
+        }
 
         // A name the module exports as a module namespace — `export * as ns
         // from './m'`, or zod's `import * as z from './external.js'; export
@@ -4742,7 +4915,7 @@ function resolveStaticMember(
   // A Python reference keeps its whole chain, and it reads the chain's last
   // link: `Foo.bar.fset()` is no call of `bar`, nor `Foo.Inner.objects.create()`
   // a new `Inner`, but `Foo.Inner.run()` is `Inner`'s `run`.
-  if (ref.language === 'python' && rest.length > 0) {
+  if ((ref.language === 'python' || ref.language === 'zig') && rest.length > 0) {
     const next = candidates.find((n) => STATIC_MEMBER_CONTAINERS.has(n.kind));
     return next && resolveStaticMember(next, { ...ref, referenceName: `${member}.${rest.join('.')}` }, member, context);
   }

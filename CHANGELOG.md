@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- CodeGraph now indexes **Zig** (`.zig`) — functions, structs, enums, unions, opaque types, error sets, constants, `test` blocks, relative `@import` and `build.zig` named-module resolution, and call/reference edges.
 - `codegraph_callers` and `codegraph_callees` take an `offset`, so an agent can page through a list longer than `limit`, and a cut list names the offset of the next page. Thanks @blairjordan. (#3449)
 - `codegraph init` is faster on large projects: the background workers that link references start sooner, and they and the indexer's own writes no longer hold each other up. (#3472)
 

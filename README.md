@@ -288,7 +288,7 @@ CodeGraph's parsing engine is a **native Rust kernel**: 20 languages — TypeScr
 | **Full-Text Search** | Find code by name instantly across your entire codebase, powered by FTS5 |
 | **Impact Analysis** | Trace callers, callees, and the full impact radius of any symbol before making changes |
 | **Always Fresh** | File watcher uses native OS events (FSEvents/inotify/ReadDirectoryChangesW) with debounced auto-sync — the graph stays current as you code, zero config |
-| **20+ Languages** | TypeScript, JavaScript, ArkTS, Python, Go, Rust, Java, C#, VB.NET, PHP, Ruby, C, C++, CUDA, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Nix, Erlang, CFML, COBOL, Solidity, Terraform/OpenTofu, Svelte, Vue, Astro, Razor/Blazor, Liquid, Pascal/Delphi |
+| **20+ Languages** | TypeScript, JavaScript, ArkTS, Python, Go, Rust, Zig, Java, C#, VB.NET, PHP, Ruby, C, C++, CUDA, Objective-C, Metal, Swift, Kotlin, Scala, Dart, Lua, Luau, R, Nix, Erlang, CFML, COBOL, Solidity, Terraform/OpenTofu, Svelte, Vue, Astro, Razor/Blazor, Liquid, Pascal/Delphi |
 | **Framework-aware Routes** | Recognizes web-framework routing files and links URL patterns to their handlers across more than 20 web frameworks and routers |
 | **Mixed iOS / React Native / Expo** | Closes cross-language flows that static parsing misses: Swift ↔ ObjC bridging, React Native legacy bridge + TurboModules + Fabric view components, native → JS event emitters, Expo Modules |
 | **Tauri** | Follows a desktop app across its web frontend and Rust core: `invoke('save_file')`, tauri-specta's typed `commands.saveFile()`, your own wrappers around `invoke`, and events in both directions |
@@ -879,6 +879,7 @@ agents learn the `codegraph explore` command:
 | Python | `.py` | Full support |
 | Go | `.go` | Full support |
 | Rust | `.rs` | Full support |
+| Zig | `.zig` | Full support (functions, structs/enums/unions/opaque/error sets, methods, constants, `test` blocks, relative `@import` and `build.zig` named-module resolution, call and instantiation edges) |
 | Java | `.java` | Full support |
 | C# | `.cs` | Full support (MediatR `Send` / `Publish` link to their handlers, including ones written against your own interfaces like `ICommandHandler<T>` or a package's) |
 | ASP.NET Razor / Blazor | `.cshtml`, `.razor` | Markup links: `@model`, `@inherits`, `@inject`, `@typeof` and Blazor component tags link to the C# types they name, and what an inline `<script>` block calls links to the JavaScript that defines it |
