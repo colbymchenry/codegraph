@@ -768,8 +768,8 @@ function buildPythonModuleIndex(context: ResolutionContext): PythonModuleIndex {
  * `[tool.setuptools.package-dir] "" =` (or the inline `package-dir` of
  * `[tool.setuptools]`), poetry `packages = [{ from = … }]`, hatch
  * `packages = ["src/pkg"]`, and `setup.cfg`'s `[options] package_dir` and
- * `[options.packages.find] where`. A miss only costs the namespace-package
- * case, which the `__init__.py` chain can't see either.
+ * `[options.packages.find] where`. Pyright execution-environment paths are not
+ * promoted to project-wide roots because their scope belongs to the environment.
  */
 function declaredPythonRoots(context: ResolutionContext, service: string): string[] {
   const out: string[] = [];
@@ -783,9 +783,10 @@ function declaredPythonRoots(context: ResolutionContext, service: string): strin
     for (const [table, body] of iniTables(toml)) {
       const isPytest = table === 'tool.pytest.ini_options' || table === 'tool.pytest';
       if (isPytest || table === 'tool.pyright' || table === 'tool.basedpyright') {
+        const array = String.raw`\[((?:"(?:\\.|[^"\\])*"|'[^']*'|#[^\r\n]*|[^\]"'#])*)\]`;
         const paths = isPytest
-          ? body.match(/^[ \t]*pythonpath[ \t]*=[ \t]*(?:\[([^\]]*)\]|["']([^"'\r\n]*)["'])/m)
-          : body.match(/^[ \t]*extraPaths[ \t]*=[ \t]*\[([^\]]*)\]/m);
+          ? body.match(new RegExp(String.raw`^[ \t]*pythonpath[ \t]*=[ \t]*(?:${array}|["']([^"'\r\n]*)["'])`, 'm'))
+          : body.match(new RegExp(String.raw`^[ \t]*extraPaths[ \t]*=[ \t]*${array}`, 'm'));
         if (paths?.[1] !== undefined) {
           for (const item of paths[1].matchAll(/"([^"\r\n]*)"|'([^'\r\n]*)'|#[^\r\n]*/g)) {
             const dir = item[1] ?? item[2];
@@ -835,10 +836,11 @@ function declaredPythonRoots(context: ResolutionContext, service: string): strin
 /** `[table]` sections of a TOML / INI file, with the body under each. */
 function iniTables(content: string): Array<[string, string]> {
   const out: Array<[string, string]> = [];
-  const headers = [...content.matchAll(/^[ \t]*\[([^\[\]\n]+)\][ \t]*(?:#.*)?$/gm)];
+  const headers = [...content.matchAll(/^[ \t]*(?:\[\[([^\[\]\n]+)\]\]|\[([^\[\]\n]+)\])[ \t\r]*(?:#.*)?$/gm)];
   headers.forEach((h, i) => {
     const end = i + 1 < headers.length ? headers[i + 1]!.index! : content.length;
-    out.push([h[1]!.trim().replace(/["']/g, ''), content.slice(h.index! + h[0].length, end)]);
+    const name = (h[1] ?? h[2]!).trim().replace(/["']/g, '');
+    out.push([h[1] === undefined ? name : `[[${name}]]`, content.slice(h.index! + h[0].length, end)]);
   });
   return out;
 }
