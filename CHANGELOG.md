@@ -17,6 +17,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph_callers` and `codegraph_callees` take an `offset`, so an agent can page through a list longer than `limit`, and a cut list names the offset of the next page. Thanks @blairjordan. (#3449)
 - `codegraph init` is faster on large projects: the background workers that link references start sooner, and they and the indexer's own writes no longer hold each other up. (#3472)
 
+- **`codegraph_component` — a Vue component's contract in one call.** Ask for a component by name and get its props (with their types, defaults and the comments above them), emits, slots and exposed members, the child components it renders, and every parent `@event="handler"` binding attached to it — so changing an emit shows exactly which parent handlers break, without reading the SFC. Opt-in with `CODEGRAPH_MCP_TOOLS=component`; projects indexed before this change pick the data up as their files re-index.
+
+- **Vue props and emits are read across files.** When a component's `defineProps` / `defineEmits` types live in a shared types file — imported directly, reached through `extends` chains, or renamed on import — their members are pulled in and shown with the types and docs as written. A base reached through two branches of an inheritance diamond shows up once, tsconfig `paths` aliases (`@/types/props`) resolve exactly like relative imports, and an import this extractor cannot follow (a bare package) is skipped rather than guessed.
+
+- **Vue templates are indexed as wiring, not just text.** Every `@event="handler"` on a component tag becomes a real edge from the component to the function that handles it, so callers, impact and the new component view see which functions a template drives — including through kebab-case tags.
+
 ### Fixes
 
 - In Rust, a method called on a closure's parameter now links to the right type's method when the closure is handed to a standard method such as `map`, `for_each`, `is_none_or` or `map_err`, as in `rpc.as_mut().is_none_or(|r| r.stop().is_ok())`, and so does one called on what `if let Some(x) = value.as_mut()` binds. Before, such a call was left out of `callers` and `impact` whenever two types in the project had a method of that name; re-index Rust projects after upgrading. (#3497)
