@@ -19,6 +19,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In TypeScript, a method call on a value codegraph can't type in a `.tsx` file no longer links to the only `.tsx` method of that name when a `.ts` file also has a method of that name, and the same holds the other way round, so `scene.mutateElement(…)` in a React component stops linking to an unrelated component's method; re-index TypeScript projects after upgrading (#3443).
 - In Rust, a method called on a closure's parameter now links to the right type's method when the closure is handed to a standard method such as `map`, `for_each`, `is_none_or` or `map_err`, as in `rpc.as_mut().is_none_or(|r| r.stop().is_ok())`, and so does one called on what `if let Some(x) = value.as_mut()` binds. Before, such a call was left out of `callers` and `impact` whenever two types in the project had a method of that name; re-index Rust projects after upgrading. (#3497)
 - On Windows, the `codegraph` command in Git Bash now works in a terminal that turns off path conversion with `MSYS_NO_PATHCONV=1` or `MSYS2_ARG_CONV_EXCL=*`, as some agent harnesses do, instead of failing with "Cannot find module". Thanks @BlueberryDuck for the report. (#3464)
 - On projects with fewer than 500 files, every tool named in `CODEGRAPH_MCP_TOOLS` is now listed to the agent, instead of only the small-repo defaults. Thanks @nchrisr for the report and the fix. (#3462)
