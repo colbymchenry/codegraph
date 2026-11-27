@@ -92,11 +92,15 @@ jobs:
           token: ${{ secrets.RELEASE_PAT }}
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: '22.23.4'
           # No registry-url here: it writes an .npmrc that requires a
           # NODE_AUTH_TOKEN env var to exist, and we publish via OIDC
           # trusted publishing instead of a token.
 
+      - name: Verify Node.js runtime
+        run: |
+          node --version
+          test "$(node --version)" = "v22.23.4"
       - name: Upgrade npm for OIDC trusted publishing
         # Trusted publishing needs npm >= 11.5; Node 22 bundles npm 10.
         run: npm install -g npm@11 && npm --version
