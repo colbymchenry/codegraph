@@ -303,6 +303,13 @@ export interface IndexHealth {
    * they stay this way until the file (or the parser) changes.
    */
   parseErrors: string[];
+  /**
+   * Source files over the size limit (`MAX_SOURCE_FILE_SIZE_BYTES`): tracked,
+   * never parsed, so the graph holds none of their symbols. Empty on purpose,
+   * and nothing to repair, but reported: a search, a caller list or an impact
+   * report says nothing of what is in them, and silence reads as "not there".
+   */
+  oversize: { path: string; size: number }[];
 }
 
 // =============================================================================
