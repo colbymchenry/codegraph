@@ -52,6 +52,7 @@ import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, makeGitignoreLocalOnly, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, isAgentMessage, isCrossSessionMessage, stripSystemReminders, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
+import { LockUnavailableError } from '../errors';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -1126,6 +1127,12 @@ program
         releaseWriterLock(projectPath, 'rebuild.pid');
       }
     } catch (err) {
+      // The rebuild now takes the write lock before it replaces the database,
+      // so a busy lock is reported here instead of from indexAll's result.
+      if (err instanceof LockUnavailableError) {
+        if (!options.quiet) error(err.message);
+        process.exit(1);
+      }
       error(`Failed to index: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }

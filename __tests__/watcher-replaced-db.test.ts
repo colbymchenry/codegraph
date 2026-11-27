@@ -16,7 +16,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import CodeGraph, { LockUnavailableError } from '../src/index';
+import CodeGraph from '../src/index';
 import type { MCPEngine } from '../src/mcp/engine';
 
 const posixOnly = it.runIf(process.platform !== 'win32');
@@ -83,17 +83,15 @@ describe('live sync after the index is rebuilt by another process (#1902)', () =
     }
   });
 
-  posixOnly('a sync in the gap between recreate and indexAll steps aside, then reconciles in full', async () => {
+  posixOnly('a sync steps aside while recreate holds the write lock, then reconciles in full', async () => {
     const server = CodeGraph.initSync(root);
     await server.indexAll();
     try {
-      // `codegraph index`: the file is recreated first, the write lock is taken later by indexAll.
+      // The rebuild already holds the lock before indexAll starts.
       const rebuilder = await CodeGraph.recreate(root);
       fs.appendFileSync(path.join(root, 'src', 'a.ts'), 'export function gamma() { return 3; }\n');
-      // The server's sync lands in the gap: it must not claim the lock for a
-      // full reconcile of the empty file, and reports contention instead of success.
-      await expect(server.sync({ paths: ['src/a.ts'] })).rejects.toBeInstanceOf(LockUnavailableError);
-      // So the rebuild still gets its lock and completes.
+      await expect(server.sync({ paths: ['src/a.ts'] })).rejects.toThrow(/^Sync could not acquire the file lock/);
+      // The rebuild uses the same lock to complete the index.
       const built = await rebuilder.indexAll();
       expect(built.success).toBe(true);
       rebuilder.close();
@@ -115,10 +113,10 @@ describe('live sync after the index is rebuilt by another process (#1902)', () =
     }
   });
 
-  posixOnly('a watcher sync that lands in the rebuild gap keeps its pending files until the rebuild is reconciled', async () => {
+  posixOnly('a watcher blocked by the rebuild lock keeps its pending files until the rebuild is reconciled', async () => {
     const server = CodeGraph.initSync(root);
     await server.indexAll();
-    // Record every sync the watcher starts, so the test can wait for the one in the gap.
+    // Record every sync the watcher starts, so the test can wait for the blocked attempt.
     const attempts: Array<Promise<unknown>> = [];
     const realSync = server.sync.bind(server);
     (server as any).sync = (options?: Parameters<CodeGraph['sync']>[0]) => {
@@ -131,11 +129,11 @@ describe('live sync after the index is rebuilt by another process (#1902)', () =
     // must outlast the rebuild below; 200 ms leaves several seconds.
     expect(server.watch({ debounceMs: 200, onSyncComplete: () => { synced++; } })).toBe(true);
     try {
-      // `codegraph index` has recreated the file but not taken the write lock yet.
+      // The rebuilt file is empty, but already locked.
       const rebuilder = await CodeGraph.recreate(root);
       fs.appendFileSync(path.join(root, 'src', 'a.ts'), 'export function gamma() { return 3; }\n');
       await waitFor(() => attempts.length > 0);
-      await expect(attempts[0]).rejects.toBeInstanceOf(LockUnavailableError);
+      await expect(attempts[0]).rejects.toThrow(/^Sync could not acquire the file lock/);
       // Stepping aside is not a sync: the edit stays pending, nothing is reported as synced.
       expect(synced).toBe(0);
       expect(server.getPendingFiles().map((f) => f.path)).toContain('src/a.ts');
