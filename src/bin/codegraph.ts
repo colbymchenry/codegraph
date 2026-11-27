@@ -3079,7 +3079,6 @@ program
         // If the changed file is itself a test file, include it
         if (isTestFile(file)) {
           affectedTests.add(file);
-          continue;
         }
 
         // BFS through dependents
@@ -3101,9 +3100,9 @@ program
 
             if (isTestFile(dep)) {
               affectedTests.add(dep);
-            } else {
-              queue.push({ file: dep, depth: current.depth + 1 });
             }
+            // Test files can export helpers used by other tests too.
+            queue.push({ file: dep, depth: current.depth + 1 });
           }
         }
       }

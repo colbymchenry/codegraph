@@ -228,6 +228,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Setup, the background server and the CLI
 
+- `codegraph affected` now includes tests that depend on another test file, including when the changed file is itself a test.
 - The Claude Code prompt hook now goes by what you typed, skipping the status notes Claude Code's desktop app puts before your prompt, and gives no context to a message from another session. Thanks @WonderMr and @yang0228. (#2635)
 - Upgrading CodeGraph while an agent session is open no longer leaves the old version's background server in charge: the first session from the new install replaces it with a current one. Thanks @lipchey. (#2335)
 - `codegraph index` no longer stops with advice to run `codegraph daemon stop`, which doesn't exist, when a stale lock names a process that isn't CodeGraph; it clears that lock and rebuilds. Thanks @inth3shadows and @danusha2345. (#2770)
