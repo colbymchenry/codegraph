@@ -42,6 +42,7 @@ import {
 import { classifyLockHolder, describeProcess } from './process-identity';
 import { isOlderRelease } from './version';
 import { WORKER_START_SETTLE_MS } from '../worker-teardown';
+import { readRegularFile } from '../file-limits';
 
 export interface DaemonRecord {
   /** Realpath'd project root the daemon serves. */
@@ -198,7 +199,7 @@ function removeDaemonArtifacts(root: string, expectedLockContents: string | null
     if (fs.existsSync(pidPath)) return false;
   } else {
     try {
-      if (fs.readFileSync(pidPath, 'utf8') !== expectedLockContents) return false;
+      if (readRegularFile(pidPath, 'utf8') !== expectedLockContents) return false;
     } catch {
       return false;
     }
@@ -228,7 +229,7 @@ export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> 
   let info: DaemonLockInfo | null = null;
   let lockContents: string | null = null;
   try {
-    lockContents = fs.readFileSync(pidPath, 'utf8');
+    lockContents = readRegularFile(pidPath, 'utf8');
     info = decodeLockInfo(lockContents);
   } catch { /* missing/corrupt */ }
   if (info && isProcessAlive(info.pid)) {
@@ -316,7 +317,7 @@ export async function stopDaemonAt(
   let identity: DaemonLockInfo | null = null;
   let lockContents: string | null = null;
   try {
-    lockContents = fs.readFileSync(getDaemonPidPath(root), 'utf8');
+    lockContents = readRegularFile(getDaemonPidPath(root), 'utf8');
     identity = decodeLockInfo(lockContents);
     pid = identity?.pid ?? null;
   } catch {
@@ -375,7 +376,7 @@ export async function daemonStopFailureMessage(root: string, result: StopResult)
   const lockPath = getDaemonPidPath(root);
   let holder: number | null = null;
   try {
-    const current = decodeLockInfo(fs.readFileSync(lockPath, 'utf8'));
+    const current = decodeLockInfo(readRegularFile(lockPath, 'utf8'));
     if (current && isProcessAlive(current.pid)) holder = current.pid;
   } catch { /* no lock now */ }
   if (holder !== null && result.pid !== null && holder !== result.pid) {
@@ -427,7 +428,7 @@ async function stopVerifiedDaemon(
   const { pid, version } = identity;
   // Identity probing awaits I/O: never act on a superseded ownership record.
   const sameLock = (): boolean => {
-    try { return fs.readFileSync(getDaemonPidPath(root), 'utf8') === lockContents; }
+    try { return readRegularFile(getDaemonPidPath(root), 'utf8') === lockContents; }
     catch { return lockContents === null; }
   };
   if (!sameLock()) return { root, pid, outcome: 'unverified', version };

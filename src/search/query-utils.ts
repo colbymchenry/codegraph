@@ -4,8 +4,8 @@
  * Shared module for search term extraction and scoring.
  */
 
-import * as fs from 'fs';
 import * as path from 'path';
+import { readRegularFile } from '../file-limits';
 import { Node } from '../types';
 
 /** Normalize a name to a comparable token: lowercase, alphanumerics only. */
@@ -36,14 +36,14 @@ export function deriveProjectNameTokens(projectRoot: string): Set<string> {
 
   // go.mod module last segment (the most reliable signal for Go repos).
   try {
-    const gomod = fs.readFileSync(path.join(projectRoot, 'go.mod'), 'utf-8');
+    const gomod = readRegularFile(path.join(projectRoot, 'go.mod'), 'utf-8');
     const m = gomod.match(/^\s*module\s+(\S+)/m);
     if (m && m[1]) add(m[1].split('/').pop());
   } catch { /* no go.mod */ }
 
   // package.json name (strip an `@scope/` prefix).
   try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf-8'));
+    const pkg = JSON.parse(readRegularFile(path.join(projectRoot, 'package.json'), 'utf-8'));
     if (typeof pkg.name === 'string') add(pkg.name.replace(/^@[^/]+\//, ''));
   } catch { /* no / invalid package.json */ }
 

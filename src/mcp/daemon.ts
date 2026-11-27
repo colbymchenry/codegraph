@@ -65,6 +65,7 @@ import {
   type WriterLockInfo,
 } from './writer-lock';
 import { registerDaemon, deregisterDaemon } from './daemon-registry';
+import { readRegularFile } from '../file-limits';
 
 /** Default idle linger after the last client disconnects. */
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
@@ -165,7 +166,7 @@ export function projectGoneReason(projectRoot: string, pidPath: string, pid: num
   }
   let raw: string;
   try {
-    raw = fs.readFileSync(pidPath, 'utf8');
+    raw = readRegularFile(pidPath, 'utf8');
   } catch (err) {
     return isMissing(err) ? `its lock file ${pidPath} was removed` : null;
   }
@@ -342,7 +343,7 @@ export class Daemon {
 
     let initialLockContents: string;
     try {
-      initialLockContents = fs.readFileSync(this.pidPath, 'utf8');
+      initialLockContents = readRegularFile(this.pidPath, 'utf8');
       if (decodeLockInfo(initialLockContents)?.pid !== process.pid) {
         throw new Error('daemon lock belongs to another process');
       }
@@ -737,7 +738,7 @@ export class Daemon {
       if (fs.existsSync(this.pidPath)) {
         // Only remove if it still belongs to us — another daemon may have
         // already taken over while we were shutting down (extremely rare).
-        const raw = fs.readFileSync(this.pidPath, 'utf8');
+        const raw = readRegularFile(this.pidPath, 'utf8');
         const info = decodeLockInfo(raw);
         if (info && info.pid === process.pid) {
           fs.unlinkSync(this.pidPath);
@@ -775,7 +776,7 @@ export function refreshDaemonLock(
     fs.writeFileSync(tmpPid, encodeLockInfo(lock), { mode: 0o600 });
     for (let attempt = 0; ; attempt++) {
       // A retry must never replace a record whose owner changed while waiting.
-      if (fs.readFileSync(pidPath, 'utf8') !== initialContents) {
+      if (readRegularFile(pidPath, 'utf8') !== initialContents) {
         throw new Error('Lost daemon lock ownership after binding.');
       }
       try {
@@ -888,7 +889,7 @@ export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
   let existing: DaemonLockInfo | null = null;
   let lockContents: string | null = null;
   try {
-    lockContents = fs.readFileSync(pidPath, 'utf8');
+    lockContents = readRegularFile(pidPath, 'utf8');
     existing = decodeLockInfo(lockContents);
   } catch { /* unreadable lockfile — treat as malformed */ }
   return { kind: 'taken', existing, lockContents, pidPath };
@@ -937,7 +938,7 @@ export function clearStaleDaemonLock(
   opts: { allowLivePid?: boolean; expectedLockContents?: string } = {}
 ): boolean {
   try {
-    const raw = fs.readFileSync(pidPath, 'utf8');
+    const raw = readRegularFile(pidPath, 'utf8');
     // The identity record changed after the caller inspected it. Even the same
     // PID may now advertise a newly-bound socket, so this snapshot was never
     // disproved and must not be deleted.
