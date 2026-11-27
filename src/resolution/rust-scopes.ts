@@ -38,6 +38,19 @@ export interface RustBinding {
   site?: RustPatternSite;
   /** What an `if let`, `while let`, `let … else` or `match` pattern is matched against, or what a `for` iterates. */
   scrutinee?: string;
+  /**
+   * For a closure's only parameter with no type written: the method call the
+   * closure is an argument of — `rpc.as_mut().is_none_or(|r| …)` is
+   * `{ receiver: 'rpc.as_mut()', method: 'is_none_or', arg: 0 }`.
+   */
+  callee?: RustClosureCallee;
+}
+
+/** The method call a closure is handed to: its receiver as written, the method, and which argument the closure is. */
+export interface RustClosureCallee {
+  receiver: string;
+  method: string;
+  arg: number;
 }
 
 /** A function with a body: its generic parameters and `where` clause, and the span its parameters are bound in. */
@@ -502,6 +515,100 @@ export function rustInnerBlockAt(scopes: RustScopes, offset: number): [number, n
   return blockAt(scopes.events, scopes.openAfter, scopes.close, scopes.code.length, offset);
 }
 
+/**
+ * Where the expression ending at `end` starts, read backwards as a chain of
+ * postfix steps: `rpc.as_mut()`, `self.items.iter()`, `find()?`, `a::b(x)[0]`.
+ * White space is part of it only inside a chain broken over lines. A prefix
+ * operator (`&`, `*`, `!`) is not: it applies to what the whole call returns.
+ */
+function chainStart(code: string, end: number): number {
+  let start = end;
+  let pos = end;
+  for (;;) {
+    let p = pos;
+    while (p > 0 && /\s/.test(code[p - 1]!)) p--;
+    const c = code[p - 1];
+    if (c === ')' || c === ']') {
+      const opener = c === ')' ? '(' : '[';
+      let depth = 0;
+      let k = p - 1;
+      for (; k >= 0; k--) {
+        if (code[k] === c) depth++;
+        else if (code[k] === opener && --depth === 0) break;
+      }
+      if (k < 0) return start;
+      start = pos = k;
+      continue;
+    }
+    if (c === '?') {
+      start = pos = p - 1;
+      continue;
+    }
+    if (!isIdentChar(c)) return start;
+    let k = p - 1;
+    while (k > 0 && isIdentChar(code[k - 1])) k--;
+    start = k;
+    let q = k;
+    while (q > 0 && /\s/.test(code[q - 1]!)) q--;
+    if (code[q - 1] === '.' && code[q - 2] !== '.') pos = q - 1;
+    else if (code[q - 1] === ':' && code[q - 2] === ':') pos = q - 2;
+    else return start;
+  }
+}
+
+/**
+ * The method call the closure whose parameters open at `bar` is an argument
+ * of, if it is one: `xs.iter().for_each(|x| …)`, `opt.map_or(0, |x| …)`. None
+ * for a closure bound to a name, returned, or passed to a free function or a
+ * macro — nothing there says what its parameter is.
+ */
+function closureCallee(code: string, close: Map<number, number>, bar: number): RustClosureCallee | undefined {
+  let depth = 0;
+  let open = -1;
+  for (let j = bar - 1; j >= 0 && j > bar - 4000; j--) {
+    const c = code[j]!;
+    if (c === ')' || c === ']' || c === '}') depth++;
+    else if (c === '(' || c === '[' || c === '{') {
+      if (depth === 0) {
+        open = j;
+        break;
+      }
+      depth--;
+    } else if (c === ';' && depth === 0) break;
+  }
+  if (open < 0 || code[open] !== '(') return undefined;
+  let e = open;
+  while (e > 0 && /\s/.test(code[e - 1]!)) e--;
+  // A turbofish: `.map::<T, _>(|x| …)`.
+  if (code[e - 1] === '>') {
+    let angles = 0;
+    let k = e - 1;
+    for (; k >= 0; k--) {
+      if (code[k] === '>') angles++;
+      else if (code[k] === '<' && --angles === 0) break;
+    }
+    if (k < 2 || code[k - 1] !== ':' || code[k - 2] !== ':') return undefined;
+    e = k - 2;
+  }
+  let m = e;
+  while (m > 0 && isIdentChar(code[m - 1])) m--;
+  const method = code.slice(m, e);
+  if (!/^[a-z_]\w*$/.test(method)) return undefined;
+  let dot = m;
+  while (dot > 0 && /\s/.test(code[dot - 1]!)) dot--;
+  if (code[dot - 1] !== '.' || code[dot - 2] === '.') return undefined;
+  const receiver = code.slice(chainStart(code, dot - 1), dot - 1).replace(/\s+/g, ' ').trim();
+  if (receiver === '') return undefined;
+  // Which argument the closure is: the top-level commas before it.
+  let arg = 0;
+  for (let at = open + 1; ; arg++) {
+    const comma = walkTop(code, at, bar, close, false, (i) => code[i] === ',');
+    if (comma >= bar) break;
+    at = comma + 1;
+  }
+  return { receiver, method, arg };
+}
+
 /** The names a Rust file binds (RustBinding), read from what readRustScopes kept of it. */
 function readRustBindings(scopes: RustScopes): Map<string, RustBinding[]> {
   const { code, close, events, openAfter } = scopes;
@@ -512,8 +619,8 @@ function readRustBindings(scopes: RustScopes): Map<string, RustBinding[]> {
     if (list) list.push(binding);
     else bindings.set(name, [binding]);
   };
-  const bindPattern = (from: number, to: number, kind: RustBinding['kind'], scopeFrom: number, scopeTo: number, scrutinee?: string): void => {
-    const emit: Emit = (name, at, site) => add(name, { at, kind, from: scopeFrom, to: scopeTo, site, scrutinee });
+  const bindPattern = (from: number, to: number, kind: RustBinding['kind'], scopeFrom: number, scopeTo: number, scrutinee?: string, callee?: RustClosureCallee): void => {
+    const emit: Emit = (name, at, site) => add(name, { at, kind, from: scopeFrom, to: scopeTo, site, scrutinee, callee });
     // A tuple pattern, `(k, v)` or `(i, mut x)`: a name alone at its top is
     // the tuple's field at its place (a site with no path).
     const open = skipSpace(code, from);
@@ -532,7 +639,7 @@ function readRustBindings(scopes: RustScopes): Map<string, RustBinding[]> {
     walkPattern(code, from, to, close, undefined, emit);
   };
   // A parameter `pattern: Type`, or a closure's `pattern`.
-  const param = (from: number, to: number, kind: 'param' | 'closure', scopeFrom: number, scopeTo: number): void => {
+  const param = (from: number, to: number, kind: 'param' | 'closure', scopeFrom: number, scopeTo: number, callee?: RustClosureCallee): void => {
     const colon = topColon(code, from, to, close);
     const pattern = code.slice(from, colon < 0 ? to : colon);
     const simple = /^\s*(?:mut\s+)?([A-Za-z_]\w*)\s*$/.exec(pattern);
@@ -541,11 +648,12 @@ function readRustBindings(scopes: RustScopes): Map<string, RustBinding[]> {
         add(simple[1]!, {
           at: from + pattern.lastIndexOf(simple[1]!), kind, from: scopeFrom, to: scopeTo,
           type: colon < 0 ? undefined : code.slice(colon + 1, to).trim(),
+          callee: colon < 0 ? callee : undefined,
         });
       }
       return;
     }
-    bindPattern(from, colon < 0 ? to : colon, kind, scopeFrom, scopeTo);
+    bindPattern(from, colon < 0 ? to : colon, kind, scopeFrom, scopeTo, undefined, colon < 0 ? callee : undefined);
   };
 
   for (const f of scopes.fns) {
@@ -582,7 +690,10 @@ function readRustBindings(scopes: RustScopes): Map<string, RustBinding[]> {
     } else {
       bodyEnd = expressionEnd(code, b, close);
     }
-    for (const [s, e] of splitTop(code, i + 1, end, close, true)) param(s, e, 'closure', end + 1, bodyEnd);
+    const params = splitTop(code, i + 1, end, close, true);
+    // One parameter is what the call it is handed to passes it; with more, which is which is the callee's to say.
+    const callee = params.length === 1 ? closureCallee(code, close, i) : undefined;
+    for (const [s, e] of params) param(s, e, 'closure', end + 1, bodyEnd, callee);
     // The body is read on: closures nest.
     i = end;
   }
