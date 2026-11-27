@@ -111,6 +111,7 @@ export const LANGUAGES = [
   'lua',
   'luau',
   'objc',
+  'groovy',
   'r',
   'solidity',
   'nix',
@@ -125,6 +126,7 @@ export const LANGUAGES = [
   'vbnet',
   'erlang',
   'terraform',
+  'groovy',
   'unknown',
 ] as const;
 

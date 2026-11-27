@@ -27,6 +27,7 @@ import { luaExtractor } from './lua';
 import { rExtractor } from './r';
 import { luauExtractor } from './luau';
 import { objcExtractor } from './objc';
+import { groovyExtractor } from './groovy';
 import { cfscriptExtractor } from './cfscript';
 import { cfqueryExtractor } from './cfquery';
 import { cobolExtractor } from './cobol';
@@ -60,6 +61,7 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   r: rExtractor,
   luau: luauExtractor,
   objc: objcExtractor,
+  groovy: groovyExtractor,
   cfscript: cfscriptExtractor,
   cfquery: cfqueryExtractor,
   cobol: cobolExtractor,

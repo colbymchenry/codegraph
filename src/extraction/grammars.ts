@@ -41,6 +41,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  groovy: 'tree-sitter-groovy.wasm',
   cfml: 'tree-sitter-cfml.wasm',
   cfscript: 'tree-sitter-cfscript.wasm',
   cfquery: 'tree-sitter-cfquery.wasm',
@@ -142,6 +143,12 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cu': 'cpp',
   '.cuh': 'cpp',
   '.nix': 'nix',
+  // Groovy: .groovy source, .gradle build scripts, plus alternate extensions
+  '.groovy': 'groovy',
+  '.gradle': 'groovy',
+  '.gvy': 'groovy',
+  '.gy': 'groovy',
+  '.gsh': 'groovy',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -396,7 +403,7 @@ export async function initGrammars(): Promise<void> {
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
-  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix', 'groovy',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -445,6 +452,9 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // The kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
   // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
   'dart',
+  // Groovy: tree-sitter-groovy ships its own wasm (not in tree-sitter-wasms);
+  // vendored in src/extraction/wasm/.
+  'groovy',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
@@ -1165,6 +1175,7 @@ export function getLanguageDisplayName(language: Language): string {
     lua: 'Lua',
     luau: 'Luau',
     objc: 'Objective-C',
+    groovy: 'Groovy',
     solidity: 'Solidity',
     nix: 'Nix',
     yaml: 'YAML',
