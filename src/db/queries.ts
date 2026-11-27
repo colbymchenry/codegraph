@@ -516,6 +516,7 @@ export class QueryBuilder {
     getUnresolvedDependentsAfter?: SqliteStatement;
     deleteRefsByRowIdsFull?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
+    getFilePathsAcrossSizeLimit?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
     getCppIncludeNodes?: SqliteStatement;
     getDominantFile?: SqliteStatement;
@@ -4710,6 +4711,24 @@ export class QueryBuilder {
       this.stmts.getAllFilePaths = this.db.prepare('SELECT path FROM files ORDER BY path');
     }
     const rows = this.stmts.getAllFilePaths.all() as Array<{ path: string }>;
+    return rows.map((r) => r.path);
+  }
+
+  /**
+   * Tracked files on the other side of `limit` than they were stored on: over
+   * it but stored with their symbols, or within it but stored as over the
+   * limit (their `size_exceeded` reason, see `storedOverSizeLimit`). After
+   * `maxFileSize` changes these need a read even though their bytes did not.
+   */
+  getFilePathsAcrossSizeLimit(limit: number): string[] {
+    if (!this.stmts.getFilePathsAcrossSizeLimit) {
+      this.stmts.getFilePathsAcrossSizeLimit = this.db.prepare(
+        `SELECT path FROM files
+         WHERE (size > ?) <> (errors IS NOT NULL AND instr(errors, '"code":"size_exceeded"') > 0)
+         ORDER BY path`
+      );
+    }
+    const rows = this.stmts.getFilePathsAcrossSizeLimit.all(limit) as Array<{ path: string }>;
     return rows.map((r) => r.path);
   }
 

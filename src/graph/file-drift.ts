@@ -10,6 +10,7 @@
 import { createHash } from 'crypto';
 import { existsSync, readFileSync, statSync } from 'fs';
 import { indexedHashInput } from '../file-limits';
+import { loadMaxFileSize } from '../project-config';
 import { lexicalPathWithinRoot, validatePathWithinRoot } from '../utils';
 
 /** What the check reads from an open index. */
@@ -49,7 +50,7 @@ export function fileDrift(index: DriftIndex, relPath: string, content?: string):
     if (st.size === rec.size && Math.floor(st.mtimeMs) === Math.floor(rec.modifiedAt)) return 'current';
     const absPath = validatePathWithinRoot(root, relPath);
     if (!absPath) return 'unknown';
-    const data = indexedHashInput(st.size, () => content ?? readFileSync(absPath, 'utf-8'));
+    const data = indexedHashInput(st.size, loadMaxFileSize(root), () => content ?? readFileSync(absPath, 'utf-8'));
     return createHash('sha256').update(data).digest('hex') === rec.contentHash ? 'current' : 'changed';
   } catch {
     return 'unknown';

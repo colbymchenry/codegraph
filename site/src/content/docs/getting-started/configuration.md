@@ -1,15 +1,15 @@
 ---
 title: Configuration
-description: CodeGraph is zero-config by default, with one optional codegraph.json for custom extensions, excluding tracked directories, indexing gitignored source, indexing nested git repositories, and naming a PHP site's web root.
+description: CodeGraph is zero-config by default, with one optional codegraph.json for custom extensions, excluding tracked directories, indexing gitignored source, indexing nested git repositories, larger source files, and naming a PHP site's web root.
 ---
 
-Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file, `codegraph.json`, covers [custom file extensions](#custom-file-extensions), [excluding tracked directories](#excluding-a-tracked-directory), [indexing gitignored source](#indexing-gitignored-source-a-second-vcs), [indexing nested git repositories](#indexing-nested-git-repositories), and [naming a PHP site's web root](#php-includes-from-the-web-root) when CodeGraph can't work it out.
+Next to none — CodeGraph is **zero-config by default**, with nothing to write or keep in sync to get started. Language support is automatic from the file extension; there's nothing to wire up per language. The one optional file, `codegraph.json`, covers [custom file extensions](#custom-file-extensions), [excluding tracked directories](#excluding-a-tracked-directory), [indexing gitignored source](#indexing-gitignored-source-a-second-vcs), [indexing nested git repositories](#indexing-nested-git-repositories), [larger source files](#larger-source-files), and [naming a PHP site's web root](#php-includes-from-the-web-root) when CodeGraph can't work it out.
 
 ## What it skips out of the box
 
 - **Dependency, build, and cache directories** — `node_modules`, `vendor`, `dist`, `build`, `target`, `.venv`, `Pods`, `.next`, and the like across every [supported stack](/codegraph/reference/languages/) — so the graph is your code, not third-party noise. This holds even with no `.gitignore`. A `build` folder inside `src/` is the exception: no build step writes TypeScript, JSX, Vue, Svelte, Astro, Go, C# or Rust files into one, so those are indexed from it, and a Java, Kotlin or Scala package named `build` is indexed whole.
 - **Anything in your `.gitignore`** — honored in git repos via git, and in non-git projects by reading `.gitignore` directly (root and nested).
-- **Files larger than 1 MB** — generated bundles, minified JS, vendored blobs.
+- **Files larger than 1 MB** — generated bundles, minified JS, vendored blobs. A project whose own source runs past that can [raise the limit](#larger-source-files).
 
 ## Excluding or including more
 
@@ -52,6 +52,23 @@ A few things to know:
 - This is the opposite of `exclude` (which keeps tracked files *out*); it's for source git itself never tracks.
 
 Re-index (`codegraph index`) after adding or changing `include`.
+
+## Larger source files
+
+A file over 1 MB is listed in the index with no symbols, which keeps generated bundles and blobs out. When your own source runs past that — a UI file a generator writes, or a test suite kept in one file — set `maxFileSize` in `codegraph.json`, in bytes:
+
+```json
+{
+  "maxFileSize": 4194304
+}
+```
+
+It can go lower than 1 MB too. Every part of CodeGraph that reads a file — the full index, `sync`, the file watcher, `codegraph status` and the freshness checks — reads this one value, so they all agree on which files are in.
+
+A few things to know:
+
+- After a change, the next `sync`, or the file watcher, indexes the files the new limit covers and drops the symbols of the ones it no longer does; there's no need to re-index.
+- The limit goes up to 16 MB (`16777216`). A larger value is warned about and 16 MB used; a value that isn't a whole number of bytes is warned about and ignored, as if `maxFileSize` weren't set.
 
 ## Custom file extensions
 

@@ -16,6 +16,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `codegraph_callers` and `codegraph_callees` take an `offset`, so an agent can page through a list longer than `limit`, and a cut list names the offset of the next page. Thanks @blairjordan. (#3449)
 - `codegraph init` is faster on large projects: the background workers that link references start sooner, and they and the indexer's own writes no longer hold each other up. (#3472)
+- A project whose own source runs past 1 MB, like a generated UI file or a test suite kept in one file, can set `maxFileSize` in `codegraph.json` to index it; the CLI, the background server and its file watcher all go by it, and the next sync picks up the files a change of it covers or drops. Thanks @fengshao1227 and @eddieran for the earlier proposals. (#369, #1016)
 
 ### Fixes
 

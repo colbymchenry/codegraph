@@ -676,6 +676,8 @@ What it skips out of the box:
 - **Anything in your `.gitignore`** — honored in git repos via git, and in
   non-git projects by reading `.gitignore` directly (root and nested).
 - **Files larger than 1 MB** — generated bundles, minified JS, vendored blobs.
+  A project whose own source runs past that can [raise the
+  limit](#larger-source-files).
 
 To keep something else out, add it to `.gitignore`. To pull a default-excluded
 directory back **in** (say you really do want a vendored dependency indexed),
@@ -729,6 +731,28 @@ ranking. It is *not* a filter: unlike the built-in `example/`, `sample/`,
 `fixture/`, `benchmark/` and `demo/` handling — which also drops those files
 from some result sets outright — `deprioritize` only ever changes rank. Reach
 for `exclude` when you want something gone.
+
+### Larger source files
+
+A file over 1 MB is listed in the index with no symbols, which keeps generated
+bundles and blobs out. When your own source runs past that — a UI file a
+generator writes, or a test suite kept in one file — set `maxFileSize` in
+`codegraph.json`, in bytes:
+
+```json
+{
+  "maxFileSize": 4194304
+}
+```
+
+It can go lower than 1 MB too. Every part of CodeGraph that reads a file — the
+full index, `sync`, the file watcher, `codegraph status` and the freshness
+checks — reads this one value, so they all agree on which files are in. After a
+change, the next `sync` (or the watcher) indexes the files the new limit
+covers and drops the symbols of the ones it no longer does; there's no need to
+re-index. The limit goes up to 16 MB (`16777216`): a larger value is warned
+about and 16 MB used, and a value that isn't a whole number of bytes is warned
+about and ignored.
 
 ### Custom file extensions
 

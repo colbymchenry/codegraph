@@ -27,6 +27,7 @@ import * as path from 'path';
 import { Language } from './types';
 import { isLanguageSupported } from './extraction/grammars';
 import { logWarn } from './errors';
+import { MAX_FILE_SIZE_CEILING_BYTES, MAX_SOURCE_FILE_SIZE_BYTES } from './file-limits';
 
 /** Filename of the project-scoped config, resolved relative to the project root. */
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
@@ -94,6 +95,17 @@ export interface ProjectConfig {
    * file wherever two folders hold one of the same name.
    */
   webRoot?: string;
+  /**
+   * The largest source file to parse, in bytes (#369, #1016). A file over it
+   * is listed in the index with a `size_exceeded` warning and no symbols, as
+   * before. Absent (the default) is 1 MiB, which keeps generated bundles and
+   * blobs out; a project whose own source is bigger, like a generated UI file
+   * or a single large test suite, raises it. Every process that reads or
+   * hashes a source file reads this one value, so the CLI, the background
+   * server and its watcher always agree on which files are in. At most
+   * 16 MiB; a larger value warns and uses 16 MiB.
+   */
+  maxFileSize?: number;
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -105,6 +117,8 @@ interface ParsedConfig {
   include: string[];
   /** Project-root-relative, `/`-separated, no trailing `/`; '' is the project root. Null when unset or invalid. */
   webRoot: string | null;
+  /** The size limit in bytes: the default when unset or invalid. */
+  maxFileSize: number;
 }
 
 interface CacheEntry {
@@ -129,6 +143,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
   webRoot: null,
+  maxFileSize: MAX_SOURCE_FILE_SIZE_BYTES,
 });
 
 /**
@@ -183,17 +198,44 @@ function parseConfig(file: string): ParsedConfig {
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
   const webRoot = extractWebRoot(parsed, file);
+  const maxFileSize = extractMaxFileSize(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
     deprioritize.length === 0 &&
-    webRoot === null
+    webRoot === null &&
+    maxFileSize === MAX_SOURCE_FILE_SIZE_BYTES
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize, webRoot };
+  return { extensions, includeIgnored, exclude, include, deprioritize, webRoot, maxFileSize };
+}
+
+/**
+ * Validate `maxFileSize`: a whole number of bytes, at least 1. Anything else
+ * warns and keeps the default; a value over the ceiling warns and uses the
+ * ceiling. Never throws.
+ */
+function extractMaxFileSize(parsed: object, file: string): number {
+  const raw = (parsed as ProjectConfig).maxFileSize;
+  if (raw === undefined) return MAX_SOURCE_FILE_SIZE_BYTES;
+  if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 1) {
+    logWarn(
+      `Ignoring "maxFileSize" in ${PROJECT_CONFIG_FILENAME}: it must be a whole number of bytes, like 4194304 for 4 MiB; using the default of ${MAX_SOURCE_FILE_SIZE_BYTES}`,
+      { file },
+    );
+    return MAX_SOURCE_FILE_SIZE_BYTES;
+  }
+  if (raw > MAX_FILE_SIZE_CEILING_BYTES) {
+    logWarn(
+      `"maxFileSize" in ${PROJECT_CONFIG_FILENAME} is over the highest allowed size; using ${MAX_FILE_SIZE_CEILING_BYTES} (16 MiB)`,
+      { file },
+    );
+    return MAX_FILE_SIZE_CEILING_BYTES;
+  }
+  return raw;
 }
 
 /**
@@ -447,6 +489,16 @@ export function loadIncludePatterns(rootDir: string): string[] {
  */
 export function loadWebRoot(rootDir: string): string | null {
   return loadParsedConfig(rootDir).webRoot;
+}
+
+/**
+ * Load the project's size limit in bytes, mtime-cached: `maxFileSize` from
+ * `codegraph.json`, or 1 MiB when it sets none. Whatever reads, hashes or
+ * skips a source file of this project goes by this value, so every process
+ * indexing or checking the project agrees on which files are over it.
+ */
+export function loadMaxFileSize(rootDir: string): number {
+  return loadParsedConfig(rootDir).maxFileSize;
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */

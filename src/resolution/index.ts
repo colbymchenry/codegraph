@@ -63,7 +63,8 @@ import { folderOf, inferPhpWebRoots, phpWebRootSnapshot, phpWebRootsMoved } from
 import { PHP_DOCUMENT_ROOT } from '../extraction/languages/php';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { FlowChange, planParameterFlows } from './parameter-flow';
-import { MAX_SOURCE_FILE_SIZE_BYTES, readSourceText } from '../file-limits';
+import { readSourceText } from '../file-limits';
+import { loadMaxFileSize } from '../project-config';
 import { createHash } from 'crypto';
 import { aliasConfigFields, loadProjectAliases, type AliasMap } from './path-aliases';
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
@@ -382,9 +383,9 @@ function moduleConfigDigest(abs: string, projectRoot: string): string {
  * missing, not a regular file (a FIFO or a device would block or flood the
  * read), over the source size limit, or not a JSON object.
  */
-function readPackageJson(abs: string): Record<string, unknown> | null {
+function readPackageJson(abs: string, limit: number): Record<string, unknown> | null {
   try {
-    const text = readSourceText(abs);
+    const text = readSourceText(abs, limit);
     if (text === null) return null;
     const json = JSON.parse(text.replace(/^\uFEFF/, '')) as unknown;
     return json && typeof json === 'object' && !Array.isArray(json) ? json as Record<string, unknown> : null;
@@ -572,10 +573,13 @@ export class ReferenceResolver {
   // files the maps above were read from, as absolute paths. A sync compares
   // what they say now with what the index was resolved by (#2977).
   private moduleConfigFiles = new Set<string>();
+  // The largest file a pass reads, from codegraph.json; refreshed by clearCaches.
+  private maxFileSize: number;
 
   constructor(projectRoot: string, queries: QueryBuilder) {
     this.projectRoot = projectRoot;
     this.queries = queries;
+    this.maxFileSize = loadMaxFileSize(projectRoot);
 
     const limit = resolveCacheLimit();
     // The content cache is heavier (full file text), so we give it a
@@ -814,6 +818,8 @@ export class ReferenceResolver {
    * Clear internal caches
    */
   clearCaches(): void {
+    // A pass reads files under the limit the project sets now (codegraph.json).
+    this.maxFileSize = loadMaxFileSize(this.projectRoot);
     this.mocklessContext = null;
     this.mocklessBase = null;
     this.manualMocks = undefined;
@@ -931,7 +937,7 @@ export class ReferenceResolver {
       // Import resolvers may follow package metadata to an archive (`file:*.har`,
       // for example). Reject anything extraction would not accept before UTF-8
       // decoding can multiply a large binary blob into gigabytes of V8 heap.
-      const content = readSourceText(fullPath);
+      const content = readSourceText(fullPath, this.maxFileSize);
       this.fileCache.set(filePath, content);
       return content;
     } catch (error) {
@@ -951,7 +957,7 @@ export class ReferenceResolver {
     const fullPath = path.join(this.projectRoot, filePath);
     try {
       const stats = fs.statSync(fullPath);
-      if (!stats.isFile() || stats.size > MAX_SOURCE_FILE_SIZE_BYTES) return false;
+      if (!stats.isFile() || stats.size > this.maxFileSize) return false;
       return fs.readFileSync(fullPath).includes(needle);
     } catch {
       return false;
@@ -962,7 +968,7 @@ export class ReferenceResolver {
   private scanFile(filePath: string): string | null {
     if (this.fileCache.has(filePath)) return this.fileCache.get(filePath) ?? null;
     try {
-      return readSourceText(path.join(this.projectRoot, filePath), 'latin1');
+      return readSourceText(path.join(this.projectRoot, filePath), this.maxFileSize, 'latin1');
     } catch {
       return null;
     }
@@ -5033,7 +5039,7 @@ export class ReferenceResolver {
     const key = modules + '\0' + name;
     let installedAs = this.installedNames.get(key);
     if (installedAs === undefined) {
-      const json = readPackageJson(path.join(modules, name, 'package.json'));
+      const json = readPackageJson(path.join(modules, name, 'package.json'), this.maxFileSize);
       installedAs = typeof json?.name === 'string' ? json.name : '';
       this.installedNames.set(key, installedAs);
     }
@@ -5064,7 +5070,7 @@ export class ReferenceResolver {
     }
     for (const dir of dirs) {
       // Read directly: a sweep of every directory would push source text out of the read cache.
-      const json = readPackageJson(path.join(this.projectRoot, dir, 'package.json'));
+      const json = readPackageJson(path.join(this.projectRoot, dir, 'package.json'), this.maxFileSize);
       if (!json) continue;
       if (typeof json.name === 'string') names.add(json.name);
       for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {

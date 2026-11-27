@@ -40,6 +40,7 @@ import type { FileRecord } from '../../types';
 import type { CodeGraph } from '../../index';
 import { resolveProjectFile } from '../security';
 import { indexedHashInput } from '../../file-limits';
+import { loadMaxFileSize } from '../../project-config';
 import { highlightLines, type HighlightResult } from '../highlight';
 import { ApiError, badRequest, intParam, notFound, textParam } from './respond';
 
@@ -214,7 +215,7 @@ export function hasDriftedOnDisk(
     }
     // A file over the index's size limit is stored as its size stamp (#1910),
     // so it is compared as one — without reading it.
-    const hashed = indexedHashInput(stats.size, () => fs.readFileSync(absolute, 'utf-8'));
+    const hashed = indexedHashInput(stats.size, loadMaxFileSize(projectRoot), () => fs.readFileSync(absolute, 'utf-8'));
     return createHash('sha256').update(hashed).digest('hex') !== record.contentHash;
   } catch {
     return false;
@@ -254,7 +255,7 @@ export function readFileShape(
       return { drift: false, totalLines: null, reason: 'The file is too large to read here.' };
     }
     const content = fs.readFileSync(absolute, 'utf-8');
-    const hashed = indexedHashInput(stats.size, () => content);
+    const hashed = indexedHashInput(stats.size, loadMaxFileSize(projectRoot), () => content);
     const drift = createHash('sha256').update(hashed).digest('hex') !== record.contentHash;
     return {
       drift,
@@ -400,7 +401,7 @@ export async function buildSource(
   // string). A touch or a checkout that rewrote the same bytes must not count
   // as drift, which is exactly what hashing content rather than mtime buys.
   // A file over the index's size limit is stored as its size stamp (#1910).
-  const hash = createHash('sha256').update(indexedHashInput(stats.size, () => content)).digest('hex');
+  const hash = createHash('sha256').update(indexedHashInput(stats.size, loadMaxFileSize(projectRoot), () => content)).digest('hex');
   const drift = hash !== record.contentHash;
   if (drift && onDrift === 'omit') {
     return {

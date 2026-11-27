@@ -21,6 +21,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { readBoundedSourceSync } from '../file-limits';
+import { loadMaxFileSize } from '../project-config';
 import { validatePathWithinRoot } from '../utils';
 
 /** The manifests read, in the order that settles a directory holding both. */
@@ -53,7 +54,7 @@ function manifestName(projectRoot: string, manifestPath: string): string | null 
   const file = validatePathWithinRoot(projectRoot, manifestPath);
   if (!file) return null;
   try {
-    const { bytes } = readBoundedSourceSync(file);
+    const { bytes } = readBoundedSourceSync(file, loadMaxFileSize(projectRoot));
     if (!bytes) return null;
     // JSON.parse rejects the byte-order mark some Windows editors write.
     const manifest: unknown = JSON.parse(bytes.toString('utf8').replace(/^﻿/, ''));

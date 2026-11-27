@@ -38,7 +38,7 @@ describe('bounded source reads (#1910)', () => {
   for (const size of [0, 100, LIMIT, LIMIT + 1]) {
     it(`returns the bytes up to the limit and null past it (${size} bytes)`, async () => {
       const file = sourceFile(Buffer.alloc(size, 0x61));
-      for (const result of [readBoundedSourceSync(file), await readBoundedSource(file)]) {
+      for (const result of [readBoundedSourceSync(file, LIMIT), await readBoundedSource(file, LIMIT)]) {
         expect(result.stats.size).toBe(size);
         if (size > LIMIT) expect(result.bytes).toBeNull();
         else expect(result.bytes?.length).toBe(size);
@@ -61,7 +61,7 @@ describe('bounded source reads (#1910)', () => {
       return original(fd, buf, off, len, pos);
     }) as typeof fs.readSync);
     let result;
-    try { result = readBoundedSourceSync(file); } finally { readSync.mockImplementation(original); }
+    try { result = readBoundedSourceSync(file, LIMIT); } finally { readSync.mockImplementation(original); }
     expect(grown).toBe(true);
     expect(requested).toBeLessThanOrEqual(LIMIT + 1);
     expect(result.bytes).toBeNull();
@@ -77,20 +77,20 @@ describe('bounded source reads (#1910)', () => {
       fs.writeFileSync(file, Buffer.alloc(LIMIT + 1));
       return original(...args);
     }) as typeof fsp.open);
-    expect((await readBoundedSource(file)).bytes).toBeNull();
+    expect((await readBoundedSource(file, LIMIT)).bytes).toBeNull();
     expect(grown).toBe(true);
   });
 
   it('returns multibyte source byte-for-byte', async () => {
     const text = 'export const greeting = "こんにちは 🌿";';
     const file = sourceFile(Buffer.from(text));
-    expect((await readBoundedSource(file)).bytes?.toString('utf8')).toBe(text);
-    expect(readBoundedSourceSync(file).bytes?.toString('utf8')).toBe(text);
+    expect((await readBoundedSource(file, LIMIT)).bytes?.toString('utf8')).toBe(text);
+    expect(readBoundedSourceSync(file, LIMIT).bytes?.toString('utf8')).toBe(text);
   });
 
   it('refuses a path that is not a regular file', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bounded-'));
     dirs.push(dir);
-    expect(() => readBoundedSourceSync(dir)).toThrow(/not a regular file/);
+    expect(() => readBoundedSourceSync(dir, LIMIT)).toThrow(/not a regular file/);
   });
 });
