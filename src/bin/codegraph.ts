@@ -63,6 +63,7 @@ import { installFatalHandlers } from './fatal-handler';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 import { installCommandSupervision, watchParent } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 // Value import, but dependency-free by design so `--help` text can name the
 // default port without dragging node:http into every other subcommand; the
@@ -509,6 +510,15 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
     // failures are indexed but possibly incomplete — say so here, or the run
     // reads as fully clean and the index quietly disagrees with a later
     // re-parse of the same bytes (#1565).
+    // Files over the size limit are stored without being parsed. That is on
+    // purpose, and it used to be silent: "Indexed 1,678 files" with one of
+    // them, 37,000 lines of hand-written source, holding no symbol at all.
+    const oversize = describeOversizeFiles(
+      result.errors
+        .filter((e) => e.code === 'size_exceeded' && e.filePath)
+        .map((e) => ({ path: e.filePath!, size: Number(/\((\d+) > \d+\)/.exec(e.message)?.[1] ?? 0) })),
+    );
+    if (oversize) clack.log.warn(oversize);
     const salvaged = result.errors.filter((e) => e.code === 'salvaged_stripped');
     if (salvaged.length > 0) {
       const sample = salvaged.slice(0, 3).map((e) => e.filePath).filter(Boolean).join(', ');
@@ -1186,6 +1196,11 @@ program
           clack.log.warn('This index was built by an older CodeGraph engine, and sync only re-reads changed files. Run "codegraph index" for a full rebuild.');
         }
 
+        // Up to date and still not whole: the files left out for their size,
+        // whether or not this sync touched them.
+        const oversize = describeOversizeFiles(cg.getIndexHealth().oversize);
+        if (oversize) clack.log.warn(oversize);
+
         clack.outro('Done');
       } finally {
         cg.destroy();
@@ -1201,6 +1216,31 @@ program
 /** Up to three of `paths`, and how many more there are. */
 function samplePaths(paths: string[]): string {
   return paths.slice(0, 3).join(', ') + (paths.length > 3 ? ` (+${formatNumber(paths.length - 3)} more)` : '');
+}
+
+/** A file size as people say it: "1.9 MB", "640 KB". */
+function formatFileSize(bytes: number): string {
+  return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(bytes / 1024)} KB`;
+}
+
+/**
+ * One line naming the source files left out of the graph for their size, or
+ * null when there are none. `init`, `index`, `sync` and `status` all say it:
+ * a file over the limit is tracked but never parsed, and until this line the
+ * only sign of that was a search that came back without it.
+ *
+ * The smallest are named first. A generated parser of 30 MB is what the limit
+ * is for; a file just over it is the one most likely to be written by hand,
+ * and the one a reader needs to see.
+ */
+function describeOversizeFiles(files: { path: string; size: number }[]): string | null {
+  if (files.length === 0) return null;
+  const smallest = [...files].sort((a, b) => a.size - b.size);
+  const named = smallest.slice(0, 3).map((f) => `${f.path} (${formatFileSize(f.size)})`).join(', ');
+  const more = files.length > 3 ? ` (+${formatNumber(files.length - 3)} more)` : '';
+  const one = files.length === 1;
+  return `${formatNumber(files.length)} source ${one ? 'file is' : 'files are'} over the ${formatFileSize(MAX_SOURCE_FILE_SIZE_BYTES)} size limit and not in the graph ${getGlyphs().dash} ` +
+    `${one ? 'its' : 'their'} symbols, callers and impact are missing from every answer: ${named}${more}`;
 }
 
 /**
@@ -1369,6 +1409,12 @@ program
             // Files with a recorded parse error and no symbols from it
             // (#2336); unchanged until the file or the parser changes.
             filesWithParseErrors: health.parseErrors.length,
+            // Source files over the size limit: tracked, never parsed, so
+            // nothing in them is in the graph. The smallest come first: the
+            // ones nearest the limit are the likeliest to be hand-written.
+            filesOverSizeLimit: health.oversize.length,
+            oversizeFiles: [...health.oversize].sort((a, b) => a.size - b.size).slice(0, 50),
+            sizeLimitBytes: MAX_SOURCE_FILE_SIZE_BYTES,
           },
         }));
         cg.destroy();
@@ -1489,6 +1535,9 @@ program
       if (totalChanges === 0 && missingSymbols.length === 0) {
         success('Index is up to date');
       }
+      // Up to date and still not whole: files left out for their size.
+      const oversize = describeOversizeFiles(health.oversize);
+      if (oversize) warn(oversize);
       console.log();
 
       // Re-index hint: the index was built by an older engine than the one now

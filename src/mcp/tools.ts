@@ -8521,7 +8521,11 @@ export class ToolHandler {
     if (opts.symbolsOnly) {
       const out = [`**${filePath}**${testLabel} — ${nodes.length} symbol${nodes.length === 1 ? '' : 's'}, ${depSummary}`, ''];
       if (nodes.length) out.push(...symbolMap('**Symbols**'));
-      else out.push('_No indexed symbols in this file._');
+      // A file over the size limit is tracked but never parsed. Say that, so
+      // an empty map is not read as an empty file.
+      else if ((resolved.errors ?? []).some((e) => e.code === 'size_exceeded')) {
+        out.push(`_Not indexed: at ${(resolved.size / 1024 / 1024).toFixed(1)} MB this file is over the size limit for source files, so the graph holds none of its symbols and no caller of them. Read the file directly._`);
+      } else out.push('_No indexed symbols in this file._');
       out.push('', '> Drop `symbolsOnly` (or pass `offset`/`limit`) to read the source, like Read.');
       return this.textResult(this.truncateOutput(out.join('\n')));
     }
