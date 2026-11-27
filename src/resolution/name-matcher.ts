@@ -27,7 +27,7 @@ import { ambientModuleDeclarations, declaringFileAnswers, inBlock, isDeclaration
 import { leavesWorkspaceRoot } from './workspace-packages';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap, parsePackageName, parseTargetPaths, parseWorkspaceMembers } from './frameworks/cargo-workspace';
-import { blankRustCode, readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustPatternSite, type RustScopes } from './rust-scopes';
+import { blankRustCode, readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustClosureCallee, type RustPatternSite, type RustScopes } from './rust-scopes';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -13855,9 +13855,57 @@ function rustBindingType(binding: RustBinding, scopes: RustScopes, ref: Unresolv
     if (!element || !binding.site) return element;
     return binding.site.path === '' && binding.site.index !== undefined ? rustTupleField(element, binding.site.index) : null;
   }
+  if (binding.kind === 'closure') {
+    // `xs.iter().for_each(|x| …)`: what the call hands its closure; `|(k, v)|` a field of that.
+    const item = binding.callee ? rustClosureItem(binding.callee, binding.at, scopes, ref, context, depth) : null;
+    if (!item || !binding.site) return item;
+    return binding.site.path === '' && binding.site.index !== undefined ? rustTupleField(item, binding.site.index) : null;
+  }
   if (binding.init !== undefined) return rustValueType(binding.init, binding.at, scopes, ref, context, depth);
   if (binding.site) return rustSiteType(binding.site, binding.scrutinee, binding.at, scopes, ref, context, depth);
   return null;
+}
+
+/** Std methods whose one-parameter closure is handed an item of what they are called on: an iterator's, an `Option`'s, a `Result`'s `Ok`. */
+const RUST_ITEM_CLOSURES: ReadonlySet<string> = new Set([
+  'map', 'and_then', 'filter', 'for_each', 'try_for_each', 'any', 'all', 'find', 'find_map', 'filter_map', 'flat_map',
+  'position', 'rposition', 'inspect', 'take_while', 'skip_while', 'map_while', 'partition', 'retain', 'retain_mut',
+  'max_by_key', 'min_by_key', 'sort_by_key', 'sort_by_cached_key', 'sort_unstable_by_key', 'dedup_by_key',
+  'is_some_and', 'is_none_or', 'is_ok_and', 'map_or', 'map_or_else',
+]);
+/** Std methods whose one-parameter closure is handed a `Result`'s error. */
+const RUST_ERROR_CLOSURES: ReadonlySet<string> = new Set(['map_err', 'or_else', 'is_err_and', 'inspect_err', 'unwrap_or_else']);
+
+/**
+ * What a closure's only parameter is, from the std method the closure is
+ * handed to and the value that method is called on: `rpc.as_mut()
+ * .is_none_or(|r| …)` with `rpc: Option<Rpc>` an `Rpc`, `self.items.iter()
+ * .for_each(|x| …)` an item of the field, `res.map_err(|e| …)` the `Result`'s
+ * error. Written with no type, such a parameter was unread, and a call on it
+ * stayed unlinked wherever two types share the method's name — the one caller
+ * a change to `Rpc::stop` broke was `|r| r.stop()`, beside a `Control::stop`.
+ *
+ * Only where that value's type is read and is std's own (rustItemOf): a
+ * project type's `map` takes whatever its own signature says. A closure with
+ * more parameters, one bound to a name, or one handed to a free function
+ * never gets here (closureCallee in rust-scopes.ts).
+ */
+function rustClosureItem(callee: RustClosureCallee, at: number, scopes: RustScopes, ref: UnresolvedRef, context: ResolutionContext, depth: number): RustWrittenType | null {
+  if (depth > 3) return null;
+  // `res.map_or_else(|e| …, |v| …)`: the error first, then the value.
+  const side = callee.method === 'map_or_else' ? (callee.arg === 0 ? 'err' : 'ok')
+    : RUST_ERROR_CLOSURES.has(callee.method) ? 'err' : RUST_ITEM_CLOSURES.has(callee.method) ? 'ok' : null;
+  if (!side || (callee.method === 'map_or' && callee.arg !== 1)) return null;
+  if (side === 'ok') {
+    const item = rustIteratedElement(callee.receiver, at, scopes, ref, context, depth);
+    if (item) return item;
+  }
+  const value = rustValueType(callee.receiver, at, scopes, ref, context, depth + 1);
+  const head = value && rustPathHead(value.text.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)+/, ''));
+  if (!value || !head || head.name !== 'Result' || isRustProjectNamed('Result', RUST_DECLARED_TYPE_KINDS, context)) return null;
+  const args = splitRustTopLevel(head.args, ',').map((a) => a.trim()).filter((a) => a !== '' && !a.startsWith("'"));
+  const held = side === 'ok' ? args[0] : args.length === 2 ? args[1] : undefined;
+  return held ? { ...value, text: held, wrappers: undefined } : null;
 }
 
 /** The type of another local, as its binding in scope at `at` writes it. */
@@ -13941,7 +13989,17 @@ function rustValueType(value: string, at: number, scopes: RustScopes, ref: Unres
     if (cloned) return unwrapped(rustLocalType(cloned[1]!, at, scopes, ref, context, depth));
     // `x.m(…)`, `self.m(…)`, `x.m(…)?.n(…)`: what the method it reaches returns.
     const method = /^([\s\S]+?)\s*\.\s*([a-z_]\w*)\s*(?:::\s*<([^()]*)>)?$/.exec(call.callee);
-    return method ? rustMethodReturn(method[1]!, method[2]!, method[3], unwraps, awaits, at, scopes, ref, context, depth) : null;
+    if (!method) return null;
+    const returned = rustMethodReturn(method[1]!, method[2]!, method[3], unwraps, awaits, at, scopes, ref, context, depth);
+    if (returned || awaits > 0 || call.args.trim() !== '' || !RUST_SAME_SHAPE_ADAPTERS.has(method[2]!)) return returned;
+    // `opt.as_mut()`, `res.as_ref()`, `opt.take()`: std's own, and still the
+    // `Option` or `Result` it is called on, borrowed or moved out.
+    const held = rustValueType(method[1]!, at, scopes, ref, context, depth + 1);
+    // Read past the borrow it is held through: `rpc: &mut Option<Rpc>`.
+    const bare = held ? held.text.replace(/^(?:&\s*(?:'\w+\s+)?(?:mut\s+)?)+/, '') : '';
+    const head = held && rustPathHead(bare);
+    if (!held || !head || (head.name !== 'Option' && head.name !== 'Result') || isRustProjectNamed(head.name, RUST_DECLARED_TYPE_KINDS, context)) return null;
+    return unwrapped({ ...held, text: bare });
   }
   // `self.items`, `opts.config.port`, `pair.0`: the field's type as its struct declares it.
   const access = /^([\s\S]+?)\s*\.\s*([A-Za-z_]\w*|\d+)$/.exec(v);
@@ -13965,6 +14023,9 @@ function rustValueType(value: string, at: number, scopes: RustScopes, ref: Unres
   }
   return null;
 }
+
+/** Std methods of `Option` and `Result` that hand back the same `Option` or `Result`: borrowed, dereferenced, copied or taken. */
+const RUST_SAME_SHAPE_ADAPTERS: ReadonlySet<string> = new Set(['as_mut', 'as_ref', 'as_deref', 'as_deref_mut', 'take', 'cloned', 'copied']);
 
 /** Where a node starts in its file, as an offset into rustScopesOf's text. */
 function rustNodeOffset(n: Node, context: ResolutionContext): number {
