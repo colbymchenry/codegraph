@@ -4615,6 +4615,8 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
  * file resolves lexically exactly as in a `.ts` one.
  */
 const JS_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'vue', 'svelte', 'astro']);
+/** TypeScript and TSX: one language to a reader, two to name matching (#1662). */
+const TS_LANGUAGES = new Set<string>(['typescript', 'tsx']);
 const JS_TS = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
 
 /** Languages whose identifiers resolve regardless of case. */
@@ -28690,16 +28692,16 @@ function matchMethodCallOn(
     const sameLanguageMethods = methods.filter(m => m.language === ref.language);
     let targetMethods = sameLanguageMethods.length > 0 ? sameLanguageMethods : methods;
     if (csharpBuiltInReceiver) targetMethods = targetMethods.filter((m) => isCsharpExtensionMethod(m, context));
+    let narrowed = false;
     // A receiver the file imports is another module's value: never a method
     // declared in the calling file. expo-camera's `CameraManager.isAvailableAsync()`
     // (`import CameraManager from './ExpoCameraManager'`) went to `CameraView`'s
     // own static `isAvailableAsync` — the method making the call.
     // Ruling the caller's file out may reject a guess; it must never
     // manufacture one — the one method left is then no likelier than before.
-    let narrowed = false;
     if (JS_FAMILY.has(ref.language) && isImportBinding(objectOrClass!, ref, context)) {
       const kept = targetMethods.filter((m) => m.filePath !== ref.filePath);
-      narrowed = kept.length !== targetMethods.length;
+      narrowed ||= kept.length !== targetMethods.length;
       targetMethods = kept;
     }
     // Ruling these out must not leave a lone other `destroy` to guess at.
@@ -28793,6 +28795,33 @@ function matchMethodCallOn(
     // the name: `self.a.b.go()` is no `Leaf.go` the receiver says nothing of.
     const pythonChain = ref.language === 'python' && objectOrClass!.includes('.');
 
+    // A `.ts` method of the name for a `.tsx` caller, or a `.tsx` one for a
+    // `.ts` caller, was set aside by the language filter above (name matching
+    // keeps the two apart, #1662), but a `.tsx` file calls `.ts` classes all
+    // the time: the one method left is then no likelier than before.
+    // excalidraw's `scene.mutateElement(…)` in `.tsx` files went to the one
+    // `.tsx` method of the name, `App.mutateElement`, past `Scene`'s in
+    // `scene.ts` (#3443). Only a method the filters above would have kept
+    // counts: the same tests, applied to a method in another file (so the
+    // import-binding and Vue filters, which only drop a method of the
+    // caller's own file or a `.vue` one, never apply). Nor does a method of
+    // the lone one's own hierarchy, the interface or abstract method it
+    // implements or a subclass's override: the call reaches that method all
+    // the same. It rules out the lone guess alone, not the scoring below.
+    // Asked only once the lone guess is in reach (mirrored in
+    // ts-tsx-lone-guess.test.ts; a change to the filters above changes it).
+    const siblingOwner = propertyOwner;
+    const tsSiblingPeer = (lone: Node): boolean => TS_LANGUAGES.has(ref.language) && sameLanguageMethods.length > 0 &&
+      methods.some((m) => m.language !== ref.language && TS_LANGUAGES.has(m.language) &&
+        (isTestPath(ref.filePath) || !isTestPath(m.filePath)) &&
+        !(DISPATCHED_ACTIONS.has(m.name) &&
+          DISPATCHED_OWNER.test(m.qualifiedName.slice(0, Math.max(0, m.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop()!)) &&
+        (!siblingOwner || tsMethodOwnerIsSubtype(m, siblingOwner, ref, context) || jsFileNamesType(m.filePath, siblingOwner, context)) &&
+        isLexicallyReachable(m, ref, context) &&
+        (objectOrClass === 'this' || objectOrClass === 'super' || !isReactLifecycleMethod(m, context)) &&
+        (!isTestPath(m.filePath) || !isConstructorFunctionMethod(m, context)) &&
+        !tsMethodsShareHierarchy(m, lone, ref, context));
+
     // If only one same-language method with this name exists, use it —
     // except in Ruby, where nothing types a receiver: there the one method
     // must also belong to something the receiver is named after
@@ -28800,6 +28829,7 @@ function matchMethodCallOn(
     // `node.loc` on a rubocop-ast node went to the one `loc` in the project
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
     if (targetMethods.length === 1 && !narrowed && !rubySuiteNarrowed && !scopedOut && !pythonChain && targetMethods[0]!.language === ref.language &&
+        !tsSiblingPeer(targetMethods[0]!) &&
         !(JS_FAMILY.has(ref.language) && targetMethods[0]!.filePath !== ref.filePath && jsFileAssignsMember(ref.filePath, methodName!, context)) &&
         // A JS constructor function's method (`Ctor.prototype.m = function`,
         // `Ctor.m = …`, #2966) is the one of that name only for a receiver
@@ -34554,11 +34584,23 @@ function jsFileNamesType(file: string, type: Node, context: ResolutionContext): 
   return hit;
 }
 
+/** The class or interface declaring the TS/JS `method`. */
+function tsMethodOwner(method: Node, context: ResolutionContext): Node | undefined {
+  const ownerName = method.qualifiedName.slice(0, Math.max(0, method.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop();
+  return context.getNodesInFile(method.filePath).find((n) =>
+    TS_MEMBER_OWNER_KINDS.has(n.kind) && n.name === ownerName && n.startLine <= method.startLine && n.endLine >= method.endLine);
+}
+
+/** Whether two TS/JS methods' owners are one class hierarchy: either one's owner is, extends or implements the other's. */
+function tsMethodsShareHierarchy(a: Node, b: Node, at: UnresolvedRef, context: ResolutionContext): boolean {
+  const ownerA = tsMethodOwner(a, context);
+  const ownerB = tsMethodOwner(b, context);
+  return (!!ownerB && tsMethodOwnerIsSubtype(a, ownerB, at, context)) || (!!ownerA && tsMethodOwnerIsSubtype(b, ownerA, at, context));
+}
+
 /** Whether the class or interface declaring `method` is `type` or extends or implements it, read up the heads as tsMethodUpChain does. */
 function tsMethodOwnerIsSubtype(method: Node, type: Node, at: UnresolvedRef, context: ResolutionContext): boolean {
-  const ownerName = method.qualifiedName.slice(0, Math.max(0, method.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop();
-  const owner = context.getNodesInFile(method.filePath).find((n) =>
-    TS_MEMBER_OWNER_KINDS.has(n.kind) && n.name === ownerName && n.startLine <= method.startLine && n.endLine >= method.endLine);
+  const owner = tsMethodOwner(method, context);
   const walk = (cls: Node, depth: number): boolean => {
     if (cls.id === type.id) return true;
     if (depth >= TS_BASE_WALK_DEPTH) return false;
