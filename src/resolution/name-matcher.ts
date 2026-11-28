@@ -13272,13 +13272,129 @@ export function isRustCallUnreachable(target: Node, ref: UnresolvedRef, guessed:
       isRustProjectNamed(named, RUST_OWNER_TYPE_KINDS, context);
   }
   const trait = rustImplTraitOf(target, context);
-  if (trait === '' || isRustProjectNamed(trait, RUST_TRAIT_KIND, context)) return false;
+  if (trait === '') return rustTraitOf(target, context) === null && rustReceiverIsOutsideOnly(target, ref, context);
+  if (isRustProjectNamed(trait, RUST_TRAIT_KIND, context)) return false;
   // The receiver: the last link of a kept chain, else the one written before the name.
   const chain = RUST_CHAINED_CALLS.get(ref);
   const dot = ref.referenceName.lastIndexOf('.');
   const receiver = chain ? chain[chain.length - 1]!.replace(/\(\)$/, '') : dot > 0 ? receiverLink(ref.referenceName.slice(0, dot)) : '';
   // (`self` is the impl's own type, which the self strategies read.)
   return receiver !== 'self' && (receiver === '' || !sharesReceiverWord(receiver, target));
+}
+
+/**
+ * Whether the receiver of a Rust method call holds only what std or a
+ * dependency makes, so a project type's own (inherent) method can't be what
+ * the call reaches (#3483): `resp.status().is_success()` on a `resp:
+ * reqwest::blocking::Response`, or `status.is_success()` after `let status =
+ * resp.status();`, is reqwest's `StatusCode::is_success`, never a project
+ * `LocalResp::is_success`. An outside crate can't name the project's types,
+ * so a value of an outside type that isn't generic, and what its methods
+ * return when a chain calls them with no arguments and no turbofish, holds
+ * none of them: a link in a chain has its type where it is written, so a
+ * generic return (`s.parse()`, `r.into()`) can't be fixed by a later use
+ * there, as it can for a `let` local, which is read only by the type it is
+ * written with. A link a project trait could provide (`resp.local()` through
+ * `impl Wrap for Response`) may hand out a project value, and ends the
+ * reading; so does a crate the manifests depend on by `path`, which may be
+ * one of the project's own, a module the file declares under the crate's
+ * name (`mod ext { … }` beside an `ext` dependency), which Rust reads the
+ * path through, and a `target` in a dependency's source indexed with the
+ * project (a `[patch]`ed or vendored copy, or a crate one depends on).
+ */
+function rustReceiverIsOutsideOnly(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const scopes = rustScopesOf(ref.filePath, context);
+  const lineStart = scopes?.lineStarts[ref.line - 1];
+  if (!scopes || lineStart === undefined || ref.column < 0) return false;
+  const start = lineStart + ref.column;
+  const chain = RUST_CHAINED_CALLS.get(ref);
+  const dot = ref.referenceName.lastIndexOf('.');
+  const receiver = chain ? rustChainedReceiver(scopes, start, chain, ref.referenceName) : dot > 0 ? ref.referenceName.slice(0, dot) : null;
+  return receiver !== null && rustOutsideOnlyValue(receiver, start, scopes, target, ref, context, 0);
+}
+
+/** Whether a Rust value, as written at `at`, holds only std's or a dependency's types (rustReceiverIsOutsideOnly). */
+function rustOutsideOnlyValue(value: string, at: number, scopes: RustScopes, target: Node, ref: UnresolvedRef, context: ResolutionContext, depth: number): boolean {
+  if (depth > 6) return false;
+  const v = value.trim().replace(/\?$/, '').trimEnd();
+  const call = /^([\s\S]+?)\s*\.\s*([a-z_]\w*)\s*\(\s*\)$/.exec(v);
+  if (call) {
+    const name = call[2]!;
+    const projectTrait = context.getNodesByName(name).some((n) => n.language === 'rust' && n.kind === 'method' && n.name === name &&
+      (rustTraitOf(n, context) !== null || isRustTraitImplMethod(n, context)));
+    return !projectTrait && rustOutsideOnlyValue(call[1]!, at, scopes, target, ref, context, depth + 1);
+  }
+  if (!/^[a-z_]\w*$/.test(v) || v === 'self') return false;
+  const found = rustBindingAt(scopes, v, at);
+  if (!found || found.ambiguous || found.binding.type === undefined) return false;
+  if (rustInDependencySource(target, context)) return false;
+  const { binding } = found;
+  const read = rustReadType({ text: binding.type!, file: ref.filePath, at: binding.at }, ref, context);
+  if (read.kind !== 'named' || read.args !== '' || read.wrappers.length > 0) return false;
+  const root = read.path.length > 0
+    ? rustUsePath(read.path[0]!, ref.filePath, binding.at, context)?.[0] ?? read.path[0]
+    : rustUsePath(read.name, ref.filePath, binding.at, context)?.[0];
+  if (root !== undefined) {
+    if (rustPathDependencies(context).has(root)) return false;
+    if ([...rustUsesOf(ref.filePath, context).modDecls.keys()].some((k) => k.endsWith(`\0${root}`))) return false;
+  }
+  return rustTypeLookup(read.name, read.path, read.written.file, context, read.written.at).outside;
+}
+
+const RUST_PATH_DEPENDENCIES = new WeakMap<ResolutionContext, Set<string>>();
+
+const RUST_DEPENDENCY_SOURCE = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether `node` lies in a crate indexed with the project that isn't one of
+ * the project's own — a `[patch]`ed or vendored dependency checked out in
+ * the tree, or one such a crate depends on — by the package of the nearest
+ * manifest above its file. Such a crate's types are what a dependency's
+ * value holds, so a call on that value can reach them.
+ */
+function rustInDependencySource(node: Node, context: ResolutionContext): boolean {
+  let memo = RUST_DEPENDENCY_SOURCE.get(context);
+  if (!memo) RUST_DEPENDENCY_SOURCE.set(context, (memo = new Map()));
+  const start = path.posix.dirname(node.filePath.replace(/\\/g, '/'));
+  const hit = memo.get(start);
+  if (hit !== undefined) return hit;
+  let found = false;
+  for (let dir = start; ; dir = path.posix.dirname(dir)) {
+    const top = dir === '.' || dir === '' || dir === '/';
+    const text = context.readFile(top ? 'Cargo.toml' : `${dir}/Cargo.toml`);
+    if (text) {
+      const name = parsePackageName(text)?.replace(/-/g, '_');
+      found = name !== undefined && !rustProjectCrates(context).has(name);
+      break;
+    }
+    if (top) break;
+  }
+  memo.set(start, found);
+  return found;
+}
+
+/**
+ * The crates the project's manifests depend on by a `path` inside the
+ * project, by the name code writes them: one that is no workspace member
+ * (`shared = { path = "shared" }`) or a member under another key (`core2 = {
+ * package = "mycore", path = "core" }`) is indexed with the project, though
+ * the crates it counts as its own leave it out. A `path` that leaves the
+ * project (`../ext`) is a dependency like any other.
+ */
+function rustPathDependencies(context: ResolutionContext): Set<string> {
+  const hit = RUST_PATH_DEPENDENCIES.get(context);
+  if (hit) return hit;
+  const deps = new Set<string>();
+  const manifests = ['Cargo.toml', ...[...getCargoWorkspaceCrateMap(context).values()].map((dir) => `${dir}/Cargo.toml`)];
+  for (const manifest of new Set(manifests)) {
+    for (const dep of rustManifestDependencies(context.readFile(manifest) ?? '')) {
+      if (dep.path === undefined) continue;
+      const at = path.posix.normalize(path.posix.join(path.posix.dirname(manifest), dep.path));
+      if (at !== '..' && !at.startsWith('../') && !path.posix.isAbsolute(at)) deps.add(dep.key);
+    }
+  }
+  RUST_PATH_DEPENDENCIES.set(context, deps);
+  return deps;
 }
 
 /**
@@ -24669,6 +24785,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_GLOB_ITEMS.delete(context);
   RUST_CRATES.delete(context);
   RUST_DEPENDENCIES.delete(context);
+  RUST_PATH_DEPENDENCIES.delete(context);
+  RUST_DEPENDENCY_SOURCE.delete(context);
   RUST_CRATE_GRAPHS.delete(context);
   RUST_IMPL_HEADERS.delete(context);
   RUST_SCOPES.delete(context);
