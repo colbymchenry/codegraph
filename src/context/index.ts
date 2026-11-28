@@ -203,7 +203,7 @@ const DEFAULT_BUILD_OPTIONS: Required<BuildContextOptions> = {
  */
 const HIGH_VALUE_NODE_KINDS: NodeKind[] = [
   'function', 'method', 'class', 'interface', 'type_alias', 'struct', 'union', 'trait',
-  'component', 'route', 'variable', 'constant', 'enum', 'module', 'namespace',
+  'component', 'route', 'event', 'variable', 'constant', 'enum', 'module', 'namespace',
 ];
 
 /**

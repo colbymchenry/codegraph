@@ -77,7 +77,7 @@ pub const EDGE_ROW_SIZE: usize = 44;
 pub const REF_ROW_SIZE: usize = 40;
 
 /// Mirror of NODE_KINDS in src/types.ts — order is the wire contract.
-pub const NODE_KINDS: [&str; 23] = [
+pub const NODE_KINDS: [&str; 24] = [
     "file",
     "module",
     "class",
@@ -101,6 +101,7 @@ pub const NODE_KINDS: [&str; 23] = [
     "route",
     "component",
     "union",
+    "event",
 ];
 
 /// Mirror of EDGE_KINDS in src/types.ts — order is the wire contract.

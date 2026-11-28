@@ -92,7 +92,7 @@ const VB_CONVERSIONS: Readonly<Record<string, string>> = {
 /** VB.NET type nodes a member can belong to (a `Module` is indexed as a class). */
 const VB_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'interface']);
 const VB_VALUE_KINDS: ReadonlySet<string> = new Set(['field', 'property', 'constant', 'variable']);
-const VB_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member', 'constant', 'variable']);
+const VB_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'event', 'enum_member', 'constant', 'variable']);
 
 /** A declaration keyword right before a name: the name is a member being declared, not a variable. */
 const VB_MEMBER_HEAD = /\b(?:Function|Sub|Property|Event|Operator|Declare|Delegate|Class|Structure|Module|Interface|Enum|Namespace)\s+$/i;
@@ -337,7 +337,7 @@ function valueBinding(expr: string): VbBinding {
 function scopeStartLine(ref: UnresolvedRef, context: ResolutionContext): number {
   const from = context.getNodeById?.(ref.fromNodeId);
   if (from && from.filePath === ref.filePath && from.startLine <= ref.line && from.endLine >= ref.line &&
-      (from.kind === 'method' || from.kind === 'function' || from.kind === 'property' || from.kind === 'field')) {
+      (from.kind === 'method' || from.kind === 'function' || from.kind === 'property' || from.kind === 'field' || from.kind === 'event')) {
     return from.startLine - 1;
   }
   let start = -1;
@@ -1415,10 +1415,10 @@ const VB_READ_TYPE_KINDS: ReadonlySet<string> = new Set([...VB_TYPE_KINDS, 'enum
  * property, a constant, an `Enum` case, an event), a method — which VB.NET
  * runs when it is named without parentheses — or a type nested in it.
  */
-const VB_READ_KINDS: ReadonlySet<string> = new Set([...VB_VALUE_KINDS, 'enum_member', 'method', ...VB_TYPE_LIKE_KINDS]);
+const VB_READ_KINDS: ReadonlySet<string> = new Set([...VB_VALUE_KINDS, 'event', 'enum_member', 'method', ...VB_TYPE_LIKE_KINDS]);
 
 /** What a read through a value names: a field, property, constant or event of its type, or a method it runs. */
-const VB_INSTANCE_READ_KINDS: ReadonlySet<string> = new Set([...VB_VALUE_KINDS, 'method']);
+const VB_INSTANCE_READ_KINDS: ReadonlySet<string> = new Set([...VB_VALUE_KINDS, 'event', 'method']);
 
 /** Members that belong to a type, not an instance, besides those declared `Shared`: a constant, an `Enum` case, a nested type. */
 const VB_SHARED_READ_KINDS: ReadonlySet<string> = new Set(['constant', 'enum_member', ...VB_TYPE_LIKE_KINDS]);

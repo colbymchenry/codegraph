@@ -17,8 +17,10 @@ import type { LanguageExtractor } from '../tree-sitter-types';
  *   - constructor_definition / fallback_receive_definition  → method (synthetic
  *     name: "constructor" / "fallback" / "receive" — these are nameless in AST)
  *   - state_variable_declaration / struct_member → field (inside contract/struct)
- *   - event_definition / error_declaration       → field-shaped node carrying
- *     the event/error name so callers/refs can resolve emit X / revert X
+ *   - event_definition                           → `event` node so emit X
+ *     resolves to it and search ranks it near callables (#3440)
+ *   - error_declaration                          → field-shaped node carrying
+ *     the error name so callers/refs can resolve revert X
  *   - import_directive → import
  *   - call_expression / emit_statement / revert_statement / modifier_invocation
  *     → calls (the latter three are call-shaped but use distinct AST nodes)
@@ -220,16 +222,14 @@ export const solidityExtractor: LanguageExtractor = {
       return true;
     }
 
-    // event SomeEvent(...) — preserve event name as a field-shaped node so
-    // `emit SomeEvent(...)` (an emit_statement) can resolve to it. We use
-    // `field` kind because Solidity events are member declarations of a
-    // contract, similar in spirit to fields, and `field` reuses the FTS index
-    // without adding a new NodeKind.
+    // event SomeEvent(...) — dedicated `event` node kind so `emit SomeEvent(...)`
+    // (an emit_statement) resolves to it and search ranks it near callables
+    // without polluting method lists (#3440).
     if (t === 'event_definition') {
       const nameNode = getChildByField(node, 'name');
       if (!nameNode) return true;
       const name = getNodeText(nameNode, ctx.source);
-      ctx.createNode('field', name, node, {
+      ctx.createNode('event', name, node, {
         signature: getNodeText(node, ctx.source).trim().slice(0, 200),
       });
       return true;

@@ -114,11 +114,12 @@ export const vbnetExtractor: LanguageExtractor = {
     return null;
   },
   visitNode: (node, ctx) => {
-    // Events are indexed so `RaiseEvent X` / `Handles obj.X` flows have a
-    // findable declaration (WinForms/WPF code is built around them).
+    // Events are indexed with the dedicated `event` kind so `RaiseEvent X` /
+    // `Handles obj.X` flows have a findable declaration and search ranks them
+    // near callables without polluting method lists (#3440).
     if (node.type === 'event_declaration' || node.type === 'custom_event_declaration') {
       const nameNode = node.childForFieldName('name');
-      const event = nameNode ? ctx.createNode('field', getNodeText(nameNode, ctx.source), node) : null;
+      const event = nameNode ? ctx.createNode('event', getNodeText(nameNode, ctx.source), node) : null;
       // A Custom Event's AddHandler / RemoveHandler / RaiseEvent blocks run
       // code, which is the event's.
       if (event && node.type === 'custom_event_declaration') {

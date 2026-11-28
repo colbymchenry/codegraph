@@ -453,7 +453,7 @@ export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
 export const RELEVANCE_KIND_WEIGHT: Readonly<Record<string, number>> = {
   // Callables and types: the answer lives in one of these.
   function: 1, method: 1, class: 1, struct: 1, union: 1, interface: 1, trait: 1,
-  protocol: 1, component: 1, route: 1, enum: 1, type_alias: 1, constructor: 1,
+  protocol: 1, component: 1, route: 1, event: 1, enum: 1, type_alias: 1, constructor: 1,
   // Containers: real structure, but a whole namespace/module matching a term is
   // a coarser signal than a callable matching it.
   namespace: 0.8, module: 0.8,
@@ -4251,7 +4251,7 @@ export class ToolHandler {
     const TEMPLATE_VIEW_FILE = /\.(?:cshtml|razor|vue|svelte|astro)$/i;
     const MEANINGFUL = new Set<string>([
       'function', 'method', 'class', 'interface', 'struct', 'union', 'trait', 'protocol',
-      'enum', 'type_alias', 'component', 'constant', 'variable', 'property', 'field',
+      'enum', 'type_alias', 'component', 'event', 'constant', 'variable', 'property', 'field',
     ]);
     const rel = (p: string) => p.replace(/\\/g, '/');
     const isTest = this.testCodeReading(cg);

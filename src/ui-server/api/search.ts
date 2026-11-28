@@ -64,6 +64,7 @@ function kindRank(kind: NodeKind): number {
     case 'union':
     case 'type_alias':
     case 'route':
+    case 'event':
       return 0;
     case 'constant':
     case 'property':

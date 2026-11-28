@@ -568,7 +568,7 @@ export function isInheritanceRef(ref: UnresolvedRef): boolean {
  * name-matched an interface property called `path` in an unrelated file.
  */
 const NON_IMPORTABLE_KINDS = new Set<Node['kind']>([
-  'property', 'field', 'method', 'enum_member', 'parameter',
+  'property', 'field', 'event', 'method', 'enum_member', 'parameter',
 ]);
 
 /** Can an `imports` reference legally resolve to this node kind? */
