@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In Python, reading a parameter or other locally bound variable as a value no longer links to an imported function or class of the same name. (#3430)
 
 ## [1.6.5] - 2026-11-28
 
