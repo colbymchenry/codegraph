@@ -59,7 +59,7 @@ describe('C++ raw-string delimiter parse collapse (#1522)', () => {
     expect(result.errors).toEqual([]);
   });
 
-  it('does not warn on parse errors when a function survives', () => {
+  it('retains a partial-parse warning when a function survives (#3019)', () => {
     const source = 'int before_the_raw_string() { return 0; }\n' + rawStringSource('FILE_TEMPLATE_V1');
     const tree = getParser('cpp')!.parse(source)!;
     try {
@@ -72,6 +72,8 @@ describe('C++ raw-string delimiter parse collapse (#1522)', () => {
 
     expect(result.nodes.filter((n) => n.kind === 'function').map((n) => n.name))
       .toEqual(['before_the_raw_string']);
-    expect(result.errors).toEqual([]);
+    expect(result.errors).toEqual([
+      expect.objectContaining({ filePath: 'min.cpp', severity: 'warning', code: 'partial_parse' }),
+    ]);
   });
 });

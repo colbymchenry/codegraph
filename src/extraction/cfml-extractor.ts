@@ -174,6 +174,17 @@ export class CfmlExtractor {
     try {
       const fileNode = this.createFileNode();
       this.walkProgram(tree.rootNode, fileNode.id);
+      if (tree.rootNode.hasError) {
+        const hasSymbols = this.nodes.some((node) => node.kind !== 'file');
+        this.errors.push({
+          message: hasSymbols
+            ? `${this.filePath}: parse has syntax errors — some symbols or calls may be missing from the graph`
+            : `${this.filePath}: parse produced no symbols (tree has errors) — the file is indexed but contributes nothing to the graph`,
+          filePath: this.filePath,
+          severity: 'warning',
+          code: hasSymbols ? 'partial_parse' : 'parse_error',
+        });
+      }
     } finally {
       // Trees hold wasm heap memory V8's GC never sees — free it per file.
       tree.delete();
@@ -526,12 +537,18 @@ export class CfmlExtractor {
       ref.language = this.language;
       this.unresolvedReferences.push(ref);
     }
-    // A broken expression is routine in hand-written markup and the file's
-    // symbols came from the tag walk, so only a genuine failure is reported —
-    // not the extractor's "no symbols" warning, which an expressions-only
-    // source always earns.
     for (const error of result.errors) {
-      if (error.severity === 'error') this.errors.push(error);
+      // A generated expression-only parse's warning is about its calls, not missing file symbols.
+      if (error.severity === 'warning' && (error.code === 'parse_error' || error.code === 'partial_parse')) {
+        this.errors.push({
+          ...error,
+          message: `${this.filePath}: tag expressions could not be fully parsed — calls inside them may be missing from the graph`,
+          filePath: this.filePath,
+          code: 'partial_parse',
+        });
+      } else {
+        this.errors.push(error);
+      }
     }
   }
 
@@ -717,10 +734,11 @@ export class CfmlExtractor {
    */
   private addBlockErrors(errors: ExtractionError[], tag: SyntaxNode, tagName: 'cfscript' | 'cfquery', lineOffset: number): void {
     for (const error of errors) {
-      if (error.severity === 'warning' && error.code === 'parse_error') {
+      if (error.severity === 'warning' && (error.code === 'parse_error' || error.code === 'partial_parse')) {
         const line = tag.startPosition.row + 1;
         this.errors.push({
           message: `${this.filePath}: <${tagName}> at line ${line} has a syntax error — the rest of the file is indexed, but calls inside that block may be missing from the graph`,
+          filePath: this.filePath,
           line,
           severity: 'warning',
           code: 'partial_parse',

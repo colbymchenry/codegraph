@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Partially parsed files now retain a warning in the SDK and indexed file details even when some symbols survive, including embedded code blocks; re-index existing projects to refresh those diagnostics. (#3019)
 
 ## [1.6.5] - 2026-11-28
 

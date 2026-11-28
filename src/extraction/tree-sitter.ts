@@ -1146,7 +1146,7 @@ export class TreeSitterExtractor {
       // kernel reads the same (kernel/index.ts and the parse worker's transport).
       pushAll(this.unresolvedReferences, commonJsRequireRefs(this.filePath, this.source, this.language));
 
-      // hasError is routine for several grammars; warn only when no symbols survived.
+      // Keep partial recovery inspectable without claiming the whole file lost its symbols.
       // (A re-export's import of its module is none: a barrel whose other lines
       // failed to parse has lost what it passes on.)
       const symbolCount = this.nodes.filter((n) => n.kind !== 'file').length - this.reExportImports;
@@ -1157,6 +1157,13 @@ export class TreeSitterExtractor {
             `the file is indexed but contributes nothing to the graph`,
           severity: 'warning',
           code: 'parse_error',
+        });
+      } else if (this.tree?.rootNode.hasError) {
+        this.errors.push({
+          message: `${this.filePath}: the tree has syntax errors — some symbols or references may be missing from the graph`,
+          filePath: this.filePath,
+          severity: 'warning',
+          code: 'partial_parse',
         });
       }
     } catch (error) {
