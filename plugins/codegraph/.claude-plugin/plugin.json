@@ -1,0 +1,24 @@
+{
+  "name": "codegraph",
+  "version": "1.0.0",
+  "description": "Agent skills for setting up CodeGraph, answering code questions with codegraph_explore and the CLI, and running only affected tests, plus the CodeGraph MCP server.",
+  "author": {
+    "name": "Colby McHenry",
+    "url": "https://colbymchenry.github.io/codegraph/"
+  },
+  "homepage": "https://colbymchenry.github.io/codegraph/",
+  "repository": "https://github.com/colbymchenry/codegraph",
+  "license": "MIT",
+  "keywords": [
+    "codegraph",
+    "code-intelligence",
+    "knowledge-graph",
+    "tree-sitter",
+    "call-graph",
+    "impact-analysis",
+    "mcp",
+    "agent-skills"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}

@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- The repository now ships an agent plugin with CodeGraph skills and the MCP server config, installable from any agent that reads `.agents` plugin marketplaces, including Codex and Claude Code.
+
 
 ## [1.6.5] - 2026-11-28
 
