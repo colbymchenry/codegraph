@@ -285,6 +285,24 @@ describe('a large file indexes in the time its size asks for, beyond the kernel\
     expect(cg!.getCallees(named('src/use.ts', 'use').id).length).toBeGreaterThanOrEqual(n);
   });
 
+  it('a React Native shim that exposes a Swift class of many methods: the shim is read, and each call arrives', async () => {
+    // The grammar cannot parse `RCT_EXTERN_METHOD(…)` under `@interface`, and
+    // its recovery took the square of these lines inside the parser: at this
+    // many the parse ran out its budget and the shim was left with nothing.
+    // The parser is given the implementation the macros expand to instead.
+    const n = 30_000;
+    expect(await index({
+      'package.json': '{"name":"big","dependencies":{"react-native":"^0.74.0"}}\n',
+      'ios/Big.m': `#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(Big, NSObject)\n${each(n, (i) => `RCT_EXTERN_METHOD(thing${i}:(NSString *)name)\n`)}+ (BOOL)requiresMainQueueSetup { return NO; }\n@end\n`,
+      'ios/Big.swift': `import Foundation\n\n@objc(Big)\nclass Big: NSObject {\n${each(n, (i) => `  @objc func thing${i}(_ name: String) {\n  }\n\n`)}}\n`,
+      'src/use.js': `import { NativeModules } from 'react-native';\n\nexport function use() {\n${each(n, (i) => `  NativeModules.Big.thing${i}('x');\n`)}}\n`,
+    })).toBeLessThan(ALLOWED_MS);
+    expect(named('ios/Big.m', 'Big').kind).toBe('class');
+    // Three lines above the first macro, then one line to each.
+    expect(named('ios/Big.m', 'requiresMainQueueSetup', 'method').startLine).toBe(n + 4);
+    for (const i of [0, 5, n - 1]) expect(into(named('ios/Big.swift', `thing${i}`), 'calls'), `thing${i}`).toEqual(['calls from use']);
+  });
+
   it('a Tauri front end of many invokes: each to its command, but not one a local binding hides', async () => {
     const n = 25_000;
     const core = `${each(n, (i) => `#[tauri::command]\nfn cmd${i}(x: i32) -> i32 {\n    x\n}\n\n`)}fn main() {\n    tauri::Builder::default().invoke_handler(tauri::generate_handler![${Array.from({ length: n }, (_, i) => `cmd${i}`).join(', ')}]).run();\n}\n`;
