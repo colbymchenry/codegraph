@@ -190,6 +190,17 @@ Every engine test file runs in a throwaway home dir (`__tests__/setup-home-sandb
 
 Behavior that differs by platform (path resolution, drive letters, `SENSITIVE_PATHS`, `%APPDATA%` config dirs, CRLF) must be gated, not assumed. Use `it.runIf(process.platform === 'win32')(...)` for Windows-only assertions and `it.runIf(process.platform !== 'win32')(...)` for POSIX-only ones — e.g. `/etc` is sensitive on POSIX but resolves to `C:\etc` (non-existent) on Windows, so an ungated `/etc` assertion fails on Windows. Validate the Windows side for real (see below); don't merge a Windows-gated test you haven't seen run.
 
+## Indexing cost grows with the file's size (do not regress)
+
+**Indexing a file costs in proportion to its size: about a second a megabyte.** Nothing done for one symbol, reference, route or match may read the whole file, all of the file's nodes, all of its imports, or everything before it. That one shape, in about forty places across the kernel, the wasm extractor, the resolver and the framework passes, made a megabyte take from half a minute to several minutes and left large files with no symbols. Each instance looks like ordinary code and is fine at 300 lines.
+
+**Before changing or reviewing a loop in `src/extraction/`, `src/resolution/` or `codegraph-kernel/`, and before answering an issue about slow indexing, a hang, or a file with no symbols, read `docs/design/large-file-performance.md`.** It lists what to look for in a diff and what to write instead, how to measure, and how to prove a fix. In short:
+
+- **Use the lookups, not a pass over the file:** `lineAt` / `linesOf` / `firstIndexOfEach` (`resolution/synth-utils.ts`), `nodesAroundLine` / `nodesNamed` (`resolution/nodes-around.ts`), `importsBoundTo` and its siblings (`resolution/import-lookup.ts`), `childrenOf` / `namedChildrenOf` or `node.namedChildren` in place of `node.child(i)` in a loop, `pushAll` / `maxOf` in place of spreading a file-sized list.
+- **Measure** with `scripts/benchmarks/large-files/` at 0.3, 1.2 and 3.9 MB, with the kernel and with `CODEGRAPH_KERNEL=0`: four times the size must cost about four times the time. Start from the README's language, framework and bridge tables, not from the list of parsers; a new one gets a case.
+- **A speed fix leaves the graph identical:** `scripts/benchmarks/large-files/compare-graphs.mjs <dist of main> <dist of the branch> <projects…>`, with both parsers. A change in what is read goes in its own pull request.
+- **Tests:** `__tests__/large-file-{indexing,frameworks,lookups}.test.ts` and `kernel-large-file-parity.test.ts`. Each case bounds the time and asserts something the faster path could get wrong.
+
 ## Cross-platform validation
 
 The dev machine — and the default `npm test` target — is **macOS**, so local runs cover the macOS path. The other two platforms aren't here; when a change is platform-sensitive (file watching, sockets / named pipes, path & symlink handling, process lifecycle, inotify budget) validate them for real rather than guessing.

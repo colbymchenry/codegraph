@@ -16,6 +16,7 @@ To install and use CodeGraph, start with the [project README](../README.md). To 
 | Checking a language by hand | [Language verification guide](SEARCH_QUALITY_LOOP.md) |
 | The browser viewer's design | [Viewer design spec](design/codegraph-ui-design-spec.md) |
 | The native extraction kernel | [Kernel design](design/native-extraction-kernel.md) |
+| Keeping indexing time in proportion to a file's size | [Large-file performance](design/large-file-performance.md) |
 
 ## Supporting material
 

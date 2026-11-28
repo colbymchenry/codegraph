@@ -48,6 +48,7 @@ Run the focused tests while you work, then `npm test` before opening a pull requ
 - **A bug fix needs a test that fails without the fix.**
 - **Behavior that differs by platform** gets a gated test, such as `it.runIf(process.platform === 'win32')(...)`, and needs checking on the platforms it affects. See [cross-platform validation](AGENTS.md#cross-platform-validation).
 - **New language or framework support** needs validating on real repositories. Start with the `/add-lang` skill in [`.claude/skills/add-lang/SKILL.md`](.claude/skills/add-lang/SKILL.md), then follow the [validation methodology](docs/AGENTS.md#validation-methodology-required-for-every-new-languageframework) and the [coverage playbook](docs/design/dynamic-dispatch-coverage-playbook.md). Before extending a router or web framework, read [framework coverage](docs/design/framework-coverage.md).
+- **A change to a loop in extraction or resolution** keeps indexing time in proportion to the file's size: a megabyte in about a second. [Large-file performance](docs/design/large-file-performance.md) lists what to look for and how to measure it.
 - **A documentation-only change** doesn't need the test suite. Check its examples and links instead.
 
 ## Prepare a pull request
