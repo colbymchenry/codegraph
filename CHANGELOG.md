@@ -28,6 +28,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- `codegraph install` now sets up MiniMax Code, adding the CodeGraph MCP server to `~/.minimax/mcp.json` plus a short section in `~/.minimax/AGENTS.md`.
 - `codegraph_callers` and `codegraph_callees` take an `offset`, so an agent can page through a list longer than `limit`, and a cut list names the offset of the next page. Thanks @blairjordan. (#3449)
 - `codegraph init` is faster on large projects: the background workers that link references start sooner, and they and the indexer's own writes no longer hold each other up. (#3472)
 

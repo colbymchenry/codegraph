@@ -28,6 +28,7 @@ import { grokTarget } from './grok';
 import { kimiTarget } from './kimi';
 import { qoderTarget } from './qoder';
 import { piTarget } from './pi';
+import { minimaxTarget } from './minimax';
 
 export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   claudeTarget,
@@ -50,6 +51,7 @@ export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   kimiTarget,
   qoderTarget,
   piTarget,
+  minimaxTarget,
 ]);
 
 export function getTarget(id: string): AgentTarget | undefined {

@@ -6,7 +6,7 @@
  * Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot in
  * VS Code / the Copilot CLI / JetBrains IDEs, IBM Bob, Factory Droid,
  * Windsurf, Qwen Code, DeepSeek Harness, Grok Build, Kimi Code, the
- * Qoder CLI, and Pi).
+ * Qoder CLI, Pi, and MiniMax Code).
  * Defaults to the Claude-only behavior for backwards compatibility
  * when no targets are explicitly chosen and nothing else is detected.
  *
@@ -495,7 +495,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot, ~/.config/github-copilot, ~/.bob, ~/.factory, ~/.codeium/windsurf, ~/.qwen, ~/.dsh, ~/.grok, ~/.kimi-code, ~/.qoder, ~/.pi' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot, ~/.config/github-copilot, ~/.bob, ~/.factory, ~/.codeium/windsurf, ~/.qwen, ~/.dsh, ~/.grok, ~/.kimi-code, ~/.qoder, ~/.pi, ~/.minimax' },
         { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./.vscode, ./opencode.jsonc, ./.gemini, ./.kiro, ./.bob, ./.factory, ./.qwen, ./.grok, ./.kimi-code, ./.qoder, ./.pi' },
       ],
       initialValue: 'global' as const,
