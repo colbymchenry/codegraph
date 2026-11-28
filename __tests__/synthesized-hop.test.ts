@@ -99,6 +99,7 @@ describe('describeSynthesizedHop', () => {
     [{ synthesizedBy: 'interface-impl', via: 'Report', promotedInto: 'scrapeLoop' }, 'interface → method promoted into scrapeLoop', ''],
     [{ synthesizedBy: 'closure-collection', field: 'validators' }, 'runs `validators` handlers', ''],
     [{ synthesizedBy: 'cpp-override', via: 'Run' }, 'cpp override', ''],
+    [{ synthesizedBy: 'python-override' }, 'base → override', ''],
     [{ synthesizedBy: 'redux-thunk', via: 'fetchUser' }, 'redux thunk', ''],
     [{ synthesizedBy: 'gin-middleware-chain', via: 'Auth' }, 'gin middleware chain', ''],
     [{ synthesizedBy: 'event-bus', channel: 'event', event: 'user.created' }, 'bus event `user.created`', ''],
