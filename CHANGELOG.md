@@ -19,6 +19,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In TypeScript, a canvas or its context kept in a local, like `const context = document.createElement('canvas').getContext('2d')!` or a canvas from a function in the same file declared to return `HTMLCanvasElement`, no longer links its method calls to an unrelated project method of the same name. (#3444)
 - In Rust, a method called on a closure's parameter now links to the right type's method when the closure is handed to a standard method such as `map`, `for_each`, `is_none_or` or `map_err`, as in `rpc.as_mut().is_none_or(|r| r.stop().is_ok())`, and so does one called on what `if let Some(x) = value.as_mut()` binds. Before, such a call was left out of `callers` and `impact` whenever two types in the project had a method of that name; re-index Rust projects after upgrading. (#3497)
 - A large source file now indexes in seconds in every supported language, where the time used to grow so fast with the file's size that a file past about a megabyte could run out its time limit and end up with no symbols.
 - The same now holds for a large routes or handlers file in every supported framework and router (Express, Rails, CodeIgniter, Play, React Router, Angular and the rest), for Liquid, ArkTS and the other languages read without the native parser, and for the React Native, Expo, Tauri and Swift to Objective-C bridges.
