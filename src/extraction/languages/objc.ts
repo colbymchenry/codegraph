@@ -9,6 +9,7 @@ import {
   rewriteFoundationEnumMacros,
   unnamedTypeVariableName,
 } from './c-cpp';
+import { rewriteRctExternShims } from './objc-rn-extern';
 
 function findCompoundStatement(node: SyntaxNode): SyntaxNode | null {
   for (const child of namedChildrenOf(node)) {
@@ -106,8 +107,12 @@ export const objcExtractor: LanguageExtractor = {
   // `RCT_EXTERN_C_BEGIN`, reads to the parser as the start of a declaration:
   // it swallowed the `typedef` below it, and an `@interface` below it lost
   // its class to error recovery. Blanked as in C, offsets kept. A
-  // `typedef NS_ENUM(NSInteger, Name) {` is rewritten as `enum Name {`.
-  preParse: (source) => blankLoneMacroLines(rewriteFoundationEnumMacros(source), OBJC_LONE_MACROS),
+  // `typedef NS_ENUM(NSInteger, Name) {` is rewritten as `enum Name {`, and
+  // React Native's shim for a Swift module, `@interface
+  // RCT_EXTERN_MODULE(Name, Super)` and the macros under it, as the
+  // implementation of `Name` it expands to (objc-rn-extern.ts).
+  preParse: (source) =>
+    blankLoneMacroLines(rewriteFoundationEnumMacros(rewriteRctExternShims(source)), OBJC_LONE_MACROS),
   functionTypes: ['function_definition'],
   // Only @interface emits a class node; @implementation reuses it via visitNode.
   classTypes: ['class_interface'],
