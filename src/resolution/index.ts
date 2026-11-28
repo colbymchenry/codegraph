@@ -59,6 +59,7 @@ import { readCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } from './frameworks';
 import { clearDeclaredDependencies } from './frameworks/package-deps';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
+import { APPLE_EXTERNAL_TYPE_PREFIX, refreshAppleExternalTypes } from './apple-external-types';
 import { loadWebRoot, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { folderOf, inferPhpWebRoots, phpWebRootSnapshot, phpWebRootsMoved } from './php-web-root';
 import { PHP_DOCUMENT_ROOT } from '../extraction/languages/php';
@@ -630,6 +631,11 @@ export class ReferenceResolver {
       ? getAllFrameworkResolvers().filter((f) => frameworks.includes(f.name))
       : detectFrameworks(this.context);
     this.frameworksByLanguage.clear();
+  }
+
+  /** Reconcile explicitly configured SDK symbol graphs after project resolution. */
+  async refreshAppleExternalTypes(): Promise<void> {
+    if (await refreshAppleExternalTypes(this.queries, this.context, this.projectRoot)) this.clearCaches();
   }
 
   /** The detected frameworks whose `resolve()` reads a reference written in `language`. */
@@ -1775,6 +1781,8 @@ export class ReferenceResolver {
       scoped?.resolvedBy === 'framework' ? this.gateFrameworkLanguage(scoped, ref) : this.gateLanguage(scoped, ref),
       ref,
     ), ref, this.context), ref, this.context);
+    // 外部节点只由受限的外部继承步骤连接，不能成为普通调用或名称匹配的候选目标。
+    if (resolved?.targetNodeId.startsWith(APPLE_EXTERNAL_TYPE_PREFIX)) return null;
     // A Dart class whose field holds its own type (`class Node { Node? next; }`)
     // names itself: a self-edge that says nothing (#2327).
     if (resolved && ref.language === 'dart' && ref.referenceKind === 'references' &&

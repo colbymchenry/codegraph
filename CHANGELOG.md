@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Swift and Objective-C projects can opt into compiler-generated SDK symbol graphs to follow external superclass relationships without maintaining a type list.
+
 
 ## [1.6.5] - 2026-11-28
 

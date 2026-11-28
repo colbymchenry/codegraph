@@ -909,6 +909,68 @@ agents learn the `codegraph explore` command:
 | Terraform / OpenTofu | `.tf`, `.tfvars`, `.tofu` | Full support (resources, data sources, modules, variables, outputs, providers incl. aliases, `locals`; `var.`/`local.`/`module.`/resource references with Terraform's per-directory scoping enforced; module calls bridged across the boundary — inputs to the child module's variables, `module.M.out` to the child's output, `source` to the module's files; cloudposse/atmos `remote-state` cross-component wiring when the component is statically named; `provider = aws.east` selections resolved up the module tree; `moved`/`import`/`removed`/`check` block references; `.tfvars` assignments linked to the variables they set) |
 | Nix | `.nix` | Full support (functions with simple/destructured/curried params, `let`/attrset bindings, `inherit`, `import ./path` file edges — `./dir` resolving through `default.nix` — plus NixOS module `imports = [ ./x.nix ]` lists and `callPackage ./pkg.nix` file edges; call edges; module-system option wiring — a config write like `launchd.user.agents.x = { ... }` links to the module declaring `options.launchd.user.agents`, so option flows trace across modules) |
 
+### Optional Apple SDK superclass graphs
+
+CodeGraph can supplement unresolved Swift/Objective-C superclass references from
+compiler-generated Swift Symbol Graphs. This is disabled by default. On macOS
+with Xcode, select the SDK and target matching your project in `codegraph.json`:
+
+```json
+{
+  "appleExternalTypes": {
+    "sdk": "iphoneos",
+    "target": "arm64-apple-ios17.0"
+  }
+}
+```
+
+Run `codegraph sync` (or `codegraph init` for a new index). CodeGraph invokes
+`xcrun swift-symbolgraph-extract` for directly imported modules in files with
+unresolved superclass references. Completed graphs are cached under the system
+temporary directory, keyed by SDK path/version, compiler version, extractor path,
+target and module. Removing that cache forces extraction again. Missing SDKs or
+failed extractions warn and leave the affected references unresolved.
+CodeGraph does not infer a scheme's build settings; set the target explicitly.
+The initial extractor supports SDK modules, not custom framework search paths.
+
+Alternatively, export graphs for one consistent SDK/target/toolchain and use them
+on any supported host without invoking Xcode:
+
+```json
+{
+  "appleExternalTypes": {
+    "symbolGraphs": ["sdk-graphs/Foundation.symbols.json"]
+  }
+}
+```
+
+Paths are relative to the project root, or absolute. Choose exactly one mode;
+`false` or omitting the option disables it. The SDK export command is:
+
+```sh
+mkdir -p sdk-graphs
+xcrun swift-symbolgraph-extract -module-name Foundation \
+  -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
+  -target arm64-apple-ios17.0 -output-dir sdk-graphs
+```
+
+Type identities (USR), Swift names, Objective-C class names and superclass
+relationships come from the compiler output, with no maintained type/alias list.
+Only top-level class declarations are matched, with a direct module import and a
+unique name; indexed local declarations take precedence. Qualified references,
+indirect imports, nested types, methods, availability checks and overload resolution are outside this
+fallback's scope. This is not a substitute for compiler-based project indexing.
+
+Nodes use `external:apple:symbolgraph:` IDs and `@external/apple/symbolgraphs`
+locations, and explicitly identify themselves as external declarations, not SDK
+source. Edges carry `metadata.external: true`, the target USR and whether their
+evidence is an `inheritsFrom` record or an unresolved project superclass name.
+Only referenced classes and their known ancestors enter the graph. A parent
+known only by the compiler's `targetFallback` is represented without inventing
+further ancestry. Ordinary call resolution cannot target these nodes.
+Changing an input graph, disabling the option, or removing a source declaration
+is reconciled on the next sync, including in a long-running process.
+
 ## Measured cross-file coverage
 
 Impact and blast-radius queries are only as good as the dependency graph behind them, so coverage is measured rather than asserted. **Fair coverage** = the share of symbol-bearing source files that have at least one *resolved cross-file dependent* — something that imports, calls, references, or (through a framework convention) routes to them — on a real-world benchmark repo per language. The residual is always a genuine static-analysis frontier (runtime dynamic dispatch, reflection / DI containers, framework-convention entry points, vendored third-party code), never hidden by gaming the denominator.

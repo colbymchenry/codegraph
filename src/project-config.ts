@@ -31,7 +31,13 @@ import { logWarn } from './errors';
 /** Filename of the project-scoped config, resolved relative to the project root. */
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
 
+export type AppleExternalTypesConfig =
+  | { sdk: string; target: string }
+  | { symbolGraphs: string[] };
+
 export interface ProjectConfig {
+  /** 从指定 SDK 提取，或读取预先导出的 Symbol Graph；默认关闭。 */
+  appleExternalTypes?: AppleExternalTypesConfig | false;
   /** Map of custom file extension (`.foo`) to a supported language id. */
   extensions?: Record<string, string>;
   /**
@@ -98,6 +104,7 @@ export interface ProjectConfig {
 
 /** Parsed, validated view of a project's `codegraph.json`. */
 interface ParsedConfig {
+  appleExternalTypes: AppleExternalTypesConfig | null;
   extensions: Record<string, Language>;
   includeIgnored: string[];
   exclude: string[];
@@ -129,6 +136,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
   webRoot: null,
+  appleExternalTypes: null,
 });
 
 /**
@@ -183,17 +191,18 @@ function parseConfig(file: string): ParsedConfig {
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
   const webRoot = extractWebRoot(parsed, file);
+  const appleExternalTypes = extractAppleExternalTypes(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
     deprioritize.length === 0 &&
-    webRoot === null
+    webRoot === null && !appleExternalTypes
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize, webRoot };
+  return { extensions, includeIgnored, exclude, include, deprioritize, webRoot, appleExternalTypes };
 }
 
 /**
@@ -504,4 +513,28 @@ export function addIncludeIgnoredPatterns(rootDir: string, patterns: string[]): 
   fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
   clearProjectConfigCache();
   return added;
+}
+
+/** 读取显式选择的外部符号来源。 */
+export function loadAppleExternalTypes(rootDir: string): AppleExternalTypesConfig | null {
+  return loadParsedConfig(rootDir).appleExternalTypes;
+}
+
+function extractAppleExternalTypes(parsed: object, file: string): AppleExternalTypesConfig | null {
+  const value = (parsed as ProjectConfig).appleExternalTypes;
+  if (value === undefined || value === false) return null;
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    if ('symbolGraphs' in value && !('sdk' in value) && !('target' in value) &&
+        Array.isArray(value.symbolGraphs) && value.symbolGraphs.length > 0 &&
+        value.symbolGraphs.every(p => typeof p === 'string' && p.trim().length > 0)) {
+      return { symbolGraphs: value.symbolGraphs };
+    }
+    if ('sdk' in value && 'target' in value && !('symbolGraphs' in value) &&
+        typeof value.sdk === 'string' && /^[a-z][a-z0-9.]*$/.test(value.sdk) &&
+        typeof value.target === 'string' && /^[A-Za-z0-9_]+-apple-[A-Za-z0-9_.-]+$/.test(value.target)) {
+      return { sdk: value.sdk, target: value.target };
+    }
+  }
+  logWarn(`Ignoring "appleExternalTypes" in ${PROJECT_CONFIG_FILENAME}: expected { sdk, target } or { symbolGraphs: [files] }`, { file });
+  return null;
 }
