@@ -316,8 +316,10 @@ Object.assign(CASES, {
     return one('src/big.c', `struct op { const char *name; int (*run)(int); };\n\n${Array.from({ length: n }, (_, i) => `static int op${i}(int x) { return x + ${i}; }\n`).join('')}\nstatic const struct op OPS[] = {\n${Array.from({ length: n }, (_, i) => `  {"op${i}", op${i}},\n`).join('')}};\n\nint dispatch(int i, int x) {\n  return OPS[i].run(x);\n}\n`);
   },
   'spring/mappings': () => ({ files: { 'pom.xml': '<project><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency></dependencies></project>\n', 'src/main/java/x/BigController.java': fill((i) => `  @RequestMapping(value = "/x${i}", method = RequestMethod.POST)\n  public ResponseEntity<String> x${i}(@RequestBody String body) {\n    return ResponseEntity.ok(service.handle(body));\n  }\n\n`, 'package x;\n\nimport org.springframework.http.ResponseEntity;\nimport org.springframework.web.bind.annotation.*;\n\n@RestController\npublic class BigController {\n  private final BigService service = new BigService();\n\n', '}\n\nclass BigService {\n  String handle(String body) { return body; }\n}\n') }, main: 'src/main/java/x/BigController.java' }),
-  // The cases above for Razor, Blazor and TanStack give the engine nothing it links
-  // (no component, no script, a root route with no options). These do.
+  // The cases above for Razor and Blazor give the engine nothing it links (no component,
+  // no script), and the TanStack one has a root route with no options, which was read as
+  // no root until the scan took a root in each form it is written. These do, and this
+  // TanStack tree has a root with options.
   'tanstack/tree': () => {
     const n = count(200);
     return { files: {
