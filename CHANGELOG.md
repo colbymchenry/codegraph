@@ -12,6 +12,17 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Highlights
+
+- **Large files no longer stall indexing.** A big source file now indexes in seconds in every supported language, framework and router, where one past about a megabyte could run out its time and end up with no symbols at all.
+- **More of your code in the graph.** Source files up to 4 MB are now indexed, up from 1 MB, and `codegraph status` names any file still left out for its size instead of leaving it out with nothing said.
+- **Long caller lists can be paged.** `codegraph_callers` and `codegraph_callees` take an `offset`, and callers outside tests are listed before tests.
+- **Faster `codegraph init` on large projects.** The workers that link references start sooner and no longer wait on the indexer's writes.
+- **React Native and TanStack Router apps are read more fully.** The Objective-C file that exposes a Swift module is read as that module's class, and a TanStack route tree declared in code has its routes whichever way its root route is written.
+- **More accurate links in Pascal, Kotlin, Go and Rust.** Calls reach the method they mean in more cases, most of all in Pascal: overloads, helpers, `with` blocks and `inherited`.
+- **Works in more Windows terminals.** The `codegraph` command now runs in Git Bash with path conversion turned off, as some agent harnesses set it.
+- **Upgrading:** re-index your projects with `codegraph index` after this release. Many of these fixes are written while indexing, and files between 1 MB and 4 MB are picked up as soon as you do.
+
 ### New Features
 
 - `codegraph_callers` and `codegraph_callees` take an `offset`, so an agent can page through a list longer than `limit`, and a cut list names the offset of the next page. Thanks @blairjordan. (#3449)
@@ -19,9 +30,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- In Rust, a method called on a closure's parameter now links to the right type's method when the closure is handed to a standard method such as `map`, `for_each`, `is_none_or` or `map_err`, as in `rpc.as_mut().is_none_or(|r| r.stop().is_ok())`, and so does one called on what `if let Some(x) = value.as_mut()` binds. Before, such a call was left out of `callers` and `impact` whenever two types in the project had a method of that name; re-index Rust projects after upgrading. (#3497)
-- A TanStack Router app that declares its routes in code now has its routes and the navigation between them when the root route is written `createRootRouteWithContext<…>()({ … })` or `createRootRoute()` with no options, where the whole route tree came out empty; re-index TanStack Router projects after upgrading.
-- In a React Native project, the Objective-C file that exposes a Swift module with `RCT_EXTERN_MODULE` is now read as that module's class with the methods written in it, where it gave a class named `RCT_EXTERN_MODULE` or nothing at all, and a very long one no longer runs out the time a file is given; re-index React Native projects after upgrading.
+#### Setup and the CLI
+
+- On Windows, the `codegraph` command in Git Bash now works in a terminal that turns off path conversion with `MSYS_NO_PATHCONV=1` or `MSYS2_ARG_CONV_EXCL=*`, as some agent harnesses do, instead of failing with "Cannot find module". Thanks @BlueberryDuck for the report. (#3464)
+- On projects with fewer than 500 files, every tool named in `CODEGRAPH_MCP_TOOLS` is now listed to the agent, instead of only the small-repo defaults. Thanks @nchrisr for the report and the fix. (#3462)
+- `codegraph callers` and `codegraph_callers` list callers outside tests before tests, so a symbol called mostly from tests no longer shows only tests under the default limit while its real callers are cut. Thanks @blairjordan for the report and the fix. (#3456)
+
+#### Indexing and sync
+
 - A large source file now indexes in seconds in every supported language, where the time used to grow so fast with the file's size that a file past about a megabyte could run out its time limit and end up with no symbols.
 - The same now holds for a large routes or handlers file in every supported framework and router (Express, Rails, CodeIgniter, Play, React Router, Angular and the rest), for Liquid, ArkTS and the other languages read without the native parser, and for the React Native, Expo, Tauri and Swift to Objective-C bridges.
 - A file that holds one long string of hex or base64-like text, such as an embedded image, font or key, no longer stalls indexing.
@@ -29,19 +45,31 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A generated file of thousands of imports, `require` lines, routes or comment lines now indexes in seconds, and a file with a very large number of imports no longer stops indexing with "Maximum call stack size exceeded".
 - Source files up to 4 MB are now indexed, up from 1 MB, so a large hand-written file is no longer left out of the graph with nothing said; the next `codegraph sync` after upgrading indexes any file between the two sizes.
 - `init`, `index`, `sync` and `status` now name the source files left out of the graph for being over the size limit, smallest first, and `status --json` lists them as `index.oversizeFiles`; before, nothing said that such a file's symbols, callers and impact were missing from every answer, and the file's own symbol map read as empty.
-- On Windows, the `codegraph` command in Git Bash now works in a terminal that turns off path conversion with `MSYS_NO_PATHCONV=1` or `MSYS2_ARG_CONV_EXCL=*`, as some agent harnesses do, instead of failing with "Cannot find module". Thanks @BlueberryDuck for the report. (#3464)
-- On projects with fewer than 500 files, every tool named in `CODEGRAPH_MCP_TOOLS` is now listed to the agent, instead of only the small-repo defaults. Thanks @nchrisr for the report and the fix. (#3462)
-- `codegraph callers` and `codegraph_callers` list callers outside tests before tests, so a symbol called mostly from tests no longer shows only tests under the default limit while its real callers are cut. Thanks @blairjordan for the report and the fix. (#3456)
+
+#### JavaScript, TypeScript and React Native
+
+- A TanStack Router app that declares its routes in code now has its routes and the navigation between them when the root route is written `createRootRouteWithContext<…>()({ … })` or `createRootRoute()` with no options, where the whole route tree came out empty; re-index TanStack Router projects after upgrading.
+- In a React Native project, the Objective-C file that exposes a Swift module with `RCT_EXTERN_MODULE` is now read as that module's class with the methods written in it, where it gave a class named `RCT_EXTERN_MODULE` or nothing at all, and a very long one no longer runs out the time a file is given; re-index React Native projects after upgrading.
+
+#### Rust and Go
+
+- In Rust, a method called on a closure's parameter now links to the right type's method when the closure is handed to a standard method such as `map`, `for_each`, `is_none_or` or `map_err`, as in `rpc.as_mut().is_none_or(|r| r.stop().is_ok())`, and so does one called on what `if let Some(x) = value.as_mut()` binds. Before, such a call was left out of `callers` and `impact` whenever two types in the project had a method of that name; re-index Rust projects after upgrading. (#3497)
 - In Go, a variable given a chain that starts with `new(T)`, `make(T)` or a struct literal, like `sub := new(Route).Host("x").Subrouter()`, now has the type the chain returns, so a method called on it links to that type's method, not to a same-named method of the type the chain starts from. Thanks @inth3shadows for the report and the analysis, and @maxmilian. (#3447)
 - In Go, a variable given a method chain broken across lines after its `.`s, the way gofmt leaves a long chain, now has the type the chain returns, so a method called on it links again. Thanks @maxmilian for the report and @zhangkom for the fix. (#3455)
+
+#### Kotlin
+
+- In Kotlin, calls written in a class's header, such as a constructor parameter's default value, a superclass constructor's arguments, or a delegate like `SecureActivityDelegate by SecureActivityDelegateImpl()`, now link from the class when the class also has a body. (#3410)
+- In Kotlin, a class that implements an interface by delegation, like `class CachedRepo(inner: Repo) : Repo by inner`, is now listed as an implementation of that interface, so a call through the interface also reaches the methods the class overrides. (#3474)
+- In Kotlin, a class's superclass or interface now links to the type its file can see through its own package or its imports, instead of a same-named type somewhere else in the project, such as Exposed's JDBC test entities linking to the R2DBC `IntEntity`. (#3474)
+
+#### Pascal
+
 - Pascal methods and functions now show their implementation bodies in `node` and `explore` instead of their interface or forward declarations, while keeping their declaration metadata and call relationships; re-index Pascal projects after upgrading. Thanks @Vizit0r for the report and @yang0228 for the fix. (#3453)
 - In Pascal, a call to an overloaded method or function now links to the overload whose parameters fit its arguments. (#3453)
 - In Pascal, a class declared right after a subrange or set type, like `TPercent = 0 .. 100;`, now gets its own name instead of that type's. (#3453)
-- In Kotlin, calls written in a class's header, such as a constructor parameter's default value, a superclass constructor's arguments, or a delegate like `SecureActivityDelegate by SecureActivityDelegateImpl()`, now link from the class when the class also has a body. (#3410)
 - In Pascal, a call to a routine that nothing in its scope declares, like `Max(A, B)` from `System.Math` or DUnit's `Check(…)`, no longer links to a project routine that only shares its name. (#3471)
 - In Pascal, a call inside a `with` block, like `Add(S)` in `with Writer do`, now links to the method of the `with` object's class, before a same-named method of the calling class or of an unrelated class. (#3471)
-- In Kotlin, a class that implements an interface by delegation, like `class CachedRepo(inner: Repo) : Repo by inner`, is now listed as an implementation of that interface, so a call through the interface also reaches the methods the class overrides. (#3474)
-- In Kotlin, a class's superclass or interface now links to the type its file can see through its own package or its imports, instead of a same-named type somewhere else in the project, such as Exposed's JDBC test entities linking to the R2DBC `IntEntity`. (#3474)
 - In Pascal, class and record helpers like `TFooHelper = class helper for TFoo` are now indexed as types with their methods, so `node` and `explore` show those methods and the calls they make; re-index Pascal projects after upgrading. (#3475)
 - In Pascal, a call on a value whose type has a helper in scope, like `R.Count` or `with R do Count`, now links to the helper's method, which hides a same-named method of the type, as in Delphi. (#3475)
 - In Pascal, a call to a routine its scope declares, like `Check(…)` in a test case or `Render(…)` in a controller, now links to that routine instead of a same-named method of an unrelated class. (#3476)
