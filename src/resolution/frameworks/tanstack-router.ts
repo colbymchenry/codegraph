@@ -8,7 +8,9 @@
  *     component: InvoiceComponent,
  *   })
  *
- *   // code-based: a path per route, composed through its parent
+ *   // code-based: a path per route, composed through its parent, up to a
+ *   // root written `createRootRoute({ … })`, `createRootRoute()` or
+ *   // `createRootRouteWithContext<Ctx>()({ … })`
  *   const postsRoute = createRoute({ getParentRoute: () => rootRoute, path: 'posts' })
  *   const postRoute  = createRoute({ getParentRoute: () => postsRoute, path: '$postId' })
  *
@@ -47,7 +49,7 @@ import type {
 } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { dependsOn } from './package-deps';
-import { matchBracket, readFields } from './object-literal';
+import { matchBracket, readFields, skipString } from './object-literal';
 import {
   addRouteTo,
   appRootFor,
@@ -195,13 +197,17 @@ export function parseTanstackRoutes(content: string): TanstackRouteEntry[] {
 
   // ---- code-based: a fragment per route, composed through its parent ----
   const decls = new Map<string, { path: string | null; parent: string | null; component: string | null; root: boolean; index: number }>();
-  const named = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*?)?=\s*create(Root)?Route\s*\(\s*\{/g;
+  const named = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*?)?=\s*create(?:(Root)Route(WithContext)?|Route)\b/g;
   let d: RegExpExecArray | null;
   while ((d = named.exec(safe)) !== null) {
-    const brace = safe.indexOf('{', d.index + d[0].length - 1);
-    const end = matchBracket(safe, brace);
-    if (end < 0) continue;
-    const fields = readFields(safe, brace, end);
+    const brace = optionsBrace(safe, d.index + d[0].length, d[2] !== undefined, d[3] !== undefined);
+    if (brace === null) continue;
+    let fields: ReturnType<typeof readFields> = NO_FIELDS;
+    if (brace >= 0) {
+      const end = matchBracket(safe, brace);
+      if (end < 0) continue;
+      fields = readFields(safe, brace, end);
+    }
     const pathField = fields.get('path');
     const path = d[2] ? '/' : pathField ? readStringAt(pathField.text.trimStart(), 0) : null;
     const parentField = fields.get('getParentRoute');
@@ -235,6 +241,78 @@ export function parseTanstackRoutes(content: string): TanstackRouteEntry[] {
     out.push({ path, component: decl.component, index: decl.path === '/', fileBased: false, line: lineOf(decl.index) });
   }
   return out;
+}
+
+const NO_FIELDS: ReturnType<typeof readFields> = new Map();
+
+/**
+ * Where the options object of a route factory opens, the factory's name
+ * ending at `at`: the `{` of `createRoute({ … })`.
+ *
+ * A root is the root whatever it is given, and it is written three more ways
+ * than with an object: with nothing, `createRootRoute()`; with the type of
+ * its context, where a first call takes nothing and returns the factory,
+ * `createRootRouteWithContext<{ auth: Auth }>()({ … })`; and that with
+ * nothing, `…<Ctx>()()`. For those the answer is -1, a root with no options
+ * to read, or the `{` of the second call. Read as no declaration at all,
+ * such a root left every route under it with a parent the file never
+ * declared, and a whole route tree came out empty: TanStack's own
+ * kitchen-sink example is written this way.
+ *
+ * Null when what follows the name is not such a call.
+ */
+function optionsBrace(s: string, at: number, root: boolean, withContext: boolean): number | null {
+  const afterSpace = (i: number): number => {
+    while (i < s.length && /\s/.test(s[i]!)) i++;
+    return i;
+  };
+  let i = afterSpace(at);
+  if (root && s[i] === '<') {
+    i = afterTypeArguments(s, i);
+    if (i < 0) return null;
+    i = afterSpace(i);
+  }
+  if (s[i] !== '(') return null;
+  if (withContext) {
+    const close = matchBracket(s, i);
+    if (close < 0) return null;
+    i = afterSpace(close + 1);
+    if (s[i] !== '(') return null;
+  }
+  const first = afterSpace(i + 1);
+  if (s[first] === '{') return first;
+  return root ? -1 : null;
+}
+
+/**
+ * The index after the `>` that closes the type arguments opened at `open`,
+ * or -1. Braces, parentheses, brackets and strings are stepped over, so the
+ * `>` of an arrow in a function type, or one inside an object type, closes
+ * nothing; a statement's end before the close means these were no type
+ * arguments.
+ */
+function afterTypeArguments(s: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < s.length; i++) {
+    const ch = s[i]!;
+    if (ch === '{' || ch === '(' || ch === '[') {
+      const close = matchBracket(s, i);
+      if (close < 0) return -1;
+      i = close;
+    } else if (ch === '"' || ch === "'" || ch === '`') {
+      const close = skipString(s, i);
+      if (close < 0) return -1;
+      i = close;
+    } else if (ch === '<') {
+      depth++;
+    } else if (ch === '>') {
+      if (s[i - 1] === '=') continue;
+      if (--depth === 0) return i + 1;
+    } else if (ch === ';') {
+      return -1;
+    }
+  }
+  return -1;
 }
 
 /** The address a code-based route sits at, following `getParentRoute` up. */

@@ -143,6 +143,66 @@ describe('tanstack: parseTanstackRoutes — code-based', () => {
     expect(posts).toHaveLength(1);
     expect(posts[0]!.component).toBe('PostsIndexComponent');
   });
+
+  // A root is the root whatever it is given. Read only when it was given an
+  // object, a root written any other way left every route under it with a
+  // parent the file never declared, and the whole tree came out empty:
+  // TanStack's kitchen-sink example, whose root takes its context's type.
+  const ROOT = 'const rootRoute = createRootRoute({ component: RootComponent })\n';
+  const withRoot = (root: string): string => {
+    expect(src).toContain(ROOT);
+    return src.replace(ROOT, root);
+  };
+  const expected = parseTanstackRoutes(src).map((r) => [r.path, r.component, r.index]);
+
+  it.each([
+    ['with nothing', 'const rootRoute = createRootRoute()\n'],
+    ['with nothing, over two lines', 'const rootRoute = createRootRoute(\n)\n'],
+    ['exported, with a type', 'export const rootRoute: AnyRoute = createRootRoute()\n'],
+    ['with options in a variable', 'const rootRoute = createRootRoute(rootOptions)\n'],
+    ['with type arguments', 'const rootRoute = createRootRoute<RouterContext>({ component: RootComponent })\n'],
+    ["with its context's type", 'const rootRoute = createRootRouteWithContext<RouterContext>()({ component: RootComponent })\n'],
+    ["with its context's type and nothing else", 'const rootRoute = createRootRouteWithContext<RouterContext>()()\n'],
+    ['with a context written as an object type', 'const rootRoute = createRootRouteWithContext<{ auth: Auth }>()({\n  component: RootComponent,\n})\n'],
+    [
+      'with a context type that holds arrows, generics and a comparison-like default',
+      'const rootRoute = createRootRouteWithContext<{\n' +
+        '  auth: Auth\n' +
+        '  load: (id: string) => Promise<Map<string, Array<Post>>>\n' +
+        "  mode: 'a>b' | 'c<d'\n" +
+        '}>()({\n' +
+        '  component: RootComponent,\n' +
+        '})\n',
+    ],
+    ['with a context that is a function type', 'const rootRoute = createRootRouteWithContext<() => RouterContext>()({ component: RootComponent })\n'],
+  ])('composes the same routes under a root written %s', (_what, root) => {
+    expect(parseTanstackRoutes(withRoot(root)).map((r) => [r.path, r.component, r.index])).toEqual(expected);
+  });
+
+  it('a root is never an address of its own, however it is written', () => {
+    for (const root of [
+      "export const Route = createRootRoute()\n",
+      "export const Route = createRootRouteWithContext<RouterContext>()({ component: RootComponent })\n",
+      "export const Route = createRootRouteWithContext<{ auth: Auth }>()()\n",
+    ]) {
+      expect(parseTanstackRoutes(`import { createRootRoute, createRootRouteWithContext } from '@tanstack/react-router'\n${root}`), root).toEqual([]);
+    }
+  });
+
+  it('still composes nothing under a parent the file does not declare', () => {
+    // No root here at all: it is imported from another file.
+    expect(parseTanstackRoutes(withRoot("import { rootRoute } from './root'\n"))).toEqual([]);
+    // The factory kept, never called: `rootRoute` is not a route.
+    expect(parseTanstackRoutes(withRoot('const rootRoute = createRootRouteWithContext<RouterContext>()\n'))).toEqual([]);
+    // Type arguments that never close, and a call that is none.
+    expect(parseTanstackRoutes(withRoot('const rootRoute = createRootRoute<RouterContext;\n'))).toEqual([]);
+    expect(parseTanstackRoutes(withRoot('const rootRoute = createRootRoute\n'))).toEqual([]);
+  });
+
+  it('a route other than the root still needs its options written out', () => {
+    const viaVariable = withRoot(ROOT) + 'const extraRoute = createRoute(extraOptions)\nconst otherRoute = createRoute()\n';
+    expect(parseTanstackRoutes(viaVariable).map((r) => [r.path, r.component, r.index])).toEqual(expected);
+  });
 });
 
 // =============================================================================
@@ -351,5 +411,98 @@ describe('tanstack: a routed app end to end', () => {
     expect(signIn.via.map((v) => v.name)).toEqual(['submit']);
     expect(signIn.when).toBe('ok');
     expect(screens.dropped).toBe(0);
+  });
+});
+
+// =============================================================================
+// A code-based tree under a root that takes its context's type
+// =============================================================================
+
+describe('tanstack: a code-based app whose root is written with its context, end to end', () => {
+  let tmpDir: string;
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    await initGrammars();
+    await loadAllGrammars();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-tanstack-context-'));
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify({ name: 'app', dependencies: { react: '19', '@tanstack/react-router': '1' } }));
+    // The shape of TanStack's kitchen-sink example.
+    fs.writeFileSync(
+      path.join(tmpDir, 'src/main.tsx'),
+      "import { Link, Outlet, createRootRouteWithContext, createRoute, createRouter, useNavigate } from '@tanstack/react-router'\n" +
+        'const rootRoute = createRootRouteWithContext<{\n' +
+        '  auth: Auth\n' +
+        '}>()({\n' +
+        '  component: RootComponent,\n' +
+        '})\n' +
+        'function RootComponent() {\n  return <Outlet />\n}\n' +
+        'const indexRoute = createRoute({\n' +
+        '  getParentRoute: () => rootRoute,\n' +
+        "  path: '/',\n" +
+        '  component: IndexComponent,\n' +
+        '})\n' +
+        'function IndexComponent() {\n' +
+        '  return <Link to="/dashboard/invoices/$invoiceId" params={{ invoiceId: 3 }}>An invoice</Link>\n' +
+        '}\n' +
+        'const dashboardLayoutRoute = createRoute({\n' +
+        '  getParentRoute: () => rootRoute,\n' +
+        "  path: 'dashboard',\n" +
+        '  component: DashboardLayoutComponent,\n' +
+        '})\n' +
+        'function DashboardLayoutComponent() {\n  return <Outlet />\n}\n' +
+        'const dashboardIndexRoute = createRoute({\n' +
+        '  getParentRoute: () => dashboardLayoutRoute,\n' +
+        "  path: '/',\n" +
+        '  component: DashboardIndexComponent,\n' +
+        '})\n' +
+        'function DashboardIndexComponent() {\n  return <div>Dashboard</div>\n}\n' +
+        'const invoiceRoute = createRoute({\n' +
+        '  getParentRoute: () => dashboardLayoutRoute,\n' +
+        "  path: 'invoices/$invoiceId',\n" +
+        '  component: InvoiceComponent,\n' +
+        '})\n' +
+        'function InvoiceComponent() {\n' +
+        '  const navigate = useNavigate()\n' +
+        '  function done() {\n' +
+        "    navigate({ to: '/dashboard' })\n" +
+        '  }\n' +
+        '  return <button onClick={done} />\n' +
+        '}\n' +
+        'const routeTree = rootRoute.addChildren([indexRoute, dashboardLayoutRoute.addChildren([dashboardIndexRoute, invoiceRoute])])\n' +
+        'export const router = createRouter({ routeTree, context: { auth: undefined! } })\n'
+    );
+    cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+  });
+
+  afterAll(() => {
+    cg?.close();
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const route = (name: string): Node => {
+    const r = cg.getNodesByKind('route').find((r) => r.name === name);
+    if (!r) throw new Error(`no route ${name}: ${cg.getNodesByKind('route').map((r) => r.name).join(', ')}`);
+    return r;
+  };
+  const sym = (name: string): Node => cg.getNodesByName(name).find((n) => n.kind === 'function')!;
+  const navTargets = (from: Node): string[] =>
+    cg.getOutgoingEdges(from.id).filter((e) => e.kind === 'navigates').map((e) => cg.getNode(e.target)!.name).sort();
+
+  it('has the routes the tree declares, each bound to its component', () => {
+    expect(cg.getNodesByKind('route').map((r) => r.name).sort()).toEqual(['/', '/dashboard', '/dashboard/invoices/:invoiceId']);
+    const componentOf = (name: string): string | undefined =>
+      cg.getOutgoingEdges(route(name).id).filter((e) => e.kind === 'calls').map((e) => cg.getNode(e.target)?.name)[0];
+    expect(componentOf('/')).toBe('IndexComponent');
+    // The index under the layout is the page at `/dashboard`.
+    expect(componentOf('/dashboard')).toBe('DashboardIndexComponent');
+    expect(componentOf('/dashboard/invoices/:invoiceId')).toBe('InvoiceComponent');
+  });
+
+  it('has the navigation between them', () => {
+    expect(navTargets(sym('done'))).toEqual(['/dashboard']);
+    expect(navTargets(sym('IndexComponent'))).toEqual(['/dashboard/invoices/:invoiceId']);
   });
 });
