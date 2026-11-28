@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In JavaScript and TypeScript, a method call on a value named like a class, such as `ky.create()`, no longer links to a `static` method of that class; genuine static calls like `Ky.create()` still resolve. (#3429)
 
 ## [1.6.5] - 2026-11-28
 

@@ -25341,13 +25341,13 @@ function tsClassHead(lines: readonly string[], cls: Node): string {
 }
 
 /** A method named `name` on a supertype of the given classes, nearest first. */
-function inheritedClassMethod(classes: Node[], name: string, context: ResolutionContext, kind?: RubyMethodKind): Node | null {
+function inheritedClassMethod(classes: Node[], name: string, context: ResolutionContext, kind?: RubyMethodKind, instanceOnly = false): Node | null {
   if (classes.length === 0) return null;
   let memo = INHERITED_METHODS.get(context);
   if (!memo) INHERITED_METHODS.set(context, (memo = new Map()));
-  const key = `${classes.map((c) => c.id).join(',')}|${name}|${kind ?? ''}`;
+  const key = `${classes.map((c) => c.id).join(',')}|${name}|${kind ?? ''}|${instanceOnly ? '1' : '0'}`;
   if (memo.has(key)) return memo.get(key)!;
-  const found = findInheritedClassMethod(classes, name, context, kind);
+  const found = findInheritedClassMethod(classes, name, context, kind, instanceOnly);
   memo.set(key, found);
   return found;
 }
@@ -25381,7 +25381,7 @@ function fileMethodsNamed(file: string, name: string, context: ResolutionContext
   return methods.get(`\0${name.toLowerCase()}`) ?? methods.get(name) ?? [];
 }
 
-function findInheritedClassMethod(classes: Node[], name: string, context: ResolutionContext, kind?: RubyMethodKind): Node | null {
+function findInheritedClassMethod(classes: Node[], name: string, context: ResolutionContext, kind?: RubyMethodKind, instanceOnly = false): Node | null {
   const seen = new Set<string>(classes.map((c) => c.id));
   let frontier = classes;
   for (let depth = 0; depth < 5 && frontier.length > 0; depth++) {
@@ -25393,6 +25393,7 @@ function findInheritedClassMethod(classes: Node[], name: string, context: Resolu
           if (cls.language === 'python' && isPythonBaseFromOutside(cls, sup, decl, context)) continue;
           seen.add(decl.id);
           const method = rubyMethodsOfKindFirst(fileMethodsNamed(decl.filePath, name, context).filter((n) =>
+            !(instanceOnly && n.isStatic) &&
             n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === decl.name), kind)[0];
           if (method) return method;
           next.push(decl);
@@ -29173,11 +29174,13 @@ function matchMethodCallOn(
         // two methods of the name is preferred: the first declared is taken.
         // (A standard name a class only inherits, `ToString` on C#'s `year`, says
         // nothing of a receiver that shares a word with the class.)
+        // A TS/JS instance variable receiver never calls a static method on the
+        // capitalized class (#3429): `ky.create()` is not `Ky.create`.
         const methodNode = ref.language === 'php' && !phpNamed.includes(classNode)
           ? phpUnnamedClassMethod(classNode, methodName!, fuzzyClassCandidates.filter((c) => c.language === 'php').length === 1, context)
           : ref.language === 'csharp' && isStdMethodName('csharp', methodName!)
             ? findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName!)
-            : classStrategyMethod(classNode, methodName!, context, undefined, ref.language === 'ruby' ? ref.filePath : undefined);
+            : classStrategyMethod(classNode, methodName!, context, undefined, ref.language === 'ruby' ? ref.filePath : undefined, JS_FAMILY.has(ref.language));
         // Inside the class a PHP variable is named after, it is another
         // instance of that class by its name alone, for what the class declares
         // or takes from its traits: `$model->fill()` in `Model`. Not for what it
@@ -29239,8 +29242,15 @@ function matchMethodCallOn(
     // A Kotlin extension the calling file cannot see, `fun Modes.hidden()` in
     // another package with neither it nor its package imported, is no
     // candidate at all: as if no method had its name there.
+    // A TS/JS lowercase value receiver (`ky.create()`, `this.ky.create()`)
+    // never calls a static method on a class (#3429); `this` / `super` inside a
+    // static method or a capitalized class receiver (`Ky.create()`) can.
+    const jsInstanceOnly = JS_FAMILY.has(ref.language) &&
+      objectOrClass !== 'this' && objectOrClass !== 'super' &&
+      /^[a-z]/.test(receiverLink(objectOrClass!));
     const methods = methodCandidates.filter(
       (n) => n.kind === 'method' && n.name === methodName &&
+        !(jsInstanceOnly && n.isStatic) &&
         !(ref.language === 'kotlin' && !isKotlinExtensionInScope(n, ref, context))
     );
 
@@ -35638,8 +35648,11 @@ function tsFieldCall(
  * `kind` picks between a Ruby class's two methods of the name, `def self.m`
  * and `def m`, which share one qualified name (rubyMethodsOfKindFirst).
  */
-function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string, kind?: RubyMethodKind): Node | undefined {
-  const methods = rubyMethodsOfKindFirst(nodesInFile.filter((n) => n.kind === 'method' && n.name === methodName), kind);
+function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string, kind?: RubyMethodKind, instanceOnly = false): Node | undefined {
+  const methods = rubyMethodsOfKindFirst(
+    nodesInFile.filter((n) => n.kind === 'method' && n.name === methodName && !(instanceOnly && n.isStatic)),
+    kind,
+  );
   const exact = `${classNode.qualifiedName}::${methodName}`;
   const byName = `${classNode.name}::${methodName}`;
   const found =
@@ -35653,7 +35666,7 @@ function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string,
     .filter((n) => n.kind === 'method' && n.language === 'php' && n.name !== methodName && n.name.toLowerCase() === lower)
     .map((n) => n.name));
   for (const declared of spellings) {
-    const own = findOwnMethod(nodesInFile, classNode, declared, kind);
+    const own = findOwnMethod(nodesInFile, classNode, declared, kind, instanceOnly);
     if (own) return own;
   }
   return undefined;
@@ -35667,12 +35680,12 @@ function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string,
  * only found because `BaseForm` contains `Form`. Read `from` a file, a Ruby
  * class's ancestors are the declarations that file runs with.
  */
-function classStrategyMethod(classNode: Node, methodName: string, context: ResolutionContext, kind?: RubyMethodKind, from?: string): Node | undefined {
-  const own = findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName, kind);
+function classStrategyMethod(classNode: Node, methodName: string, context: ResolutionContext, kind?: RubyMethodKind, from?: string, instanceOnly = false): Node | undefined {
+  const own = findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName, kind, instanceOnly);
   if (own) return own;
   if (classNode.language === 'ruby') return rubyAncestorMethod(classNode.qualifiedName, methodName, context, kind, from) ?? undefined;
   if (classNode.language === 'php') return phpAncestorMethod(classNode, methodName, context) ?? undefined;
-  return inheritedClassMethod([classNode], methodName, context, kind) ?? undefined;
+  return inheritedClassMethod([classNode], methodName, context, kind, instanceOnly) ?? undefined;
 }
 
 /**
