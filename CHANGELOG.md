@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+
+## [1.6.5] - 2026-11-28
+
 ### Highlights
 
 - **Large files no longer stall indexing.** A big source file now indexes in seconds in every supported language, framework and router, where one past about a megabyte could run out its time and end up with no symbols at all.
@@ -2050,3 +2053,4 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [1.6.2]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.2
 [1.6.3]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.3
 [1.6.4]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.4
+[1.6.5]: https://github.com/colbymchenry/codegraph/releases/tag/v1.6.5
