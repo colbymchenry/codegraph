@@ -174,6 +174,24 @@ export function projectGoneReason(projectRoot: string, pidPath: string, pid: num
 }
 
 /**
+ * Why the socket this daemon listens on is gone, or null while it is there.
+ * A socket in the user's runtime folder (#3417) goes with the folder when
+ * their last login session ends, and one in the project goes if someone
+ * deletes it; either way no client can reach the daemon any more, while it
+ * still holds the project's locks. Windows pipes have no file. Exported for
+ * testing.
+ */
+export function socketGoneReason(socketPath: string): string | null {
+  if (process.platform === 'win32') return null;
+  try {
+    fs.lstatSync(socketPath);
+    return null;
+  } catch (err) {
+    return isMissing(err) ? `its socket ${socketPath} was removed` : null;
+  }
+}
+
+/**
  * Why the install this daemon was started from no longer matches it, or null
  * while it still does. An upgrade replaces or deletes the package directory
  * under a running daemon (npm reinstalling the package, the launcher pruning
@@ -642,7 +660,8 @@ export class Daemon {
    * check and the clock are injected for tests; the timer passes the real ones.
    */
   checkProject(
-    gone: () => string | null = () => projectGoneReason(this.projectRoot, this.pidPath, process.pid),
+    gone: () => string | null = () =>
+      projectGoneReason(this.projectRoot, this.pidPath, process.pid) ?? socketGoneReason(this.socketPath),
     now: number = Date.now(),
   ): boolean {
     if (this.stopping) return false;
