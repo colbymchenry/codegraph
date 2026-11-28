@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
+import { getNodeText, getChildByField, childrenOf, namedChildrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /**
@@ -44,8 +44,7 @@ function fallbackReceiveName(node: SyntaxNode): string {
   // tree-sitter-solidity reuses one node type for both `fallback() ...` and
   // `receive() ...` — the keyword is an unnamed/anonymous child. Walk all
   // children (named + unnamed) and pick the first whose text is one of these.
-  for (let i = 0; i < node.childCount; i++) {
-    const child = node.child(i);
+  for (const child of childrenOf(node)) {
     if (!child) continue;
     const t = child.text;
     if (t === 'fallback' || t === 'receive') return t;
@@ -124,8 +123,7 @@ export const solidityExtractor: LanguageExtractor = {
   getVisibility: (node) => {
     // Solidity functions: public/private/internal/external — `external` maps
     // to 'public' for our purposes (callable from outside the contract).
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (child?.type !== 'visibility') continue;
       const t = child.text.trim();
       if (t === 'public' || t === 'external') return 'public';

@@ -30,7 +30,7 @@ import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap, parsePackageName, parseTargetPaths, parseWorkspaceMembers } from './frameworks/cargo-workspace';
 import { blankRustCode, readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustClosureCallee, type RustPatternSite, type RustScopes } from './rust-scopes';
 import { lineAt, linesOf } from './synth-utils';
-import { nodesAroundLine } from './nodes-around';
+import { nodesAroundLine, nodesNamed, nodesAroundLineIn } from './nodes-around';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -1601,16 +1601,16 @@ function pythonGlobalReceiverTarget(
   receiver: string, member: string, ref: UnresolvedRef, context: ResolutionContext, call = false,
 ): Node | null | undefined {
   const global = pythonNameScan(context, `global\0${ref.filePath}\0${receiver}`, () =>
-    context.getNodesInFile(ref.filePath).find(n => n.name === receiver && isPythonModuleGlobal(n, context)) ?? null);
+    nodesNamed(context, ref.filePath, receiver).find(n => n.name === receiver && isPythonModuleGlobal(n, context)) ?? null);
   if (!global || pythonBindsLocally(receiver, ref, context, true)) return undefined;
   // A `def _svc` / `class _svc` nested in an enclosing function binds the name there.
   const nodes = context.getNodesInFile(ref.filePath);
-  const scopes = nodes.filter(n => (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line);
+  const scopes = nodesAroundLine(context, ref.filePath, ref.line).filter(n => (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line);
   const innermost = (n: Node) => nodes
     .filter(c => c.id !== n.id && (c.kind === 'function' || c.kind === 'method' || c.kind === 'class') &&
       c.startLine < n.startLine && c.endLine >= n.startLine)
     .sort((a, b) => b.startLine - a.startLine)[0];
-  if (nodes.some(n => n.name === receiver && (n.kind === 'class' || n.kind === 'function') &&
+  if (nodesNamed(context, ref.filePath, receiver).some(n => n.name === receiver && (n.kind === 'class' || n.kind === 'function') &&
       scopes.some(f => f.id === innermost(n)?.id))) return undefined;
   if (!pythonOwnGlobalWrites(global, context) || pythonExternalWrites(global, context).writers.has(ref.filePath)) {
     return null;
@@ -2741,7 +2741,7 @@ export function isJavaOutsideImport(name: string, ref: UnresolvedRef, context: R
   // `TypeAdapters`' field `URI`, as a type always is beside a value.
   const call = ref.referenceKind === 'calls' && name === ref.referenceName;
   const kinds = call ? JVM_CALLABLE_KINDS : JVM_TYPE_KINDS;
-  if ((context.getNodesInFileNamed?.(ref.filePath, name) ?? context.getNodesInFile(ref.filePath).filter((n) => n.name === name))
+  if ((context.getNodesInFileNamed?.(ref.filePath, name) ?? nodesNamed(context, ref.filePath, name).filter((n) => n.name === name))
     .some((n) => kinds.has(n.kind))) return false;
   let packages = JVM_PACKAGES.get(context);
   if (!packages) {
@@ -3051,7 +3051,7 @@ function luaModuleMember(name: string, path: string[], decl: Node, context: Reso
 function luaMemberIn(file: string, path: string[], context: ResolutionContext): LuaStep {
   const member = path[path.length - 1]!;
   const nodes = context.getNodesInFile(file);
-  const inFile = nodes.filter((n) => n.name === member);
+  const inFile = nodesNamed(context, file, member).filter((n) => n.name === member);
   const fns = inFile.filter((n) => n.kind === 'function' || n.kind === 'method');
   if (fns.length > 0) {
     const owner = path.length > 1 ? path[path.length - 2]! : null;
@@ -3070,7 +3070,7 @@ function luaMemberIn(file: string, path: string[], context: ResolutionContext): 
     const rhs = exported[1]!;
     const line = lineAt(source, exported.index) + 1;
     if (/^[A-Za-z_]\w*$/.test(rhs)) {
-      const fn = nodes.find((n) => n.name === rhs && (n.kind === 'function' || n.kind === 'method'));
+      const fn = nodesNamed(context, file, rhs).find((n) => n.name === rhs && (n.kind === 'function' || n.kind === 'method'));
       if (fn) return { done: fn };
     }
     const at = nodes.find((n) => n.kind === 'file') ?? nodes[0];
@@ -5692,7 +5692,7 @@ function isPythonOutsideModuleName(name: string, filePath: string, context: Reso
     const keys = pythonImportKeys(name, filePath, context);
     if (keys.size === 0) return false;
     if (pythonGlobalBindings(name, filePath, context).some((b) => b.kind !== 'import')) return false;
-    if (context.getNodesInFile(filePath).some((n) => n.name === name && (n.kind === 'class' || n.kind === 'function'))) return false;
+    if (nodesNamed(context, filePath, name).some((n) => n.name === name && (n.kind === 'class' || n.kind === 'function'))) return false;
     // `import a.b as x` keys as `a.b:*`; `from a import x` as `a:x`, where only
     // the module `a` tells that `x` comes from outside.
     return [...keys].every((key) => {
@@ -9169,14 +9169,13 @@ function objcCallShape(ref: UnresolvedRef, context: ResolutionContext): 'c-call'
  * the class they extend). Null outside any class.
  */
 function objcHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Set<string> | null {
-  const inFile = context.getNodesInFile(ref.filePath);
-  let here = inFile
+  let here = nodesAroundLine(context, ref.filePath, ref.line)
     .filter((c) => c.kind === 'class' && c.startLine <= ref.line && c.endLine >= ref.line)
     .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0]?.name;
   // An `@implementation` whose range the index lost still names its class in
   // its methods: `SDWebImageDownloaderDecryptor::initWithBlock:`.
   if (!here) {
-    const method = inFile.find((c) => c.kind === 'method' && c.startLine <= ref.line && c.endLine >= ref.line && c.qualifiedName.includes('::'));
+    const method = nodesAroundLine(context, ref.filePath, ref.line).find((c) => c.kind === 'method' && c.startLine <= ref.line && c.endLine >= ref.line && c.qualifiedName.includes('::'));
     here = method?.qualifiedName.slice(0, method.qualifiedName.lastIndexOf('::'));
   }
   if (!here) return null;
@@ -12089,7 +12088,7 @@ function rustDeclaredItems(m: RustModule, name: string, context: ResolutionConte
   for (const file of m.alt ? [m.file, m.alt] : [m.file]) {
     const layout = rustUsesOf(file, context);
     const block = file === m.file ? m.block : null;
-    for (const n of context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file).filter((c) => c.name === name)) {
+    for (const n of context.getNodesInFileNamed?.(file, name) ?? nodesNamed(context, file, name).filter((c) => c.name === name)) {
       // An item in a function body is qualified by it (`outer::Inner`); an inline module adds nothing.
       if (n.language !== 'rust' || n.qualifiedName !== name || !RUST_MODULE_ITEM_KINDS.has(n.kind)) continue;
       if (publicOnly && n.visibility === 'private') continue;
@@ -16866,7 +16865,7 @@ function javaLambdaParameterType(name: string, ref: UnresolvedRef, context: Reso
     if (!called) return null;
     const position = m[1] ? m[1].split(',').length - 1 : 0;
     const found = new Set<string>();
-    for (const method of context.getNodesInFile(ref.filePath)) {
+    for (const method of nodesNamed(context, ref.filePath, called)) {
       if (method.kind !== 'method' || method.name !== called) continue;
       const written = javaParameters(method.signature)?.[index]?.written;
       if (written === undefined) continue;
@@ -17412,25 +17411,29 @@ export function resolveObjectLiteralMember(
   if (!OBJECT_LITERAL_LANGUAGES.has(container.language)) return null;
   if (!sameLanguageFamily(container.language, ref.language)) return null;
 
-  const inFile = context.getNodesInFile(container.filePath);
   const callable = (n: Node) => n.kind === 'function' || n.kind === 'method';
   const valueMember = (n: Node) =>
     callable(n) || n.kind === 'property' || n.kind === 'variable' || n.kind === 'constant';
   const accepts = ref.referenceKind === 'calls' ? callable : valueMember;
 
-  const inside = inFile.filter((n) => n.id !== container.id && rangeWithin(n, container));
+  // What the literal holds: looked for among the file's nodes of the member's
+  // name, and around a candidate's line, not among all of the file's nodes
+  // for each reference.
+  const inside = (n: Node): boolean => n.id !== container.id && rangeWithin(n, container);
   const property = objectLiteralProperty(container, member, context);
   if (property === null || property?.binding) return null;
-  let candidates = inside.filter((n) => n.name === member && accepts(n) && (!property || property.contains(n)));
+  let candidates = nodesNamed(context, container.filePath, member)
+    .filter((n) => inside(n) && n.name === member && accepts(n) && (!property || property.contains(n)));
   if (candidates.length === 0) return null;
 
   // Drop a candidate nested inside ANOTHER callable's body within the literal
   // (`{ run() { const call = () => {}; } }` — `call` is `run`'s local, not a
   // member). Strict containment: an identically-ranged sibling node for the
   // same member (a property node over an arrow function) is not a body.
-  const bodies = inside.filter(callable);
+  // A body a candidate is nested in holds the candidate's first line.
   candidates = candidates.filter(
-    (c) => !bodies.some((b) => b.id !== c.id && !sameRange(b, c) && rangeWithin(c, b))
+    (c) => !nodesAroundLine(context, container.filePath, c.startLine)
+      .some((b) => inside(b) && callable(b) && b.id !== c.id && !sameRange(b, c) && rangeWithin(c, b))
   );
   if (candidates.length === 0) return null;
 
@@ -17702,7 +17705,7 @@ export function resolveObjectLiteralBinding(
       : (n: Node) => callable(n) || n.kind === 'constant' || n.kind === 'variable' || n.kind === 'component';
 
   const locals = (context.getNodesInFileNamed?.(container.filePath, binding) ??
-      context.getNodesInFile(container.filePath).filter((n) => n.name === binding))
+      nodesNamed(context, container.filePath, binding).filter((n) => n.name === binding))
     .filter((n) => n.id !== container.id &&
       ['function', 'class', 'constant', 'variable', 'component'].includes(n.kind))
     .map((node) => ({ node, scope: scopeAt(node) }))
@@ -23565,7 +23568,7 @@ function javaEnclosingFieldType(receiverName: string, ref: UnresolvedRef, inFile
   const m = receiverName.match(/^(?:(?:(\w+)\.)?this\.)?(\w+)$/);
   if (!m) return null;
   const [, outer, fieldName] = m;
-  const enclosing = inFile
+  const enclosing = nodesAroundLineIn(inFile, ref.line)
     .filter(
       (n) =>
         (n.kind === 'class' || n.kind === 'interface' || n.kind === 'enum') &&
@@ -24752,6 +24755,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CSHARP_EXTENSION_THIS.delete(context);
   CSHARP_FILE_BASENAMES.delete(context);
   JS_ASSIGNED_MEMBERS.delete(context);
+  MODULE_DEFAULTS_STATED.delete(context);
   JS_CONSTRUCTOR_METHODS.delete(context);
   CFML_CHAINS.delete(context);
   NO_RECEIVER_LINES.delete(context);
@@ -25864,6 +25868,20 @@ export function inferLocalReceiverType(
         }
         return state.ansType;
       }
+      // A line above the last one asked about. Nothing between the answer and
+      // that last line matched, so when the answer is at or above this line
+      // it is this line's answer too, and no answer is none. Scanned again
+      // from this line down, a file of some thousand route handlers, each
+      // calling a method on a parameter nothing declares, went through every
+      // line above each of them: 58 seconds for 1.2 MB.
+      if (state.ansIdx <= hi) {
+        if (state.ansIdx < lo) return null;
+        if (decl) {
+          decl.raw = state.ansRaw;
+          decl.line = state.ansIdx + 1;
+        }
+        return state.ansType;
+      }
       for (let i = hi; i >= lo; i--) {
         const type = matchLine(i);
         if (type) {
@@ -26965,7 +26983,7 @@ function jsCalledFunction(name: string, at: number, file: JsScopeFile, ref: Unre
     // Overloads are declarations of the name in one block; another block's helper of the name is another function.
     if (site.kind !== 'function' || jsBindingSites(name, file).filter((s) => s.kind === 'function' && s.from === site.from).length !== 1) return null;
     const line = jsLineOf(file, site.at);
-    const own = context.getNodesInFile(ref.filePath).find((n) => n.kind === 'function' && n.name === name && n.startLine === line);
+    const own = nodesNamed(context, ref.filePath, name).find((n) => n.kind === 'function' && n.name === name && n.startLine === line);
     return own && own.signature && ESM_FAMILY.has(own.language) ? own : null;
   }
   if (!(context.getImportMappings?.(ref.filePath, ref.language) ?? []).some((m) => m.localName === name)) return null;
@@ -29538,17 +29556,52 @@ const ESM_DEFAULT_EXPORT_STATEMENT = /^[ \t]*export\s+(?:default\b|=)|\bas\s+def
  * the members of its class, which the module file declares or imports.
  */
 function projectModuleMemberCall(file: string, methodName: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
-  const source = context.readFile(file) ?? '';
-  const commonJs = source.includes('module.exports') ? MODULE_EXPORTS_DEFAULT.exec(source) : null;
-  const made = commonJs?.[2];
-  if (made) {
+  const stated = moduleDefaultStated(file, context);
+  if (stated.made) {
     const language = context.getNodesInFile(file)[0]?.language ?? ref.language;
-    const declaring = tsImportedTypeFile(made, { ...ref, filePath: file, language }, context) ?? file;
-    return resolveMethodOnType(made, methodName, ref, context, 0.85, 'instance-method', declaring);
+    const declaring = tsImportedTypeFile(stated.made, { ...ref, filePath: file, language }, context) ?? file;
+    return resolveMethodOnType(stated.made, methodName, ref, context, 0.85, 'instance-method', declaring);
   }
-  if (commonJs) return commonJs[1] === '{' ? null : undefined;
-  const esmDefault = (source.includes('default') || source.includes('export =')) && ESM_DEFAULT_EXPORT_STATEMENT.test(source);
-  return esmDefault ? undefined : null;
+  if (stated.commonJs) return stated.literal ? null : undefined;
+  return stated.esmDefault ? undefined : null;
+}
+
+/** What a module's file states as its default: see projectModuleMemberCall. */
+interface ModuleDefaultStated {
+  /** It says `module.exports = …`. */
+  commonJs: boolean;
+  /** The class of `module.exports = new Class(…)`. */
+  made: string | undefined;
+  /** `module.exports = {`. */
+  literal: boolean;
+  /** No `module.exports = …`, and an ES default: `export default …`, `export { x as default }`, `export = …`. */
+  esmDefault: boolean;
+}
+const MODULE_DEFAULTS_STATED = new WeakMap<ResolutionContext, Map<string, ModuleDefaultStated>>();
+
+/**
+ * What `file` states as its default, read once for the file. Read for each
+ * member called on the module's default binding, a module that says neither
+ * `module.exports` nor `default` was searched to its end for both, every
+ * time: a file of eight thousand calls on one native module's binding took
+ * four seconds.
+ */
+function moduleDefaultStated(file: string, context: ResolutionContext): ModuleDefaultStated {
+  let memo = MODULE_DEFAULTS_STATED.get(context);
+  if (!memo) MODULE_DEFAULTS_STATED.set(context, (memo = new Map()));
+  let stated = memo.get(file);
+  if (!stated) {
+    const source = context.readFile(file) ?? '';
+    const commonJs = source.includes('module.exports') ? MODULE_EXPORTS_DEFAULT.exec(source) : null;
+    stated = {
+      commonJs: commonJs !== null,
+      made: commonJs?.[2],
+      literal: commonJs?.[1] === '{',
+      esmDefault: commonJs === null && (source.includes('default') || source.includes('export =')) && ESM_DEFAULT_EXPORT_STATEMENT.test(source),
+    };
+    memo.set(file, stated);
+  }
+  return stated;
 }
 
 const JS_ASSIGNED_MEMBERS = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
@@ -29924,7 +29977,7 @@ function csharpArgumentsFit(params: CsharpParameter[], args: string[]): boolean 
 function csharpExtensionOverload(picked: Node, ref: UnresolvedRef, context: ResolutionContext): Node | null | undefined {
   if (picked.language !== 'csharp' || picked.kind !== 'method' || ref.referenceKind !== 'calls') return undefined;
   const owner = picked.qualifiedName.slice(0, Math.max(0, picked.qualifiedName.lastIndexOf('::')));
-  const overloads = (context.getNodesInFileNamed?.(picked.filePath, picked.name) ?? context.getNodesInFile(picked.filePath).filter((n) => n.name === picked.name))
+  const overloads = (context.getNodesInFileNamed?.(picked.filePath, picked.name) ?? nodesNamed(context, picked.filePath, picked.name).filter((n) => n.name === picked.name))
     .filter((n) => n.kind === 'method' && n.qualifiedName === picked.qualifiedName);
   if (overloads.length < 2 || !isCsharpExtensionMethod(picked, context)) return undefined;
   // The receiver is written before the name, unless it is the class itself.
@@ -33335,8 +33388,8 @@ function pythonScopeBindings(scope: Node, name: string, context: ResolutionConte
  * declares it `global`.
  */
 function pythonBindingScope(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
-  for (const scope of pythonFileDefs(ref.filePath, context)) {
-    if (scope.startLine > ref.line || scope.endLine < ref.line) continue;
+  // The defs around the reference, innermost first: those of the file's defs that hold its line.
+  for (const scope of pythonScopesAround(ref, context)) {
     const { param, bindings } = pythonScopeBindings(scope, name, context);
     if (param !== undefined) return scope;
     if (bindings.some((b) => b.kind === 'global')) return null;
@@ -34926,7 +34979,7 @@ const TS_MEMBER_OWNER_KINDS = new Set<string>(['class', 'interface']);
 
 /** The class or interface named `name` that `file` declares. */
 function tsTypeDeclaredIn(file: string, name: string, context: ResolutionContext): Node | undefined {
-  return context.getNodesInFile(file).find((n) => n.name === name && TS_MEMBER_OWNER_KINDS.has(n.kind));
+  return nodesNamed(context, file, name).find((n) => n.name === name && TS_MEMBER_OWNER_KINDS.has(n.kind));
 }
 
 /**
@@ -34997,7 +35050,7 @@ function tsNamedType(
     found = !node || isMergedAmbientDeclaration(node, context) ? null
       : TS_MEMBER_OWNER_KINDS.has(node.kind) ? node : tsTypeDeclaredIn(node.filePath, node.name, context) ?? null;
   } else if (!written.includes('.')) {
-    found = context.getNodesInFile(from.filePath).find((n) => n.id !== from.id && n.name === written && TS_MEMBER_OWNER_KINDS.has(n.kind)) ?? null;
+    found = nodesNamed(context, from.filePath, written).find((n) => n.id !== from.id && n.name === written && TS_MEMBER_OWNER_KINDS.has(n.kind)) ?? null;
   }
   memo.set(key, found);
   return found;
@@ -35166,7 +35219,7 @@ function tsAliasedType(name: string, file: string, at: UnresolvedRef, context: R
     }
     if (walked.has(key)) break;
     walked.add(key);
-    const alias = (context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file).filter((n) => n.name === name))
+    const alias = (context.getNodesInFileNamed?.(file, name) ?? nodesNamed(context, file, name).filter((n) => n.name === name))
       .find((n) => n.kind === 'type_alias');
     const written = alias ? tsAliasValueName(alias, context) : null;
     // `type Box<T> = T | null` holds whatever its argument is.
@@ -35432,7 +35485,7 @@ function tsNamedClass(name: string, from: Node, ref: UnresolvedRef, context: Res
     const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
     if (node && (node.kind === 'class' || node.kind === 'component') && !isMergedAmbientDeclaration(node, context)) found = node;
   } else {
-    found = context.getNodesInFile(from.filePath).find((n) => n.kind === 'class' && n.name === name) ?? null;
+    found = nodesNamed(context, from.filePath, name).find((n) => n.kind === 'class' && n.name === name) ?? null;
   }
   memo.set(key, found);
   return found;
@@ -35696,7 +35749,7 @@ export function newReceiverClass(ref: UnresolvedRef, context: ResolutionContext)
     return imported.exportedName;
   }
   if (!imported && !written.includes('.') && JS_BUILT_INS.has(last) &&
-      !context.getNodesInFile(ref.filePath).some((n) => n.kind === 'class' && n.name === last)) {
+      !nodesNamed(context, ref.filePath, last).some((n) => n.kind === 'class' && n.name === last)) {
     return null;
   }
   return last;
@@ -36138,10 +36191,10 @@ function destructuredKeyTarget(calleeName: string, key: string, ref: UnresolvedR
   if (!new RegExp(`\\breturn\\s*\\{[^]*?\\b${escapeRegExp(key)}\\b`).test(calleeText)) return null;
   const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'constant' || n.kind === 'variable';
   const inFile = context.getNodesInFile(callee.filePath);
-  const inner = inFile.filter((n) => n.name === key && callable(n) && n.id !== callee.id && rangeWithin(n, callee) &&
+  const inner = nodesNamed(context, callee.filePath, key).filter((n) => n.name === key && callable(n) && n.id !== callee.id && rangeWithin(n, callee) &&
     !inFile.some((f) => f.id !== callee.id && f.id !== n.id && (f.kind === 'function' || f.kind === 'method') &&
       rangeWithin(f, callee) && rangeWithin(n, f) && !sameRange(f, n)));
-  const top = inner.length > 0 ? inner : inFile.filter((n) => n.name === key && callable(n) && !n.qualifiedName.includes('::') &&
+  const top = inner.length > 0 ? inner : nodesNamed(context, callee.filePath, key).filter((n) => n.name === key && callable(n) && !n.qualifiedName.includes('::') &&
     !inFile.some((f) => (f.kind === 'function' || f.kind === 'method') && f.id !== n.id && rangeWithin(n, f) && !sameRange(f, n)));
   const target = top.sort((a, b) => Number(b.kind === 'function') - Number(a.kind === 'function'))[0];
   if (!target) return null;
@@ -37104,7 +37157,7 @@ function overloadSetOf(id: string, context: ResolutionContext): { name: string; 
   if (!self || (self.kind !== 'method' && self.kind !== 'function')) return null;
   const name = self.name;
   const owner = self.qualifiedName.slice(0, Math.max(0, self.qualifiedName.lastIndexOf('::')));
-  const siblings = (context.getNodesInFileNamed?.(self.filePath, name) ?? context.getNodesInFile(self.filePath).filter((n) => n.name === name))
+  const siblings = (context.getNodesInFileNamed?.(self.filePath, name) ?? nodesNamed(context, self.filePath, name).filter((n) => n.name === name))
     .filter((n) => n.id !== self.id && (n.kind === 'method' || n.kind === 'function') &&
       n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))) === owner);
   if (siblings.length === 0) return null;
@@ -37203,7 +37256,7 @@ function matchReferenceInner(
     // `ipairs(t)` is Lua's, unless the file defines its own: telescope's 122
     // `for _, v in ipairs(…)` went to a linked list's `ipairs` method.
     if (LUA_GLOBAL_FUNCTIONS.has(ref.referenceName) &&
-        !context.getNodesInFile(ref.filePath).some((n) => n.name === ref.referenceName && n.kind === 'function')) return null;
+        !nodesNamed(context, ref.filePath, ref.referenceName).some((n) => n.name === ref.referenceName && n.kind === 'function')) return null;
   }
 
   // Erlang `-behaviour(m)` refs target a MODULE. Letting them fall through to

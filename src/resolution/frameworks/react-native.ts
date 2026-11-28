@@ -58,6 +58,7 @@
  *     belongs in the callback synthesizer's cross-language channel.
  */
 import type { Node } from '../../types';
+import { lineAt } from '../synth-utils';
 import {
   FrameworkResolver,
   ResolutionContext,
@@ -130,11 +131,9 @@ function parseObjcRNExports(
     (className ? defaultObjcModuleName(className) : null);
   if (!moduleName) return results;
 
-  const lineOf = (idx: number): number => {
-    let line = 1;
-    for (let i = 0; i < idx && i < source.length; i++) if (source.charCodeAt(i) === 10) line++;
-    return line;
-  };
+  // From the text's newline index: counted from its start for each macro, a
+  // module of some thousand exported methods read itself that many times.
+  const lineOf = (idx: number): number => (idx > 0 ? lineAt(source, idx) : 1);
 
   // RCT_EXPORT_METHOD(selectorFirstKw:(args)…)
   // The first keyword (everything up to the first `:` or open paren) is the
@@ -191,11 +190,9 @@ export function parseObjcRNExterns(
   const className = remap?.[2] ?? plain?.[1] ?? null;
   if (!moduleName || !className) return results;
 
-  const lineOf = (idx: number): number => {
-    let line = 1;
-    for (let i = 0; i < idx && i < source.length; i++) if (source.charCodeAt(i) === 10) line++;
-    return line;
-  };
+  // From the text's newline index: counted from its start for each macro, a
+  // module of some thousand exported methods read itself that many times.
+  const lineOf = (idx: number): number => (idx > 0 ? lineAt(source, idx) : 1);
 
   const methodRegex = /RCT_EXTERN_METHOD\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)/g;
   let m: RegExpExecArray | null;

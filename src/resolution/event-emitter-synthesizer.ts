@@ -38,6 +38,7 @@ import type { MaybeYield } from './cooperative-yield';
 import { FN_KINDS } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 import { isManualMockHiddenFrom } from './name-matcher';
+import { nodesAroundLineIn, nodesNamedIn } from './nodes-around';
 
 /** `.on('e', handler)`: 1 the event; 2 an inline `function name`, or 3 `this.` and 4 a name. */
 const ON_RE = /\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*(?:function\s+(\w+)|(this\.)?(\w+))/g;
@@ -223,7 +224,7 @@ function textOf(facts: FileFacts, node: Pick<Node, 'startLine' | 'endLine'>): { 
 
 /** The function/method nodes whose lines contain `line`, innermost first. */
 function fnChain(nodes: readonly Node[], line: number): Node[] {
-  return nodes
+  return nodesAroundLineIn(nodes, line)
     .filter((n) => FN_KINDS.has(n.kind) && n.startLine <= line && (n.endLine ?? n.startLine) >= line)
     .sort((a, b) => b.startLine - a.startLine || (a.endLine ?? a.startLine) - (b.endLine ?? b.startLine));
 }
@@ -237,7 +238,7 @@ function handlerAt(env: Env, facts: FileFacts, m: RegExpExecArray, line: number,
   if (inline) {
     // `on('mount', function onmount(parent) {…})`: the function expression is its own node.
     const nameLine = lineOf(facts, m.index + m[0].length - inline.length);
-    return facts.nodes.find((n) => FN_KINDS.has(n.kind) && n.name === inline && n.startLine === nameLine) ?? null;
+    return nodesNamedIn(facts.nodes, inline).find((n) => FN_KINDS.has(n.kind) && n.name === inline && n.startLine === nameLine) ?? null;
   }
   const name = m[4]!;
   const viaThis = m[3] !== undefined;
@@ -259,7 +260,7 @@ function handlerAt(env: Env, facts: FileFacts, m: RegExpExecArray, line: number,
       if (bound) return ownMethod(env, facts, bound[1]!, chain.slice(i)) ?? resolvedReference(env, sources, `this.${bound[1]!}`, () => true);
       if (new RegExp(String.raw`\b(?:const|let|var)\s+${n}\s*=\s*(?:async\s+)?(?:function\b|\([^()]*\)\s*(?::[^=]*)?=>|[\w$]+\s*=>)|\bfunction\s*\*?\s*${n}\s*\(`).test(text)) {
         const end = fn.endLine ?? fn.startLine;
-        return facts.nodes.find((x) => x.kind === 'function' && x.name === name && x.startLine >= fn.startLine && (x.endLine ?? x.startLine) <= end) ?? null;
+        return nodesNamedIn(facts.nodes, name).find((x) => x.kind === 'function' && x.name === name && x.startLine >= fn.startLine && (x.endLine ?? x.startLine) <= end) ?? null;
       }
       const local = localBinding(text, name, '');
       if (local?.kind === 'import') break;
@@ -295,7 +296,7 @@ function resolvedReference(env: Env, sources: readonly string[], refName: string
 /** The nodes a reference at `line` can be attributed to: the enclosing functions, then whatever else spans the line, then the file. */
 function referenceSources(facts: FileFacts, line: number, chain: readonly Node[]): string[] {
   const ids = chain.map((n) => n.id);
-  for (const n of facts.nodes) {
+  for (const n of nodesAroundLineIn(facts.nodes, line)) {
     if (n.kind === 'file' || FN_KINDS.has(n.kind)) continue;
     if (n.startLine <= line && (n.endLine ?? n.startLine) >= line) ids.push(n.id);
   }
@@ -322,7 +323,7 @@ function fnRefsOf(env: Env, sourceId: string): Map<string, Edge[]> {
  * when it can't tell which.
  */
 function ownMethod(env: Env, facts: FileFacts, name: string, chain: readonly Node[]): Node | null | undefined {
-  const methods = facts.nodes.filter((n) => n.kind === 'method' && n.name === name);
+  const methods = nodesNamedIn(facts.nodes, name).filter((n) => n.kind === 'method' && n.name === name);
   if (methods.length === 0) return undefined;
   const owner = thisFunction(facts, chain);
   const cls = owner ? ownerClass(env, owner) : null;
@@ -343,7 +344,7 @@ function ownMethod(env: Env, facts: FileFacts, name: string, chain: readonly Nod
  * defines none.
  */
 function ownFunction(facts: FileFacts, name: string, line: number, chain: readonly Node[]): Node | null | undefined {
-  const local = facts.nodes.filter((n) => n.kind === 'function' && n.name === name);
+  const local = nodesNamedIn(facts.nodes, name).filter((n) => n.kind === 'function' && n.name === name);
   if (local.length <= 1) return local[0];
   const scope = chain[0]?.id ?? null;
   const inScope = local
@@ -538,7 +539,7 @@ function fieldClass(env: Env, owner: Node, field: string): Node | null {
   const content = env.ctx.readFile(owner.filePath);
   if (content) {
     const facts = fileFacts(env.ctx, owner.filePath, content);
-    const declared = facts.nodes.find((n) => (n.kind === 'property' || n.kind === 'field') && n.name === field &&
+    const declared = nodesNamedIn(facts.nodes, field).find((n) => (n.kind === 'property' || n.kind === 'field') && n.name === field &&
       n.startLine >= owner.startLine && (n.endLine ?? n.startLine) <= (owner.endLine ?? owner.startLine));
     if (declared) cls = classReferencedAt(env, owner.filePath, [declared.id], declared.startLine, null);
     if (!cls) {
@@ -671,13 +672,13 @@ function anonymousLocal(facts: FileFacts, site: Site, name: string): number | nu
   for (const offset of offsets) {
     if (offset >= site.index) break;
     const line = lineOf(facts, offset);
-    const inOther = facts.nodes.some((f) => FN_KINDS.has(f.kind) && f.startLine <= line && (f.endLine ?? f.startLine) >= line &&
+    const inOther = nodesAroundLineIn(facts.nodes, line).some((f) => FN_KINDS.has(f.kind) && f.startLine <= line && (f.endLine ?? f.startLine) >= line &&
       !site.chain.some((c) => c.id === f.id));
     if (!inOther) found = offset;
   }
   if (found === null) return null;
   const line = lineOf(facts, found);
-  const moduleLevel = facts.nodes.some((x) => (x.kind === 'constant' || x.kind === 'variable') && x.name === name && x.startLine === line);
+  const moduleLevel = nodesNamedIn(facts.nodes, name).some((x) => (x.kind === 'constant' || x.kind === 'variable') && x.name === name && x.startLine === line);
   return moduleLevel ? null : found;
 }
 
@@ -693,9 +694,9 @@ function moduleKeys(env: Env, facts: FileFacts, name: string, tail: string): rea
     const where = imported.module !== null ? `mod:${imported.module}` : `pkg:${imported.source}`;
     return [`${where}#${imported.exported}${suffix}`];
   }
-  const decl = facts.nodes.find((n) =>
+  const decl = nodesNamedIn(facts.nodes, name).find((n) =>
     (n.kind === 'constant' || n.kind === 'variable') && n.name === name &&
-    !facts.nodes.some((f) => FN_KINDS.has(f.kind) && f.startLine < n.startLine && (f.endLine ?? f.startLine) >= n.startLine));
+    !nodesAroundLineIn(facts.nodes, n.startLine).some((f) => FN_KINDS.has(f.kind) && f.startLine < n.startLine && (f.endLine ?? f.startLine) >= n.startLine));
   if (!decl) return null;
   const keys = [`bind:${facts.file}#${name}${suffix}`];
   for (const exported of exportNamesOf(env, facts, name)) keys.push(`mod:${facts.file}#${exported}${suffix}`);
@@ -751,10 +752,10 @@ function exportNamesOf(env: Env, facts: FileFacts, name: string): string[] {
  * (`const { WebSocket } = require('..')`), the project's only class of that name.
  */
 function classNamed(env: Env, facts: FileFacts, name: string, line: number): Node | null {
-  const spanning = facts.nodes.filter((n) => n.startLine <= line && (n.endLine ?? n.startLine) >= line).map((n) => n.id);
+  const spanning = nodesAroundLineIn(facts.nodes, line).filter((n) => n.startLine <= line && (n.endLine ?? n.startLine) >= line).map((n) => n.id);
   const bound = classReferencedAt(env, facts.file, spanning, line, name);
   if (bound) return bound;
-  const own = facts.nodes.filter((n) => CLASS_KINDS.has(n.kind) && n.name === name);
+  const own = nodesNamedIn(facts.nodes, name).filter((n) => CLASS_KINDS.has(n.kind) && n.name === name);
   if (own.length > 0) return own.length === 1 ? own[0]! : null;
   const imported = importedModule(env, facts, name);
   if (!imported || imported.module === null) return null;

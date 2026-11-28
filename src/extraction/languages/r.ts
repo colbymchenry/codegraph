@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
+import { getNodeText, getChildByField, namedChildrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
 
 /**
@@ -58,8 +58,7 @@ function calleeName(call: SyntaxNode, source: string): string | null {
 function firstArgValue(call: SyntaxNode): SyntaxNode | null {
   const args = getChildByField(call, 'arguments');
   if (!args) return null;
-  for (let i = 0; i < args.namedChildCount; i++) {
-    const arg = args.namedChild(i);
+  for (const arg of namedChildrenOf(args)) {
     if (arg?.type !== 'argument') continue;
     return getChildByField(arg, 'value');
   }
@@ -71,8 +70,7 @@ function literalOrIdentifier(node: SyntaxNode | null, source: string): string | 
   if (!node) return null;
   if (node.type === 'identifier') return getNodeText(node, source);
   if (node.type === 'string') {
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const c = node.namedChild(i);
+    for (const c of namedChildrenOf(node)) {
       if (c?.type === 'string_content') return getNodeText(c, source);
     }
     return ''; // empty string literal

@@ -8,6 +8,7 @@ import { Node } from '../../types';
 import { FrameworkResolver, FrameworkExtractionResult, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { lineAt } from '../synth-utils';
+import { nodesNamed } from '../nodes-around';
 
 /**
  * A `resources` line's `only:` / `except:` action list, written any way Rails
@@ -379,7 +380,7 @@ function resolveControllerAction(ctrlPath: string, action: string, context: Reso
   // Rails convention: `articles` → app/controllers/articles_controller.rb.
   const direct = `app/controllers/${ctrlPath}_controller.rb`;
   if (context.fileExists(direct)) {
-    const m = context.getNodesInFile(direct).find((n) => (n.kind === 'method' || n.kind === 'function') && n.name === action);
+    const m = nodesNamed(context, direct, action).find((n) => (n.kind === 'method' || n.kind === 'function') && n.name === action);
     if (m) return m.id;
   }
   // Fall back: controller class by name, then the action method in its file —
@@ -393,7 +394,7 @@ function resolveControllerAction(ctrlPath: string, action: string, context: Reso
   const own = ctrlPath.includes('/') ? all.filter((n) => ('/' + n.filePath).endsWith(suffix)) : [];
   const classes = own.length > 0 ? own : all;
   for (const ctrl of classes) {
-    const m = context.getNodesInFile(ctrl.filePath).find((n) => (n.kind === 'method' || n.kind === 'function') && n.name === action);
+    const m = nodesNamed(context, ctrl.filePath, action).find((n) => (n.kind === 'method' || n.kind === 'function') && n.name === action);
     if (m) return m.id;
   }
   return null;

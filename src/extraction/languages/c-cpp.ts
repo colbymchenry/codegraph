@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getChildByField, getNodeText } from '../tree-sitter-helpers';
+import { getChildByField, getNodeText, namedChildrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /** Per tree, by a parent's id: what cppExtractor.getVisibility found among its children. */
@@ -241,8 +241,7 @@ function findDeclaratorQualifiedId(declarator: SyntaxNode): SyntaxNode | undefin
   while (queue.length > 0) {
     const current = queue.shift()!;
     if (current.type === 'qualified_identifier') return current;
-    for (let i = 0; i < current.namedChildCount; i++) {
-      const child = current.namedChild(i);
+    for (const child of namedChildrenOf(current)) {
       // Don't descend into parameters, the trailing return type or the
       // clauses after them — `const std::string&`, `-> std::string`,
       // nlohmann/json's `noexcept(noexcept(JSONSerializer<U>::to_json(…)))`,
@@ -600,8 +599,7 @@ export const cExtractor: LanguageExtractor = {
     // to become the enum/struct node name. `typedef union { ... } name;` takes the
     // same route — otherwise the union body would mint a second, `<anonymous>` node
     // beside the alias.
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (!child) continue;
       if (child.type === 'enum_specifier' && getChildByField(child, 'body')) return 'enum';
       if (
@@ -3056,8 +3054,7 @@ export const cppExtractor: LanguageExtractor = {
   resolveTypeAliasKind: (node, _source) => {
     // C++ typedef: `typedef enum { ... } name;`, `typedef struct { ... } name;`,
     // or `typedef union { ... } name;` — see the C extractor.
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (!child) continue;
       if (child.type === 'enum_specifier' && getChildByField(child, 'body')) return 'enum';
       if (

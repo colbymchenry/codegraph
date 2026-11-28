@@ -23,6 +23,7 @@ import { Node } from '../../types';
 import { FrameworkResolver, ResolutionContext, ResolvedRef, UnresolvedRef } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { lineAt } from '../synth-utils';
+import { nodesNamedLower } from '../nodes-around';
 
 const ROUTES_FILE = /(?:^|\/)application\/(?:modules\/[^/]+\/)?config\/(?:[^/]+\/)?routes\.php$/;
 const CONTROLLER_FILE = /^(?:.*?\/)?(?:application\/controllers|modules\/([^/]+)\/controllers)\/(.+)\.php$/;
@@ -197,8 +198,8 @@ function methodOf(cls: Node, name: string, context: ResolutionContext): Node | n
       if (seen.has(type.id)) continue;
       seen.add(type.id);
       const prefix = `${type.qualifiedName}::`.toLowerCase();
-      const own = context.getNodesInFile(type.filePath).find(
-        (n) => n.kind === 'method' && n.name.toLowerCase() === lower && n.qualifiedName.toLowerCase().startsWith(prefix)
+      const own = nodesNamedLower(context, type.filePath, lower).find(
+        (n) => n.kind === 'method' && n.qualifiedName.toLowerCase().startsWith(prefix)
       );
       if (own) return own;
       for (const parent of context.getSupertypeNodes?.(type.id) ?? []) {
@@ -304,7 +305,7 @@ export const codeigniterResolver: FrameworkResolver = {
 
     if (name.startsWith(METHOD_REF)) {
       const [file, method] = name.slice(METHOD_REF.length).split('|');
-      return resolved(context.getNodesInFile(file!).find((n) => n.kind === 'method' && n.name === method), 0.95);
+      return resolved(method === undefined ? undefined : nodesNamedLower(context, file!, method.toLowerCase()).find((n) => n.kind === 'method' && n.name === method), 0.95);
     }
     if (name.startsWith(ROUTE_REF)) {
       const [root, handler] = name.slice(ROUTE_REF.length).split('|');

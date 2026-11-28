@@ -32,7 +32,7 @@
  */
 
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField } from './tree-sitter-helpers';
+import { getNodeText, getChildByField, namedChildrenOf, childrenOf } from './tree-sitter-helpers';
 import { pushAll } from '../utils';
 
 export interface FnRefCandidate {
@@ -708,8 +708,7 @@ function normalizeSpecial(
     // nothing.
     case 'navigation_expression': {
       if (!getNodeText(node, source).startsWith('this::')) return [];
-      for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
+      for (const child of namedChildrenOf(node)) {
         if (child && child.type === 'navigation_suffix' && getNodeText(child, source).startsWith('::')) {
           const id = child.namedChild(child.namedChildCount - 1);
           if (id) return [{ name: `this.${getNodeText(id, source)}`, node: id }];
@@ -862,8 +861,7 @@ function normalizeSpecial(
 
 /** Content of a PHP string literal node (single- or double-quoted). */
 function phpStringContent(node: SyntaxNode, source: string): string | null {
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of namedChildrenOf(node)) {
     if (child?.type === 'string_content') return getNodeText(child, source).trim();
   }
   return null;
@@ -961,8 +959,7 @@ export function goLocalBindings(
       if (names.has(name)) out.add(`${unit.id}|${name}`);
     };
     const declares = (n: SyntaxNode): boolean => {
-      for (let i = 0; i < n.childCount; i++) {
-        const c = n.child(i);
+      for (const c of childrenOf(n)) {
         if (c && !c.isNamed && c.type === ':=') return true;
       }
       return false;

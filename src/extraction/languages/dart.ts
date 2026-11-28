@@ -1,6 +1,6 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import type { UnresolvedReference } from '../../types';
-import { getNodeText, BUILTIN_TYPE_NAMES } from '../tree-sitter-helpers';
+import { getNodeText, BUILTIN_TYPE_NAMES, childrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /**
@@ -51,8 +51,7 @@ export function pushDartTypeRefs(
  */
 export function dartTypeAliasName(node: SyntaxNode): SyntaxNode | undefined {
   let name: SyntaxNode | undefined;
-  for (let i = 0; i < node.childCount; i++) {
-    const child = node.child(i);
+  for (const child of childrenOf(node)) {
     if (!child || child.type === '=' || child.type === 'type_parameters' || child.type === 'formal_parameter_list') break;
     if (child.type === 'type_identifier') name = child;
   }
@@ -956,8 +955,7 @@ export const dartExtractor: LanguageExtractor = {
     // In Dart, 'async' is on the function_body (next sibling), not the signature
     const nextSibling = node.nextNamedSibling;
     if (nextSibling?.type === 'function_body') {
-      for (let i = 0; i < nextSibling.childCount; i++) {
-        const child = nextSibling.child(i);
+      for (const child of childrenOf(nextSibling)) {
         if (child?.type === 'async') return true;
       }
     }
@@ -966,8 +964,7 @@ export const dartExtractor: LanguageExtractor = {
   isStatic: (node) => {
     // For method_signature, check for 'static' child
     if (node.type === 'method_signature') {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
+      for (const child of childrenOf(node)) {
         if (child?.type === 'static') return true;
       }
     }

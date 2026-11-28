@@ -19,6 +19,7 @@ import { Node } from '../../types';
 import { FrameworkResolver, ResolutionContext, ResolvedRef, UnresolvedRef } from '../types';
 import { isPlayRoutesFile } from '../../extraction/grammars';
 import { isJavaOutsideImport, retargetSelfOverload } from '../name-matcher';
+import { nodesNamed } from '../nodes-around';
 
 const ROUTE_LINE = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)\s+(.+)$/;
 const METHOD_KINDS = new Set(['method', 'function']);
@@ -74,7 +75,7 @@ export const playResolver: FrameworkResolver = {
       const members = new Map<string, Node>();
       for (const cls of group) {
         const memberQn = `${cls.qualifiedName}::${methodName}`;
-        for (const n of context.getNodesInFile(cls.filePath)) {
+        for (const n of nodesNamed(context, cls.filePath, methodName)) {
           if (METHOD_KINDS.has(n.kind) && n.name === methodName && n.qualifiedName === memberQn) members.set(n.id, n);
         }
       }

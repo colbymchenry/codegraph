@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText } from '../tree-sitter-helpers';
+import { getNodeText, childrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /**
@@ -15,8 +15,7 @@ export function ensureTrailingNewline(source: string): string {
 
 /** Case-insensitive member-modifier scan (VB keywords are case-insensitive). */
 function hasModifier(node: SyntaxNode, re: RegExp): boolean {
-  for (let i = 0; i < node.childCount; i++) {
-    const child = node.child(i);
+  for (const child of childrenOf(node)) {
     if (child?.type === 'member_modifier' && re.test(child.text)) return true;
   }
   return false;

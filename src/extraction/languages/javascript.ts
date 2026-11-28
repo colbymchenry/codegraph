@@ -1,4 +1,4 @@
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
+import { getNodeText, getChildByField, namedChildrenOf, childrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 import { classifyTsClassMember, hasStaticModifier } from './typescript';
 
@@ -37,8 +37,7 @@ export const javascriptExtractor: LanguageExtractor = {
     // Also handles wrapper patterns like: field = throttle((e) => { ... })
     //   field_definition → call_expression → arguments → arrow_function → body
     if (node.type === 'field_definition') {
-      for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
+      for (const child of namedChildrenOf(node)) {
         if (!child) continue;
         if (child.type === 'arrow_function' || child.type === 'function_expression') {
           return getChildByField(child, bodyField);
@@ -46,8 +45,7 @@ export const javascriptExtractor: LanguageExtractor = {
         if (child.type === 'call_expression') {
           const args = getChildByField(child, 'arguments');
           if (args) {
-            for (let j = 0; j < args.namedChildCount; j++) {
-              const arg = args.namedChild(j);
+            for (const arg of namedChildrenOf(args)) {
               if (arg && (arg.type === 'arrow_function' || arg.type === 'function_expression')) {
                 return getChildByField(arg, bodyField);
               }
@@ -72,8 +70,7 @@ export const javascriptExtractor: LanguageExtractor = {
     return false;
   },
   isAsync: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'async') return true;
     }
     return false;
@@ -83,8 +80,7 @@ export const javascriptExtractor: LanguageExtractor = {
   isStatic: hasStaticModifier,
   isConst: (node) => {
     if (node.type === 'lexical_declaration') {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
+      for (const child of childrenOf(node)) {
         if (child?.type === 'const') return true;
       }
     }

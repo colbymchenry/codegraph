@@ -1,11 +1,10 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText } from '../tree-sitter-helpers';
+import { getNodeText, childrenOf, namedChildrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /** The visibility a Kotlin declaration's `modifiers` child spells out; public by default. */
-function kotlinVisibility(node: { childCount: number; child(i: number): { type: string; text: string } | null }): 'public' | 'private' | 'protected' | 'internal' {
-  for (let i = 0; i < node.childCount; i++) {
-    const child = node.child(i);
+function kotlinVisibility(node: SyntaxNode): 'public' | 'private' | 'protected' | 'internal' {
+  for (const child of childrenOf(node)) {
     if (child?.type === 'modifiers') {
       const text = child.text;
       if (text.includes('public')) return 'public';
@@ -31,8 +30,7 @@ const KOTLIN_NON_CLASS_RETURN = new Set(['Unit', 'Nothing']);
  */
 function extractKotlinReturnType(node: SyntaxNode, source: string): string | undefined {
   let seenParams = false;
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of namedChildrenOf(node)) {
     if (!child) continue;
     if (child.type === 'function_value_parameters') {
       seenParams = true;
@@ -153,8 +151,7 @@ function kotlinFollowingAccessors(node: SyntaxNode): SyntaxNode[] {
 /** The named child right after the first `token` child of `node`, if any. */
 function namedChildAfter(node: SyntaxNode, token: string): SyntaxNode | null {
   let seen = false;
-  for (let i = 0; i < node.childCount; i++) {
-    const c = node.child(i);
+  for (const c of childrenOf(node)) {
     if (!c) continue;
     if (!c.isNamed) {
       if (c.type === token) seen = true;
@@ -431,11 +428,9 @@ export const kotlinExtractor: LanguageExtractor = {
     // an ERROR child — direct simple_identifier children are the misparsed method name.
     let nameText: string | null = null;
     if (node.type === 'function_declaration') {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
+      for (const child of childrenOf(node)) {
         if (child && child.type === 'ERROR') {
-          for (let j = 0; j < child.childCount; j++) {
-            const gc = child.child(j);
+          for (const gc of childrenOf(child)) {
             if (gc && gc.type === 'simple_identifier') {
               nameText = gc.text;
               break;
@@ -447,8 +442,7 @@ export const kotlinExtractor: LanguageExtractor = {
     }
     // Fallback: direct simple_identifier child (Pattern 1: ERROR node at top level)
     if (!nameText) {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
+      for (const child of childrenOf(node)) {
         if (child && child.type === 'simple_identifier') {
           nameText = child.text;
           break;
@@ -495,8 +489,7 @@ export const kotlinExtractor: LanguageExtractor = {
     // misparsed the parent's body as an ERROR node (starting with `{`) and creates
     // a class_body sibling for the nested interface's body. Prefer the ERROR body
     // so the parent's methods are extracted.
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (child && child.type === 'ERROR') {
         const firstChild = child.child(0);
         if (firstChild && firstChild.type === '{') {
@@ -516,8 +509,7 @@ export const kotlinExtractor: LanguageExtractor = {
     //   interface Foo { }       → has 'interface' keyword child
     //   enum class Level { }    → has 'enum' keyword child
     //   class / data class / abstract class → default 'class'
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (!child) continue;
       if (child.type === 'interface') return 'interface';
       if (child.type === 'enum') return 'enum';
@@ -529,8 +521,7 @@ export const kotlinExtractor: LanguageExtractor = {
     // AST: function_declaration > receiver_type > user_type, then ".", simple_identifier.
     // Only a plain user_type receiver counts (a nullable or function-type one
     // gives none), and a qualified one names its FIRST type_identifier.
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (!child) continue;
       if (child.type === 'receiver_type') {
         const userType = child.namedChildren.find((c: SyntaxNode) => c.type === 'user_type');
@@ -550,8 +541,7 @@ export const kotlinExtractor: LanguageExtractor = {
     // child, then the type node that follows it before the body.
     let params: SyntaxNode | null = null;
     let returnType: SyntaxNode | null = null;
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (!child) continue;
       if (child.type === 'function_value_parameters') {
         params = child;
@@ -578,8 +568,7 @@ export const kotlinExtractor: LanguageExtractor = {
   },
   isAsync: (node) => {
     // Kotlin uses suspend keyword for coroutines
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'modifiers' && child.text.includes('suspend')) {
         return true;
       }

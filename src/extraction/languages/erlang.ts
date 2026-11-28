@@ -4,6 +4,7 @@ import {
   getChildByField,
   getPrecedingDocstring,
   namedArgCount,
+  namedChildrenOf,
 } from '../tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
 
@@ -72,8 +73,7 @@ function moduleExports(node: SyntaxNode, source: string, filePath: string): Set<
   let root: SyntaxNode = node;
   while (root.parent) root = root.parent;
   let result: Set<string> | 'all' = new Set<string>();
-  for (let i = 0; i < root.namedChildCount; i++) {
-    const form = root.namedChild(i);
+  for (const form of namedChildrenOf(root)) {
     if (!form) continue;
     if (
       form.type === 'compile_options_attribute' &&

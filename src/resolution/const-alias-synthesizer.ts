@@ -36,6 +36,7 @@ import { declarationText, initializerAt } from './frameworks/react';
 import { isStatedDefaultExport } from './import-resolver';
 import { resolveObjectLiteralBinding, resolveObjectLiteralMember } from './name-matcher';
 import { FN_KINDS } from './synth-utils';
+import { nodesNamed } from './nodes-around';
 
 const ALIAS_KINDS = ['constant', 'variable'] as const;
 const ALIAS_LANGUAGES = ['typescript', 'javascript', 'tsx', 'jsx'];
@@ -173,7 +174,7 @@ function initializerOf(value: Node, ctx: ResolutionContext): string | null {
 
 /** What `file` declares as `name` at its own top level. */
 function ownBinding(name: string, file: string, ctx: ResolutionContext): Node | undefined {
-  return (ctx.getNodesInFileNamed?.(file, name) ?? ctx.getNodesInFile(file).filter((n) => n.name === name))
+  return (ctx.getNodesInFileNamed?.(file, name) ?? nodesNamed(ctx, file, name).filter((n) => n.name === name))
     .find((n) => n.qualifiedName === name && BINDING_KINDS.has(n.kind));
 }
 

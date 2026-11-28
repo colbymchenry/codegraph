@@ -28,7 +28,7 @@
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 import { escapeRegExp, maxOf } from '../utils';
-import { nodesAroundLine } from './nodes-around';
+import { nodesAroundLine, nodesNamed } from './nodes-around';
 
 const TYPE_KINDS: ReadonlySet<Node['kind']> = new Set<Node['kind']>(['class', 'struct', 'enum', 'interface', 'protocol', 'type_alias']);
 
@@ -324,7 +324,7 @@ function fitsPath(node: Node, path: string, context: ResolutionContext): boolean
   // level — the grammar ends `enum NIOBSDSocket {` at an `#if` right inside
   // it, so `typealias Handle` loses its parent. It still shares a file with a
   // declaration or extension of the parent the site names.
-  if (context.getNodesInFile(node.filePath).some((p) => p.name === parentName && TYPE_KINDS.has(p.kind) && p.id !== node.id)) return true;
+  if (nodesNamed(context, node.filePath, parentName).some((p) => p.name === parentName && TYPE_KINDS.has(p.kind) && p.id !== node.id)) return true;
   // `App.Build`: a top-level type under a qualifier that names no type — a module.
   return !head.includes('::') && !context.getNodesByName(head).some((n) => n.language === 'swift' && TYPE_KINDS.has(n.kind));
 }

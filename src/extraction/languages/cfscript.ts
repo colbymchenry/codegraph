@@ -1,11 +1,10 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
+import { getNodeText, getChildByField, childrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /** CFML access modifiers (`public`/`private`/`package`/`remote`) on a function_declaration. */
 function cfmlVisibility(node: SyntaxNode): 'public' | 'private' | 'protected' | 'internal' | undefined {
-  for (let i = 0; i < node.childCount; i++) {
-    const child = node.child(i);
+  for (const child of childrenOf(node)) {
     if (child?.type === 'access_type') {
       const text = child.text;
       if (text === 'public') return 'public';

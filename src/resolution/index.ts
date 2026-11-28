@@ -82,6 +82,7 @@ import { isTestPath } from '../search/query-utils';
 import { JS_BUILT_INS } from './js-builtins';
 import { builtinModules } from 'module';
 import { parse as parseJsonc } from 'jsonc-parser';
+import { nodesNamed } from './nodes-around';
 
 const NODE_BUILTINS = new Set(builtinModules);
 
@@ -538,6 +539,8 @@ export class ReferenceResolver {
   private nodesByKindCache = new Map<Node['kind'], Node[]>();
   // Filesystem existence probes behind context.fileExists (paths not in knownFiles).
   private fileExistsMemo = new Map<string, boolean>();
+  /** By file and needle, whether the file holds the needle (fileContains); dropped with the content cache. */
+  private fileContainsMemo = new Map<string, boolean>();
   private knownNames: Set<string> | null = null; // all known symbol names for fast pre-filtering
   private knownFiles: Set<string> | null = null;
   private cachesWarmed = false;
@@ -847,6 +850,7 @@ export class ReferenceResolver {
     this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
+    this.fileContainsMemo.clear();
     this.manifestScopes.clear();
     this.installedPackages.clear();
     this.directoryListings.clear();
@@ -958,6 +962,18 @@ export class ReferenceResolver {
    * unchanged, and decoding is most of reading a file nobody keeps.
    */
   private fileContains(filePath: string, needle: string): boolean {
+    // Asked once for a file and a needle: a reference through a module's
+    // default import asks whether the module's file says `module.exports`,
+    // and a file that does not was read to its end for each such reference.
+    const key = `${filePath}\0${needle}`;
+    const known = this.fileContainsMemo.get(key);
+    if (known !== undefined) return known;
+    const contains = this.fileContainsNow(filePath, needle);
+    this.fileContainsMemo.set(key, contains);
+    return contains;
+  }
+
+  private fileContainsNow(filePath: string, needle: string): boolean {
     if (this.fileCache.has(filePath)) return this.fileCache.get(filePath)?.includes(needle) ?? false;
     const fullPath = path.join(this.projectRoot, filePath);
     try {
@@ -5214,8 +5230,7 @@ export class ReferenceResolver {
    * first by position; null when the file declares none.
    */
   private sameNamedValueOfType(type: Node): Node | null {
-    return this.context
-      .getNodesInFile(type.filePath)
+    return nodesNamed(this.context, type.filePath, type.name)
       .filter((n) => n.name === type.name && TYPE_COMPANION_VALUE_KINDS.has(n.kind))
       .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0] ?? null;
   }
@@ -5223,8 +5238,7 @@ export class ReferenceResolver {
   private sameNamedTypeOfValue(value: Node): Node | null {
     if (value.kind !== 'constant' && value.kind !== 'variable') return null;
     if (value.language !== 'typescript' && value.language !== 'tsx') return null;
-    const types = this.context
-      .getNodesInFile(value.filePath)
+    const types = nodesNamed(this.context, value.filePath, value.name)
       .filter((n) => n.name === value.name && isSupertypeTarget(n));
     return types.length === 1 ? types[0]! : null;
   }

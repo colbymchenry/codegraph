@@ -47,6 +47,7 @@ import {
   retargetSelfOverload,
 } from './name-matcher';
 import { JS_ARRAY_METHODS } from './js-builtins';
+import { nodesNamed } from './nodes-around';
 
 /**
  * Extension resolution order by language
@@ -346,7 +347,7 @@ function moduleBindingsFirst(filePath: string, nodes: Node[]): Node[] {
 
 /** The file's nodes named `name`, in `getNodesInFile` order. */
 function nodesInFileNamed(filePath: string, name: string, context: ResolutionContext): Node[] {
-  return context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name);
+  return context.getNodesInFileNamed?.(filePath, name) ?? nodesNamed(context, filePath, name).filter((n) => n.name === name);
 }
 
 /**
@@ -3239,7 +3240,7 @@ function typesFirst(a: Node, b: Node): number {
 function declarationsIn(file: string, scope: string[], name: string, context: ResolutionContext): Node[] {
   const blocks = namespaceBlocks(file, context);
   const want = scope.join('.');
-  return (context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file).filter((n) => n.name === name))
+  return (context.getNodesInFileNamed?.(file, name) ?? nodesNamed(context, file, name).filter((n) => n.name === name))
     .filter((n) => n.qualifiedName === name && MEMBER_DECLARATION_KINDS.has(n.kind) && (innermostBlock(n, blocks)?.path ?? '') === want)
     .sort(typesFirst);
 }

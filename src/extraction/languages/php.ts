@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
+import { getNodeText, getChildByField, childrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 // include / require (+ _once) expression node types. These carry the
@@ -328,8 +328,7 @@ export const phpExtractor: LanguageExtractor = {
     return node.type === 'trait_declaration' ? 'trait' : 'class';
   },
   getVisibility: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'visibility_modifier') {
         const text = child.text;
         if (text === 'public') return 'public';
@@ -340,8 +339,7 @@ export const phpExtractor: LanguageExtractor = {
     return 'public'; // PHP defaults to public
   },
   isStatic: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'static_modifier') return true;
     }
     return false;

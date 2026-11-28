@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
+import { getNodeText, getChildByField, namedChildrenOf, childrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /**
@@ -13,8 +13,7 @@ import type { LanguageExtractor } from '../tree-sitter-types';
  */
 function extractSwiftReturnType(node: SyntaxNode, source: string): string | undefined {
   let seenName = false;
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of namedChildrenOf(node)) {
     if (!child) continue;
     if (child.type === 'simple_identifier' && !seenName) {
       seenName = true;
@@ -132,8 +131,7 @@ export const swiftExtractor: LanguageExtractor = {
   },
   getVisibility: (node) => {
     // Check for visibility modifiers in Swift
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'modifiers') {
         const text = child.text;
         if (text.includes('public')) return 'public';
@@ -145,8 +143,7 @@ export const swiftExtractor: LanguageExtractor = {
     return 'internal'; // Swift defaults to internal
   },
   isStatic: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'modifiers') {
         if (child.text.includes('static') || child.text.includes('class')) {
           return true;
@@ -157,16 +154,14 @@ export const swiftExtractor: LanguageExtractor = {
   },
   classifyClassNode: (node) => {
     // Swift uses class_declaration for classes, structs, and enums
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'struct') return 'struct';
       if (child?.type === 'enum') return 'enum';
     }
     return 'class';
   },
   isAsync: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'modifiers' && child.text.includes('async')) {
         return true;
       }

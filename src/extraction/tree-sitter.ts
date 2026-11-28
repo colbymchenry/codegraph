@@ -16,7 +16,7 @@ import {
   UnresolvedReference,
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
-import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring, BUILTIN_TYPE_NAMES, namedArgCount } from './tree-sitter-helpers';
+import { NodeIdAllocator, getNodeText, getChildByField, getPrecedingDocstring, BUILTIN_TYPE_NAMES, namedArgCount, namedChildrenOf, childrenOf } from './tree-sitter-helpers';
 import { FN_REF_SPECS, captureFnRefCandidates, goScopedFnRefScopes, type FnRefSpec, type FnRefCandidate } from './function-ref';
 import { isGeneratedFile, isMinifiedContent } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
@@ -172,8 +172,7 @@ function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExt
 
   // For Dart method_signature, look inside inner signature types
   if (node.type === 'method_signature') {
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (child && (
         child.type === 'function_signature' ||
         child.type === 'getter_signature' ||
@@ -182,8 +181,7 @@ function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExt
         child.type === 'factory_constructor_signature'
       )) {
         // Find identifier inside the inner signature
-        for (let j = 0; j < child.namedChildCount; j++) {
-          const inner = child.namedChild(j);
+        for (const inner of namedChildrenOf(child)) {
           if (inner?.type === 'identifier') {
             return getNodeText(inner, source);
           }
@@ -201,8 +199,7 @@ function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExt
   }
 
   // Fall back to first identifier child
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of namedChildrenOf(node)) {
     if (
       child &&
       (child.type === 'identifier' ||
@@ -890,6 +887,13 @@ export class TreeSitterExtractor {
   private source: string;
   private tree: Tree | null = null;
   private nodes: Node[] = [];
+  /**
+   * The file's nodes by id, the first of an id as `nodes.find` finds it. A
+   * member's qualified name is built from the ids on the stack above it, and
+   * each was looked for among all the nodes extracted so far: a file of
+   * fourteen thousand small classes went through them for every member.
+   */
+  private nodesById = new Map<string, Node>();
   private nodeIds = new NodeIdAllocator();
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
@@ -1115,6 +1119,7 @@ export class TreeSitterExtractor {
       const fileDocstring = this.extractor?.getBodyDocstring?.(this.tree.rootNode, this.source);
       if (fileDocstring) fileNode.docstring = fileDocstring;
       this.nodes.push(fileNode);
+      if (!this.nodesById.has(fileNode.id)) this.nodesById.set(fileNode.id, fileNode);
 
       // Push file node onto stack so top-level declarations get contains edges
       this.nodeStack.push(fileNode.id);
@@ -1580,7 +1585,7 @@ export class TreeSitterExtractor {
     const written = getNodeText(object, this.source);
     const qualifier = written.slice(written.lastIndexOf('.') + 1).trim();
     if (qualifier === 'this') return false;
-    const segments = this.nodes.find((d) => d.id === targetId)?.qualifiedName.split('::') ?? [];
+    const segments = this.nodesById.get(targetId)?.qualifiedName.split('::') ?? [];
     return segments[segments.length - 2] !== qualifier;
   }
 
@@ -1729,7 +1734,7 @@ export class TreeSitterExtractor {
       const nsName = this.extractor.extractPackage?.(node, this.source);
       if (nsName) {
         const topId = this.nodeStack[this.nodeStack.length - 1];
-        const top = this.nodes.find((n) => n.id === topId);
+        const top = topId === undefined ? undefined : this.nodesById.get(topId);
         const outer = top?.kind === 'namespace' ? top : null;
         if (outer) this.nodeStack.pop();
         const ns = this.createNode('namespace', outer ? `${outer.name}.${nsName}` : nsName, node);
@@ -2188,6 +2193,7 @@ export class TreeSitterExtractor {
     }
 
     this.nodes.push(newNode);
+    if (!this.nodesById.has(newNode.id)) this.nodesById.set(newNode.id, newNode);
     if (this.language === 'pascal' && node.type === 'declProc' && (kind === 'method' || kind === 'function')) {
       this.indexPascalRoutine(newNode, node);
     }
@@ -2217,8 +2223,7 @@ export class TreeSitterExtractor {
    * Used to locate inner type nodes (e.g. enum_specifier inside a typedef).
    */
   private findChildByTypes(node: SyntaxNode, types: string[]): SyntaxNode | null {
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (child && types.includes(child.type)) return child;
     }
     return null;
@@ -2235,8 +2240,7 @@ export class TreeSitterExtractor {
     if (!types || types.length === 0 || !this.extractor?.extractPackage) return null;
 
     let pkgNode: SyntaxNode | null = null;
-    for (let i = 0; i < rootNode.namedChildCount; i++) {
-      const child = rootNode.namedChild(i);
+    for (const child of namedChildrenOf(rootNode)) {
       if (child && types.includes(child.type)) {
         pkgNode = child;
         break;
@@ -2305,7 +2309,7 @@ export class TreeSitterExtractor {
         parts.splice(0, parts.length, pathOwner);
         continue;
       }
-      const node = this.nodes.find((n) => n.id === nodeId);
+      const node = this.nodesById.get(nodeId);
       if (node && node.kind !== 'file') {
         parts.push(node.name);
       }
@@ -2350,7 +2354,7 @@ export class TreeSitterExtractor {
     if (this.nodeStack.length === 0) return false;
     const parentId = this.nodeStack[this.nodeStack.length - 1];
     if (!parentId) return false;
-    const parentNode = this.nodes.find((n) => n.id === parentId);
+    const parentNode = this.nodesById.get(parentId);
     if (!parentNode) return false;
     return (
       parentNode.kind === 'class' ||
@@ -2661,8 +2665,7 @@ export class TreeSitterExtractor {
     const args = getChildByField(valueNode, 'arguments');
     let inner: SyntaxNode | null = null;
     if (args) {
-      for (let i = 0; i < args.namedChildCount; i++) {
-        const a = args.namedChild(i);
+      for (const a of namedChildrenOf(args)) {
         if (a && (a.type === 'arrow_function' || a.type === 'function_expression')) {
           inner = a;
           break;
@@ -3563,8 +3566,7 @@ export class TreeSitterExtractor {
   /** `value` when it is an object literal that owns at least one function member, else null. */
   private ownedObjectValue(value: SyntaxNode | null): SyntaxNode | null {
     if (!value || (value.type !== 'object' && value.type !== 'object_expression') || !this.ownsObjectLiterals()) return null;
-    for (let i = 0; i < value.namedChildCount; i++) {
-      const member = value.namedChild(i);
+    for (const member of namedChildrenOf(value)) {
       if (member && this.ownedMemberFunction(member)) return value;
     }
     return null;
@@ -3820,8 +3822,7 @@ export class TreeSitterExtractor {
     if (depth > 4) return null;
     const args = getChildByField(callNode, 'arguments');
     if (!args) return null;
-    for (let i = 0; i < args.namedChildCount; i++) {
-      const arg = args.namedChild(i);
+    for (const arg of namedChildrenOf(args)) {
       if (!arg) continue;
       if (arg.type === 'arrow_function' || arg.type === 'function_expression') {
         const obj = this.functionReturnedObject(arg);
@@ -3858,8 +3859,7 @@ export class TreeSitterExtractor {
     if (direct) return direct;
     // `(set, get) => { return {...} }` — scan top-level return statements.
     if (body.type === 'statement_block') {
-      for (let i = 0; i < body.namedChildCount; i++) {
-        const stmt = body.namedChild(i);
+      for (const stmt of namedChildrenOf(body)) {
         if (stmt?.type !== 'return_statement') continue;
         for (let j = 0; j < stmt.namedChildCount; j++) {
           const obj = asObject(stmt.namedChild(j));
@@ -3890,11 +3890,9 @@ export class TreeSitterExtractor {
     if (calleeName !== 'createApi' && calleeName !== 'injectEndpoints') return null;
     const args = getChildByField(callNode, 'arguments');
     if (!args) return null;
-    for (let i = 0; i < args.namedChildCount; i++) {
-      const arg = args.namedChild(i);
+    for (const arg of namedChildrenOf(args)) {
       if (arg?.type !== 'object' && arg?.type !== 'object_expression') continue;
-      for (let j = 0; j < arg.namedChildCount; j++) {
-        const member = arg.namedChild(j);
+      for (const member of namedChildrenOf(arg)) {
         // Two equally-common spellings: `endpoints: build => ({...})` (pair with an
         // arrow value) and `endpoints(build) { return {...} }` (method shorthand).
         if (member?.type === 'pair') {
@@ -3960,8 +3958,7 @@ export class TreeSitterExtractor {
   private rtkEndpointHandler(callNode: SyntaxNode): SyntaxNode | null {
     const args = getChildByField(callNode, 'arguments');
     if (!args) return null;
-    for (let i = 0; i < args.namedChildCount; i++) {
-      const arg = args.namedChild(i);
+    for (const arg of namedChildrenOf(args)) {
       if (arg?.type !== 'object' && arg?.type !== 'object_expression') continue;
       let queryFn: SyntaxNode | null = null;
       let query: SyntaxNode | null = null;
@@ -4039,8 +4036,7 @@ export class TreeSitterExtractor {
    *  actions) from a Pinia SETUP store's all-shorthand `return { foo, bar }`
    *  (whose functions are body-local consts, walked normally instead). */
   private objectHasInlineFunctions(obj: SyntaxNode): boolean {
-    for (let i = 0; i < obj.namedChildCount; i++) {
-      const member = obj.namedChild(i);
+    for (const member of namedChildrenOf(obj)) {
       if (member?.type === 'method_definition') return true;
       if (member?.type === 'pair') {
         const v = getChildByField(member, 'value');
@@ -4113,8 +4109,7 @@ export class TreeSitterExtractor {
     if (!callee || callee.type !== 'identifier' || getNodeText(callee, this.source) !== 'defineStore') return null;
     const args = getChildByField(callNode, 'arguments');
     if (!args) return null;
-    for (let i = 0; i < args.namedChildCount; i++) {
-      const arg = args.namedChild(i);
+    for (const arg of namedChildrenOf(args)) {
       if (arg?.type !== 'arrow_function' && arg?.type !== 'function_expression') continue;
       const body = getChildByField(arg, 'body');
       if (body?.type === 'statement_block') return arg; // block body ⇒ setup form
@@ -4177,8 +4172,7 @@ export class TreeSitterExtractor {
         this.language === 'arkts') {
       // Handle lexical_declaration and variable_declaration
       // These contain one or more variable_declarator children
-      for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
+      for (const child of namedChildrenOf(node)) {
         if (child?.type === 'variable_declarator') {
           const nameNode = getChildByField(child, 'name');
           const valueNode = getChildByField(child, 'value');
@@ -4507,8 +4501,7 @@ export class TreeSitterExtractor {
       // block-local). C allows several declarators per declaration
       // (`int a = 1, b = 2;`), so iterate them.
       if (!hasFunctionAncestor(node)) {
-        for (let i = 0; i < node.namedChildCount; i++) {
-          const child = node.namedChild(i);
+        for (const child of namedChildrenOf(node)) {
           if (!child) continue;
           // Accept only `init_declarator` (has a value) and pointer/array
           // declarators. A *bare* `identifier` declarator is deliberately
@@ -4993,8 +4986,7 @@ export class TreeSitterExtractor {
   private isTsFunctionTypedProperty(propertySignature: SyntaxNode): boolean {
     const typeAnno = getChildByField(propertySignature, 'type');
     if (!typeAnno) return false;
-    for (let i = 0; i < typeAnno.namedChildCount; i++) {
-      const inner = typeAnno.namedChild(i);
+    for (const inner of namedChildrenOf(typeAnno)) {
       if (inner && inner.type === 'function_type') return true;
     }
     return false;
@@ -5966,8 +5958,9 @@ export class TreeSitterExtractor {
             column: node.startPosition.column,
           });
         }
-        for (let i = 0; i < node.childCount; i++) {
-          const child = node.child(i);
+        let i = -1;
+        for (const child of childrenOf(node)) {
+          i++;
           if (!child || child.type !== 'property_identifier') continue;
           emitAttr(child);
           if (/^on[A-Z]/.test(getNodeText(child, this.source))) {
@@ -6179,8 +6172,8 @@ export class TreeSitterExtractor {
         // (the most common form: `addObject:`, `storeImage:`, …) was named
         // without the colon and never matched its `storeImage:` method.
         let hasColon = false;
-        for (let i = 0; i < node.childCount; i++) {
-          if (node.child(i)?.type === ':') { hasColon = true; break; }
+        for (const child of childrenOf(node)) {
+          if (child.type === ':') { hasColon = true; break; }
         }
         const methodName: string = hasColon
           ? methodKeywords.map((k) => `${k}:`).join('')
@@ -6229,8 +6222,8 @@ export class TreeSitterExtractor {
               }
             }
             let innerColon = false;
-            for (let i = 0; i < receiverField.childCount; i++) {
-              if (receiverField.child(i)?.type === ':') { innerColon = true; break; }
+            for (const child of childrenOf(receiverField)) {
+              if (child.type === ':') { innerColon = true; break; }
             }
             const innerSelector = innerColon ? innerKw.map((k) => `${k}:`).join('') : innerKw[0];
             calleeName = innerSelector ? `${innerRecvName}.${innerSelector}().${methodName}` : methodName;
@@ -6279,8 +6272,7 @@ export class TreeSitterExtractor {
       // tracked separately (#1258).
       if (this.language === 'cpp' && func) {
         let operatorName = '';
-        for (let i = 0; i < node.namedChildCount; i++) {
-          const child = node.namedChild(i);
+        for (const child of namedChildrenOf(node)) {
           if (child?.type !== 'ERROR') continue;
           const op = child.namedChildren.find((c: SyntaxNode) => c.type === 'operator_name');
           if (op) { operatorName = getNodeText(op, this.source); break; }
@@ -6955,8 +6947,7 @@ export class TreeSitterExtractor {
     }
     let instantiates = false;
     const arities: number[] = [];
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (!child) continue;
       if (child.type === 'storage_class_specifier' && getNodeText(child, this.source) === 'extern') return none;
       if (child.type === 'identifier' || child.type === 'array_declarator') {
@@ -7257,8 +7248,7 @@ export class TreeSitterExtractor {
    * node so the caller can walk it as the anon class's members.
    */
   private findAnonymousClassBody(node: SyntaxNode): SyntaxNode | null {
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       // Java: `class_body`. C# uses the same node kind.
       if (child && (child.type === 'class_body' || child.type === 'declaration_list')) {
         return child;
@@ -7416,7 +7406,7 @@ export class TreeSitterExtractor {
         const attribute = sibling.namedChild(0);
         const name = attribute?.namedChild(0)?.text.replace(/\s/g, '');
         if (name === 'tauri::command') {
-          const decorated = this.nodes.find(n => n.id === decoratedId);
+          const decorated = this.nodesById.get(decoratedId);
           if (decorated) decorated.decorators = ['tauri::command'];
           break;
         }
@@ -7461,8 +7451,7 @@ export class TreeSitterExtractor {
       // Find the leading identifier: skip the `@` punct, unwrap
       // a call_expression if the decorator is invoked with args.
       let target: SyntaxNode | null = null;
-      for (let i = 0; i < n.namedChildCount; i++) {
-        const child = n.namedChild(i);
+      for (const child of namedChildrenOf(n)) {
         if (!child) continue;
         if (child.type === 'call_expression') {
           const fn = getChildByField(child, 'function') ?? child.namedChild(0);

@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getChildByField, getNodeText } from '../tree-sitter-helpers';
+import { getChildByField, getNodeText, namedChildrenOf } from '../tree-sitter-helpers';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
 import {
   blankLoneMacroLines,
@@ -11,8 +11,7 @@ import {
 } from './c-cpp';
 
 function findCompoundStatement(node: SyntaxNode): SyntaxNode | null {
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of namedChildrenOf(node)) {
     if (child?.type === 'compound_statement') {
       return child;
     }
@@ -148,8 +147,7 @@ export const objcExtractor: LanguageExtractor = {
     return findCompoundStatement(node);
   },
   resolveTypeAliasKind: (node, _source) => {
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (!child) continue;
       if (child.type === 'enum_specifier' && getChildByField(child, 'body')) return 'enum';
       if (child.type === 'struct_specifier' && getChildByField(child, 'body'))

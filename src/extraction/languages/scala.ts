@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText } from '../tree-sitter-helpers';
+import { getNodeText, namedChildrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 function getValVarName(node: SyntaxNode, source: string): string | null {
@@ -66,8 +66,7 @@ function extractScalaReturnType(node: SyntaxNode, source: string): string | unde
 }
 
 function extractVisibility(node: SyntaxNode): 'public' | 'private' | 'protected' {
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of namedChildrenOf(node)) {
     if (!child) continue;
     if (child.type === 'modifiers' || child.type === 'access_modifier') {
       const text = child.text;
@@ -125,8 +124,7 @@ export const scalaExtractor: LanguageExtractor = {
   isAsync: () => false,
 
   isStatic: (node: SyntaxNode) => {
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (child?.type === 'modifiers' && child.text.includes('static')) return true;
     }
     return false;
@@ -212,8 +210,7 @@ export const scalaExtractor: LanguageExtractor = {
     const importText = getNodeText(node, source).trim();
     const pathNode = node.childForFieldName('path');
     if (pathNode) return { moduleName: getNodeText(pathNode, source), signature: importText };
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (child?.type === 'identifier' || child?.type === 'stable_identifier') {
         return { moduleName: getNodeText(child, source), signature: importText };
       }

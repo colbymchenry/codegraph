@@ -9,6 +9,7 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { lineAt } from '../synth-utils';
+import { nodesNamed } from '../nodes-around';
 
 /**
  * Laravel facade mappings to underlying classes
@@ -690,7 +691,7 @@ function resolveControllerMethod(
   }
   const rel = controller.replace(/\\/g, '/');
   const methodIn = (filePath: string): string | null =>
-    context.getNodesInFile(filePath).find((n) => n.kind === 'method' && n.name === method)?.id ?? null;
+    nodesNamed(context, filePath, method).find((n) => n.kind === 'method' && n.name === method)?.id ?? null;
 
   const conventional = `app/Http/Controllers/${rel}.php`;
   if (context.fileExists(conventional)) {

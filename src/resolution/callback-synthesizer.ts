@@ -54,6 +54,7 @@ import { declaredComponent, exportedComponent, lazyValueModules, wrappedComponen
 import { jsxCode } from './jsx-code';
 import { isTestPath } from '../search/query-utils';
 import { withoutLongRuns } from '../file-limits';
+import { nodesNamed } from './nodes-around';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -2179,7 +2180,7 @@ function wrappedChild(
   exportOf: (module: string, exported: string) => Node | null
 ): Node | undefined {
   const declared = ownValueOf(name) !== undefined ||
-    (ctx.getNodesInFileNamed?.(file, name) ?? ctx.getNodesInFile(file).filter((n) => n.name === name))
+    (ctx.getNodesInFileNamed?.(file, name) ?? nodesNamed(ctx, file, name).filter((n) => n.name === name))
       .some((n) => JSX_CHILD_KINDS.has(n.kind));
   if (!declared && !projectImport(ctx, name, file)) return undefined;
   return jsxChild(ctx, name, file, importsOf, ownValueOf, exportOf);
@@ -2257,9 +2258,27 @@ function spanTags(src: string, startLine: number): SpanTags {
       counted = m.index;
       if (!names.tags.get(m[1]!)) names.tags.set(m[1]!, opensTag(src, m.index, m[1]!) ? line : 0);
     }
-    for (const [name, first] of names.tags) if (first && writtenBare(src, name)) names.bare.add(name);
+    // Every word the code writes outside a tag, read once when the tags are
+    // many: searched for name by name, a file of eight thousand components
+    // read itself that many times.
+    const bare = names.tags.size > 16 ? wordsWrittenBare(src) : null;
+    for (const [name, first] of names.tags) {
+      if (first && (bare && /^[\w$]+$/.test(name) ? bare.has(name) : writtenBare(src, name))) names.bare.add(name);
+    }
   }
   return names;
+}
+
+/** Every word (a run of `[\w$]`) `src` writes other than in a tag: what writtenBare answers for each of them. */
+function wordsWrittenBare(src: string): Set<string> {
+  const words = new Set<string>();
+  const word = /[\w$]+/g;
+  for (let m = word.exec(src); m; m = word.exec(src)) {
+    const at = m.index;
+    if (src[at - 1] === '<' || (src[at - 1] === '/' && src[at - 2] === '<')) continue;
+    words.add(m[0]);
+  }
+  return words;
 }
 
 /**
@@ -2950,7 +2969,7 @@ function constantEventName(expr: string, file: string, ctx: ResolutionContext, m
       const m = /^\s*(?::[^=;]*)?[=:]\s*@?(["'`])([^"'`]+)\1/.exec(rest) ?? /^\s+@?(")([^"]+)"/.exec(rest);
       return m ? m[2]! : null;
     };
-    const declaredIn = (f: string) => ctx.getNodesInFile(f).filter((n) => n.name === name && CONSTANT_KINDS.has(n.kind));
+    const declaredIn = (f: string) => nodesNamed(ctx, f, name).filter((n) => n.name === name && CONSTANT_KINDS.has(n.kind));
     const js = /\.(?:[cm]?[jt]sx?)$/.test(file);
     const language: Language = /\.tsx$/.test(file) ? 'tsx' : /\.[cm]?ts$/.test(file) ? 'typescript' : file.endsWith('.jsx') ? 'jsx' : 'javascript';
     const importedFile = (local: string): string | null => {
@@ -3151,7 +3170,7 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
         const bare = /^[A-Za-z_$][\w$.]*$/.test(arg) ? arg.slice(arg.lastIndexOf('.') + 1) : null;
         const line = lineOf(m.index);
         // The handler this file names — never a same-named function elsewhere.
-        const named = bare ? nodesInFile.find((n) => (n.kind === 'function' || n.kind === 'method') && n.name === bare) : undefined;
+        const named = bare ? nodesNamed(ctx, file, bare).find((n) => (n.kind === 'function' || n.kind === 'method') && n.name === bare) : undefined;
         const target = named ?? enclosingFn(nodesInFile, line);
         if (!target) continue;
         const map = jsHandlersByEvent.get(event) ?? new Map<string, string>();
