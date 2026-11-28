@@ -105,6 +105,8 @@ async function indexedProject(): Promise<string> {
     path.join(root, 'orders.ts'),
     'export function placeOrder() { return chargeCard(); }\nexport function chargeCard() { return 1; }\n',
   );
+  // The hook trusts a private socket directory even on hosts with a group-writable umask.
+  fs.mkdirSync(path.join(root, '.codegraph'), { mode: 0o700 });
   const cg = await CodeGraph.init(root, { index: true });
   cg.close();
   return root;
