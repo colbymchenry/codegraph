@@ -7,6 +7,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, FrameworkExtractionResult, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { lineAt } from '../synth-utils';
 
 /**
  * A `resources` line's `only:` / `except:` action list, written any way Rails
@@ -146,7 +147,7 @@ export const railsResolver: FrameworkResolver = {
     let match: RegExpExecArray | null;
     while ((match = routeRegex.exec(safe)) !== null) {
       const [, method, routePath, ctrl, action] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       const upper = method!.toUpperCase();
       const routeNode: Node = {
         id: `route:${filePath}:${line}:${upper}:${routePath}`,
@@ -190,7 +191,7 @@ export const railsResolver: FrameworkResolver = {
       else if (except) actions = actions.filter((a) => !except.has(a));
       // `resources :articles` → ArticlesController; `resource :user` → UsersController.
       const ctrl = plural ? resName : pluralize(resName);
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       for (const action of actions) {
         const spec = RESTFUL_ROUTES[action]!;
         const path = spec.path(resName);

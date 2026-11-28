@@ -97,8 +97,8 @@ describe('files left out of the graph for their size are said to be', () => {
     expect(code).toBe(0);
     // Nothing is stale and nothing needs a sync: the file is left out by design.
     expect(stdout).toContain('Index is up to date');
-    expect(stdout).toMatch(/1 source file is over the 1\.0 MB size limit and not in the graph/);
-    expect(stdout).toContain('src/big.ts (1.0 MB)');
+    expect(stdout).toMatch(/1 source file is over the 4\.0 MB size limit and not in the graph/);
+    expect(stdout).toContain('src/big.ts (4.0 MB)');
 
     const json = JSON.parse(cli('status', dir, '--json').stdout);
     expect(json.index.filesOverSizeLimit).toBe(1);
@@ -114,9 +114,9 @@ describe('files left out of the graph for their size are said to be', () => {
     const { code, stdout, stderr } = cli('init', dir);
     expect(code).toBe(0);
     const said = `${stdout}\n${stderr}`;
-    expect(said).toMatch(/2 source files are over the 1\.0 MB size limit and not in the graph/);
+    expect(said).toMatch(/2 source files are over the 4\.0 MB size limit and not in the graph/);
     // The file nearest the limit is the likeliest to be hand-written source.
-    expect(said).toMatch(/src\/big\.ts \(1\.0 MB\), src\/bigger\.ts \(1\.3 MB\)/);
+    expect(said).toMatch(/src\/big\.ts \(4\.0 MB\), src\/bigger\.ts \(4\.3 MB\)/);
   });
 
   it('sync says so too, for a file that grew past the limit and for one already left out', async () => {
@@ -125,10 +125,10 @@ describe('files left out of the graph for their size are said to be', () => {
     write({ 'src/big.ts': BIG });
     const grew = cli('sync', dir);
     expect(grew.code).toBe(0);
-    expect(`${grew.stdout}\n${grew.stderr}`).toMatch(/1 source file is over the 1\.0 MB size limit and not in the graph/);
+    expect(`${grew.stdout}\n${grew.stderr}`).toMatch(/1 source file is over the 4\.0 MB size limit and not in the graph/);
     // Nothing changed this time; the file is still left out, and sync still says so.
     const again = cli('sync', dir);
-    expect(`${again.stdout}\n${again.stderr}`).toContain('src/big.ts (1.0 MB)');
+    expect(`${again.stdout}\n${again.stderr}`).toContain('src/big.ts (4.0 MB)');
   });
 
   it('the symbol map of such a file says it was not indexed, not that it is empty', async () => {
@@ -140,7 +140,7 @@ describe('files left out of the graph for their size are said to be', () => {
       const map = async (file: string): Promise<string> =>
         (await handler.execute('codegraph_node', { file, symbolsOnly: true })).content.map((c) => c.text).join('\n');
       const big = await map('src/big.ts');
-      expect(big).toContain('_Not indexed: at 1.0 MB this file is over the size limit for source files');
+      expect(big).toContain('_Not indexed: at 4.0 MB this file is over the size limit for source files');
       expect(big).not.toContain('No indexed symbols in this file');
       expect(await map('src/small.ts')).toContain('`alpha`');
     } finally {

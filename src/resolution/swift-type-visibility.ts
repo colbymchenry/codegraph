@@ -27,7 +27,8 @@
  */
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
-import { escapeRegExp } from '../utils';
+import { escapeRegExp, maxOf } from '../utils';
+import { nodesAroundLine } from './nodes-around';
 
 const TYPE_KINDS: ReadonlySet<Node['kind']> = new Set<Node['kind']>(['class', 'struct', 'enum', 'interface', 'protocol', 'type_alias']);
 
@@ -374,7 +375,7 @@ function declarationFor(name: string, written: string, ref: UnresolvedRef, from:
     // over another package's. A tie is left unresolved.
     found = declarations.find((n) => n.filePath === ref.filePath) ?? null;
     if (!found) {
-      const near = Math.max(...declarations.map((n) => sharedDirs(n.filePath, ref.filePath)));
+      const near = maxOf(declarations.map((n) => sharedDirs(n.filePath, ref.filePath)));
       const nearest = declarations.filter((n) => sharedDirs(n.filePath, ref.filePath) === near);
       found = nearest.length === 1 ? nearest[0]! : null;
     }
@@ -469,8 +470,7 @@ export function resolveSwiftTypePathCall(ref: UnresolvedRef, context: Resolution
 
 /** Is this case declared in a `@Reducer enum`? */
 function isReducerEnum(member: Node, context: ResolutionContext): boolean {
-  const owner = context
-    .getNodesInFile(member.filePath)
+  const owner = nodesAroundLine(context, member.filePath, member.startLine)
     .filter((t) => t.kind === 'enum' && t.startLine <= member.startLine && t.endLine >= member.endLine)
     .reduce<Node | null>((inner, t) => (!inner || t.startLine >= inner.startLine ? t : inner), null);
   if (!owner) return false;
@@ -502,8 +502,7 @@ function ownerPath(member: Node, context: ResolutionContext): string | null {
   let path: string | null = cut < 0 ? null : member.qualifiedName.slice(0, cut);
   if (path !== null) {
     const first = path.split('::')[0]!;
-    const outer = context
-      .getNodesInFile(member.filePath)
+    const outer = nodesAroundLine(context, member.filePath, member.startLine)
       .filter((t) => t.name === first && TYPE_KINDS.has(t.kind) && t.startLine <= member.startLine && t.endLine >= member.endLine)
       .reduce<Node | null>((out, t) => (!out || t.startLine < out.startLine ? t : out), null);
     const extended = outer ? extendedPath(outer, context) : null;

@@ -4,6 +4,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import CodeGraph from '../src/index';
 import { QueryBuilder } from '../src/db/queries';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../src/file-limits';
+
+/** A Python file a little over the size limit. */
+const OVERSIZED = 'value = 1\n'.repeat(Math.ceil(MAX_SOURCE_FILE_SIZE_BYTES / 10) + 1);
 
 describe('large-corpus regression fixes', () => {
   it('collects a dense unresolved-reference chunk without spreading it onto the V8 stack (#1558)', () => {
@@ -29,7 +33,7 @@ describe('large-corpus regression fixes', () => {
   it('records an oversized file during a fresh index so sync does not retry it (#1557)', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-skipped-file-'));
     try {
-      fs.writeFileSync(path.join(dir, 'oversized.py'), 'value = 1\n'.repeat(120_000));
+      fs.writeFileSync(path.join(dir, 'oversized.py'), OVERSIZED);
       const cg = await CodeGraph.init(dir, { silent: true });
       const indexed = await cg.indexAll();
       expect(indexed.filesSkipped).toBe(1);
@@ -45,7 +49,7 @@ describe('large-corpus regression fixes', () => {
   it('records an oversized file through the single-file indexing path (#1557)', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-single-skipped-file-'));
     try {
-      fs.writeFileSync(path.join(dir, 'oversized.py'), 'value = 1\n'.repeat(120_000));
+      fs.writeFileSync(path.join(dir, 'oversized.py'), OVERSIZED);
       const cg = await CodeGraph.init(dir, { silent: true });
       const indexed = await cg.indexFiles(['oversized.py']);
       expect(indexed.filesSkipped).toBe(1);

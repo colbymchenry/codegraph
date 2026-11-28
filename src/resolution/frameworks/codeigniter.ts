@@ -22,6 +22,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, ResolutionContext, ResolvedRef, UnresolvedRef } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { lineAt } from '../synth-utils';
 
 const ROUTES_FILE = /(?:^|\/)application\/(?:modules\/[^/]+\/)?config\/(?:[^/]+\/)?routes\.php$/;
 const CONTROLLER_FILE = /^(?:.*?\/)?(?:application\/controllers|modules\/([^/]+)\/controllers)\/(.+)\.php$/;
@@ -134,7 +135,7 @@ function conventionRoutes(filePath: string, baseUrl: string, safe: string): { no
     const routePath = name.toLowerCase() === 'index' ? baseUrl : `${baseUrl}/${name.toLowerCase()}`;
     if (seen.has(routePath)) continue;
     seen.add(routePath);
-    const line = safe.slice(0, m.index).split('\n').length;
+    const line = lineAt(safe, m.index);
     const route = routeNode(filePath, line, 'ANY', routePath, now);
     nodes.push(route);
     references.push({
@@ -168,7 +169,7 @@ function explicitRoutes(filePath: string, safe: string): { nodes: Node[]; refere
   while ((m = ROUTE_RE.exec(safe)) !== null) {
     const [, pattern, verb, handler] = m;
     if (pattern === '404_override' || pattern === 'translate_uri_dashes' || !handler) continue;
-    const line = safe.slice(0, m.index).split('\n').length;
+    const line = lineAt(safe, m.index);
     const routePath = pattern === 'default_controller' ? '/' : `/${pattern!.replace(/^\/+/, '')}`;
     const route = routeNode(filePath, line, (verb ?? 'ANY').toUpperCase(), routePath, now);
     nodes.push(route);

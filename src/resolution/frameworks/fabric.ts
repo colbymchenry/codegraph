@@ -48,6 +48,7 @@ import {
   FrameworkExtractionResult,
   FrameworkResolver,
 } from '../types';
+import { lineAt } from '../synth-utils';
 
 const CODEGEN_DECL_RE =
   /\b(codegenNativeComponent|requireNativeComponent)\s*(?:<[^>]+>)?\s*\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]/g;
@@ -169,8 +170,7 @@ function extractLegacyViewManagerNodes(filePath: string, source: string): Node[]
   // works for legacy too. The native class IS the manager itself in this
   // case; the convention-based suffix lookup in the synthesizer
   // (`Manager`, `ViewManager`) will find it.
-  const before = source.slice(0, implMatch.index ?? 0);
-  const startLine = before.split('\n').length;
+  const startLine = lineAt(source, implMatch.index ?? 0);
   nodes.push({
     id: `fabric-component:${filePath}:${componentName}:${startLine}`,
     kind: 'component',
@@ -196,8 +196,7 @@ function extractLegacyViewManagerNodes(filePath: string, source: string): Node[]
     const propName = m[1]!;
     if (seen.has(propName)) continue;
     seen.add(propName);
-    const propBefore = source.slice(0, m.index);
-    const propLine = propBefore.split('\n').length;
+    const propLine = lineAt(source, m.index);
     nodes.push({
       id: `fabric-prop:${filePath}:${propName}:${propLine}`,
       kind: 'property',
@@ -242,8 +241,7 @@ function extractJvmViewManagerNodes(filePath: string, source: string): Node[] {
   const now = Date.now();
   const nodes: Node[] = [];
 
-  const classBefore = source.slice(0, classMatch.index ?? 0);
-  const startLine = classBefore.split('\n').length;
+  const startLine = lineAt(source, classMatch.index ?? 0);
   nodes.push({
     id: `fabric-component:${filePath}:${componentName}:${startLine}`,
     kind: 'component',
@@ -271,8 +269,7 @@ function extractJvmViewManagerNodes(filePath: string, source: string): Node[] {
     const propName = m[1]!;
     if (seen.has(propName)) continue;
     seen.add(propName);
-    const propBefore = source.slice(0, m.index);
-    const propLine = propBefore.split('\n').length;
+    const propLine = lineAt(source, m.index);
     nodes.push({
       id: `fabric-prop:${filePath}:${propName}:${propLine}`,
       kind: 'property',
@@ -304,7 +301,7 @@ function extractFabricNodes(filePath: string, source: string): Node[] {
     const declaredWith = m[1]!;
     const componentName = m[2]!;
     const before = source.slice(0, m.index);
-    const startLine = before.split('\n').length;
+    const startLine = lineAt(source, m.index);
     const startColumn = before.length - before.lastIndexOf('\n') - 1;
 
     // The component itself — kind: 'component' so the existing
@@ -341,7 +338,7 @@ function extractFabricNodes(filePath: string, source: string): Node[] {
     for (const propName of props) {
       const propBefore = source.indexOf(propName, source.indexOf(body));
       const propLine =
-        propBefore >= 0 ? source.slice(0, propBefore).split('\n').length : 1;
+        propBefore >= 0 ? lineAt(source, propBefore) : 1;
       nodes.push({
         id: `fabric-prop:${filePath}:${propName}:${propLine}`,
         kind: 'property',

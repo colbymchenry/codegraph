@@ -111,8 +111,7 @@ function extractClassMembers(classCall: SyntaxNode, classId: string, ctx: Extrac
   const args = getChildByField(classCall, 'arguments');
   if (!args) return;
   let positional = 0;
-  for (let i = 0; i < args.namedChildCount; i++) {
-    const arg = args.namedChild(i);
+  for (const arg of args.namedChildren) {
     if (arg?.type !== 'argument') continue;
     const argName = getChildByField(arg, 'name');
     const value = getChildByField(arg, 'value');
@@ -154,8 +153,7 @@ function extractClassMembers(classCall: SyntaxNode, classId: string, ctx: Extrac
     if (value?.type === 'call' && calleeName(value, ctx.source) === 'list') {
       const listArgs = getChildByField(value, 'arguments');
       if (!listArgs) continue;
-      for (let j = 0; j < listArgs.namedChildCount; j++) {
-        const entry = listArgs.namedChild(j);
+      for (const entry of listArgs.namedChildren) {
         if (entry?.type === 'argument') emitMethodArg(entry, ctx);
       }
     }

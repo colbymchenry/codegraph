@@ -8,6 +8,8 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { pickByNameAndKind } from './name-heuristic';
+import { lineAt } from '../synth-utils';
+import { nodesAroundLine } from '../nodes-around';
 
 // No extract(): a SwiftUI view is its own struct node, and a UIKit controller
 // its class. A one-line `component`/`class` twin per `struct X: View` (and per
@@ -306,7 +308,7 @@ export const vaporResolver: FrameworkResolver = {
     let match: RegExpExecArray | null;
     while ((match = routeRegex.exec(safe)) !== null) {
       const [, receiver, method, segsStr, handlerExpr] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       const upper = method!.toUpperCase();
       const routePath = (groupPrefix.get(receiver!) ?? '') + segJoin('', segsStr!) || '/';
 
@@ -346,7 +348,7 @@ export const vaporResolver: FrameworkResolver = {
     const pathArgs = (argText: string) => argText.split(',').filter((a) => /^\s*"[^"]*"\s*$/.test(a)).join(',');
     while ((match = onRegex.exec(safe)) !== null) {
       const [, receiver, method, segsStr, handlerExpr] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       const routePath = (groupPrefix.get(receiver!) ?? '') + segJoin('', pathArgs(segsStr!)) || '/';
       const id = `route:${filePath}:${line}:${method}:${routePath}`;
       nodes.push({
@@ -377,7 +379,7 @@ export const vaporResolver: FrameworkResolver = {
         method = on[1]!;
         segs = on[2]!;
       }
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       const routePath = (groupPrefix.get(receiver!) ?? '') + segJoin('', segs) || '/';
       const id = `route:${filePath}:${line}:${method}:${routePath}`;
       nodes.push({
@@ -499,8 +501,7 @@ function resolveVaporHandler(typePath: string | null, method: string, ref: Unres
   if (typePath === null) {
     // `use: self.index` / `use: index`: the type whose body holds the route —
     // its own method in this file, else one declared in another extension of it.
-    const owner = context
-      .getNodesInFile(ref.filePath)
+    const owner = nodesAroundLine(context, ref.filePath, ref.line)
       .filter((n) => SWIFT_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
       .reduce<Node | null>((inner, n) => (!inner || n.startLine >= inner.startLine ? n : inner), null);
     if (!owner) {
@@ -531,8 +532,7 @@ function resolveVaporHandler(typePath: string | null, method: string, ref: Unres
     const declared = new RegExp(String.raw`\bextension\s+${segs.join(String.raw`\s*\.\s*`)}\b`);
     const inExtension = callables.filter((n) => {
       if (ownerOf(n) !== type) return false;
-      const owner = context
-        .getNodesInFile(n.filePath)
+      const owner = nodesAroundLine(context, n.filePath, n.startLine)
         .filter((o) => SWIFT_TYPE_KINDS.has(o.kind) && o.name === type && o.startLine <= n.startLine && o.endLine >= n.endLine)
         .reduce<Node | null>((inner, o) => (!inner || o.startLine >= inner.startLine ? o : inner), null);
       if (!owner) return false;

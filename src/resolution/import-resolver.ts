@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
+import { importsBoundTo, importsFrom, importsReadBy, pythonMemberImports } from './import-lookup';
 import { applyAliases, aliasAndBaseUrlCandidates } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport, workspaceImportTargets, type WorkspaceImportTargets } from './workspace-packages';
@@ -987,14 +988,14 @@ function pythonModuleOfScript(
   context: ResolutionContext
 ): string | null {
   if (PYTHON_STDLIB_MODULES.has(specifier.split('.')[0]!)) return null;
-  const taken = context.getImportMappings(fromFile, 'python')
-    .filter((imp) => imp.source === specifier && !imp.isNamespace)
+  const taken = importsFrom(context.getImportMappings(fromFile, 'python'), specifier)
+    .filter((imp) => !imp.isNamespace)
     .map((imp) => imp.exportedName);
   if (taken.length === 0) return null;
   for (let dir = importerDir; dir; dir = parentDir(dir)) {
     if (dir !== importerDir && index.packageDirs.has(dir)) continue;
     const file = pythonModuleUnder(dir, relPath, index);
-    if (!file || context.getImportMappings(file, 'python').some((imp) => imp.source === specifier)) continue;
+    if (!file || importsFrom(context.getImportMappings(file, 'python'), specifier).length > 0) continue;
     const defined = new Set(context.getNodesInFile(file).filter(isPythonModuleLevelDef).map((n) => n.name));
     if (taken.every((name) => defined.has(name))) return file;
   }
@@ -2060,10 +2061,10 @@ export function extractImportMappings(
   content: string,
   language: Language
 ): ImportMapping[] {
-  const mappings: ImportMapping[] = [];
-
+  // Each language's list is handed on as it is. Spread into a `push`, a
+  // file of some hundred thousand imports overflowed the stack.
   if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx' || language === 'arkts') {
-    mappings.push(...extractJSImports(content));
+    return extractJSImports(content);
   } else if (language === 'svelte' || language === 'vue' || language === 'astro') {
     // Svelte/Vue single-file components import via plain ES6 inside their
     // `<script>` block (Astro: the `---` frontmatter). Without this, a
@@ -2074,20 +2075,20 @@ export function extractImportMappings(
     // component's real name, yielding a false 0 callers (#629). The ES6
     // import regex only matches `import … from '…'`, so running it over the
     // whole SFC (markup + styles included) is safe.
-    mappings.push(...extractJSImports(content));
+    return extractJSImports(content);
   } else if (language === 'python') {
-    mappings.push(...extractPythonImports(stripCommentsForRegex(content, 'python')));
+    return extractPythonImports(stripCommentsForRegex(content, 'python'));
   } else if (language === 'go') {
-    mappings.push(...extractGoImports(content));
+    return extractGoImports(content);
   } else if (language === 'java' || language === 'kotlin') {
-    mappings.push(...extractJavaImports(content));
+    return extractJavaImports(content);
   } else if (language === 'php') {
-    mappings.push(...extractPHPImports(content));
+    return extractPHPImports(content);
   } else if (language === 'c' || language === 'cpp') {
-    mappings.push(...extractCppImports(content));
+    return extractCppImports(content);
   }
 
-  return mappings;
+  return [];
 }
 
 /** A JavaScript identifier — `$`, `_` and Unicode letters included. Use with the `u` flag. */
@@ -2966,7 +2967,7 @@ export function isJsPathImportRef(ref: UnresolvedRef): boolean {
 function isJsBareModuleRef(ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (ref.referenceKind !== 'imports' || !ESM_IMPORT_LANGUAGES.has(ref.language) || isJsPathSpecifier(ref.referenceName)) return false;
   const imports = context.getImportMappings(ref.filePath, ref.language);
-  return imports.some((m) => m.source === ref.referenceName) && !imports.some((m) => m.localName === ref.referenceName);
+  return importsFrom(imports, ref.referenceName).length > 0 && importsBoundTo(imports, ref.referenceName).length === 0;
 }
 
 /**
@@ -3543,7 +3544,7 @@ export function resolveViaImport(
   }
 
   // Check if the reference name matches any import
-  for (const imp of imports) {
+  for (const imp of importsReadBy(imports, ref.referenceName)) {
     if (imp.localName === ref.referenceName || ref.referenceName.startsWith(imp.localName + '.')) {
       // Resolve the import path
       // Python absolute and relative specifiers alike resolve here, from the
@@ -3922,7 +3923,7 @@ function resolvePythonModuleMember(
     return target ? { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'import' } : null;
   }
 
-  for (const imp of imports) {
+  for (const imp of pythonMemberImports(imports, receiver, ref.referenceName)) {
     // `import pkg.mod` binds `pkg`, so a call spells the whole path out —
     // `pkg.mod.func()`. The mapping names the module by its last segment, which
     // never matches that receiver; match the full dotted source instead.
@@ -4123,8 +4124,7 @@ function resolveModuleImportToFile(
   if (ref.referenceKind !== 'imports') return null;
   if (ref.referenceName.includes('.')) return null;
 
-  for (const imp of imports) {
-    if (imp.localName !== ref.referenceName) continue;
+  for (const imp of importsBoundTo(imports, ref.referenceName)) {
 
     let modulePath: string;
     if (imp.isNamespace || imp.isDefault) {
@@ -4319,7 +4319,7 @@ function resolveJavaImportedReference(
 ): ResolvedRef | null {
   if (imports.length === 0) return null;
 
-  for (const imp of imports) {
+  for (const imp of importsReadBy(imports, ref.referenceName)) {
     const matchesBare = imp.localName === ref.referenceName;
     const matchesQualified = ref.referenceName.startsWith(imp.localName + '.');
     if (!matchesBare && !matchesQualified) continue;
@@ -4879,7 +4879,7 @@ export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext
   const name = receiver ?? ref.referenceName;
   if (!receiver && !IDENTIFIER.test(name)) return undefined;
   const mappings = context.getImportMappings(ref.filePath, ref.language);
-  let binding = mappings.find((m) => m.localName === name);
+  let binding = importsBoundTo(mappings, name)[0];
   if (!binding && receiver && ref.referenceKind === 'calls') {
     // A receiver typed through another file's signature — a callback's
     // parameter, a call's result — waits for that file, whose edit may
@@ -4939,7 +4939,7 @@ export function importBindingTail(ref: UnresolvedRef, context: ResolutionContext
  */
 function pythonImportBindingTail(ref: UnresolvedRef, context: ResolutionContext): string | undefined {
   if (!IDENTIFIER.test(ref.referenceName)) return undefined;
-  const binding = context.getImportMappings(ref.filePath, 'python').find((m) => m.localName === ref.referenceName);
+  const binding = importsBoundTo(context.getImportMappings(ref.filePath, 'python'), ref.referenceName)[0];
   if (!binding || isExternalImport(binding.source, 'python', context)) return undefined;
   const declared = binding.isNamespace ? binding.source.slice(binding.source.lastIndexOf('.') + 1) : binding.exportedName;
   if (declared === binding.localName && (binding.isNamespace || !isProjectPythonModule(binding.source, context))) return undefined;

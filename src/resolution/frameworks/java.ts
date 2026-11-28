@@ -8,6 +8,8 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { pickByNameAndKind } from './name-heuristic';
+import { lineAt } from '../synth-utils';
+import { nodesAroundLine } from '../nodes-around';
 
 export const springResolver: FrameworkResolver = {
   name: 'spring',
@@ -251,7 +253,7 @@ export const springResolver: FrameworkResolver = {
       if (!annotation) continue;
       const method = VERB[match[1]!]!;
       const paths = parseMappingPaths(annotation.args, consts);
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       // The method it decorates: the declaration it is written on (#851).
       const handler = annotatedMethodName(safe, match.index, lang);
       for (const routePath of classPrefixes.flatMap(prefix => paths.map(sub => joinPath(prefix, sub)))) {
@@ -300,7 +302,7 @@ export const springResolver: FrameworkResolver = {
       const verbM = args.match(/method\s*=\s*[{\[]?\s*(?:RequestMethod\.)?(\w+)/);
       const method = verbM ? verbM[1]!.toUpperCase() : 'ANY';
       const paths = parseMappingPaths(args, consts);
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       for (const routePath of classPrefixes.flatMap(prefix => paths.map(sub => joinPath(prefix, sub)))) {
         const routeNode: Node = {
           id: `route:${filePath}:${line}:${method}:${routePath}`,
@@ -460,7 +462,7 @@ function extractSpringValueBindings(
   while ((m = valueRe.exec(safe)) !== null) {
     const key = m[1]!.trim();
     if (!key) continue;
-    const line = safe.slice(0, m.index).split('\n').length;
+    const line = lineAt(safe, m.index);
     const bindNode: Node = {
       id: `spring-value:${filePath}:${line}:${key}`,
       kind: 'constant',
@@ -491,7 +493,7 @@ function extractSpringValueBindings(
   while ((m = cpRe.exec(safe)) !== null) {
     const prefix = m[1]!.trim();
     if (!prefix) continue;
-    const line = safe.slice(0, m.index).split('\n').length;
+    const line = lineAt(safe, m.index);
     const bindNode: Node = {
       id: `spring-cp:${filePath}:${line}:${prefix}`,
       kind: 'constant',
@@ -742,7 +744,7 @@ function routeHandlerAt(ref: UnresolvedRef, context: ResolutionContext): Node | 
   if (ref.referenceKind !== 'references' || (ref.language !== 'java' && ref.language !== 'kotlin')) return null;
   if (!ref.fromNodeId.startsWith(`route:${ref.filePath}:${ref.line}:`)) return null;
   let handler: Node | null = null;
-  for (const node of context.getNodesInFile(ref.filePath)) {
+  for (const node of nodesAroundLine(context, ref.filePath, ref.line)) {
     if ((node.kind !== 'method' && node.kind !== 'function') || node.name !== ref.referenceName) continue;
     if (node.startLine > ref.line || node.endLine < ref.line) continue;
     if (!handler || node.startLine > handler.startLine) handler = node;

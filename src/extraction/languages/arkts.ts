@@ -62,8 +62,7 @@ function collectDecoratorNames(node: SyntaxNode): string[] | undefined {
     return undefined;
   };
 
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of node.namedChildren) {
     if (child?.type === 'decorator') {
       const n = nameOf(child);
       if (n) names.push(n);

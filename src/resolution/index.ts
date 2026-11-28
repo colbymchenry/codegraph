@@ -51,6 +51,7 @@ import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { clearRubyConstantPathMemos, matchRubyConstantPathRef } from './ruby-constant-paths';
+import { importsBoundTo, importsReadBy } from './import-lookup';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, CPP_COMPILE_DB_FILES, loadCppIncludeDirsFromCompileDB, loadCppIncludeDirsHeuristic, readCompileDbIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName, packageJsonMain } from './import-resolver';
 import { ResolverPool, poolStartBeforeFirstBatch, poolStartSettled, resolveWorkersWorthStarting, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -63,7 +64,10 @@ import { folderOf, inferPhpWebRoots, phpWebRootSnapshot, phpWebRootsMoved } from
 import { PHP_DOCUMENT_ROOT } from '../extraction/languages/php';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { FlowChange, planParameterFlows } from './parameter-flow';
-import { MAX_SOURCE_FILE_SIZE_BYTES, readSourceText } from '../file-limits';
+import { MAX_SOURCE_FILE_SIZE_BYTES, readSourceText, withoutLongRuns } from '../file-limits';
+
+/** How many names a file outside the node cache is asked for one query at a time, before it is read whole. */
+const NAMED_LOOKUPS_BEFORE_READ = 16;
 import { createHash } from 'crypto';
 import { aliasConfigFields, loadProjectAliases, type AliasMap } from './path-aliases';
 import { findGoModuleForImport, goModulePackageDir, loadGoModule, type GoModule } from './go-module';
@@ -473,6 +477,10 @@ export class ReferenceResolver {
   // unbounded Maps that grew with every distinct lookup and OOM'd on
   // codebases with 20k+ files (see issue: unbounded cache growth).
   private nodeCache: LRUCache<string, Node[]>; // per-file node cache
+  /** By a file's nodes, as nodeCache holds them: those of each name (getNodesInFileNamed). */
+  private namedInFile = new WeakMap<Node[], Map<string, Node[]>>();
+  /** How often each file outside nodeCache was asked for a name's nodes since the caches were cleared. */
+  private namedLookups = new Map<string, number>();
   private fileCache: LRUCache<string, string | null>; // per-file content cache
   private importMappingCache: LRUCache<string, ImportMapping[]>;
   private reExportCache: LRUCache<string, ReExport[]>;
@@ -822,6 +830,7 @@ export class ReferenceResolver {
     this.classExpressionIndex = undefined;
     this.classExpressionOnlyNameSet = null;
     this.nodeCache.clear();
+    this.namedLookups.clear();
     this.fileCache.clear();
     this.importMappingCache.clear();
     this.reExportCache.clear();
@@ -931,7 +940,9 @@ export class ReferenceResolver {
       // Import resolvers may follow package metadata to an archive (`file:*.har`,
       // for example). Reject anything extraction would not accept before UTF-8
       // decoding can multiply a large binary blob into gigabytes of V8 heap.
-      const content = readSourceText(fullPath);
+      // Read for names, never for a megabyte of hex (see withoutLongRuns).
+      const source = readSourceText(fullPath);
+      const content = source === null ? null : withoutLongRuns(source);
       this.fileCache.set(filePath, content);
       return content;
     } catch (error) {
@@ -962,7 +973,8 @@ export class ReferenceResolver {
   private scanFile(filePath: string): string | null {
     if (this.fileCache.has(filePath)) return this.fileCache.get(filePath) ?? null;
     try {
-      return readSourceText(path.join(this.projectRoot, filePath), 'latin1');
+      const source = readSourceText(path.join(this.projectRoot, filePath), 'latin1');
+      return source === null ? null : withoutLongRuns(source);
     } catch {
       return null;
     }
@@ -1018,8 +1030,33 @@ export class ReferenceResolver {
       },
 
       getNodesInFileNamed: (filePath: string, name: string) => {
-        const cached = this.nodeCache.get(filePath);
-        return cached !== undefined ? cached.filter((n) => n.name === name) : this.queries.getNodesByFileAndName(filePath, name);
+        let cached = this.nodeCache.get(filePath);
+        if (cached === undefined) {
+          // One name of a file is one query. A file asked for name after name
+          // (the one being resolved, or a module half the project imports) is
+          // read whole instead: each query went through all of the file's
+          // rows, the square of them for a file whose every call asks.
+          const asked = (this.namedLookups.get(filePath) ?? 0) + 1;
+          if (asked <= NAMED_LOOKUPS_BEFORE_READ) {
+            this.namedLookups.set(filePath, asked);
+            return this.queries.getNodesByFileAndName(filePath, name);
+          }
+          this.namedLookups.delete(filePath);
+          cached = this.queries.getNodesByFile(filePath);
+          this.nodeCache.set(filePath, cached);
+        }
+        let byName = this.namedInFile.get(cached);
+        if (!byName) {
+          byName = new Map();
+          for (const n of cached) {
+            const same = byName.get(n.name);
+            if (same) same.push(n);
+            else byName.set(n.name, [n]);
+          }
+          this.namedInFile.set(cached, byName);
+        }
+        // A copy: the caller's to keep or change, as the filtered array was.
+        return byName.get(name)?.slice() ?? [];
       },
 
       getNodesByName: (name: string) => {
@@ -1547,16 +1584,7 @@ export class ReferenceResolver {
    */
   private matchesAnyImport(ref: UnresolvedRef): boolean {
     const imports = this.context.getImportMappings(ref.filePath, ref.language);
-    if (imports.length === 0) return false;
-    for (const imp of imports) {
-      if (
-        imp.localName === ref.referenceName ||
-        ref.referenceName.startsWith(imp.localName + '.')
-      ) {
-        return true;
-      }
-    }
-    return false;
+    return imports.length > 0 && importsReadBy(imports, ref.referenceName).length > 0;
   }
 
   /**
@@ -3940,9 +3968,8 @@ export class ReferenceResolver {
    * an alias — from a package of one of the project's own modules.
    */
   private isGoProjectPackage(ref: UnresolvedRef, qualifier: string): boolean {
-    return this.context
-      .getImportMappings(ref.filePath, ref.language)
-      .some((imp) => imp.localName === qualifier && this.context.getGoPackageDir?.(imp.source, ref.filePath) != null);
+    return importsBoundTo(this.context.getImportMappings(ref.filePath, ref.language), qualifier)
+      .some((imp) => this.context.getGoPackageDir?.(imp.source, ref.filePath) != null);
   }
 
   /**
@@ -3957,7 +3984,7 @@ export class ReferenceResolver {
     // JavaScript/TypeScript built-ins — unless the file imports its own
     // binding of that name (`import Map from './Map.svelte'`).
     if (isJsTs && JS_BUILT_INS.has(name) &&
-        !this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === name)) {
+        importsBoundTo(this.context.getImportMappings(ref.filePath, ref.language), name).length === 0) {
       return true;
     }
 

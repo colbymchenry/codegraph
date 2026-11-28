@@ -10,6 +10,7 @@ import { stripCommentsForRegex } from '../strip-comments';
 import { getCargoWorkspaceCrateMap } from './cargo-workspace';
 import { isRustNameInScope } from '../name-matcher';
 import { pickByNameAndKind } from './name-heuristic';
+import { lineAt } from '../synth-utils';
 
 /**
  * Whether the item a name heuristic found is one the reference can name:
@@ -102,7 +103,7 @@ export const rustResolver: FrameworkResolver = {
     // rustfmt wraps a long `.route(` call so its handler sits below it (#2326).
     const handlerSite = (exprEnd: number, expr: string, handler: string) => {
       const offset = exprEnd - expr.length + expr.lastIndexOf(handler);
-      return { line: safe.slice(0, offset).split('\n').length, column: offset - safe.lastIndexOf('\n', offset - 1) - 1 };
+      return { line: lineAt(safe, offset), column: offset - safe.lastIndexOf('\n', offset - 1) - 1 };
     };
 
     // Actix-web / Rocket attribute: #[get("/path")] fn handler(..)
@@ -111,7 +112,7 @@ export const rustResolver: FrameworkResolver = {
     let match: RegExpExecArray | null;
     while ((match = attrRegex.exec(safe)) !== null) {
       const [, method, routePath] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       const upper = method!.toUpperCase();
 
       const routeNode: Node = {
@@ -159,7 +160,7 @@ export const rustResolver: FrameworkResolver = {
       const pathMatch = args.match(/^\s*"([^"]+)"\s*,/);
       if (!pathMatch) continue;
       const routePath = pathMatch[1]!;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
 
       const methodBody = args.slice(pathMatch[0].length);
       const bodyAt = openIdx + 1 + pathMatch[0].length;
@@ -244,7 +245,7 @@ export const rustResolver: FrameworkResolver = {
     const resourceRegex = /web::resource\s*\(\s*"([^"]+)"\s*\)/g;
     while ((match = resourceRegex.exec(safe)) !== null) {
       const routePath = match[1]!;
-      const startLine = safe.slice(0, match.index).split('\n').length;
+      const startLine = lineAt(safe, match.index);
       const after = match.index + match[0].length;
       // Bound the resource's method chain at the next resource() to avoid bleed.
       const nextRes = safe.indexOf('web::resource', after);
@@ -264,7 +265,7 @@ export const rustResolver: FrameworkResolver = {
       let m2: RegExpExecArray | null;
       let found = false;
       while ((m2 = methodTo.exec(chain)) !== null) {
-        const mLine = startLine + chain.slice(0, m2.index).split('\n').length - 1;
+        const mLine = startLine + lineAt(chain, m2.index) - 1;
         pushActixRoute(routePath, m2[1]!, m2[2]!, mLine, after + m2.index + m2[0].length);
         found = true;
       }
@@ -278,7 +279,7 @@ export const rustResolver: FrameworkResolver = {
     // App-level: .route("/path", web::METHOD().to(handler)).
     const appRouteRegex = /\.route\s*\(\s*"([^"]+)"\s*,\s*web::(get|post|put|patch|delete|head)\s*\(\s*\)\s*\.to\s*\(\s*([A-Za-z_][\w:]*)/g;
     while ((match = appRouteRegex.exec(safe)) !== null) {
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       pushActixRoute(match[1]!, match[2]!, match[3]!, line, match.index + match[0].length);
     }
 

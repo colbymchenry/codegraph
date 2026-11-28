@@ -2,6 +2,14 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+type RubyVisibility = 'public' | 'private' | 'protected';
+
+/**
+ * Per tree, by a parent's id: the last method whose visibility was worked out
+ * under it (where it starts) and what it was. See rubyExtractor.getVisibility.
+ */
+const RUBY_VISIBILITY_SEEN = new WeakMap<object, Map<number, { start: number; visibility: RubyVisibility }>>();
+
 /**
  * A class method: `def self.x` or `def Widget.x` (a singleton_method), or a
  * `def` inside `class << self`. It shares its qualified name with an instance
@@ -47,8 +55,7 @@ export const rubyExtractor: LanguageExtractor = {
         const args = node.childForFieldName('arguments')
           ?? node.namedChildren.find((c: SyntaxNode) => c.type === 'argument_list');
         if (parentId && args) {
-          for (let i = 0; i < args.namedChildCount; i++) {
-            const arg = args.namedChild(i);
+          for (const arg of args.namedChildren) {
             // `Mod` is `constant`, `Foo::Bar` is `scope_resolution`. Skip
             // `extend self` / dynamic args (`include foo()`).
             if (arg && (arg.type === 'constant' || arg.type === 'scope_resolution')) {
@@ -80,8 +87,7 @@ export const rubyExtractor: LanguageExtractor = {
     ctx.pushScope(moduleNode.id);
     const body = node.childForFieldName('body');
     if (body) {
-      for (let i = 0; i < body.namedChildCount; i++) {
-        const child = body.namedChild(i);
+      for (const child of body.namedChildren) {
         if (child) ctx.visitNode(child);
       }
     }
@@ -119,21 +125,35 @@ export const rubyExtractor: LanguageExtractor = {
   },
   isStatic: isRubyClassMethod,
   getVisibility: (node) => {
-    // Ruby visibility is based on preceding visibility modifiers
-    let sibling = node.previousNamedSibling;
-    while (sibling) {
+    // Ruby visibility is based on preceding visibility modifiers. The walk
+    // back stops at the method it last answered for under the same parent
+    // and takes that answer: nothing between the two changed it. Without
+    // that, every method walked back over every sibling before it, and a
+    // class of seven thousand methods took twelve seconds over this alone.
+    const tree = node.tree;
+    let seen = RUBY_VISIBILITY_SEEN.get(tree);
+    if (!seen) RUBY_VISIBILITY_SEEN.set(tree, (seen = new Map()));
+    const parent = node.parent?.id ?? 0;
+    const start = node.startIndex;
+    const last = seen.get(parent);
+    // Only a method further down than the remembered one may lean on it.
+    const known = last && last.start < start ? last : undefined;
+    let visibility: RubyVisibility = 'public';
+    for (let sibling = node.previousNamedSibling; sibling; sibling = sibling.previousNamedSibling) {
+      if (known && sibling.startIndex <= known.start) {
+        visibility = known.visibility;
+        break;
+      }
       if (sibling.type === 'call') {
-        const methodName = getChildByField(sibling, 'method');
-        if (methodName) {
-          const text = methodName.text;
-          if (text === 'private') return 'private';
-          if (text === 'protected') return 'protected';
-          if (text === 'public') return 'public';
+        const text = getChildByField(sibling, 'method')?.text;
+        if (text === 'private' || text === 'protected' || text === 'public') {
+          visibility = text;
+          break;
         }
       }
-      sibling = sibling.previousNamedSibling;
     }
-    return 'public';
+    if (!last || last.start < start) seen.set(parent, { start, visibility });
+    return visibility;
   },
   extractImport: (node, source) => {
     const importText = source.substring(node.startIndex, node.endIndex).trim();

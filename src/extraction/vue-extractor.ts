@@ -5,6 +5,8 @@ import { isLanguageSupported } from './grammars';
 import { foldScriptResult, sfcFileNode, sfcScriptLanguage, SFC_SCRIPT_ELEMENT, sfcBlockLineRanges } from './sfc-script';
 import { vueOptionsMembers } from './vue-options-api';
 import { vueTemplateCalls } from './vue-template-calls';
+import { lineAt } from '../resolution/synth-utils';
+import { pushAll } from '../utils';
 
 /**
  * Vue built-in components — skipped so a `<Transition>` / `<KeepAlive>` in the
@@ -139,13 +141,13 @@ export class VueExtractor {
     if (members.length === 0) return;
     const component = this.nodes.find((n) => n.id === componentNodeId);
     const owner = component?.name ?? 'component';
-    const lineAt = (offset: number) => block.content.slice(0, offset).split('\n').length;
+    const lineOf = (offset: number) => lineAt(block.content, offset);
     const colAt = (offset: number) => offset - block.content.lastIndexOf('\n', offset - 1) - 1;
     const now = Date.now();
     const created: Node[] = [];
     for (const m of members) {
-      const startLine = lineAt(m.start);
-      const endLine = lineAt(m.end);
+      const startLine = lineOf(m.start);
+      const endLine = lineOf(m.end);
       created.push({
         id: generateNodeId(this.filePath, 'method', `${owner}.${m.name}`, startLine + block.startLine),
         kind: 'method',
@@ -182,7 +184,7 @@ export class VueExtractor {
       const member = memberAt(edge.line);
       if (member) edge.source = member.id;
     }
-    result.nodes.push(...created);
+    pushAll(result.nodes, created);
   }
 
   /**

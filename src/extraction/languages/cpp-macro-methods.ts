@@ -33,6 +33,7 @@ import { Edge, ExtractionResult, Node } from '../../types';
 import { generateNodeId } from '../tree-sitter-helpers';
 import { normalizeCppReturnType, stripCppTemplateArgs } from './c-cpp';
 import { scanCppBraceScopes } from './cpp-brace-scopes';
+import { pushAll } from '../../utils';
 
 /** A function-like macro a file defines (not a variadic one: none defines a method in practice). */
 interface CppMacro {
@@ -79,8 +80,8 @@ export function mayDefineCppMacroMethods(source: string): boolean {
 export function appendCppMacroMethods(result: ExtractionResult, filePath: string, source: string, preParse: (source: string) => string): void {
   if (!mayDefineCppMacroMethods(source)) return;
   const minted = cppMacroMethods(filePath, source, preParse, result.nodes);
-  result.nodes.push(...minted.nodes);
-  result.edges.push(...minted.edges);
+  pushAll(result.nodes, minted.nodes);
+  pushAll(result.edges, minted.edges);
 }
 
 /**

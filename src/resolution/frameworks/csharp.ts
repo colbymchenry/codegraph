@@ -10,6 +10,7 @@ import { stripCommentsForRegex } from '../strip-comments';
 import { pickByNameAndKind } from './name-heuristic';
 import { csharpTypeArityFits } from '../name-matcher';
 import { aspnetAttributeRoutes, aspnetDeclaredTemplates, aspnetRoutePath } from './aspnet-routes';
+import { lineAt } from '../synth-utils';
 
 export const aspnetResolver: FrameworkResolver = {
   name: 'aspnet',
@@ -192,7 +193,7 @@ export const aspnetResolver: FrameworkResolver = {
       // `app.MapGet("api/todos", …)` serves `/api/todos`.
       const routePath = joinCsPath('', rawPath!);
       const method = verb!.toUpperCase();
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
 
       const routeNode: Node = {
         id: `route:${filePath}:${line}:${method}:${routePath}`,
@@ -240,7 +241,7 @@ export const aspnetResolver: FrameworkResolver = {
     while ((match = groupRegex.exec(safe)) !== null) {
       const [, verb, handlerName, sub] = match;
       const method = verb!.toUpperCase();
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       const before = safe.slice(0, match.index);
       const classMatch = [...before.matchAll(/\bclass\s+([A-Za-z_]\w*)/g)].pop();
       if (!classMatch) continue;
@@ -294,7 +295,7 @@ export const aspnetResolver: FrameworkResolver = {
         const literals = [...args.matchAll(/"([^"]+)"/g)].map((l) => joinCsPath('', l[1]!.replace(/\{\s*nameof\s*\(\s*(\w+)\s*\)\s*\}/g, '$1')));
         const constant = /^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/.exec(args);
         const targets = literals.length > 0 ? literals.map((p) => ({ name: p, key: p })) : constant ? [{ name: `${constant[1]}.${constant[2]}`, key: `const:${constant[1]}.${constant[2]}` }] : [];
-        const line = safe.slice(0, match.index + verb.index).split('\n').length;
+        const line = lineAt(safe, match.index + verb.index);
         for (const t of targets) {
           const id = `route:${filePath}:${line}:${method}:${t.name}`;
           nodes.push({

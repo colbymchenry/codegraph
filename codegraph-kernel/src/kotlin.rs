@@ -123,8 +123,7 @@ fn kotlin_receiver_chain(text: &str) -> Option<String> {
 fn property_initializers<'t>(node: Node<'t>) -> Vec<Node<'t>> {
     let mut out: Vec<Node<'t>> = Vec::new();
     let mut after_eq = false;
-    for i in 0..node.child_count() {
-        let Some(c) = node.child(i) else { continue };
+    for c in node.children(&mut node.walk()) {
         if !c.is_named() {
             if c.kind() == "=" {
                 after_eq = true;
@@ -160,8 +159,7 @@ fn accessor_owner<'t>(node: Node<'t>) -> Option<Node<'t>> {
 /// The named child right after the first `token` child of `node`, if any.
 fn named_child_after<'t>(node: Node<'t>, token: &str) -> Option<Node<'t>> {
     let mut seen = false;
-    for i in 0..node.child_count() {
-        let Some(c) = node.child(i) else { continue };
+    for c in node.children(&mut node.walk()) {
         if !c.is_named() {
             if c.kind() == token {
                 seen = true;
@@ -183,12 +181,10 @@ fn named_child_after<'t>(node: Node<'t>, token: &str) -> Option<Node<'t>> {
 /// before the body; the types and annotations around it are left alone.
 fn class_header_code<'t>(node: Node<'t>) -> Vec<Node<'t>> {
     let mut out: Vec<Node<'t>> = Vec::new();
-    for i in 0..node.named_child_count() {
-        let Some(child) = node.named_child(i) else { continue };
+    for child in node.named_children(&mut node.walk()) {
         match child.kind() {
             "primary_constructor" => {
-                for j in 0..child.named_child_count() {
-                    let Some(param) = child.named_child(j) else { continue };
+                for param in child.named_children(&mut child.walk()) {
                     if param.kind() != "class_parameter" {
                         continue;
                     }
@@ -275,7 +271,7 @@ struct Cand {
 pub struct Walker<'t> {
     src: &'t str,
     file_path: &'t str,
-    line_starts: Vec<usize>,
+    line_starts: util::LineStarts,
     arena: Arena,
     node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
@@ -356,8 +352,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
     // the whole walk.
     let root = tree.root_node();
     let mut pkg_pushed = false;
-    for i in 0..root.named_child_count() {
-        let Some(child) = root.named_child(i) else { continue };
+    for child in root.named_children(&mut root.walk()) {
         if child.kind() != "package_header" {
             continue;
         }
@@ -446,8 +441,7 @@ impl<'t> Walker<'t> {
     /// (fun-interface parent body — unreachable post-defer, kept for
     /// contract), else first function_body | class_body | enum_class_body.
     fn resolve_body(&self, node: Node<'t>) -> Option<Node<'t>> {
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i) else { continue };
+        for child in node.named_children(&mut node.walk()) {
             if child.kind() == "ERROR" {
                 if let Some(first) = child.child(0) {
                     if first.kind() == "{" {
@@ -593,11 +587,9 @@ impl<'t> Walker<'t> {
             // (mirrored for shape; the grammar has zero fields).
             return self.text(name_node).to_string();
         }
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                if matches!(c.kind(), "identifier" | "type_identifier" | "simple_identifier" | "constant") {
-                    return self.text(c).to_string();
-                }
+        for c in node.named_children(&mut node.walk()) {
+            if matches!(c.kind(), "identifier" | "type_identifier" | "simple_identifier" | "constant") {
+                return self.text(c).to_string();
             }
         }
         "<anonymous>".to_string()
@@ -607,8 +599,7 @@ impl<'t> Walker<'t> {
     /// internal in that order; default PUBLIC. Text-includes semantics —
     /// annotation text inside modifiers can flip it (bug-for-bug).
     fn visibility_of(&self, node: Node) -> u8 {
-        for i in 0..node.child_count() {
-            let Some(child) = node.child(i) else { continue };
+        for child in node.children(&mut node.walk()) {
             if child.kind() == "modifiers" {
                 let text = self.text(child);
                 if text.contains("public") {
@@ -643,8 +634,7 @@ impl<'t> Walker<'t> {
     fn signature_of(&self, node: Node) -> Option<String> {
         let mut params: Option<Node> = None;
         let mut return_type: Option<Node> = None;
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i) else { continue };
+        for child in node.named_children(&mut node.walk()) {
             if child.kind() == "function_value_parameters" {
                 params = Some(child);
                 continue;
@@ -674,8 +664,7 @@ impl<'t> Walker<'t> {
     /// None; Unit/Nothing → None; `: T` generic params leak (preserve).
     fn return_type_of(&self, node: Node) -> Option<String> {
         let mut seen_params = false;
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i) else { continue };
+        for child in node.named_children(&mut node.walk()) {
             if child.kind() == "function_value_parameters" {
                 seen_params = true;
                 continue;
@@ -716,8 +705,7 @@ impl<'t> Walker<'t> {
     /// type_identifier's text (qualified receivers take the FIRST segment —
     /// the `com::qext` bug, preserve).
     fn receiver_type_of(&self, node: Node<'t>) -> Option<String> {
-        for i in 0..node.child_count() {
-            let Some(child) = node.child(i) else { continue };
+        for child in node.children(&mut node.walk()) {
             match child.kind() {
                 "receiver_type" => {
                     let ut = (0..child.named_child_count())
@@ -739,18 +727,15 @@ impl<'t> Walker<'t> {
     /// TYPE (never text), in order. Runs inside create_node for every node.
     fn extract_modifiers(&self, node: Node) -> Option<Vec<String>> {
         let mut mods: Vec<String> = Vec::new();
-        for i in 0..node.child_count() {
-            let Some(child) = node.child(i) else { continue };
+        for child in node.children(&mut node.walk()) {
             if child.kind() != "modifiers" {
                 continue;
             }
-            for j in 0..child.child_count() {
-                let Some(pm) = child.child(j) else { continue };
+            for pm in child.children(&mut child.walk()) {
                 if pm.kind() != "platform_modifier" {
                     continue;
                 }
-                for k in 0..pm.child_count() {
-                    let Some(kw) = pm.child(k) else { continue };
+                for kw in pm.children(&mut pm.walk()) {
                     if matches!(kw.kind(), "expect" | "actual") {
                         mods.push(kw.kind().to_string());
                     }
@@ -902,7 +887,7 @@ impl<'t> Walker<'t> {
     fn visit_node(&mut self, node: Node<'t>) {
         stack_guard!();
         if let Some(walked) = self.try_visit_hook(node) {
-            self.scan_fn_ref_subtree(node, 0, &walked);
+            self.scan_fn_ref_subtree(node, 0, &walked.into_iter().collect());
             return;
         }
 
@@ -921,16 +906,14 @@ impl<'t> Walker<'t> {
         } else if kind == "class_declaration" {
             // classifyClassNode: `interface`/`enum` keyword children.
             let mut classified = "class";
-            for i in 0..node.child_count() {
-                if let Some(c) = node.child(i) {
-                    if c.kind() == "interface" {
-                        classified = "interface";
-                        break;
-                    }
-                    if c.kind() == "enum" {
-                        classified = "enum";
-                        break;
-                    }
+            for c in node.children(&mut node.walk()) {
+                if c.kind() == "interface" {
+                    classified = "interface";
+                    break;
+                }
+                if c.kind() == "enum" {
+                    classified = "enum";
+                    break;
                 }
             }
             match classified {
@@ -949,7 +932,7 @@ impl<'t> Walker<'t> {
             // Hook-declined destructuring: extractField/extractVariable both
             // find no matching children for kotlin — NOTHING minted, RHS
             // invisible; candidates-only scan.
-            self.scan_fn_ref_subtree(node, 0, &[]);
+            self.scan_fn_ref_subtree(node, 0, &HashSet::new());
             skip_children = true;
         } else if kind == "import_header" {
             self.extract_import(node);
@@ -968,10 +951,8 @@ impl<'t> Walker<'t> {
         // branch — recursed (calls attribute to the stack top).
 
         if !skip_children {
-            for i in 0..node.named_child_count() {
-                if let Some(c) = node.named_child(i) {
-                    self.visit_node(c);
-                }
+            for c in node.named_children(&mut node.walk()) {
+                self.visit_node(c);
             }
         }
     }
@@ -1014,16 +995,14 @@ impl<'t> Walker<'t> {
         }
         if kind == "class_declaration" {
             let mut classified = "class";
-            for i in 0..node.child_count() {
-                if let Some(c) = node.child(i) {
-                    if c.kind() == "interface" {
-                        classified = "interface";
-                        break;
-                    }
-                    if c.kind() == "enum" {
-                        classified = "enum";
-                        break;
-                    }
+            for c in node.children(&mut node.walk()) {
+                if c.kind() == "interface" {
+                    classified = "interface";
+                    break;
+                }
+                if c.kind() == "enum" {
+                    classified = "enum";
+                    break;
                 }
             }
             match classified {
@@ -1037,10 +1016,8 @@ impl<'t> Walker<'t> {
         // `fun`s hit the function branch above and leak out as FUNCTIONS
         // under the enclosing fn; its properties mint nothing (quirk).
 
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.visit_for_calls_and_structure(c);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.visit_for_calls_and_structure(c);
         }
     }
 
@@ -1157,10 +1134,8 @@ impl<'t> Walker<'t> {
             }
         }
         let body = resolved_body.unwrap_or(node);
-        for i in 0..body.named_child_count() {
-            if let Some(c) = body.named_child(i) {
-                self.visit_node(c);
-            }
+        for c in body.named_children(&mut body.walk()) {
+            self.visit_node(c);
         }
         self.stack.pop();
     }
@@ -1176,10 +1151,8 @@ impl<'t> Walker<'t> {
         self.extract_inheritance(node, row);
         self.stack.push(Scope { row, kind: "interface", name });
         let body = self.resolve_body(node).unwrap_or(node);
-        for i in 0..body.named_child_count() {
-            if let Some(c) = body.named_child(i) {
-                self.visit_node(c);
-            }
+        for c in body.named_children(&mut body.walk()) {
+            self.visit_node(c);
         }
         self.stack.pop();
     }
@@ -1200,8 +1173,7 @@ impl<'t> Walker<'t> {
         for code in class_header_code(node) {
             self.visit_node(code);
         }
-        for i in 0..body.named_child_count() {
-            let Some(child) = body.named_child(i) else { continue };
+        for child in body.named_children(&mut body.walk()) {
             if child.kind() == "enum_entry" {
                 let member = self.extract_enum_members(child);
                 self.visit_enum_entry_body(child, member);
@@ -1217,8 +1189,7 @@ impl<'t> Walker<'t> {
         // enum_member per direct simple_identifier, positioned AT the
         // identifier. Entry value_arguments are never visited.
         let mut first: Option<(u32, String)> = None;
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i) else { continue };
+        for child in node.named_children(&mut node.walk()) {
             if matches!(child.kind(), "simple_identifier" | "identifier" | "property_identifier") {
                 let name = self.text(child).to_string();
                 let row = self.create_node("enum_member", &name, child, Extra::default());
@@ -1236,10 +1207,8 @@ impl<'t> Walker<'t> {
         let Some((row, name)) = member else { return };
         let Some(body) = (0..node.named_child_count()).filter_map(|i| node.named_child(i)).find(|c| c.kind() == "class_body") else { return };
         self.stack.push(Scope { row, kind: "enum_member", name });
-        for i in 0..body.named_child_count() {
-            if let Some(c) = body.named_child(i) {
-                self.visit_node(c);
-            }
+        for c in body.named_children(&mut body.walk()) {
+            self.visit_node(c);
         }
         self.stack.pop();
     }
@@ -1450,8 +1419,7 @@ impl<'t> Walker<'t> {
     /// delegation names no class and emits nothing).
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
         let extends_kind = edge_kind_index("extends").unwrap();
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i) else { continue };
+        for child in node.named_children(&mut node.walk()) {
             if child.kind() != "delegation_specifier" {
                 continue;
             }
@@ -1564,13 +1532,11 @@ impl<'t> Walker<'t> {
         }
         let anon_name = format!("<{short_name}$anon@{}>", node.start_position().row + 1);
         let Some(row) = self.create_node("class", &anon_name, node, Extra::default()) else {
-            for i in 0..body.named_child_count() {
-                if let Some(c) = body.named_child(i) {
-                    if body_walker {
-                        self.visit_for_calls_and_structure(c);
-                    } else {
-                        self.visit_node(c);
-                    }
+            for c in body.named_children(&mut body.walk()) {
+                if body_walker {
+                    self.visit_for_calls_and_structure(c);
+                } else {
+                    self.visit_node(c);
                 }
             }
             return true;
@@ -1581,10 +1547,8 @@ impl<'t> Walker<'t> {
             self.push_ref_at(row, name, extends_kind, at);
         }
         self.stack.push(Scope { row, kind: "class", name: anon_name });
-        for i in 0..body.named_child_count() {
-            if let Some(c) = body.named_child(i) {
-                self.visit_node(c);
-            }
+        for c in body.named_children(&mut body.walk()) {
+            self.visit_node(c);
         }
         self.stack.pop();
         true
@@ -1595,41 +1559,24 @@ impl<'t> Walker<'t> {
     /// (constructor_invocation) → NOTHING. Runs for functions/methods/classes
     /// only (hook properties never call it).
     fn extract_decorators_for(&mut self, decl: Node<'t>, decorated_row: u32) {
-        for i in 0..decl.named_child_count() {
-            let Some(child) = decl.named_child(i) else { continue };
+        for child in decl.named_children(&mut decl.walk()) {
             self.consider_decorator(child, decorated_row);
             if child.kind() == "modifiers" {
-                for j in 0..child.named_child_count() {
-                    if let Some(m) = child.named_child(j) {
-                        self.consider_decorator(m, decorated_row);
-                    }
+                for m in child.named_children(&mut child.walk()) {
+                    self.consider_decorator(m, decorated_row);
                 }
             }
         }
-        let Some(parent) = decl.parent() else { return };
-        let decl_start = decl.start_byte();
-        let mut decl_idx: isize = -1;
-        for i in 0..parent.named_child_count() {
-            if let Some(sib) = parent.named_child(i) {
-                if sib.start_byte() == decl_start {
-                    decl_idx = i as isize;
-                    break;
-                }
+        // Walked back from the declaration itself. Finding its place first, by counting the
+        // parent's children from the start, cost each declaration as much as it has
+        // siblings before it: a file of twenty thousand took minutes.
+        let mut sibling = decl.prev_named_sibling();
+        while let Some(sib) = sibling {
+            if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
+                break;
             }
-        }
-        if decl_idx > 0 {
-            let mut j = decl_idx - 1;
-            while j >= 0 {
-                let Some(sib) = parent.named_child(j as usize) else {
-                    j -= 1;
-                    continue;
-                };
-                if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
-                    break;
-                }
-                self.consider_decorator(sib, decorated_row);
-                j -= 1;
-            }
+            self.consider_decorator(sib, decorated_row);
+            sibling = sib.prev_named_sibling();
         }
     }
 
@@ -1638,8 +1585,7 @@ impl<'t> Walker<'t> {
             return;
         }
         let mut target: Option<Node> = None;
-        for i in 0..n.named_child_count() {
-            let Some(child) = n.named_child(i) else { continue };
+        for child in n.named_children(&mut n.walk()) {
             if child.kind() == "call_expression" {
                 target = child.child_by_field_name("function").or_else(|| child.named_child(0));
                 if target.is_some() {
@@ -1683,10 +1629,8 @@ impl<'t> Walker<'t> {
         let mut values: Vec<Node> = Vec::new();
         match mode {
             Mode::Args => {
-                for i in 0..node.named_child_count() {
-                    if let Some(c) = node.named_child(i) {
-                        values.push(c);
-                    }
+                for c in node.named_children(&mut node.walk()) {
+                    values.push(c);
                 }
             }
             Mode::Rhs => {
@@ -1730,10 +1674,8 @@ impl<'t> Walker<'t> {
             // value_argument layer with NO field resolution (zero fields) —
             // the label-forward skip is DEAD for kotlin; fan out namedChildren.
             "value_argument" => {
-                for i in 0..v.named_child_count() {
-                    if let Some(c) = v.named_child(i) {
-                        self.normalize_fn_ref_value(c, from, depth + 1);
-                    }
+                for c in v.named_children(&mut v.walk()) {
+                    self.normalize_fn_ref_value(c, from, depth + 1);
                 }
             }
             // `::topLevel` / `OtherClass::handle` — receiver = LAST
@@ -1743,8 +1685,7 @@ impl<'t> Walker<'t> {
             "callable_reference" => {
                 let mut receiver: Option<Node> = None;
                 let mut member: Option<Node> = None;
-                for i in 0..v.named_child_count() {
-                    let Some(child) = v.named_child(i) else { continue };
+                for child in v.named_children(&mut v.walk()) {
                     if child.kind() == "type_identifier" {
                         receiver = Some(child);
                     }
@@ -1770,8 +1711,7 @@ impl<'t> Walker<'t> {
                 if !self.text(v).starts_with("this::") {
                     return;
                 }
-                for i in 0..v.named_child_count() {
-                    let Some(child) = v.named_child(i) else { continue };
+                for child in v.named_children(&mut v.walk()) {
                     if child.kind() == "navigation_suffix" && self.text(child).starts_with("::") {
                         if child.named_child_count() > 0 {
                             if let Some(id) = child.named_child(child.named_child_count() - 1) {
@@ -1801,7 +1741,7 @@ impl<'t> Walker<'t> {
         });
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &HashSet<usize>) {
         stack_guard!();
         if depth > 12 {
             return;
@@ -1823,10 +1763,8 @@ impl<'t> Walker<'t> {
             return;
         }
         self.maybe_capture_fn_refs(node);
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1, walked);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.scan_fn_ref_subtree(c, depth + 1, walked);
         }
     }
 
@@ -1898,8 +1836,7 @@ impl<'t> Walker<'t> {
                             *decl_counts.entry(nm).or_insert(0) += 1;
                         }
                     } else {
-                        for i in 0..left.named_child_count() {
-                            let Some(c) = left.named_child(i) else { continue };
+                        for c in left.named_children(&mut left.walk()) {
                             if matches!(c.kind(), "identifier" | "simple_identifier") {
                                 let nm = self.text(c);
                                 if targets.contains_key(nm) {
@@ -1928,10 +1865,8 @@ impl<'t> Walker<'t> {
                 // (the Swift name-field half of the shared case is a null
                 // path for kotlin — variable_declaration always present)
             }
-            for i in 0..n.named_child_count() {
-                if let Some(c) = n.named_child(i) {
-                    dstack.push(c);
-                }
+            for c in n.named_children(&mut n.walk()) {
+                dstack.push(c);
             }
         }
         let shadowed: Vec<String> = decl_counts
@@ -1983,10 +1918,8 @@ impl<'t> Walker<'t> {
                         }
                     }
                 }
-                for i in 0..n.named_child_count() {
-                    if let Some(c) = n.named_child(i) {
-                        stack.push(c);
-                    }
+                for c in n.named_children(&mut n.walk()) {
+                    stack.push(c);
                 }
             }
         }

@@ -38,8 +38,7 @@ function emitScalaTypeRefs(typeNode: SyntaxNode, fromId: string, ctx: { addUnres
     }
     return;
   }
-  for (let i = 0; i < typeNode.namedChildCount; i++) {
-    const child = typeNode.namedChild(i);
+  for (const child of typeNode.namedChildren) {
     if (child) emitScalaTypeRefs(child, fromId, ctx, source);
   }
 }
@@ -185,8 +184,7 @@ export const scalaExtractor: LanguageExtractor = {
 
     // enum_case_definitions wraps simple_enum_case / full_enum_case children
     if (t === 'enum_case_definitions') {
-      for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
+      for (const child of node.namedChildren) {
         if (!child) continue;
         if (child.type === 'simple_enum_case' || child.type === 'full_enum_case') {
           const nameNode = child.childForFieldName('name');
@@ -200,8 +198,7 @@ export const scalaExtractor: LanguageExtractor = {
     if (t === 'extension_definition') {
       const body = node.childForFieldName('body');
       if (body) {
-        for (let i = 0; i < body.namedChildCount; i++) {
-          const child = body.namedChild(i);
+        for (const child of body.namedChildren) {
           if (child) ctx.visitNode(child);
         }
       }

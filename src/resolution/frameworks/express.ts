@@ -9,6 +9,7 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 import { REGEX_START_BEFORE, stripCommentsForRegex } from '../strip-comments';
 import { resolveImportPath } from '../import-resolver';
 import { dependsOn } from './package-deps';
+import { lineAt } from '../synth-utils';
 
 /** The languages a route file is read in here and by the Elysia resolver, which shares these readers. */
 export type ScriptLanguage = 'typescript' | 'javascript' | 'tsx' | 'jsx';
@@ -111,7 +112,7 @@ function replyRefs(safe: string, bodyStart: number, bodyEnd: number, fromNodeId:
       fromNodeId,
       referenceName: `${m[1]}.${m[2]}`,
       referenceKind: 'calls',
-      line: safe.slice(0, at).split('\n').length,
+      line: lineAt(safe, at),
       column: at - (safe.lastIndexOf('\n', at - 1) + 1),
       filePath,
       language,
@@ -221,7 +222,7 @@ export const expressResolver: FrameworkResolver = {
       const method = match[2]!;
       const routePath = match[3]!;
       if (method === 'use' && !routePath.startsWith('/')) continue;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       const routeNode: Node = {
         id: `route:${filePath}:${line}:${method.toUpperCase()}:${routePath}`,
         kind: 'route',
@@ -258,7 +259,7 @@ export const expressResolver: FrameworkResolver = {
         if (!call) break;
         const closeParen = call.close;
         const method = link[1]!;
-        const line = safe.slice(0, openParen).split('\n').length;
+        const line = lineAt(safe, openParen);
         const args = call.structure.slice(1, -1);
         const routeNode: Node = {
           id: `route:${filePath}:${line}:${method.toUpperCase()}:${routePath}`,

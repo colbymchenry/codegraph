@@ -2,6 +2,9 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getChildByField, getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
+/** Per tree, by a parent's id: what cppExtractor.getVisibility found among its children. */
+const CPP_VISIBILITY_SEEN = new WeakMap<object, Map<number, 'public' | 'private' | 'protected' | undefined>>();
+
 /**
  * Resolve the declared identifier inside a C declarator. A `declaration`'s
  * `declarator` field nests the name through `init_declarator` (with value),
@@ -3029,20 +3032,26 @@ export const cppExtractor: LanguageExtractor = {
     return parameters ? getNodeText(parameters, source) + (node.type === 'declaration' ? ';' : '') : undefined;
   },
   getVisibility: (node) => {
-    // Check for access specifier in parent
+    // Check for access specifier in parent. The answer is the parent's, so
+    // it is read once for each parent and kept: read again for every member,
+    // a file of twenty thousand functions spent a minute on it, each one
+    // reading every sibling it has.
     const parent = node.parent;
-    if (parent) {
-      for (let i = 0; i < parent.childCount; i++) {
-        const child = parent.child(i);
-        if (child?.type === 'access_specifier') {
-          const text = child.text;
-          if (text.includes('public')) return 'public';
-          if (text.includes('private')) return 'private';
-          if (text.includes('protected')) return 'protected';
-        }
-      }
+    if (!parent) return undefined;
+    const tree = node.tree;
+    let seen = CPP_VISIBILITY_SEEN.get(tree);
+    if (!seen) CPP_VISIBILITY_SEEN.set(tree, (seen = new Map()));
+    if (seen.has(parent.id)) return seen.get(parent.id);
+    let found: 'public' | 'private' | 'protected' | undefined;
+    for (let child = parent.firstChild; child && !found; child = child.nextSibling) {
+      if (child.type !== 'access_specifier') continue;
+      const text = child.text;
+      if (text.includes('public')) found = 'public';
+      else if (text.includes('private')) found = 'private';
+      else if (text.includes('protected')) found = 'protected';
     }
-    return undefined;
+    seen.set(parent.id, found);
+    return found;
   },
   resolveTypeAliasKind: (node, _source) => {
     // C++ typedef: `typedef enum { ... } name;`, `typedef struct { ... } name;`,

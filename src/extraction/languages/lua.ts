@@ -1,6 +1,7 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
+import { pushAll } from '../../utils';
 
 // Node names follow the vendored ABI-15 grammar (@tree-sitter-grammars/
 // tree-sitter-lua), NOT the older tree-sitter-wasms build — see grammars.ts.
@@ -11,7 +12,7 @@ function findDescendant(node: SyntaxNode, type: string): SyntaxNode | null {
   while (queue.length) {
     const n = queue.shift()!;
     if (n.type === type) return n;
-    queue.push(...n.namedChildren);
+    pushAll(queue, n.namedChildren);
   }
   return null;
 }

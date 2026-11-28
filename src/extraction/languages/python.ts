@@ -1,5 +1,6 @@
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
+import { minOf } from '../../utils';
 
 export const pythonExtractor: LanguageExtractor = {
   functionTypes: ['function_definition'],
@@ -104,7 +105,7 @@ function dedentDocstring(raw: string): string {
   const rest = lines.slice(1).filter((l) => l.trim().length > 0);
   const indent = rest.length === 0
     ? 0
-    : Math.min(...rest.map((l) => l.length - l.trimStart().length));
+    : minOf(rest.map((l) => l.length - l.trimStart().length));
   const out = [
     lines[0]?.trim() ?? '',
     ...lines.slice(1).map((l) => l.slice(indent).trimEnd()),

@@ -33,6 +33,7 @@
 
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from './tree-sitter-helpers';
+import { pushAll } from '../utils';
 
 export interface FnRefCandidate {
   name: string;
@@ -445,8 +446,7 @@ export function captureFnRefCandidates(
   switch (rule.mode) {
     case 'args':
     case 'list': {
-      for (let i = 0; i < container.namedChildCount; i++) {
-        const child = container.namedChild(i);
+      for (const child of container.namedChildren) {
         if (child) valueNodes.push(child);
       }
       break;
@@ -589,9 +589,8 @@ function normalizeValue(
       return inner ? normalizeValue(inner, spec, source, depth + 1) : [];
     }
     const results: NormalizedRef[] = [];
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
-      if (child) results.push(...normalizeValue(child, spec, source, depth + 1));
+    for (const child of node.namedChildren) {
+      if (child) pushAll(results, normalizeValue(child, spec, source, depth + 1));
     }
     return results;
   }
@@ -628,8 +627,7 @@ function normalizeValue(
 /** Rightmost descendant-or-self named child of one of the given types. */
 function lastNamedOfType(node: SyntaxNode, types: Set<string>): SyntaxNode | null {
   let found: SyntaxNode | null = null;
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of node.namedChildren) {
     if (!child) continue;
     if (types.has(child.type)) found = child;
     const deeper = lastNamedOfType(child, types);
@@ -653,8 +651,7 @@ function normalizeSpecial(
     //     the deferred obj.method class)
     case 'method_reference': {
       let last: SyntaxNode | null = null;
-      for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
+      for (const child of node.namedChildren) {
         if (child && child.type === 'identifier') last = child;
       }
       if (!last) return [];
@@ -691,8 +688,7 @@ function normalizeSpecial(
     case 'callable_reference': {
       let receiver: SyntaxNode | null = null;
       let member: SyntaxNode | null = null;
-      for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
+      for (const child of node.namedChildren) {
         if (!child) continue;
         if (child.type === 'type_identifier') receiver = child;
         if (child.type === 'simple_identifier') member = child;

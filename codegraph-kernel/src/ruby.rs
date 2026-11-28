@@ -24,6 +24,7 @@ use crate::docstring::preceding_docstring;
 use crate::ids;
 use crate::textutil as util;
 use regex::Regex;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use tree_sitter::{Node, Parser};
@@ -119,7 +120,7 @@ struct Cand {
 pub struct Walker<'t> {
     src: &'t str,
     file_path: &'t str,
-    line_starts: Vec<usize>,
+    line_starts: util::LineStarts,
     arena: Arena,
     node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
@@ -131,6 +132,9 @@ pub struct Walker<'t> {
     fs_values: HashMap<String, u32>,
     fs_value_counts: HashMap<String, u32>,
     value_scopes: Vec<ValueScope<'t>>,
+    /// For each parent, the last method whose visibility was worked out and what it was:
+    /// (parent's id) -> (that method's start byte, its visibility). See `visibility_of`.
+    visibility_seen: RefCell<HashMap<usize, (usize, u8)>>,
 }
 
 pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
@@ -160,6 +164,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         fs_values: HashMap::new(),
         fs_value_counts: HashMap::new(),
         value_scopes: Vec::new(),
+        visibility_seen: RefCell::new(HashMap::new()),
     };
 
     let line_count = source.bytes().filter(|b| *b == b'\n').count() as u32 + 1;
@@ -366,11 +371,9 @@ impl<'t> Walker<'t> {
         if let Some(name_node) = node.child_by_field_name("name") {
             return self.text(name_node).to_string();
         }
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                if matches!(c.kind(), "identifier" | "type_identifier" | "simple_identifier" | "constant") {
-                    return self.text(c).to_string();
-                }
+        for c in node.named_children(&mut node.walk()) {
+            if matches!(c.kind(), "identifier" | "type_identifier" | "simple_identifier" | "constant") {
+                return self.text(c).to_string();
             }
         }
         "<anonymous>".to_string()
@@ -382,22 +385,51 @@ impl<'t> Walker<'t> {
     /// Bug-for-bug: a BARE `private` line parses as identifier (invisible),
     /// and a matching call poisons every later sibling def regardless of
     /// ruby's actual arg-scoped semantics.
+    ///
+    /// The walk stops at the method it last answered for under the same parent
+    /// and takes that answer: nothing between the two changed it. Without that,
+    /// every method walked back over every sibling before it, and a class or a
+    /// file of seven thousand methods took twelve seconds over this alone.
     fn visibility_of(&self, node: Node) -> u8 {
+        let parent = node.parent().map_or(0, |p| p.id());
+        let start = node.start_byte();
+        // Only a method further down than the remembered one may lean on it.
+        let seen = self
+            .visibility_seen
+            .borrow()
+            .get(&parent)
+            .copied()
+            .filter(|(at, _)| *at < start);
+        let mut visibility = 1; // public
         let mut sibling = node.prev_named_sibling();
         while let Some(s) = sibling {
+            if let Some((at, known)) = seen {
+                if s.start_byte() <= at {
+                    visibility = known;
+                    break;
+                }
+            }
             if s.kind() == "call" {
                 if let Some(method) = s.child_by_field_name("method") {
-                    match self.text(method) {
-                        "private" => return 2,
-                        "protected" => return 3,
-                        "public" => return 1,
-                        _ => {}
+                    let decided = match self.text(method) {
+                        "private" => Some(2),
+                        "protected" => Some(3),
+                        "public" => Some(1),
+                        _ => None,
+                    };
+                    if let Some(decided) = decided {
+                        visibility = decided;
+                        break;
                     }
                 }
             }
             sibling = s.prev_named_sibling();
         }
-        1 // public
+        let mut memo = self.visibility_seen.borrow_mut();
+        if memo.get(&parent).is_none_or(|(at, _)| *at < start) {
+            memo.insert(parent, (start, visibility));
+        }
+        visibility
     }
 
     // --- the visitNode hook (languages/ruby.ts:19-76) ---------------------------
@@ -423,8 +455,7 @@ impl<'t> Walker<'t> {
                         let implements = edge_kind_index("implements").unwrap();
                         let line = self.line_of(node);
                         let col = self.col_of(node);
-                        for i in 0..args.named_child_count() {
-                            let Some(arg) = args.named_child(i) else { continue };
+                        for arg in args.named_children(&mut args.walk()) {
                             // `Mod` is constant, `Foo::Bar` is scope_resolution;
                             // `extend self` / dynamic args are skipped. Unlike
                             // every other extraction ref, the hook sets
@@ -463,10 +494,8 @@ impl<'t> Walker<'t> {
         };
         self.stack.push(Scope { row, kind: "module", name });
         if let Some(body) = node.child_by_field_name("body") {
-            for i in 0..body.named_child_count() {
-                if let Some(c) = body.named_child(i) {
-                    self.visit_node(c);
-                }
+            for c in body.named_children(&mut body.walk()) {
+                self.visit_node(c);
             }
         }
         self.stack.pop();
@@ -531,10 +560,8 @@ impl<'t> Walker<'t> {
         // `uninterpreted`, operator_assignment: no branch — recursed.
 
         if !skip_children {
-            for i in 0..node.named_child_count() {
-                if let Some(c) = node.named_child(i) {
-                    self.visit_node(c);
-                }
+            for c in node.named_children(&mut node.walk()) {
+                self.visit_node(c);
             }
         }
     }
@@ -587,10 +614,8 @@ impl<'t> Walker<'t> {
             return;
         }
 
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.visit_for_calls_and_structure(c);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.visit_for_calls_and_structure(c);
         }
     }
 
@@ -680,8 +705,7 @@ impl<'t> Walker<'t> {
         // text (scope_resolution / even `Struct.new(:a)` expressions verbatim),
         // positioned at the type child.
         let extends_kind = edge_kind_index("extends").unwrap();
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i) else { continue };
+        for child in node.named_children(&mut node.walk()) {
             if child.kind() == "superclass" {
                 if let Some(target) = child.named_child(0) {
                     let tname = self.text(target).to_string();
@@ -694,10 +718,8 @@ impl<'t> Walker<'t> {
         // Bodiless `class X; end` has no body field → the class node itself
         // is walked (name/superclass children revisit harmlessly).
         let body = node.child_by_field_name("body").unwrap_or(node);
-        for i in 0..body.named_child_count() {
-            if let Some(c) = body.named_child(i) {
-                self.visit_node(c);
-            }
+        for c in body.named_children(&mut body.walk()) {
+            self.visit_node(c);
         }
         self.stack.pop();
     }
@@ -883,10 +905,8 @@ impl<'t> Walker<'t> {
         let mut values: Vec<Node> = Vec::new();
         match mode {
             Mode::Args => {
-                for i in 0..node.named_child_count() {
-                    if let Some(c) = node.named_child(i) {
-                        values.push(c);
-                    }
+                for c in node.named_children(&mut node.walk()) {
+                    values.push(c);
                 }
             }
             Mode::PairValue => {
@@ -918,10 +938,8 @@ impl<'t> Walker<'t> {
         }
         match v.kind() {
             "block_argument" => {
-                for i in 0..v.named_child_count() {
-                    if let Some(c) = v.named_child(i) {
-                        self.normalize_fn_ref_value(c, from, depth + 1);
-                    }
+                for c in v.named_children(&mut v.walk()) {
+                    self.normalize_fn_ref_value(c, from, depth + 1);
                 }
             }
             "call" => {
@@ -995,10 +1013,8 @@ impl<'t> Walker<'t> {
             return;
         }
         self.maybe_capture_fn_refs(node);
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.scan_fn_ref_subtree(c, depth + 1);
         }
     }
 
@@ -1074,23 +1090,19 @@ impl<'t> Walker<'t> {
                             *decl_counts.entry(nm).or_insert(0) += 1;
                         }
                     } else {
-                        for i in 0..left.named_child_count() {
-                            if let Some(c) = left.named_child(i) {
-                                if c.kind() == "identifier" {
-                                    let nm = self.text(c);
-                                    if targets.contains_key(nm) {
-                                        *decl_counts.entry(nm).or_insert(0) += 1;
-                                    }
+                        for c in left.named_children(&mut left.walk()) {
+                            if c.kind() == "identifier" {
+                                let nm = self.text(c);
+                                if targets.contains_key(nm) {
+                                    *decl_counts.entry(nm).or_insert(0) += 1;
                                 }
                             }
                         }
                     }
                 }
             }
-            for i in 0..n.named_child_count() {
-                if let Some(c) = n.named_child(i) {
-                    dstack.push(c);
-                }
+            for c in n.named_children(&mut n.walk()) {
+                dstack.push(c);
             }
         }
         let shadowed: Vec<String> = decl_counts
@@ -1141,10 +1153,8 @@ impl<'t> Walker<'t> {
                         }
                     }
                 }
-                for i in 0..n.named_child_count() {
-                    if let Some(c) = n.named_child(i) {
-                        stack.push(c);
-                    }
+                for c in n.named_children(&mut n.walk()) {
+                    stack.push(c);
                 }
             }
         }

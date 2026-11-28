@@ -89,7 +89,7 @@ struct NodeMeta {
 pub struct Walker<'t> {
     src: &'t str,
     file_path: &'t str,
-    line_starts: Vec<usize>,
+    line_starts: util::LineStarts,
     arena: Arena,
     node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
@@ -318,11 +318,9 @@ impl<'t> Walker<'t> {
         if let Some(name_node) = node.child_by_field_name("name") {
             return self.text(name_node).to_string();
         }
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                if matches!(c.kind(), "identifier" | "type_identifier" | "simple_identifier" | "constant") {
-                    return self.text(c).to_string();
-                }
+        for c in node.named_children(&mut node.walk()) {
+            if matches!(c.kind(), "identifier" | "type_identifier" | "simple_identifier" | "constant") {
+                return self.text(c).to_string();
             }
         }
         "<anonymous>".to_string()
@@ -433,7 +431,7 @@ impl<'t> Walker<'t> {
             // The initializers extract_variable walked under their specs'
             // symbols took their own candidates; the scan covers the rest.
             let walked = self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0, &walked);
+            self.scan_fn_ref_subtree(node, 0, &walked.into_iter().collect());
             skip_children = true;
         } else if kind == "import_declaration" {
             self.extract_import(node);
@@ -444,10 +442,8 @@ impl<'t> Walker<'t> {
         }
 
         if !skip_children {
-            for i in 0..node.named_child_count() {
-                if let Some(c) = node.named_child(i) {
-                    self.visit_node(c);
-                }
+            for c in node.named_children(&mut node.walk()) {
+                self.visit_node(c);
             }
         }
     }
@@ -476,10 +472,8 @@ impl<'t> Walker<'t> {
             }
         }
 
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.visit_for_calls_and_structure(c);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.visit_for_calls_and_structure(c);
         }
     }
 
@@ -599,10 +593,8 @@ impl<'t> Walker<'t> {
                     self.push_ref_at(row, &text, references, ty);
                 }
                 let body = type_child.child_by_field_name("body").unwrap_or(type_child);
-                for i in 0..body.named_child_count() {
-                    if let Some(c) = body.named_child(i) {
-                        self.visit_node(c);
-                    }
+                for c in body.named_children(&mut body.walk()) {
+                    self.visit_node(c);
                 }
             }
             self.stack.pop();
@@ -650,8 +642,7 @@ impl<'t> Walker<'t> {
     fn extract_go_interface_methods(&mut self, interface_type: Node<'t>, iface_row: u32, iface_name: &str, decl: Node<'t>) {
         self.stack.push(Scope { row: iface_row, kind: "interface", name: iface_name.to_string() });
         let references = edge_kind_index("references").unwrap();
-        for i in 0..interface_type.named_child_count() {
-            let Some(m) = interface_type.named_child(i) else { continue };
+        for m in interface_type.named_children(&mut interface_type.walk()) {
             if !matches!(m.kind(), "method_elem" | "method_spec") {
                 continue;
             }
@@ -695,8 +686,7 @@ impl<'t> Walker<'t> {
         // A `var ( … )` group wraps its specs in a `var_spec_list`; a
         // `const ( … )` group holds them directly.
         let mut specs: Vec<Node<'t>> = Vec::new();
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i) else { continue };
+        for child in node.named_children(&mut node.walk()) {
             if child.kind() == "var_spec_list" {
                 specs.extend((0..child.named_child_count()).filter_map(|j| child.named_child(j)));
             } else {
@@ -804,11 +794,9 @@ impl<'t> Walker<'t> {
             .filter_map(|i| node.named_child(i))
             .find(|c| c.kind() == "import_spec_list");
         if let Some(list) = spec_list {
-            for i in 0..list.named_child_count() {
-                if let Some(spec) = list.named_child(i) {
-                    if spec.kind() == "import_spec" {
-                        handle_spec(self, spec);
-                    }
+            for spec in list.named_children(&mut list.walk()) {
+                if spec.kind() == "import_spec" {
+                    handle_spec(self, spec);
                 }
             }
         } else {
@@ -1079,10 +1067,8 @@ impl<'t> Walker<'t> {
             return;
         }
         let qualified = node.kind() == "qualified_type";
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.collect_type_names(c, declared, qualified, out);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.collect_type_names(c, declared, qualified, out);
         }
     }
 
@@ -1093,8 +1079,7 @@ impl<'t> Walker<'t> {
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
         stack_guard!();
         let extends_kind = edge_kind_index("extends").unwrap();
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i) else { continue };
+        for child in node.named_children(&mut node.walk()) {
             match child.kind() {
                 "type_elem" => {
                     let mut terms = (0..child.named_child_count())
@@ -1153,10 +1138,8 @@ impl<'t> Walker<'t> {
             }
             return;
         }
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.extract_type_refs_from_subtree(c, from_row);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.extract_type_refs_from_subtree(c, from_row);
         }
     }
 
@@ -1180,10 +1163,8 @@ impl<'t> Walker<'t> {
         let mut values: Vec<Node> = Vec::new();
         match mode {
             "args" | "list" => {
-                for i in 0..node.named_child_count() {
-                    if let Some(c) = node.named_child(i) {
-                        values.push(c);
-                    }
+                for c in node.named_children(&mut node.walk()) {
+                    values.push(c);
                 }
             }
             "rhs" => {
@@ -1281,22 +1262,22 @@ impl<'t> Walker<'t> {
                 });
             }
             "literal_element" | "expression_list" => {
-                for i in 0..v.named_child_count() {
-                    if let Some(c) = v.named_child(i) {
-                        self.normalize_fn_ref_value(c, from, depth + 1, container);
-                    }
+                for c in v.named_children(&mut v.walk()) {
+                    self.normalize_fn_ref_value(c, from, depth + 1, container);
                 }
             }
             _ => {}
         }
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &HashSet<usize>) {
         stack_guard!();
         if depth > 12 {
             return;
         }
-        // Subtrees the body walker has already been through.
+        // Subtrees the body walker has already been through. A set: looked up
+        // for every node of the subtree, the list of a `const (…)` block of some
+        // thousand names was read through each time.
         if walked.contains(&node.id()) {
             return;
         }
@@ -1310,10 +1291,8 @@ impl<'t> Walker<'t> {
             return;
         }
         self.maybe_capture_fn_refs(node);
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1, walked);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.scan_fn_ref_subtree(c, depth + 1, walked);
         }
     }
 
@@ -1408,10 +1387,8 @@ impl<'t> Walker<'t> {
                 }
                 _ => {}
             }
-            for i in 0..n.named_child_count() {
-                if let Some(c) = n.named_child(i) {
-                    dstack.push(c);
-                }
+            for c in n.named_children(&mut n.walk()) {
+                dstack.push(c);
             }
         }
         let shadowed: Vec<String> = decl_counts
@@ -1460,10 +1437,8 @@ impl<'t> Walker<'t> {
                         }
                     }
                 }
-                for i in 0..n.named_child_count() {
-                    if let Some(c) = n.named_child(i) {
-                        stack.push(c);
-                    }
+                for c in n.named_children(&mut n.walk()) {
+                    stack.push(c);
                 }
             }
         }
@@ -1620,8 +1595,7 @@ fn go_local_bindings<'t>(units: &[Node<'t>], names: &HashSet<&str>, src: &str) -
             if list.kind() != "parameter_list" {
                 continue;
             }
-            for i in 0..list.named_child_count() {
-                let Some(p) = list.named_child(i) else { continue };
+            for p in list.named_children(&mut list.walk()) {
                 if !matches!(p.kind(), "parameter_declaration" | "variadic_parameter_declaration") {
                     continue;
                 }

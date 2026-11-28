@@ -31,6 +31,7 @@ import {
 } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { declaredDependencies } from './package-deps';
+import { lineAt } from '../synth-utils';
 
 // ---------------------------------------------------------------------------
 // Public surface — see comment at top of file. This file owns four NestJS
@@ -725,10 +726,6 @@ function joinHttpPath(prefix: string, sub: string): string {
     .map((p) => p.trim().replace(/^\/+|\/+$/g, ''))
     .filter((p) => p.length > 0);
   return '/' + parts.join('/');
-}
-
-function lineAt(safe: string, index: number): number {
-  return safe.slice(0, index).split('\n').length;
 }
 
 function detectLanguage(filePath: string): JsLang {

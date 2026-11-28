@@ -26,8 +26,7 @@ import type { LanguageExtractor } from '../tree-sitter-types';
 
 function getInheritanceAncestors(node: SyntaxNode, source: string): string[] {
   const ancestors: string[] = [];
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of node.namedChildren) {
     if (!child || child.type !== 'inheritance_specifier') continue;
     const ancestor = getChildByField(child, 'ancestor');
     if (!ancestor) continue;
@@ -100,8 +99,7 @@ export const solidityExtractor: LanguageExtractor = {
     let returnType: SyntaxNode | undefined;
     let visibility: SyntaxNode | undefined;
     let mutability: SyntaxNode | undefined;
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const [i, child] of node.namedChildren.entries()) {
       if (!child) continue;
       const fieldName = node.fieldNameForNamedChild(i);
       if (child.type === 'parameter' && fieldName !== 'return_type') {
@@ -187,8 +185,7 @@ export const solidityExtractor: LanguageExtractor = {
       }
       ctx.pushScope(created.id);
       if (body) {
-        for (let i = 0; i < body.namedChildCount; i++) {
-          const child = body.namedChild(i);
+        for (const child of body.namedChildren) {
           if (child) ctx.visitNode(child);
         }
       }
@@ -209,8 +206,7 @@ export const solidityExtractor: LanguageExtractor = {
       const created = ctx.createNode(kind, name, node);
       if (!created) return true;
       ctx.pushScope(created.id);
-      for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
+      for (const child of node.namedChildren) {
         if (!child) continue;
         if (child === nameNode) continue;
         ctx.visitNode(child);

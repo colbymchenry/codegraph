@@ -436,7 +436,7 @@ describe('what the pass reads of a file', () => {
   it('takes a file over the size limit for nothing, as the index does', async () => {
     // A mention it could read would cost the flow, and reading it costs the heap.
     const mention = 'class Huge\n  def run(name)\n    name.send(:add_to, name)\n  end\nend\n';
-    const huge = `${mention}${'# a line of padding, to go over the limit\n'.repeat(30_000)}`;
+    const huge = `${mention}${'# a line of padding, to go over the limit\n'.repeat(Math.ceil(MAX_SOURCE_FILE_SIZE_BYTES / 40))}`;
     expect(Buffer.byteLength(huge)).toBeGreaterThan(MAX_SOURCE_FILE_SIZE_BYTES);
     const { cg } = await indexed({ ...BASE, 'lib/huge.rb': huge });
     expect(addToCalls(cg)).toEqual(FLOWED);
@@ -444,7 +444,7 @@ describe('what the pass reads of a file', () => {
 
   it('counts a mention in a file just under the limit', async () => {
     const mention = 'class Big\n  def run(name)\n    name.send(:add_to, name)\n  end\nend\n';
-    const big = `${mention}${'# a line of padding, to go near the limit\n'.repeat(20_000)}`;
+    const big = `${mention}${'# a line of padding, to go near the limit\n'.repeat(Math.floor((MAX_SOURCE_FILE_SIZE_BYTES * 0.8) / 42))}`;
     expect(Buffer.byteLength(big)).toBeLessThan(MAX_SOURCE_FILE_SIZE_BYTES);
     const { cg } = await indexed({ ...BASE, 'lib/big.rb': big });
     expect(addToCalls(cg)).toEqual(GUESSED);

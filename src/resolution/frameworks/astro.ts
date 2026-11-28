@@ -9,6 +9,7 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { pageComponentRef, resolvePageComponent } from './page-component';
 import { inReferencingFolder } from './component-folder';
+import { lineAt } from '../synth-utils';
 
 /**
  * Astro virtual module prefixes — framework-provided, not user code
@@ -148,7 +149,7 @@ export const astroResolver: FrameworkResolver = {
           // APIRoute = …`, `export async function POST(…)`.
           for (const m of content.matchAll(ENDPOINT_EXPORT)) {
             const verb = m[1] ?? m[2]!;
-            const line = content.slice(0, m.index).split('\n').length;
+            const line = lineAt(content, m.index);
             references.push({ fromNodeId: route.id, referenceName: verb, referenceKind: 'references', line, column: 0, filePath, language, candidates: [verb] });
           }
         }

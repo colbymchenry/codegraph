@@ -12,7 +12,7 @@ import { resolveImportPath } from '../import-resolver';
 import { defaultExportBinding, extractLocalExportAliases } from '../alias-binding';
 import { stripCommentsForRegex } from '../strip-comments';
 import { escapeRegExp } from '../../utils';
-import { FN_KINDS, makeLineAt } from '../synth-utils';
+import { FN_KINDS, makeLineAt, lineAt } from '../synth-utils';
 import { isTestPath } from '../../search/query-utils';
 import { matchBracket, skipString } from './object-literal';
 import { inReferencingFolder } from './component-folder';
@@ -180,7 +180,7 @@ export const reactResolver: FrameworkResolver = {
     const declarations = scanRouteDeclarations(content, allowsJsx(filePath));
     for (const route of declarations) {
       const { path: routePath, parts, at } = route;
-      const line = content.slice(0, at).split('\n').length;
+      const line = lineAt(content, at);
       const routeNode: Node = {
         id: `route:${filePath}:${line}:${routePath}`,
         kind: 'route',

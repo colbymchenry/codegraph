@@ -72,8 +72,7 @@ function extractKotlinReturnType(node: SyntaxNode, source: string): string | und
 function kotlinPropertyInitializers(node: SyntaxNode): SyntaxNode[] {
   const out: SyntaxNode[] = [];
   let afterEq = false;
-  for (let i = 0; i < node.childCount; i++) {
-    const c = node.child(i);
+  for (const c of node.children) {
     if (!c) continue;
     if (!c.isNamed) {
       if (c.type === '=') afterEq = true;
@@ -176,11 +175,9 @@ function namedChildAfter(node: SyntaxNode, token: string): SyntaxNode | null {
  */
 function kotlinClassHeaderCode(node: SyntaxNode): SyntaxNode[] {
   const out: SyntaxNode[] = [];
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of node.namedChildren) {
     if (child?.type === 'primary_constructor') {
-      for (let j = 0; j < child.namedChildCount; j++) {
-        const param = child.namedChild(j);
+      for (const param of child.namedChildren) {
         const value = param?.type === 'class_parameter' ? namedChildAfter(param, '=') : null;
         if (value) out.push(value);
       }
@@ -202,8 +199,7 @@ function kotlinClassHeaderCode(node: SyntaxNode): SyntaxNode[] {
 function isFunInterfaceNode(node: SyntaxNode): boolean {
   let hasFun = false;
   let hasInterfaceType = false;
-  for (let i = 0; i < node.childCount; i++) {
-    const child = node.child(i);
+  for (const child of node.children) {
     if (!child) continue;
     if (child.type === 'fun' && !child.isNamed) hasFun = true;
     if (child.type === 'user_type') {
@@ -212,8 +208,7 @@ function isFunInterfaceNode(node: SyntaxNode): boolean {
     }
     // Pattern 2b: user_type("interface") is inside an ERROR child
     if (child.type === 'ERROR') {
-      for (let j = 0; j < child.childCount; j++) {
-        const gc = child.child(j);
+      for (const gc of child.children) {
         if (gc && gc.type === 'user_type') {
           const typeId = gc.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
           if (typeId && typeId.text === 'interface') hasInterfaceType = true;
@@ -472,11 +467,9 @@ export const kotlinExtractor: LanguageExtractor = {
       // Pattern 1: body is in the next sibling lambda_literal
       const nextSibling = node.nextSibling;
       if (nextSibling && nextSibling.type === 'lambda_literal') {
-        for (let i = 0; i < nextSibling.namedChildCount; i++) {
-          const child = nextSibling.namedChild(i);
+        for (const child of nextSibling.namedChildren) {
           if (child && child.type === 'statements') {
-            for (let j = 0; j < child.namedChildCount; j++) {
-              const stmt = child.namedChild(j);
+            for (const stmt of child.namedChildren) {
               if (stmt) ctx.visitNode(stmt);
             }
           }
@@ -602,14 +595,11 @@ export const kotlinExtractor: LanguageExtractor = {
     // to the `expect`). Match the AST node, not raw text, so an annotation
     // argument or identifier named "actual" can't false-positive.
     const mods: string[] = [];
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of node.children) {
       if (child?.type !== 'modifiers') continue;
-      for (let j = 0; j < child.childCount; j++) {
-        const pm = child.child(j);
+      for (const pm of child.children) {
         if (pm?.type !== 'platform_modifier') continue;
-        for (let k = 0; k < pm.childCount; k++) {
-          const kw = pm.child(k);
+        for (const kw of pm.children) {
           if (kw && (kw.type === 'expect' || kw.type === 'actual')) mods.push(kw.type);
         }
       }

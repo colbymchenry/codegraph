@@ -432,9 +432,19 @@ struct InlineScan {
 fn scan_inline_structs(s: &[u8]) -> InlineScan {
     let mut out = InlineScan { ptr: false, types: Vec::new(), tags: Vec::new() };
     let mut last = 0;
+    // Where each keyword next stands, looked for again only once the scan has
+    // passed it. Looked for from `last` on every turn, the one a file does not
+    // use was searched for to the end of the file for each of the other: a
+    // header of twenty thousand structs and no union read itself that many times.
+    let mut next_struct = find_word(s, b"struct", 0);
+    let mut next_union = find_word(s, b"union", 0);
     loop {
-        let next_struct = find_word(s, b"struct", last);
-        let next_union = find_word(s, b"union", last);
+        if next_struct.is_some_and(|at| at < last) {
+            next_struct = find_word(s, b"struct", last);
+        }
+        if next_union.is_some_and(|at| at < last) {
+            next_union = find_word(s, b"union", last);
+        }
         let Some((t, keyword_len)) = (match (next_struct, next_union) {
             (Some(st), Some(un)) if st < un => Some((st, 6)),
             (Some(_), Some(un)) => Some((un, 5)),

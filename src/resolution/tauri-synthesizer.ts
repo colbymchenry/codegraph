@@ -39,6 +39,7 @@ import { HOLE, readStringAt } from './frameworks/expo-router';
 import { FN_KINDS, enclosingFn, enclosingValue, makeLineAt } from './synth-utils';
 import { TIER_CLIENT_TO_SERVER, TIER_SERVER_TO_CLIENT } from './tier-synthesizer';
 import { jsCodeBindsName } from './name-matcher';
+import { maxOf } from '../utils';
 
 const FRONTEND_FILE = /\.(?:[cm]?[jt]sx?|vue|svelte)$/;
 const FRONTEND_GATE = /invoke|listen|once|\bemit|\bcommands\b|\bevents\b|__TAURI/;
@@ -381,7 +382,7 @@ function commandsFor(entry: ListEntry, list: HandlerList, crates: Map<string, st
   }
   if (candidates.length > 1) {
     const scores = candidates.map((n) => pathScore(entry.segments, n));
-    const best = Math.max(...scores);
+    const best = maxOf(scores);
     candidates = candidates.filter((_, i) => scores[i] === best);
   }
   return candidates.length <= MAX_VARIANTS ? candidates : [];

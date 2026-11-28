@@ -51,8 +51,7 @@ const OBJC_TYPE_QUALIFIERS = new Set([
 /** Collect the type identifiers under a `method_type`, in document order. */
 function collectTypeIdentifiers(node: SyntaxNode, source: string, out: string[]): void {
   if (node.type === 'type_identifier') out.push(getNodeText(node, source).trim());
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of node.namedChildren) {
     if (child) collectTypeIdentifiers(child, source, out);
   }
 }
@@ -174,11 +173,9 @@ export const objcExtractor: LanguageExtractor = {
     if (!classNode) return true;
 
     ctx.pushScope(classNode.id);
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of node.namedChildren) {
       if (child?.type === 'implementation_definition') {
-        for (let j = 0; j < child.namedChildCount; j++) {
-          const implChild = child.namedChild(j);
+        for (const implChild of child.namedChildren) {
           if (implChild) ctx.visitNode(implChild);
         }
       }

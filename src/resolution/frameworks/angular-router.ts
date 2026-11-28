@@ -64,6 +64,8 @@ import {
   type RouteTable,
 } from './expo-router';
 import { destinationsForHref } from './nextjs';
+import { lineAt } from '../synth-utils';
+import { nodesAroundLine } from '../nodes-around';
 
 // =============================================================================
 // Reading a routes array
@@ -258,7 +260,7 @@ export function parseAngularRoutes(content: string): { routes: AngularRoute[]; m
   const redirects: AngularRedirect[] = [];
   if (!ROUTER_IMPORT.test(content)) return { routes, mounts, redirects };
   const safe = stripCommentsForRegex(content, 'typescript');
-  const lineOf = (at: number) => safe.slice(0, at).split('\n').length;
+  const lineOf = (at: number) => lineAt(safe, at);
   const seenPaths = new Set<string>();
   const walked = new Set<number>();
 
@@ -1091,8 +1093,7 @@ export const angularRouterResolver: FrameworkResolver = {
     // `navigate(['..', id], { relativeTo: this.route })` goes somewhere relative to here.
     const extras = nthArgumentText(lines, ref.line, ref.column, verb, 1);
     if (extras && /\brelativeTo\b/.test(extras)) return null;
-    const owner = context
-      .getNodesInFile(ref.filePath)
+    const owner = nodesAroundLine(context, ref.filePath, ref.line)
       .filter((n) => n.kind === 'class' && n.startLine <= ref.line && n.endLine >= ref.line)
       .reduce<Node | null>((inner, n) => (!inner || n.startLine >= inner.startLine ? n : inner), null);
     const href = angularDestination(arg, ref.filePath, owner, context, 0, true);

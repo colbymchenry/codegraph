@@ -59,7 +59,7 @@
 import { generateNodeId } from '../../extraction/tree-sitter-helpers';
 import { Node } from '../../types';
 import { FrameworkResolver, ResolutionContext, ResolvedRef, UnresolvedRef } from '../types';
-import { makeLineAt } from '../synth-utils';
+import { makeLineAt, lineAt } from '../synth-utils';
 import { matchBracket } from './object-literal';
 
 // ---------------------------------------------------------------------------
@@ -249,7 +249,7 @@ function extractDrupalHooks(
     const name = fm[1]!;
     if (!funcLineMap.has(name)) {
       // line = number of newlines before match start + 1
-      funcLineMap.set(name, content.slice(0, fm.index).split('\n').length);
+      funcLineMap.set(name, lineAt(content, fm.index));
     }
   }
 

@@ -675,7 +675,7 @@ What it skips out of the box:
   and a Java, Kotlin or Scala package named `build` is indexed whole.
 - **Anything in your `.gitignore`** — honored in git repos via git, and in
   non-git projects by reading `.gitignore` directly (root and nested).
-- **Files larger than 1 MB** — generated bundles, minified JS, vendored blobs.
+- **Files larger than 4 MB** — generated bundles, minified JS, vendored blobs. `codegraph status` names any source file left out for its size.
 
 To keep something else out, add it to `.gitignore`. To pull a default-excluded
 directory back **in** (say you really do want a vendored dependency indexed),

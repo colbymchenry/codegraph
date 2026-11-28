@@ -51,6 +51,7 @@ import {
   type HrefLiteral,
   type RouteTable,
 } from './expo-router';
+import { lineAt } from '../synth-utils';
 
 const ROUTE_LANGUAGES: readonly Language[] = ['typescript', 'javascript', 'tsx', 'jsx'];
 const HTTP_EXPORTS = 'GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS';
@@ -256,7 +257,7 @@ export const nextjsResolver: FrameworkResolver = {
     const nodes: Node[] = [];
     const references: UnresolvedRef[] = [];
     const stripped = stripCommentsForRegex(content, 'typescript');
-    const lineOf = (index: number): number => stripped.slice(0, index).split('\n').length;
+    const lineOf = (index: number): number => lineAt(stripped, index);
 
     if (file.kind === 'handler') {
       // `export async function GET(req) {…}` / `export const POST = …` — one route per method.

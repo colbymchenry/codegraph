@@ -256,7 +256,7 @@ struct Extra {
 pub struct Walker<'t> {
     src: &'t str,
     file_path: &'t str,
-    line_starts: Vec<usize>,
+    line_starts: util::LineStarts,
     arena: Arena,
     node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
@@ -686,11 +686,9 @@ impl<'t> Walker<'t> {
     fn is_async_of(&self, node: Node<'t>) -> bool {
         if let Some(next) = node.next_named_sibling() {
             if next.kind() == "function_body" {
-                for i in 0..next.child_count() {
-                    if let Some(c) = next.child(i) {
-                        if c.kind() == "async" {
-                            return true;
-                        }
+                for c in next.children(&mut next.walk()) {
+                    if c.kind() == "async" {
+                        return true;
                     }
                 }
             }
@@ -701,11 +699,9 @@ impl<'t> Walker<'t> {
     /// isStatic (dart.ts:234-243).
     fn is_static_of(&self, node: Node<'t>) -> bool {
         if node.kind() == "method_signature" {
-            for i in 0..node.child_count() {
-                if let Some(c) = node.child(i) {
-                    if c.kind() == "static" {
-                        return true;
-                    }
+            for c in node.children(&mut node.walk()) {
+                if c.kind() == "static" {
+                    return true;
                 }
             }
         }
@@ -1962,29 +1958,19 @@ impl<'t> Walker<'t> {
         // A `declaration`-wrapped member's annotations precede the wrapper,
         // and the comments between annotations and declaration are stepped over.
         let anchor = self.declaration_wrapper(decl).unwrap_or(decl);
-        if let Some(parent) = anchor.parent() {
-            let decl_start = anchor.start_byte();
-            let mut decl_idx: Option<usize> = None;
-            for i in 0..parent.named_child_count() {
-                if let Some(sib) = parent.named_child(i) {
-                    if sib.start_byte() == decl_start {
-                        decl_idx = Some(i);
-                        break;
-                    }
-                }
+        // Walked back from the declaration itself. Finding its place first, by counting the
+        // parent's children from the start, cost each declaration as much as it has
+        // siblings before it: a file of twenty thousand took minutes.
+        let mut sibling = anchor.prev_named_sibling();
+        while let Some(sib) = sibling {
+            sibling = sib.prev_named_sibling();
+            if DECORATOR_STEP_OVER.contains(&sib.kind()) {
+                continue;
             }
-            if let Some(di) = decl_idx {
-                for j in (0..di).rev() {
-                    let Some(sib) = parent.named_child(j) else { continue };
-                    if DECORATOR_STEP_OVER.contains(&sib.kind()) {
-                        continue;
-                    }
-                    if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
-                        break;
-                    }
-                    self.consider_decorator(sib, decorated_row);
-                }
+            if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
+                break;
             }
+            self.consider_decorator(sib, decorated_row);
         }
     }
 
@@ -2524,10 +2510,8 @@ impl<'t> Walker<'t> {
                     }
                 }
             }
-            for i in 0..n.named_child_count() {
-                if let Some(c) = n.named_child(i) {
-                    dstack.push(c);
-                }
+            for c in n.named_children(&mut n.walk()) {
+                dstack.push(c);
             }
         }
         let shadowed: Vec<String> = decl_counts
@@ -2584,10 +2568,8 @@ impl<'t> Walker<'t> {
                         }
                     }
                 }
-                for i in 0..n.named_child_count() {
-                    if let Some(c) = n.named_child(i) {
-                        stack.push(c);
-                    }
+                for c in n.named_children(&mut n.walk()) {
+                    stack.push(c);
                 }
             }
         }

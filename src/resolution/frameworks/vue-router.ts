@@ -65,6 +65,7 @@ import {
 } from './expo-router';
 import { destinationsForHref } from './nextjs';
 import { resolveImportPath } from '../import-resolver';
+import { lineAt } from '../synth-utils';
 
 const ROUTE_LANGUAGES: readonly Language[] = ['typescript', 'javascript', 'vue'];
 
@@ -139,7 +140,7 @@ export function parseVueRoutes(content: string, filePath = ''): VueRouteEntry[] 
   const out: VueRouteEntry[] = [];
   const seen = new Set<string>();
   const walked = new Set<number>();
-  const lineOf = (at: number) => safe.slice(0, at).split('\n').length;
+  const lineOf = (at: number) => lineAt(safe, at);
 
   const visit = (obj: { start: number; end: number }, prefix: string | null, layouts: VueLayout[], depth: number): void => {
     const fields = readFields(safe, obj.start, obj.end);

@@ -19,6 +19,8 @@ const HOLDS_NO_PROJECT_STATE: ReadonlyMap<string, string> = new Map([
   ['RUST_CHAINED_CALLS', 'keyed by the reference object, which a sync makes anew'],
   ['PY_CHAIN_GUESSING', 'keyed by the reference object, for the length of one lookup'],
   ['CPP_ARGUMENT_CHOICES_IN_FLIGHT', 'a recursion guard, empty between lookups'],
+  ['NOT_IMPORT_NODES', 'keyed by the array of nodes the context handed out, and dropped with it'],
+  ['CALLABLE_NODES', 'keyed by the array of nodes the context handed out, and dropped with it'],
 ]);
 
 /** A module-level collection that starts empty; one built from a literal (`new Map([`) is a constant. */

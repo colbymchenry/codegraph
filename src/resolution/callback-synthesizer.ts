@@ -26,7 +26,7 @@ import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
-import { escapeRegExp } from '../utils';
+import { escapeRegExp, maxOf } from '../utils';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { cppTemplateArgumentEdges } from './cpp-template-instantiations';
 import { goframeRouteEdges } from './goframe-synthesizer';
@@ -44,7 +44,7 @@ import { svelteKitLinkEdges, svelteKitPageComponentEdges } from './sveltekit-syn
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
 import { hasTauriPattern, tauriEdges } from './tauri-synthesizer';
-import { enclosingFn, makeLineAt } from './synth-utils';
+import { enclosingFn, makeLineAt, releaseLineAtTexts } from './synth-utils';
 import { eventEmitterEdges } from './event-emitter-synthesizer';
 import { resolveImportPath } from './import-resolver';
 import { cppSpecializationArguments, crossesCodeBoundary, goRefQualification, isManualMockHiddenFrom, isManualMockPath, jsCodeBindsName } from './name-matcher';
@@ -53,6 +53,7 @@ import { overrideFilter } from './override-parameters';
 import { declaredComponent, exportedComponent, lazyValueModules, wrappedComponentName } from './frameworks/react';
 import { jsxCode } from './jsx-code';
 import { isTestPath } from '../search/query-utils';
+import { withoutLongRuns } from '../file-limits';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -168,6 +169,7 @@ function releaseLineCaches(): void {
   sliceLinesSplit = [];
   lineOfSource = null;
   lineOfIndex = () => 1;
+  releaseLineAtTexts();
 }
 
 function registrarField(src: string): string | null {
@@ -4482,7 +4484,7 @@ function sharedFolders(a: string, b: string): number {
 function reachableHandlers(targets: Node[], file: string, verb: string): Node[] {
   if (targets.length < 2) return targets;
   const shared = targets.map((t) => sharedFolders(file, t.filePath));
-  const best = Math.max(...shared);
+  const best = maxOf(shared);
   if (verb === 'Send') return targets.filter((_, i) => shared[i] === best);
   return best > 0 ? targets.filter((_, i) => shared[i]! > 0) : targets;
 }
@@ -5287,7 +5289,9 @@ export interface SynthPassDef {
 const ALWAYS = (): boolean => true;
 
 /** Conservative input gates for SYNTH_PASSES; keep these in sync when adding a pass. */
-export function hasSynthesisPattern(filePath: string, content: string): boolean {
+export function hasSynthesisPattern(filePath: string, source: string): boolean {
+  // As the passes read it: a run no name is as long as holds no pattern.
+  const content = withoutLongRuns(source);
   // These passes consume declarations/layouts as well as dispatch sites. A
   // header or markup edit can change a channel whose endpoints live elsewhere.
   if (/\.(?:vue|svelte|dfm|fmx|nix|xml)$/.test(filePath)) return true;
