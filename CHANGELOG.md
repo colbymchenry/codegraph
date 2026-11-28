@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- C# member calls split around the dot or separated by comments now index like their single-line equivalents, with source navigation pointing at the method name after re-indexing.
 
 ## [1.6.5] - 2026-11-28
 
