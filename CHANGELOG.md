@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- `codegraph upgrade` can unpack its Windows bundle when launched from PowerShell 7. (#3436)
 
 ## [1.6.5] - 2026-11-28
 

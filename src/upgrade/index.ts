@@ -800,6 +800,9 @@ export function buildWindowsUpgradeScript(bundleRoot: string, version: string, a
     `  New-Item -ItemType Directory -Force -Path $tmp | Out-Null`,
     `  $zip=Join-Path $tmp 'cg.zip'`,
     `  Invoke-WebRequest -Uri $url -OutFile $zip`,
+    // A PowerShell 7 parent can leave its incompatible Archive module on
+    // Windows PowerShell's module path. Import the child's built-in copy.
+    `  Import-Module (Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Archive\\Microsoft.PowerShell.Archive.psd1') -Force`,
     `  Expand-Archive -Path $zip -DestinationPath $stage -Force`,
     `  $inner=Join-Path $stage 'codegraph-${target}'`,
     `  Install-CodeGraphFiles $(if(Test-Path $inner){$inner}else{$stage}) $dest`,
