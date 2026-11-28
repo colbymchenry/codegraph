@@ -153,7 +153,7 @@ struct Extra {
 pub struct Walker<'t> {
     src: &'t str,
     file_path: &'t str,
-    line_starts: Vec<usize>,
+    line_starts: util::LineStarts,
     arena: Arena,
     node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
@@ -1038,26 +1038,16 @@ impl<'t> Walker<'t> {
         }
         // Scan 2: preceding siblings (TS class style — inert for scala where
         // annotations are children, ported for fidelity).
-        if let Some(parent) = decl.parent() {
-            let decl_start = decl.start_byte();
-            let mut decl_idx: Option<usize> = None;
-            for i in 0..parent.named_child_count() {
-                if let Some(sib) = parent.named_child(i) {
-                    if sib.start_byte() == decl_start {
-                        decl_idx = Some(i);
-                        break;
-                    }
-                }
+        // Walked back from the declaration itself. Finding its place first, by counting the
+        // parent's children from the start, cost each declaration as much as it has
+        // siblings before it: a file of twenty thousand took minutes.
+        let mut sibling = decl.prev_named_sibling();
+        while let Some(sib) = sibling {
+            if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
+                break;
             }
-            if let Some(di) = decl_idx {
-                for j in (0..di).rev() {
-                    let Some(sib) = parent.named_child(j) else { continue };
-                    if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
-                        break;
-                    }
-                    self.consider_decorator(sib, decorated_row);
-                }
-            }
+            self.consider_decorator(sib, decorated_row);
+            sibling = sib.prev_named_sibling();
         }
     }
 
@@ -1414,10 +1404,8 @@ impl<'t> Walker<'t> {
                     }
                 }
             }
-            for i in 0..n.named_child_count() {
-                if let Some(c) = n.named_child(i) {
-                    dstack.push(c);
-                }
+            for c in n.named_children(&mut n.walk()) {
+                dstack.push(c);
             }
         }
         let shadowed: Vec<String> = decl_counts
@@ -1474,10 +1462,8 @@ impl<'t> Walker<'t> {
                         }
                     }
                 }
-                for i in 0..n.named_child_count() {
-                    if let Some(c) = n.named_child(i) {
-                        stack.push(c);
-                    }
+                for c in n.named_children(&mut n.walk()) {
+                    stack.push(c);
                 }
             }
         }

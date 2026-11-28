@@ -13,6 +13,7 @@ import * as os from 'os';
 import { execFileSync } from 'child_process';
 import CodeGraph, { LockUnavailableError } from '../src/index';
 import { QueryBuilder } from '../src/db/queries';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../src/file-limits';
 import { __emitWatchEventForTests } from '../src/sync/watcher';
 
 /**
@@ -239,7 +240,7 @@ describe('Sync Module', () => {
 
       it('persists an oversized skipped file so later syncs do not retry it (#1557)', async () => {
         const filePath = path.join(testDir, 'src', 'oversized.ts');
-        fs.writeFileSync(filePath, 'const value = 1;\n'.repeat(70_000));
+        fs.writeFileSync(filePath, 'const value = 1;\n'.repeat(Math.ceil(MAX_SOURCE_FILE_SIZE_BYTES / 17) + 1));
 
         const first = await cg.sync();
         expect(first.filesAdded).toBe(1);

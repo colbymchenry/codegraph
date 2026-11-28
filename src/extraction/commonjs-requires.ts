@@ -20,6 +20,7 @@
 
 import type { Language, UnresolvedReference } from '../types';
 import { stripCommentsForRegex } from '../resolution/strip-comments';
+import { lineAt } from '../resolution/synth-utils';
 
 const COMMONJS_LANGUAGES: ReadonlySet<Language> = new Set(['javascript', 'jsx', 'typescript', 'tsx']);
 
@@ -58,7 +59,7 @@ export function commonJsRequireRefs(filePath: string, source: string, language: 
       fromNodeId: `file:${filePath}`,
       referenceName: specifier,
       referenceKind: 'imports',
-      line: safe.slice(0, m.index).split('\n').length,
+      line: lineAt(safe, m.index),
       column: m.index - lineStart,
       filePath,
       language,

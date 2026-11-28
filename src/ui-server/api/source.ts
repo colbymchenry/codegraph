@@ -47,7 +47,7 @@ import { ApiError, badRequest, intParam, notFound, textParam } from './respond';
  * Largest file we will read to answer a source request.
  *
  * The whole file has to be read to hash it, so this bounds the work one request
- * can cause. Well above the 1 MB ceiling extraction itself applies, so anything
+ * can cause. Above the 4 MB ceiling extraction itself applies, so anything
  * actually in the index is comfortably inside it.
  */
 export const MAX_SOURCE_BYTES = 8 * 1024 * 1024;

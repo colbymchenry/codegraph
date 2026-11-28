@@ -1,6 +1,7 @@
 import type { LanguageExtractor } from '../tree-sitter-types';
 import { typescriptExtractor } from './typescript';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
+import { namedChildrenOf } from '../tree-sitter-helpers';
 
 /**
  * ArkTS (HarmonyOS / OpenHarmony, `.ets`) — a TypeScript superset whose
@@ -48,8 +49,7 @@ const DECORATED_MEMBER_TYPES = new Set([
 function collectDecoratorNames(node: SyntaxNode): string[] | undefined {
   const names: string[] = [];
   const nameOf = (dec: SyntaxNode): string | undefined => {
-    for (let i = 0; i < dec.namedChildCount; i++) {
-      const child = dec.namedChild(i);
+    for (const child of namedChildrenOf(dec)) {
       if (!child) continue;
       if (child.type === 'identifier') return child.text;
       if (child.type === 'call_expression') {
@@ -62,33 +62,19 @@ function collectDecoratorNames(node: SyntaxNode): string[] | undefined {
     return undefined;
   };
 
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of node.namedChildren) {
     if (child?.type === 'decorator') {
       const n = nameOf(child);
       if (n) names.push(n);
     }
   }
 
-  const parent = node.parent;
-  if (parent) {
-    // Find this node among the parent's named children by start offset
-    // (wrapper identity is not stable across navigation), then walk backwards.
-    const start = node.startIndex;
-    let idx = -1;
-    for (let i = 0; i < parent.namedChildCount; i++) {
-      const sib = parent.namedChild(i);
-      if (sib && sib.startIndex === start) {
-        idx = i;
-        break;
-      }
-    }
-    for (let i = idx - 1; i >= 0; i--) {
-      const sib = parent.namedChild(i);
-      if (!sib || sib.type !== 'decorator') break;
-      const n = nameOf(sib);
-      if (n) names.unshift(n);
-    }
+  // Walked back from the declaration itself. Finding its place first, by
+  // counting the parent's children from the start, cost each declaration as
+  // much as it has siblings before it: 1.2 MB of functions took 21 seconds.
+  for (let sib = node.previousNamedSibling; sib && sib.type === 'decorator'; sib = sib.previousNamedSibling) {
+    const n = nameOf(sib);
+    if (n) names.unshift(n);
   }
 
   return names.length > 0 ? names : undefined;

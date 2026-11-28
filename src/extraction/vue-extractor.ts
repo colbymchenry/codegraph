@@ -5,6 +5,8 @@ import { isLanguageSupported } from './grammars';
 import { foldScriptResult, sfcFileNode, sfcScriptLanguage, SFC_SCRIPT_ELEMENT, sfcBlockLineRanges } from './sfc-script';
 import { vueOptionsMembers } from './vue-options-api';
 import { vueTemplateCalls } from './vue-template-calls';
+import { lineAt } from '../resolution/synth-utils';
+import { pushAll } from '../utils';
 
 /**
  * Vue built-in components — skipped so a `<Transition>` / `<KeepAlive>` in the
@@ -139,13 +141,13 @@ export class VueExtractor {
     if (members.length === 0) return;
     const component = this.nodes.find((n) => n.id === componentNodeId);
     const owner = component?.name ?? 'component';
-    const lineAt = (offset: number) => block.content.slice(0, offset).split('\n').length;
+    const lineOf = (offset: number) => lineAt(block.content, offset);
     const colAt = (offset: number) => offset - block.content.lastIndexOf('\n', offset - 1) - 1;
     const now = Date.now();
     const created: Node[] = [];
     for (const m of members) {
-      const startLine = lineAt(m.start);
-      const endLine = lineAt(m.end);
+      const startLine = lineOf(m.start);
+      const endLine = lineOf(m.end);
       created.push({
         id: generateNodeId(this.filePath, 'method', `${owner}.${m.name}`, startLine + block.startLine),
         kind: 'method',
@@ -161,13 +163,17 @@ export class VueExtractor {
       });
     }
     // Innermost member for a line: `computed: { x: { get() {…} } }` is one member.
-    const memberAt = (line: number): Node | undefined => {
-      let best: Node | undefined;
-      for (const n of created) {
-        if (n.startLine <= line && n.endLine >= line && (!best || n.startLine >= best.startLine)) best = n;
-      }
-      return best;
-    };
+    // Written line by line once: by start, and of those that start together
+    // in their order, so the member a pass over all of them would end on is
+    // the one left on each line. Found by such a pass for each reference, a
+    // component of some thousand methods went through them all every time.
+    const byLine: Array<Node | undefined> = [];
+    const order = created.map((_, i) => i).sort((a, b) => created[a]!.startLine - created[b]!.startLine || a - b);
+    for (const i of order) {
+      const n = created[i]!;
+      for (let line = Math.max(0, n.startLine); line <= n.endLine; line++) byLine[line] = n;
+    }
+    const memberAt = (line: number): Node | undefined => (line >= 0 ? byLine[line] : undefined);
     // What the TS extractor attributed to the file (or to nothing narrower).
     const fileNode = result.nodes.find((n) => n.kind === 'file');
     const narrower = new Set(result.nodes.filter((n) => n.kind !== 'file').map((n) => n.id));
@@ -182,7 +188,7 @@ export class VueExtractor {
       const member = memberAt(edge.line);
       if (member) edge.source = member.id;
     }
-    result.nodes.push(...created);
+    pushAll(result.nodes, created);
   }
 
   /**

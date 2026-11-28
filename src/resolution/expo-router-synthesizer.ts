@@ -38,6 +38,7 @@ import {
   stringEnd,
   toHref,
 } from './frameworks/expo-router';
+import { lineAt } from './synth-utils';
 
 const JS_LANGS: ReadonlySet<Language> = new Set(['typescript', 'javascript', 'tsx', 'jsx']);
 const JS_FILE = /\.(?:[cm]?[jt]sx?)$/;
@@ -73,7 +74,7 @@ export async function expoRouterReturnEdges(ctx: ResolutionContext, onYield: May
     NAV_FED_BY_CALL.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = NAV_FED_BY_CALL.exec(stripped)) !== null) {
-      const line = stripped.slice(0, m.index).split('\n').length;
+      const line = lineAt(stripped, m.index);
       sites.push({ file, line, method: m[1]!, callee: m[2]! });
     }
   }
@@ -192,7 +193,7 @@ function screensInBody(
     found.set(route.id, {
       node: route,
       href: href.display,
-      line: helper.startLine + body.slice(0, start).split('\n').length - 1,
+      line: helper.startLine + lineAt(body, start) - 1,
       column: start - lineStart,
     });
     if (found.size > MAX_SCREENS_PER_HELPER) return null;

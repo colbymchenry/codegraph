@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText } from '../tree-sitter-helpers';
+import { getNodeText, namedChildrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 function getValVarName(node: SyntaxNode, source: string): string | null {
@@ -38,8 +38,7 @@ function emitScalaTypeRefs(typeNode: SyntaxNode, fromId: string, ctx: { addUnres
     }
     return;
   }
-  for (let i = 0; i < typeNode.namedChildCount; i++) {
-    const child = typeNode.namedChild(i);
+  for (const child of typeNode.namedChildren) {
     if (child) emitScalaTypeRefs(child, fromId, ctx, source);
   }
 }
@@ -67,8 +66,7 @@ function extractScalaReturnType(node: SyntaxNode, source: string): string | unde
 }
 
 function extractVisibility(node: SyntaxNode): 'public' | 'private' | 'protected' {
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of namedChildrenOf(node)) {
     if (!child) continue;
     if (child.type === 'modifiers' || child.type === 'access_modifier') {
       const text = child.text;
@@ -126,8 +124,7 @@ export const scalaExtractor: LanguageExtractor = {
   isAsync: () => false,
 
   isStatic: (node: SyntaxNode) => {
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (child?.type === 'modifiers' && child.text.includes('static')) return true;
     }
     return false;
@@ -185,8 +182,7 @@ export const scalaExtractor: LanguageExtractor = {
 
     // enum_case_definitions wraps simple_enum_case / full_enum_case children
     if (t === 'enum_case_definitions') {
-      for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
+      for (const child of node.namedChildren) {
         if (!child) continue;
         if (child.type === 'simple_enum_case' || child.type === 'full_enum_case') {
           const nameNode = child.childForFieldName('name');
@@ -200,8 +196,7 @@ export const scalaExtractor: LanguageExtractor = {
     if (t === 'extension_definition') {
       const body = node.childForFieldName('body');
       if (body) {
-        for (let i = 0; i < body.namedChildCount; i++) {
-          const child = body.namedChild(i);
+        for (const child of body.namedChildren) {
           if (child) ctx.visitNode(child);
         }
       }
@@ -215,8 +210,7 @@ export const scalaExtractor: LanguageExtractor = {
     const importText = getNodeText(node, source).trim();
     const pathNode = node.childForFieldName('path');
     if (pathNode) return { moduleName: getNodeText(pathNode, source), signature: importText };
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (child?.type === 'identifier' || child?.type === 'stable_identifier') {
         return { moduleName: getNodeText(child, source), signature: importText };
       }

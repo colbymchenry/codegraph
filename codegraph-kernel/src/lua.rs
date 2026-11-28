@@ -73,7 +73,7 @@ pub struct Walker<'t> {
     src: &'t str,
     file_path: &'t str,
     is_luau: bool,
-    line_starts: Vec<usize>,
+    line_starts: util::LineStarts,
     arena: Arena,
     node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,

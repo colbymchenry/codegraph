@@ -21,6 +21,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../src/file-limits';
 
 let root = '';
 let cg: CodeGraph;
@@ -84,12 +85,12 @@ func (m *Meta) Unmarshal(dAtA []byte) error { return nil }
 
 func (m *Meta) Describe() string { return "" }
 `,
-    // Over the index's 1 MB limit, so none of it is read: Item's own
+    // Over the index's size limit, so none of it is read: Item's own
     // Unmarshal is missing from the graph.
     'model/generated.pb.go': `package model
 
 func (i *Item) Unmarshal(dAtA []byte) error { return nil }
-${'// generated padding, never read by the indexer\n'.repeat(24_000)}`,
+${'// generated padding, never read by the indexer\n'.repeat(Math.ceil(MAX_SOURCE_FILE_SIZE_BYTES / 40))}`,
     'caller/caller.go': `package caller
 
 import (

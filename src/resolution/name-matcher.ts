@@ -4,10 +4,11 @@
  * Handles symbol name matching for reference resolution.
  */
 
+import { importsBoundTo } from './import-lookup';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node, IMPLICIT_RECORD_ACCESSOR_DOC } from '../types';
-import { escapeRegExp, escapesRoot } from '../utils';
+import { escapeRegExp, escapesRoot, maxOf, minOf } from '../utils';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { isJsSuperCallSite } from './js-super-calls';
@@ -28,6 +29,8 @@ import { leavesWorkspaceRoot } from './workspace-packages';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap, parsePackageName, parseTargetPaths, parseWorkspaceMembers } from './frameworks/cargo-workspace';
 import { blankRustCode, readRustScopes, rustBindingAt, rustInnerBlockAt, rustBoundsOf, rustFnAt, rustImplAt, splitRustTopLevel, type RustBinding, type RustClosureCallee, type RustPatternSite, type RustScopes } from './rust-scopes';
+import { lineAt, linesOf } from './synth-utils';
+import { nodesAroundLine, nodesNamed, nodesAroundLineIn } from './nodes-around';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -779,9 +782,7 @@ function pythonBindsLocally(name: string, ref: UnresolvedRef, context: Resolutio
   const lines = pythonMemberLines(ref.filePath, context);
   const statements = pythonStatementStarts(ref.filePath, context);
   const param = new RegExp(`[(,]\\s*\\*{0,2}${escapeRegExp(name)}\\s*[:=,)]`);
-  const scopes = context.getNodesInFile(ref.filePath).filter(n =>
-    (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line)
-    .sort((a, b) => b.startLine - a.startLine);
+  const scopes = pythonScopesAround(ref, context);
   for (const scope of scopes) {
     const own = pythonOwnLines(scope, ref.filePath, context);
     const bindings = own.flatMap(i => pythonLineBindings(lines, i, statements, name));
@@ -807,9 +808,7 @@ export function pythonFunctionModuleAlias(name: string, ref: UnresolvedRef, cont
   if (ref.language !== 'python' || !/^\w+$/.test(name)) return null;
   const lines = pythonMemberLines(ref.filePath, context);
   const statements = pythonStatementStarts(ref.filePath, context);
-  const scopes = context.getNodesInFile(ref.filePath).filter(n =>
-    (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line)
-    .sort((a, b) => b.startLine - a.startLine);
+  const scopes = pythonScopesAround(ref, context);
   for (const scope of scopes) {
     const bindings = pythonOwnLines(scope, ref.filePath, context).flatMap(i => pythonLineBindings(lines, i, statements, name));
     if (bindings.length === 0) continue;
@@ -857,6 +856,35 @@ export function pythonReceiverBinding(name: string, ref: UnresolvedRef, context:
     if (binding !== null) return binding;
   }
   return 'module';
+}
+
+/**
+ * The functions and methods around a Python reference, innermost first: the
+ * ones that hold its line, by where they start, the latest first. Read from
+ * the file's index of them when its functions nest one inside another and
+ * no two start on a line, as written code's do; found among all of the
+ * file's symbols otherwise, as it was for every reference before.
+ */
+function pythonScopesAround(ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  const { functions, innermost, parent } = pythonFunctionIndex(ref.filePath, context);
+  const nest = pythonNameScan(context, `functionsnest\0${ref.filePath}`, () => {
+    const open: Node[] = [];
+    for (const f of functions) {
+      while (open.length && open[open.length - 1]!.endLine < f.startLine) open.pop();
+      const around = open[open.length - 1];
+      if (around && (f.startLine <= around.startLine || f.endLine > around.endLine)) return false;
+      open.push(f);
+    }
+    return true;
+  });
+  if (!nest) {
+    return context.getNodesInFile(ref.filePath).filter(n =>
+      (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line)
+      .sort((a, b) => b.startLine - a.startLine);
+  }
+  const scopes: Node[] = [];
+  for (let i = ref.line >= 0 ? innermost[ref.line] ?? -1 : -1; i >= 0; i = parent[i]!) scopes.push(functions[i]!);
+  return scopes;
 }
 
 /**
@@ -1081,21 +1109,65 @@ function pythonCaseCaptures(statement: string, name: string): boolean {
  * bind only there, so the rest of the function still reads the module.
  */
 function pythonStatementBindsAt(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  const lines = pythonMemberLines(ref.filePath, context);
-  const starts = pythonStatementStarts(ref.filePath, context);
   const at = ref.line - 1;
-  if (at < 0 || at >= lines.length) return false;
-  let first = at;
-  while (first > 0 && !starts[first]) first--;
-  let end = at;
-  while (end + 1 < lines.length && !starts[end + 1]) end++;
-  let text = '';
-  let offset = 0;
-  for (let i = first; i <= end; i++) {
-    if (i === at) offset = text.length + Math.max(0, ref.column ?? 0);
-    text += pythonBlankStrings(lines[i]!) + '\n';
+  const spans = pythonStatementSpans(ref.filePath, context);
+  if (at < 0 || at >= spans.first.length) return false;
+  const first = spans.first[at]!;
+  const binders = pythonNameScan(context, `statement\0${ref.filePath}\0${first}`, () =>
+    pythonStatementBinders(pythonMemberLines(ref.filePath, context), first, spans.last[at]!));
+  if (!binders) return false;
+  const offset = binders.lineStarts[at - first]! + Math.max(0, ref.column ?? 0);
+  // Those that open before the reference, nearest first, for as long as one
+  // of them or of those before it still reaches past the reference.
+  const holds = <T extends { from: number; to: number; reach: number }>(all: T[], binds: (one: T) => boolean): boolean => {
+    let low = 0;
+    let high = all.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (all[mid]!.from < offset) low = mid + 1;
+      else high = mid;
+    }
+    for (let i = low - 1; i >= 0 && all[i]!.reach > offset; i--) {
+      if (all[i]!.to > offset && binds(all[i]!)) return true;
+    }
+    return false;
+  };
+  return holds(binders.lambdas, (lambda) => lambda.params.includes(name)) ||
+    holds(binders.loops, (loop) => pythonTargetBinds(loop.targets, name));
+}
+
+/**
+ * What one Python statement's lambdas and comprehensions bind, read once for
+ * the statement: a lambda's parameters hold from its `:` to where its body
+ * ends, a comprehension's `for` targets inside the brackets around it. Each
+ * is `from`…`to` in the statement's text (strings blanked), both ends out;
+ * `reach` is the furthest `to` of it and those before it. Null when the
+ * statement has neither.
+ *
+ * A reference asked about read its whole statement again, and one list of
+ * rows is one statement: a table of ten thousand rows, each calling a helper,
+ * took thirty-seven seconds at a third of a megabyte.
+ */
+interface PythonStatementBinders {
+  /** Where each of the statement's lines starts in its text. */
+  lineStarts: number[];
+  lambdas: Array<{ params: string[]; from: number; to: number; reach: number }>;
+  loops: Array<{ targets: string; from: number; to: number; reach: number }>;
+}
+
+function pythonStatementBinders(lines: string[], first: number, last: number): PythonStatementBinders | null {
+  const lineStarts: number[] = [];
+  const parts: string[] = [];
+  let length = 0;
+  for (let i = first; i <= last; i++) {
+    lineStarts.push(length);
+    const part = pythonBlankStrings(lines[i]!) + '\n';
+    parts.push(part);
+    length += part.length;
   }
-  if (!/\b(?:lambda|for)\b/.test(text)) return false;
+  const text = parts.join('');
+  if (!/\b(?:lambda|for)\b/.test(text)) return null;
+  const lambdas: PythonStatementBinders['lambdas'] = [];
   // A lambda's body runs from its `:` to the first comma or closing bracket of
   // its own level.
   for (const m of text.matchAll(/\blambda\b/g)) {
@@ -1108,7 +1180,7 @@ function pythonStatementBindsAt(name: string, ref: UnresolvedRef, context: Resol
       else if (c === ')' || c === ']' || c === '}') { if (depth === 0) break; depth--; }
       else if (c === ':' && depth === 0) colon = i;
     }
-    if (colon < 0 || offset <= colon || !pythonParamNames(text.slice(from, colon)).includes(name)) continue;
+    if (colon < 0) continue;
     let stop = text.length;
     depth = 0;
     for (let i = colon + 1; i < text.length; i++) {
@@ -1117,24 +1189,49 @@ function pythonStatementBindsAt(name: string, ref: UnresolvedRef, context: Resol
       else if (c === ')' || c === ']' || c === '}') { if (depth === 0) { stop = i; break; } depth--; }
       else if (c === ',' && depth === 0) { stop = i; break; }
     }
-    if (offset < stop) return true;
+    lambdas.push({ params: pythonParamNames(text.slice(from, colon)), from: colon, to: stop, reach: stop });
   }
-  // A comprehension's `for` sits inside the brackets it binds in.
+  // A comprehension's `for` sits inside the brackets it binds in: the nearest
+  // still open where it stands.
+  const fors = [...text.matchAll(/\bfor\b/g)].map((m) => m.index!);
+  const around: number[] = [];
+  const closes = new Map<number, number>();
   const opens: number[] = [];
-  const pairs: Array<[number, number]> = [];
-  for (let i = 0; i < text.length; i++) {
+  for (let i = 0, next = 0; i < text.length && (next < fors.length || opens.length); i++) {
+    if (i === fors[next]) {
+      around.push(opens.length ? opens[opens.length - 1]! : -1);
+      next++;
+      continue;
+    }
     const c = text[i]!;
     if (c === '(' || c === '[' || c === '{') opens.push(i);
-    else if ((c === ')' || c === ']' || c === '}') && opens.length) pairs.push([opens.pop()!, i]);
+    else if ((c === ')' || c === ']' || c === '}') && opens.length) closes.set(opens.pop()!, i);
   }
-  for (const o of opens) pairs.push([o, text.length]);
-  for (const m of text.matchAll(/\bfor\b/g)) {
-    const around = pairs.filter(([o, c]) => o < m.index! && c > m.index!).sort((a, b) => b[0] - a[0])[0];
-    if (!around || offset <= around[0] || offset >= around[1]) continue;
-    const targets = /^\s*([\s\S]+?)\s+in\b/.exec(text.slice(m.index! + 3, around[1]));
-    if (targets && pythonTargetBinds(targets[1]!, name)) return true;
+  const loops: PythonStatementBinders['loops'] = [];
+  fors.forEach((at, i) => {
+    const open = around[i]!;
+    if (open < 0) return;
+    const close = closes.get(open) ?? text.length;
+    const targets = /^\s*([\s\S]+?)\s+in\b/.exec(text.slice(at + 3, close));
+    if (targets) loops.push({ targets: targets[1]!, from: open, to: close, reach: close });
+  });
+  for (const all of [lambdas, loops]) {
+    all.sort((a, b) => a.from - b.from);
+    for (let i = 1; i < all.length; i++) all[i]!.reach = Math.max(all[i]!.reach, all[i - 1]!.reach);
   }
-  return false;
+  return { lineStarts, lambdas, loops };
+}
+
+/** For each line of a Python file, the first and the last line of the statement it belongs to. Read once per file. */
+function pythonStatementSpans(filePath: string, context: ResolutionContext): { first: Int32Array; last: Int32Array } {
+  return pythonNameScan(context, `statementspans\0${filePath}`, () => {
+    const starts = pythonStatementStarts(filePath, context);
+    const first = new Int32Array(starts.length);
+    const last = new Int32Array(starts.length);
+    for (let i = 1; i < starts.length; i++) first[i] = starts[i] ? i : first[i - 1]!;
+    for (let i = starts.length - 1; i >= 0; i--) last[i] = i + 1 < starts.length && !starts[i + 1] ? last[i + 1]! : i;
+    return { first, last };
+  });
 }
 
 /**
@@ -1504,16 +1601,16 @@ function pythonGlobalReceiverTarget(
   receiver: string, member: string, ref: UnresolvedRef, context: ResolutionContext, call = false,
 ): Node | null | undefined {
   const global = pythonNameScan(context, `global\0${ref.filePath}\0${receiver}`, () =>
-    context.getNodesInFile(ref.filePath).find(n => n.name === receiver && isPythonModuleGlobal(n, context)) ?? null);
+    nodesNamed(context, ref.filePath, receiver).find(n => n.name === receiver && isPythonModuleGlobal(n, context)) ?? null);
   if (!global || pythonBindsLocally(receiver, ref, context, true)) return undefined;
   // A `def _svc` / `class _svc` nested in an enclosing function binds the name there.
   const nodes = context.getNodesInFile(ref.filePath);
-  const scopes = nodes.filter(n => (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line);
+  const scopes = nodesAroundLine(context, ref.filePath, ref.line).filter(n => (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line);
   const innermost = (n: Node) => nodes
     .filter(c => c.id !== n.id && (c.kind === 'function' || c.kind === 'method' || c.kind === 'class') &&
       c.startLine < n.startLine && c.endLine >= n.startLine)
     .sort((a, b) => b.startLine - a.startLine)[0];
-  if (nodes.some(n => n.name === receiver && (n.kind === 'class' || n.kind === 'function') &&
+  if (nodesNamed(context, ref.filePath, receiver).some(n => n.name === receiver && (n.kind === 'class' || n.kind === 'function') &&
       scopes.some(f => f.id === innermost(n)?.id))) return undefined;
   if (!pythonOwnGlobalWrites(global, context) || pythonExternalWrites(global, context).writers.has(ref.filePath)) {
     return null;
@@ -1949,7 +2046,7 @@ function localDeclarationScope(candidate: Node, context: ResolutionContext): { s
   if (hit !== undefined) return hit;
   let scope: { start: number; end: number } | null = null;
   if (!((candidate.language === 'lua' || candidate.language === 'luau') && !isLuaLocal(candidate, context))) {
-    for (const n of context.getNodesInFile(candidate.filePath)) {
+    for (const n of nodesAroundLine(context, candidate.filePath, candidate.startLine)) {
       if ((n.kind !== 'function' && n.kind !== 'method') || n.id === candidate.id) continue;
       if (n.startLine > candidate.startLine || n.endLine < candidate.startLine || n.startLine === n.endLine) continue;
       if (n.startLine === candidate.startLine && (n.startColumn ?? 0) >= (candidate.startColumn ?? 0)) continue;
@@ -2644,7 +2741,7 @@ export function isJavaOutsideImport(name: string, ref: UnresolvedRef, context: R
   // `TypeAdapters`' field `URI`, as a type always is beside a value.
   const call = ref.referenceKind === 'calls' && name === ref.referenceName;
   const kinds = call ? JVM_CALLABLE_KINDS : JVM_TYPE_KINDS;
-  if ((context.getNodesInFileNamed?.(ref.filePath, name) ?? context.getNodesInFile(ref.filePath).filter((n) => n.name === name))
+  if ((context.getNodesInFileNamed?.(ref.filePath, name) ?? nodesNamed(context, ref.filePath, name).filter((n) => n.name === name))
     .some((n) => kinds.has(n.kind))) return false;
   let packages = JVM_PACKAGES.get(context);
   if (!packages) {
@@ -2728,11 +2825,10 @@ function luaAliasTarget(ref: UnresolvedRef, context: ResolutionContext): Resolve
 
 /** The `local name = …` in scope at `line` of `file`: the nearest one above it that no other function holds. */
 function luaLocalDecl(name: string, file: string, line: number, context: ResolutionContext): Node | null {
-  const nodes = context.getNodesInFile(file);
-  const fns = nodes.filter((n) => n.kind === 'function' || n.kind === 'method');
+  const { fns, variables, around, fileNode } = luaFileLocals(file, context);
   let best: Node | null = null;
-  for (const n of nodes) {
-    if (n.name !== name || n.kind !== 'variable' || n.startLine > line || !n.signature) continue;
+  for (const n of variables.get(name) ?? []) {
+    if (n.startLine > line) continue;
     if (fns.some((f) => f.startLine <= n.startLine && n.startLine <= f.endLine && !(f.startLine <= line && line <= f.endLine))) continue;
     if (!isLuaLocal(n, context)) continue;
     if (!best || n.startLine > best.startLine) best = n;
@@ -2740,20 +2836,93 @@ function luaLocalDecl(name: string, file: string, line: number, context: Resolut
   // A function's own locals are not nodes: kong's `local clear_header =
   // kong.response.clear_header` inside an access handler. Read the nearest
   // one above the call within the innermost function around it.
-  const fn = fns.filter((f) => f.startLine <= line && line <= f.endLine && f.startLine < line)
-    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
-  if (fn && (!best || best.startLine < fn.startLine)) {
-    const lines = context.getFileLines?.(file) ?? context.readFile(file)?.split(/\r?\n/) ?? [];
-    const decl = new RegExp(`^\\s*local\\s+${escapeRegExp(name)}\\s*=\\s*(.+?)\\s*$`);
-    for (let at = line - 1; at > fn.startLine; at--) {
-      const m = decl.exec(lines[at - 1] ?? '');
-      if (!m) continue;
-      const fileNode = nodes.find((n) => n.kind === 'file');
-      if (!fileNode) break;
-      return { ...fileNode, name, kind: 'variable', signature: `= ${m[1]}`, startLine: at, endLine: at };
-    }
+  const fn = line >= 0 ? around[line] : undefined;
+  if (fn && fileNode && (!best || best.startLine < fn.startLine)) {
+    const decl = luaLocalLineAbove(name, file, line, fn.startLine, context);
+    if (decl) return { ...fileNode, name, kind: 'variable', signature: `= ${decl.value}`, startLine: decl.line, endLine: decl.line };
   }
   return best;
+}
+
+/**
+ * What luaLocalDecl asks of a file, read once for it: its functions, its
+ * variables that have a value by name, the narrowest function around each
+ * line (its own first line apart), and its file node. Read for every call,
+ * a file of some thousand functions that call each other went through all
+ * of its symbols once for each call.
+ */
+function luaFileLocals(file: string, context: ResolutionContext): { fns: Node[]; variables: Map<string, Node[]>; around: Array<Node | undefined>; fileNode: Node | undefined } {
+  return fileScan(context, `lua-locals\0${file}`, () => {
+    const nodes = context.getNodesInFile(file);
+    const fns = nodes.filter((n) => n.kind === 'function' || n.kind === 'method');
+    const variables = new Map<string, Node[]>();
+    for (const n of nodes) {
+      if (n.kind !== 'variable' || !n.signature) continue;
+      const same = variables.get(n.name);
+      if (same) same.push(n);
+      else variables.set(n.name, [n]);
+    }
+    return { fns, variables, around: narrowestAround(fns, false), fileNode: nodes.find((n) => n.kind === 'file') };
+  });
+}
+
+/**
+ * The nearest `local name = value` line above `line` and below `floor`. A
+ * plain name is looked up among the file's `local` lines, read once; any
+ * other is looked for line by line.
+ */
+function luaLocalLineAbove(name: string, file: string, line: number, floor: number, context: ResolutionContext): { line: number; value: string } | null {
+  const lines = context.getFileLines?.(file) ?? context.readFile(file)?.split(/\r?\n/) ?? [];
+  if (!/^[A-Za-z_]\w*$/.test(name)) {
+    const decl = new RegExp(`^\\s*local\\s+${escapeRegExp(name)}\\s*=\\s*(.+?)\\s*$`);
+    for (let at = line - 1; at > floor; at--) {
+      const m = decl.exec(lines[at - 1] ?? '');
+      if (m) return { line: at, value: m[1]! };
+    }
+    return null;
+  }
+  const locals = fileScan(context, `lua-local-lines\0${file}`, () => {
+    const byName = new Map<string, { at: number[]; values: string[] }>();
+    const decl = /^\s*local\s+([A-Za-z_]\w*)\s*=\s*(.+?)\s*$/;
+    for (let i = 0; i < lines.length; i++) {
+      if (!lines[i]!.includes('local')) continue;
+      const m = decl.exec(lines[i]!);
+      if (!m) continue;
+      let own = byName.get(m[1]!);
+      if (!own) byName.set(m[1]!, (own = { at: [], values: [] }));
+      own.at.push(i + 1);
+      own.values.push(m[2]!);
+    }
+    return byName;
+  }).get(name);
+  if (!locals) return null;
+  // The last at or above the line before the reference's.
+  let low = 0;
+  let high = locals.at.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (locals.at[mid]! <= line - 1) low = mid + 1;
+    else high = mid;
+  }
+  return low > 0 && locals.at[low - 1]! > floor ? { line: locals.at[low - 1]!, value: locals.values[low - 1]! } : null;
+}
+
+/**
+ * For each line, the narrowest of `nodes` that holds it, and of those equally
+ * narrow the first: what `nodes.filter(holds the line).sort(by length)[0]`
+ * picks, read for every line at once. `ownLine` false leaves a node off its
+ * own first line.
+ */
+function narrowestAround(nodes: readonly Node[], ownLine = true): Array<Node | undefined> {
+  const around: Array<Node | undefined> = new Array(nodes.reduce((most, n) => Math.max(most, n.endLine), 0) + 2);
+  const length = (n: Node): number => n.endLine - n.startLine;
+  // The widest first, and of equals the last first: the one a sort picks is written last.
+  const order = nodes.map((_, i) => i).sort((a, b) => length(nodes[b]!) - length(nodes[a]!) || b - a);
+  for (const i of order) {
+    const n = nodes[i]!;
+    around.fill(n, Math.max(0, n.startLine + (ownLine ? 0 : 1)), n.endLine + 1);
+  }
+  return around;
 }
 
 /** Where a Lua alias is written: its file, line and name, and a node there to resolve `require`s from. */
@@ -2882,7 +3051,7 @@ function luaModuleMember(name: string, path: string[], decl: Node, context: Reso
 function luaMemberIn(file: string, path: string[], context: ResolutionContext): LuaStep {
   const member = path[path.length - 1]!;
   const nodes = context.getNodesInFile(file);
-  const inFile = nodes.filter((n) => n.name === member);
+  const inFile = nodesNamed(context, file, member).filter((n) => n.name === member);
   const fns = inFile.filter((n) => n.kind === 'function' || n.kind === 'method');
   if (fns.length > 0) {
     const owner = path.length > 1 ? path[path.length - 2]! : null;
@@ -2899,9 +3068,9 @@ function luaMemberIn(file: string, path: string[], context: ResolutionContext): 
   const exported = new RegExp(`(?:^|[\\s{,.])${escapeRegExp(member)}\\s*=\\s*([A-Za-z_]\\w*(?:\\s*\\.\\s*[A-Za-z_]\\w*)*)\\s*(?:[,;}]|$)`, 'm').exec(source);
   if (exported && exported[1] !== member) {
     const rhs = exported[1]!;
-    const line = source.slice(0, exported.index).split('\n').length + 1;
+    const line = lineAt(source, exported.index) + 1;
     if (/^[A-Za-z_]\w*$/.test(rhs)) {
-      const fn = nodes.find((n) => n.name === rhs && (n.kind === 'function' || n.kind === 'method'));
+      const fn = nodesNamed(context, file, rhs).find((n) => n.name === rhs && (n.kind === 'function' || n.kind === 'method'));
       if (fn) return { done: fn };
     }
     const at = nodes.find((n) => n.kind === 'file') ?? nodes[0];
@@ -4261,7 +4430,7 @@ function isJavaTypeVisible(candidate: Node, ref: UnresolvedRef, context: Resolut
     return here.single.has(fqn) || here.demand.has(candidateScope.pkg);
   }
   // Nested: inside its owner, a subtype of it, or imported.
-  const enclosing = (named.enclosing ??= context.getNodesInFile(ref.filePath)
+  const enclosing = (named.enclosing ??= nodesAroundLine(context, ref.filePath, ref.line)
     .filter((p) => JAVA_TYPE_KINDS_VISIBLE.has(p.kind) && p.startLine <= ref.line && p.endLine >= ref.line));
   if (enclosing.some((p) => p.qualifiedName === ownerQn || p.qualifiedName.startsWith(`${ownerQn}::`))) return true;
   // An anonymous class (`new NodeFilter() { … }`, named `<NodeFilter$anon@N>`) derives from what it instantiates.
@@ -4770,7 +4939,7 @@ export function pythonSelfCallReaches(target: Node, ref: UnresolvedRef, context:
   if (!/^[A-Za-z_]\w*$/.test(ref.referenceName)) return true;
   const receiver = bareCallReceiver(ref, context)?.receiver;
   if (receiver !== 'self' && receiver !== 'cls') return true;
-  const owner = context.getNodesInFile(ref.filePath)
+  const owner = nodesAroundLine(context, ref.filePath, ref.line)
     .filter((n) => n.kind === 'class' && n.startLine <= ref.line && n.endLine >= ref.line)
     .sort((a, b) => b.startLine - a.startLine)[0];
   if (!owner) return true;
@@ -4871,15 +5040,31 @@ function pythonValueNames(bound: { value: string; filePath: string; line: number
  */
 export function isLexicalBindingOfJsThisCall(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (!JS_FAMILY.has(ref.language) || ref.referenceKind !== 'calls') return false;
-  if (target.kind === 'function') {
-    if (!isJsDeclaredFunction(target, context)) return false;
-    const name = target.name.replace(/\$/g, '\\$');
-    if (new RegExp(String.raw`\.\s*${name}\s*=\s*${name}(?![\w$])`).test(context.readFile(ref.filePath) ?? '')) return false;
-  } else if (target.kind !== 'constant' && target.kind !== 'variable') {
-    return false;
-  }
+  if (target.kind !== 'function' && target.kind !== 'constant' && target.kind !== 'variable') return false;
+  // What the call is written on is read from its own line, so it is asked
+  // first: most calls are written on nothing, and the file was searched for
+  // each of them all the same.
   const written = bareCallReceiver(ref, context);
-  return written !== null && (written.receiver === 'self' || written.links.length > 0);
+  if (written === null || !(written.receiver === 'self' || written.links.length > 0)) return false;
+  if (target.kind !== 'function') return true;
+  return isJsDeclaredFunction(target, context) && !jsFileHandsNameToProperty(target.name, ref.filePath, context);
+}
+
+/** Per context, by `file\0name`: whether the file assigns the name to a property of that name. */
+const JS_NAME_TO_PROPERTY = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** Whether `filePath` hands `name` to a property of its name: `fastify.ready = ready`. Read once for a name. */
+function jsFileHandsNameToProperty(name: string, filePath: string, context: ResolutionContext): boolean {
+  let memo = JS_NAME_TO_PROPERTY.get(context);
+  if (!memo) JS_NAME_TO_PROPERTY.set(context, (memo = new Map()));
+  const key = `${filePath}\0${name}`;
+  let hands = memo.get(key);
+  if (hands === undefined) {
+    const n = name.replace(/\$/g, '\\$');
+    hands = new RegExp(String.raw`\.\s*${n}\s*=\s*${n}(?![\w$])`).test(context.readFile(filePath) ?? '');
+    memo.set(key, hands);
+  }
+  return hands;
 }
 
 /**
@@ -5366,7 +5551,7 @@ function isPythonLocallyBound(name: string, ref: UnresolvedRef, context: Resolut
  * yes or no would be the answer of whichever reference asked first.
  */
 function pythonLocalBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  const fn = context.getNodesInFile(ref.filePath)
+  const fn = nodesAroundLine(context, ref.filePath, ref.line)
     .filter((f) => (f.kind === 'function' || f.kind === 'method') && f.startLine <= ref.line && f.endLine >= ref.line)
     .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
   let memo = PY_LOCAL_BINDS.get(context);
@@ -5507,7 +5692,7 @@ function isPythonOutsideModuleName(name: string, filePath: string, context: Reso
     const keys = pythonImportKeys(name, filePath, context);
     if (keys.size === 0) return false;
     if (pythonGlobalBindings(name, filePath, context).some((b) => b.kind !== 'import')) return false;
-    if (context.getNodesInFile(filePath).some((n) => n.name === name && (n.kind === 'class' || n.kind === 'function'))) return false;
+    if (nodesNamed(context, filePath, name).some((n) => n.name === name && (n.kind === 'class' || n.kind === 'function'))) return false;
     // `import a.b as x` keys as `a.b:*`; `from a import x` as `a:x`, where only
     // the module `a` tells that `x` comes from outside.
     return [...keys].every((key) => {
@@ -5546,8 +5731,7 @@ function isJavaMethodInScope(method: Node, ref: UnresolvedRef, context: Resoluti
   const owner = method.qualifiedName.slice(0, cut).split('::').pop()!;
   const imports = javaStaticImportsOf(ref.filePath, context);
   if (imports.owners.has(owner) || imports.members.has(`${owner}.${ref.referenceName}`)) return true;
-  const around = context
-    .getNodesInFile(ref.filePath)
+  const around = nodesAroundLine(context, ref.filePath, ref.line)
     .filter((n) => JAVA_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line);
   const seen = new Set<string>();
   const queue = around.map((n) => n.name);
@@ -5664,8 +5848,7 @@ function dartMemberDepth(method: Node, ref: UnresolvedRef, context: ResolutionCo
   const hierarchy = dartHierarchyAt(ref, context);
   const own = hierarchy.get(owner);
   if (own !== undefined) return own;
-  const decl = context
-    .getNodesInFile(method.filePath)
+  const decl = nodesAroundLine(context, method.filePath, method.startLine)
     .find((n) => n.name === owner && DART_TYPE_KINDS.has(n.kind) && n.startLine <= method.startLine && n.endLine >= method.endLine);
   if (!decl) return Infinity;
   const head = dartHeadOf(decl, context);
@@ -5690,8 +5873,7 @@ function dartHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Map<st
   const hit = memo.get(ref);
   if (hit) return hit;
   const depths = new Map<string, number>();
-  const queue: Array<[string, number]> = context
-    .getNodesInFile(ref.filePath)
+  const queue: Array<[string, number]> = nodesAroundLine(context, ref.filePath, ref.line)
     .filter((n) => DART_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
     .map((n) => [n.name, 0]);
   while (queue.length > 0 && depths.size < 40) {
@@ -6405,7 +6587,7 @@ function dartReturnType(fn: Node, typeArgs: string[], context: ResolutionContext
       // `static T of<T …>(…)` in `BlocProvider<T …>`: the function's own parameter is the one meant.
       const own = declaredTypeParameters(fn, context);
       const cut = fn.qualifiedName.lastIndexOf('::');
-      const owner = cut > 0 && !own.includes(type) ? context.getNodesInFile(fn.filePath).find((n) => DART_TYPE_KINDS.has(n.kind) &&
+      const owner = cut > 0 && !own.includes(type) ? nodesAroundLine(context, fn.filePath, fn.startLine).find((n) => DART_TYPE_KINDS.has(n.kind) &&
         n.qualifiedName === fn.qualifiedName.slice(0, cut) && n.startLine <= fn.startLine && n.endLine >= fn.endLine) : undefined;
       if (!owner || !declaredTypeParameters(owner, context).includes(type)) info = { type, own };
     }
@@ -6420,7 +6602,7 @@ function dartReturnType(fn: Node, typeArgs: string[], context: ResolutionContext
 /** The innermost Dart class, mixin, enum or extension a reference sits in. */
 function dartEnclosingType(ref: UnresolvedRef, context: ResolutionContext): Node | null {
   let own: Node | null = null;
-  for (const n of context.getNodesInFile(ref.filePath)) {
+  for (const n of nodesAroundLine(context, ref.filePath, ref.line)) {
     if (DART_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line && (!own || n.startLine >= own.startLine)) own = n;
   }
   return own;
@@ -6794,7 +6976,7 @@ function dartExtensionOwner(member: Node, context: ResolutionContext): DartExten
   const cut = member.qualifiedName.lastIndexOf('::');
   if (cut > 0) {
     const ownerQn = member.qualifiedName.slice(0, cut);
-    const owner = context.getNodesInFile(member.filePath).find((n) => n.qualifiedName === ownerQn && n.kind === 'class' &&
+    const owner = nodesAroundLine(context, member.filePath, member.startLine).find((n) => n.qualifiedName === ownerQn && n.kind === 'class' &&
       n.startLine <= member.startLine && n.endLine >= member.startLine);
     const decl = owner ? dartExtensionDecl(owner, context) : null;
     if (owner && decl) {
@@ -7464,7 +7646,7 @@ function isDartUnnamedExtensionMember(method: Node, context: ResolutionContext):
   const cut = method.qualifiedName.lastIndexOf('::');
   if (cut <= 0) return false;
   const ownerQn = method.qualifiedName.slice(0, cut);
-  const owner = context.getNodesInFile(method.filePath).find((n) => n.qualifiedName === ownerQn && n.kind === 'class' &&
+  const owner = nodesAroundLine(context, method.filePath, method.startLine).find((n) => n.qualifiedName === ownerQn && n.kind === 'class' &&
     n.startLine <= method.startLine && n.endLine >= method.startLine);
   return owner !== undefined && dartExtensionDecl(owner, context)?.named === false;
 }
@@ -7648,7 +7830,7 @@ function kotlinHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Set<
   const hit = memo.get(ref);
   if (hit) return hit;
   const queue: string[] = [];
-  for (const n of context.getNodesInFile(ref.filePath)) {
+  for (const n of nodesAroundLine(context, ref.filePath, ref.line)) {
     if (n.startLine > ref.line || n.endLine < ref.line) continue;
     if (MEMBER_CLASS_KINDS.has(n.kind)) queue.push(n.name);
     // `fun Foo.bar() { baz() }`: Foo is the implicit receiver.
@@ -8029,8 +8211,7 @@ function swiftHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Map<s
   const hit = memo.get(ref);
   if (hit) return hit;
   const depths = new Map<string, number>();
-  const queue: Array<[string, number]> = context
-    .getNodesInFile(ref.filePath)
+  const queue: Array<[string, number]> = nodesAroundLine(context, ref.filePath, ref.line)
     .filter((n) => SWIFT_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
     .map((n) => [n.name.split('.').pop()!, 0]);
   while (queue.length > 0 && depths.size < 40) {
@@ -8071,7 +8252,7 @@ function nearestSwiftMembers(candidates: Node[], ref: UnresolvedRef, context: Re
   };
   const depths = candidates.map(depthOf).filter((d): d is number => d !== undefined);
   if (depths.length < 2) return candidates;
-  const nearest = Math.min(...depths);
+  const nearest = minOf(depths);
   return candidates.filter((n) => {
     const d = depthOf(n);
     return d === undefined || d === nearest;
@@ -8244,8 +8425,7 @@ function isScalaMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionCo
   // An imported object's inherited members: `import sttp.client4._` is
   // `package object client4 extends SttpApi`, so `multipart(…)` is SttpApi's.
   if (scalaImportedSupertypes(ref.filePath, imports, context).has(owner)) return true;
-  const around = context
-    .getNodesInFile(ref.filePath)
+  const around = nodesAroundLine(context, ref.filePath, ref.line)
     .filter((t) => SCALA_TYPE_KINDS.has(t.kind) && t.startLine <= ref.line && t.endLine >= ref.line);
   if (around.length === 0) return true;
   const seen = new Set<string>();
@@ -8323,37 +8503,105 @@ function isScalaExtensionMethod(n: Node, context: ResolutionContext): boolean {
  * `val` / `var` / `def`, a lambda or `for` parameter — or null.
  */
 function scalaLocalBinder(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
-  const nodes = context.getNodesInFile(ref.filePath);
-  const innermost = (kinds: ReadonlySet<string>) => nodes
-    .filter((f) => kinds.has(f.kind) && f.startLine <= ref.line && f.endLine >= ref.line)
-    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
-  const fn = innermost(SCALA_FUNCTION_KINDS);
+  if (ref.line < 0) return null;
+  const around = fileScan(context, `scala-scopes\0${ref.filePath}`, () => {
+    const nodes = context.getNodesInFile(ref.filePath);
+    return {
+      functions: narrowestAround(nodes.filter((f) => SCALA_FUNCTION_KINDS.has(f.kind))),
+      types: narrowestAround(nodes.filter((f) => SCALA_TYPE_KINDS.has(f.kind))),
+    };
+  });
+  const fn = around.functions[ref.line];
   // A test suite's body runs in its class: `test("…") { forAll { (e: E, f: A => B) => f(1) } }`.
-  const scope = fn ?? innermost(SCALA_TYPE_KINDS);
+  const scope = fn ?? around.types[ref.line];
   if (!scope) return null;
-  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n') ?? [];
-  const text = lines.slice(scope.startLine - 1, ref.line).join('\n');
   const n = escapeRegExp(name);
-  const binder = new RegExp(`(?:[(,\\[]\\s*(?:implicit\\s+|using\\s+)?${n}\\s*:)|(?:\\b(?:val|var|def|lazy\\s+val)\\s+${n}\\b)|(?:(?<![\\w$.])${n}\\s*(?:=>|<-))|(?:\\(\\s*${n}\\s*(?:,[^)]*)?\\)\\s*=>)`, 'g');
-  if (fn) return binder.test(text) ? fn : null;
+  const binder = (): RegExp => new RegExp(`(?:[(,\\[]\\s*(?:implicit\\s+|using\\s+)?${n}\\s*:)|(?:\\b(?:val|var|def|lazy\\s+val)\\s+${n}\\b)|(?:(?<![\\w$.])${n}\\s*(?:=>|<-))|(?:\\(\\s*${n}\\s*(?:,[^)]*)?\\)\\s*=>)`, 'g');
+  const code = scalaScopeCode(scope, ref.filePath, context);
+  const last = Math.min(ref.line, scope.startLine - 1 + code.lineEnds.length) - scope.startLine;
+  if (last < 0) return null;
+  if (fn) {
+    // Every way the pattern matches ends on what it read, so a binder in the
+    // function's lines through one line is one through any later line: the
+    // first such line is found by halving, once for the function and the name.
+    const first = fileScan(context, `scala-binder\0${ref.filePath}\0${scope.startLine}\0${scope.endLine}\0${name}`, () => {
+      const through = (index: number): boolean => binder().test(code.text.slice(0, code.lineEnds[index]!));
+      let at = code.lineEnds.length - 1;
+      if (!through(at)) return Infinity;
+      let before = -1;
+      while (at - before > 1) {
+        const mid = (at + before) >> 1;
+        if (through(mid)) at = mid;
+        else before = mid;
+      }
+      return at;
+    });
+    return last >= first ? fn : null;
+  }
   // In a class body, a binder counts only inside a block still open at the site —
   // not a sibling test's `val f`, not the class's own members at its body's depth.
-  const blockAt: number[] = new Array(text.length);
+  // Such a block lies inside the outermost one still open there, so only the
+  // text from that one's brace is read: from the `)` before it, which no
+  // match of the pattern reaches across.
+  const outer = code.openBlock[last]!;
+  if (outer < 0) return null;
+  const end = code.lineEnds[last]!;
+  const text = code.text.slice(0, end);
+  const blockAt: number[] = new Array(end - outer);
   const open: number[] = [];
-  let next = 0;
-  let depth = 0;
-  for (let i = 0; i < text.length; i++) {
+  for (let i = outer; i < end; i++) {
     const ch = text[i];
-    if (ch === '{') { open.push(++next); depth++; }
-    else if (ch === '}') { open.pop(); depth--; }
-    blockAt[i] = open.length > 1 ? open[open.length - 1]! : 0;
+    if (ch === '{') open.push(i);
+    else if (ch === '}') open.pop();
+    blockAt[i - outer] = open[open.length - 1] ?? -1;
   }
-  const live = new Set(open.slice(1));
-  for (const m of text.matchAll(binder)) {
-    const block = blockAt[m.index!] ?? 0;
-    if (block !== 0 && live.has(block)) return scope;
+  const live = new Set(open);
+  const pattern = binder();
+  pattern.lastIndex = text.lastIndexOf(')', outer) + 1;
+  for (let m = pattern.exec(text); m; m = pattern.exec(text)) {
+    if (m.index > outer && live.has(blockAt[m.index - outer]!)) return scope;
   }
   return null;
+}
+
+/** Per context: the text of the Scala scopes scalaLocalBinder read last, most recent last. */
+const SCALA_SCOPE_CODE = new WeakMap<ResolutionContext, Map<string, { text: string; lineEnds: number[]; openBlock: Int32Array }>>();
+
+/**
+ * A Scala scope's lines as one text, where each line ends in it, and for each
+ * line where the second-outermost `{` still open at its end stands (-1 for
+ * none): the outermost block inside the scope's own body.
+ */
+function scalaScopeCode(scope: Node, filePath: string, context: ResolutionContext): { text: string; lineEnds: number[]; openBlock: Int32Array } {
+  let scopes = SCALA_SCOPE_CODE.get(context);
+  if (!scopes) SCALA_SCOPE_CODE.set(context, (scopes = new Map()));
+  const key = `${filePath}\0${scope.startLine}\0${scope.endLine}`;
+  let own = scopes.get(key);
+  if (own) {
+    scopes.delete(key);
+  } else {
+    const lines = (context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split('\n') ?? [])
+      .slice(scope.startLine - 1, scope.endLine);
+    let end = -1;
+    const lineEnds = lines.map((line) => (end += line.length + 1));
+    const text = lines.join('\n');
+    const openBlock = new Int32Array(lines.length);
+    const open: number[] = [];
+    let at = 0;
+    for (let i = 0; i < lines.length; i++) {
+      for (; at < lineEnds[i]!; at++) {
+        const ch = text[at];
+        if (ch === '{') open.push(at);
+        else if (ch === '}') open.pop();
+      }
+      openBlock[i] = open.length > 1 ? open[1]! : -1;
+      at++;
+    }
+    own = { text, lineEnds, openBlock };
+    if (scopes.size >= JS_FN_CODE_KEEP) scopes.delete(scopes.keys().next().value!);
+  }
+  scopes.set(key, own);
+  return own;
 }
 
 const SCALA_FUNCTION_KINDS: ReadonlySet<string> = new Set(['method', 'function']);
@@ -8487,8 +8735,7 @@ function isCsharpMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionC
  * judge by.
  */
 function csharpTypesAround(ref: UnresolvedRef, context: ResolutionContext, owner: string): boolean | undefined {
-  const around = context
-    .getNodesInFile(ref.filePath)
+  const around = nodesAroundLine(context, ref.filePath, ref.line)
     .filter((t) => CSHARP_TYPE_KINDS.has(t.kind) && t.startLine <= ref.line && t.endLine >= ref.line);
   if (around.length === 0) return undefined;
   const seen = new Set<string>();
@@ -8837,7 +9084,7 @@ function isCsharpNestedTypeInScope(n: Node, ref: UnresolvedRef, context: Resolut
   const ownerType = context.getNodesInFile(n.filePath).find((p) => CSHARP_TYPE_KINDS.has(p.kind) && p.qualifiedName === owner);
   // Declared in a namespace, not a type.
   if (!ownerType) return true;
-  const enclosing = context.getNodesInFile(ref.filePath)
+  const enclosing = nodesAroundLine(context, ref.filePath, ref.line)
     .filter((p) => CSHARP_TYPE_KINDS.has(p.kind) && p.startLine <= ref.line && p.endLine >= ref.line);
   if (enclosing.some((p) => p.qualifiedName === owner || p.qualifiedName.startsWith(`${owner}::`))) return true;
   // Inherited: a type around the ref derives from the owner (`class SourceA :
@@ -8922,14 +9169,13 @@ function objcCallShape(ref: UnresolvedRef, context: ResolutionContext): 'c-call'
  * the class they extend). Null outside any class.
  */
 function objcHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Set<string> | null {
-  const inFile = context.getNodesInFile(ref.filePath);
-  let here = inFile
+  let here = nodesAroundLine(context, ref.filePath, ref.line)
     .filter((c) => c.kind === 'class' && c.startLine <= ref.line && c.endLine >= ref.line)
     .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0]?.name;
   // An `@implementation` whose range the index lost still names its class in
   // its methods: `SDWebImageDownloaderDecryptor::initWithBlock:`.
   if (!here) {
-    const method = inFile.find((c) => c.kind === 'method' && c.startLine <= ref.line && c.endLine >= ref.line && c.qualifiedName.includes('::'));
+    const method = nodesAroundLine(context, ref.filePath, ref.line).find((c) => c.kind === 'method' && c.startLine <= ref.line && c.endLine >= ref.line && c.qualifiedName.includes('::'));
     here = method?.qualifiedName.slice(0, method.qualifiedName.lastIndexOf('::'));
   }
   if (!here) return null;
@@ -10087,8 +10333,7 @@ function kotlinFileScope(file: string, context: ResolutionContext): { pkg: strin
  */
 function isKotlinTopLevelVisible(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (n.language !== 'kotlin' || n.filePath === ref.filePath) return true;
-  const enclosed = context
-    .getNodesInFile(n.filePath)
+  const enclosed = nodesAroundLine(context, n.filePath, n.startLine)
     .some((o) => o.id !== n.id && KOTLIN_ENCLOSING_KINDS.has(o.kind) && o.startLine <= n.startLine && o.endLine >= n.endLine &&
       (o.startLine < n.startLine || o.endLine > n.endLine));
   if (enclosed) return true;
@@ -10178,8 +10423,7 @@ function isPhpMethodInScope(method: Node, ref: UnresolvedRef, via: 'self' | 'par
   // Inside `new class … { … }` the class is that anonymous one, which the
   // index holds no node for: what it extends and the traits it uses.
   const anonymous = phpAnonymousClassAt(ref, context);
-  const enclosing = anonymous ? undefined : context
-    .getNodesInFile(ref.filePath)
+  const enclosing = anonymous ? undefined : nodesAroundLine(context, ref.filePath, ref.line)
     .filter((n) => PHP_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
     .sort((a, b) => b.startLine - a.startLine)[0];
   // Inside a trait, `$this` is whichever class uses it: Laravel's
@@ -10708,8 +10952,7 @@ function matchPhpNewReceiverCall(ref: UnresolvedRef, context: ResolutionContext)
   let qn: string;
   if (/^(?:self|static|parent)$/i.test(shape.written)) {
     if (phpAnonymousClassAt(ref, context)) return undefined;
-    const enclosing = context
-      .getNodesInFile(ref.filePath)
+    const enclosing = nodesAroundLine(context, ref.filePath, ref.line)
       .filter((n) => PHP_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
       .sort((a, b) => b.startLine - a.startLine)[0];
     if (!enclosing) return null;
@@ -11845,7 +12088,7 @@ function rustDeclaredItems(m: RustModule, name: string, context: ResolutionConte
   for (const file of m.alt ? [m.file, m.alt] : [m.file]) {
     const layout = rustUsesOf(file, context);
     const block = file === m.file ? m.block : null;
-    for (const n of context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file).filter((c) => c.name === name)) {
+    for (const n of context.getNodesInFileNamed?.(file, name) ?? nodesNamed(context, file, name).filter((c) => c.name === name)) {
       // An item in a function body is qualified by it (`outer::Inner`); an inline module adds nothing.
       if (n.language !== 'rust' || n.qualifiedName !== name || !RUST_MODULE_ITEM_KINDS.has(n.kind)) continue;
       if (publicOnly && n.visibility === 'private') continue;
@@ -13739,7 +13982,7 @@ function rustTypeLookup(name: string, writtenPath: string[], file: string, conte
     // `Handle` deeper down.
     if (within.length > 1 && root !== undefined && (root === 'crate' || crates.has(root))) {
       const depth = (n: Node): number => rustModulePath(n.filePath).length;
-      const nearest = Math.min(...within.map(depth));
+      const nearest = minOf(within.map(depth));
       within = within.filter((n) => depth(n) === nearest);
     }
     if (within.length > 0) nodes = within;
@@ -15123,69 +15366,230 @@ function jsFunctionLocalScope(name: string, ref: UnresolvedRef, context: Resolut
 }
 
 /**
- * Per context, by `file\0first line\0reference line\0name`: whether the code
- * from a function's first line through a reference's binds the name. Every
- * function that starts on the same line has that code — all of a minified
- * script's do — so they share the answer (#2334).
+ * Where a function's code binds one name: enough to say, for any line,
+ * whether the code from the function's first line through that one binds it.
  */
-const JS_CODE_BINDS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+interface JsNameBinding {
+  /**
+   * Each `const`/`let`/`var NAME` in order, up to the first that declares
+   * the name outright: where it ends, and where the first character after it
+   * that is not a blank sits. One followed by `,`, `]` or `}` declares
+   * nothing, unless the code read stops before that character.
+   */
+  ends: number[];
+  nexts: number[];
+  /** The end of the first that declares the name outright, or Infinity. */
+  plain: number;
+  /**
+   * Each `(` that opens a list the name stands in as a parameter might, in
+   * order; null for a name the code's words are not read for, whose lists
+   * are searched for in the whole code.
+   */
+  lists: number[] | null;
+  /**
+   * The first of the function's lines (0 for its first) through which a
+   * parameter list names it; Infinity when none does, null until asked.
+   */
+  parameterLine: number | null;
+}
+
+/**
+ * Per context, by `file\0first line\0last line\0name`: where the code of a
+ * function binds the name. Every function on the same lines has that code —
+ * all of a minified script's do — so they share the answer (#2334).
+ */
+const JS_CODE_BINDS = new WeakMap<ResolutionContext, Map<string, JsNameBinding>>();
 
 /**
  * Whether the function's code in `filePath`, from its first line through
  * `line` (a reference's, or a JSX tag's), declares `name`, or names it in a
  * parameter list.
+ *
+ * The function's code is read once for all the names asked of it, and each
+ * name's patterns are tried only where a word of the code is that name.
+ * Read again from the function's first line for each line asked about, a
+ * function of twenty thousand calls took the square of its length; searched
+ * whole for each name, a script minified to one line took the number of its
+ * names times its length.
  */
 export function jsCodeBindsName(name: string, fn: Node, filePath: string, line: number, context: ResolutionContext): boolean {
+  const own = jsFunctionCode(fn, filePath, context);
+  // Through `line`, or the function's last when it ends sooner.
+  const last = Math.min(line, fn.startLine - 1 + own.lineEnds.length) - fn.startLine;
+  if (last < 0) return false;
+  const end = own.lineEnds[last]!;
   let memo = JS_CODE_BINDS.get(context);
   if (!memo) JS_CODE_BINDS.set(context, (memo = new Map()));
-  const key = `${filePath}\0${fn.startLine}\0${line}\0${name}`;
-  let binds = memo.get(key);
-  if (binds === undefined) {
-    const text = jsFunctionCodeThrough(fn, filePath, line, context);
-    const n = escapeRegExp(name);
-    // A plain declaration. Destructuring re-binds what a call returns under
-    // the same name — `const { t } = useI18n()`, `const { getLabel } =
-    // useProps(props)` — which is the same-named function more often than not.
-    const sites = jsNameSites(text, name);
-    const declared = sites.declaration && new RegExp(`\\b(?:const|let|var)\\s+${n}(?![\\w$])(?!\\s*[,\\]}])`).test(text);
-    binds = declared || (sites.parameter && jsParameterListPattern(name, '').test(text));
-    memo.set(key, binds);
-  }
-  return binds;
+  const key = `${filePath}\0${fn.startLine}\0${fn.endLine}\0${name}`;
+  let binding = memo.get(key);
+  if (!binding) memo.set(key, (binding = jsNameBinding(own, name)));
+  // A plain declaration. Destructuring re-binds what a call returns under
+  // the same name — `const { t } = useI18n()`, `const { getLabel } =
+  // useProps(props)` — which is the same-named function more often than not.
+  if (binding.plain <= end) return true;
+  // The last one the code read holds, when the code stops before what follows it.
+  const before = lastAtOrBelow(binding.ends, end);
+  if (before >= 0 && binding.nexts[before]! >= end) return true;
+  if (binding.parameterLine === null) binding.parameterLine = jsParameterLine(own, name, binding.lists);
+  return last >= binding.parameterLine;
 }
 
-/** ASCII `s`. Past ASCII, `s` is left to the patterns. */
+/** The index of the last of `sorted` that is `limit` or less, or -1. */
+function lastAtOrBelow(sorted: number[], limit: number): number {
+  let low = 0;
+  let high = sorted.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (sorted[mid]! <= limit) low = mid + 1;
+    else high = mid;
+  }
+  return low - 1;
+}
+
+/** Where `own`, a whole function's code, binds `name` (see JsNameBinding). */
+function jsNameBinding(own: JsFunctionCode, name: string): JsNameBinding {
+  const { code } = own;
+  // A name of other than word characters is no word of the code: its patterns search the whole of it.
+  const words = JS_BINDING_NAME.test(name);
+  const sites = words ? (own.sites ??= jsCodeWordSites(code)).get(name) : undefined;
+  const binding: JsNameBinding = { ends: [], nexts: [], plain: Infinity, lists: words ? sites?.lists ?? [] : null, parameterLine: null };
+  const declaration = new RegExp(`\\b(?:const|let|var)\\s+${escapeRegExp(name)}(?![\\w$])`, words ? 'y' : 'g');
+  const blanks = /\s*/y;
+  /** Notes one declaration; true when it declares the name outright, and no later one matters. */
+  const note = (m: RegExpExecArray): boolean => {
+    const end = m.index + m[0].length;
+    blanks.lastIndex = end;
+    blanks.exec(code);
+    const next = blanks.lastIndex;
+    binding.ends.push(end);
+    binding.nexts.push(next);
+    const after = code[next];
+    if (after === ',' || after === ']' || after === '}') return false;
+    binding.plain = end;
+    return true;
+  };
+  if (words) {
+    for (const at of sites?.declared ?? []) {
+      declaration.lastIndex = at;
+      const m = declaration.exec(code);
+      if (m && note(m)) break;
+    }
+  } else {
+    for (let m = declaration.exec(code); m && !note(m); m = declaration.exec(code)) {
+      // One may start inside the last: a name that is itself `let`.
+      declaration.lastIndex = m.index + 1;
+    }
+  }
+  return binding;
+}
+
+/**
+ * The first of a function's lines (0 for its first) through which a
+ * parameter list names `name`, or Infinity. A list that matches in the code
+ * through one line matches in the code through any later one: the pattern
+ * ends on the `{` or `=>` it reads, and looks no further. So the first line
+ * is found by halving: for each `(` of `lists`, or over the whole code.
+ */
+function jsParameterLine(own: JsFunctionCode, name: string, lists: number[] | null): number {
+  const { code, lineEnds } = own;
+  const pattern = jsParameterListPattern(name, lists ? 'y' : '');
+  const firstThrough = (from: number, at: number): number => {
+    const through = (index: number): boolean => {
+      pattern.lastIndex = at;
+      return pattern.test(code.slice(0, lineEnds[index]!));
+    };
+    let first = lineEnds.length - 1;
+    if (first < from || !through(first)) return Infinity;
+    let before = from - 1;
+    while (first - before > 1) {
+      const mid = (first + before) >> 1;
+      if (through(mid)) first = mid;
+      else before = mid;
+    }
+    return first;
+  };
+  if (!lists) return firstThrough(0, 0);
+  let best = Infinity;
+  for (const at of lists) {
+    // The line the list opens on; a list that opens on a later line than the best found cannot beat it.
+    const from = lastAtOrBelow(lineEnds, at) + 1;
+    if (from >= best) continue;
+    best = Math.min(best, firstThrough(from, at));
+  }
+  return best;
+}
+
+/** Where the words of a function's code could bind a name: see jsCodeWordSites. */
+interface JsWordSites {
+  /** Where each `const`, `let` or `var` that a blank and then the name follow starts. */
+  declared: number[];
+  /** Each `(` still open where the name stands as a parameter's might, without repeats. */
+  lists: number[];
+}
+
+/**
+ * For each word of `code` (a run of `[\w$]`), where it could be what
+ * jsCodeBindsName's two patterns look for: a declaration's name, after a
+ * `const`, `let` or `var` and blanks, or a parameter's, with `(`, `,`, a
+ * blank or a `.` before it and `?`, `:`, `=`, `,` or `)` after. Nearly
+ * all of a function's mentions of a name it doesn't bind are calls and
+ * member reads, and trying the patterns for those was most of what asking
+ * cost. A character past ASCII is taken for a blank; the patterns decide.
+ */
+function jsCodeWordSites(code: string): Map<string, JsWordSites> {
+  const sites = new Map<string, JsWordSites>();
+  const own = (word: string): JsWordSites => {
+    let found = sites.get(word);
+    if (!found) sites.set(word, (found = { declared: [], lists: [] }));
+    return found;
+  };
+  const isWord = (c: number): boolean => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36;
+  const open: number[] = [];
+  // The word before, when only blanks stand between it and here: where it ends, and which keyword ends it.
+  let keywordEnd = -1;
+  let keywordLength = 0;
+  let blankSince = -1;
+  for (let i = 0; i < code.length; i++) {
+    const c = code.charCodeAt(i);
+    if (!isWord(c)) {
+      if (c === 40) open.push(i);
+      else if (c === 41) open.pop();
+      if (!(isJsBlank(c) || c >= 128)) keywordEnd = -1;
+      else if (blankSince < 0) blankSince = i;
+      continue;
+    }
+    const start = i;
+    while (i + 1 < code.length && isWord(code.charCodeAt(i + 1))) i++;
+    const end = i + 1;
+    const before = start === 0 ? 0 : code.charCodeAt(start - 1);
+    let word: string | null = null;
+    if (keywordEnd >= 0 && blankSince === keywordEnd) {
+      own((word = code.slice(start, end))).declared.push(keywordEnd - keywordLength);
+    }
+    if ((start === 0 || before >= 128 || before === 40 || before === 44 || before === 46 || isJsBlank(before)) &&
+        open.length > 0 && jsParameterMayFollow(code, end)) {
+      const lists = own((word ??= code.slice(start, end))).lists;
+      const list = open[open.length - 1]!;
+      if (lists[lists.length - 1] !== list) lists.push(list);
+    }
+    // `const`, `let` or `var` ends this word: what follows it after blanks may be a declaration's name.
+    keywordLength = end - start >= 5 && code.startsWith('const', end - 5) ? 5
+      : end - start >= 3 && (code.startsWith('let', end - 3) || code.startsWith('var', end - 3)) ? 3 : 0;
+    keywordEnd = keywordLength ? end : -1;
+    blankSince = -1;
+  }
+  return sites;
+}
+
+/** ASCII `\s`. Past ASCII, `\s` is left to the patterns. */
 const isJsBlank = (code: number): boolean => code === 32 || (code >= 9 && code <= 13);
 
-/** Whether the mention of `name` at `[at, end)` is followed as a parameter's name is: `?`, `:`, `=`, `,` or `)`. */
+/** Whether the mention of `name` that ends at `end` is followed as a parameter's name is: `?`, `:`, `=`, `,` or `)`. */
 function jsParameterMayFollow(text: string, end: number): boolean {
   let after = end;
   while (after < text.length && isJsBlank(text.charCodeAt(after))) after++;
   const next = text.charCodeAt(after);
   return next >= 128 || next === 63 || next === 58 || next === 61 || next === 44 || next === 41;
-}
-
-/**
- * Whether any mention of `name` in `text` could be what jsCodeBindsName's two
- * patterns look for: a declaration's name, a word and blanks before it, or a
- * parameter's, with `(`, `,`, a blank or a `.` before it. Nearly all of a
- * function's mentions of a name it doesn't bind are calls and member reads, and
- * compiling those patterns for each name was most of what asking cost.
- */
-function jsNameSites(text: string, name: string): { declaration: boolean; parameter: boolean } {
-  if (!JS_BINDING_NAME.test(name)) return { declaration: true, parameter: true };
-  let declaration = false;
-  let parameter = false;
-  for (let at = text.indexOf(name); at >= 0; at = text.indexOf(name, at + 1)) {
-    const end = at + name.length;
-    const before = at === 0 ? 0 : text.charCodeAt(at - 1);
-    if (isJsBlank(before) || before >= 128) declaration = true;
-    if (at === 0 || before >= 128 || before === 40 || before === 44 || before === 46 || isJsBlank(before)) {
-      if (jsParameterMayFollow(text, end)) parameter = true;
-    }
-    if (declaration && parameter) break;
-  }
-  return { declaration, parameter };
 }
 
 /**
@@ -15381,7 +15785,7 @@ function jsBindingAroundReference(name: string, ref: UnresolvedRef, context: Res
  * Per context: the comment-stripped lines of the functions jsCodeBindsName
  * read last, and where each line ends in that text, most recent last.
  */
-const JS_FN_CODE = new WeakMap<ResolutionContext, Map<string, { code: string; lineEnds: number[] }>>();
+const JS_FN_CODE = new WeakMap<ResolutionContext, Map<string, JsFunctionCode>>();
 const JS_FN_CODE_KEEP = 64;
 
 /**
@@ -15394,6 +15798,17 @@ const JS_FN_CODE_KEEP = 64;
  * line (#2334).
  */
 function jsFunctionCodeThrough(fn: Node, filePath: string, line: number, context: ResolutionContext): string {
+  const own = jsFunctionCode(fn, filePath, context);
+  // Through `line`, or the file's last when it ends sooner.
+  const last = Math.min(line, fn.startLine - 1 + own.lineEnds.length) - fn.startLine;
+  return last < 0 ? '' : own.code.slice(0, own.lineEnds[last]);
+}
+
+/** A function's lines, comments blanked, where each ends in that text, and where its words could bind a name (read on first use). */
+interface JsFunctionCode { code: string; lineEnds: number[]; sites?: Map<string, JsWordSites> }
+
+/** A function's lines, comments blanked, and where each ends in that text (see jsFunctionCodeThrough). */
+function jsFunctionCode(fn: Node, filePath: string, context: ResolutionContext): JsFunctionCode {
   let fns = JS_FN_CODE.get(context);
   if (!fns) JS_FN_CODE.set(context, (fns = new Map()));
   const key = `${filePath}\0${fn.startLine}\0${fn.endLine}`;
@@ -15408,9 +15823,7 @@ function jsFunctionCodeThrough(fn: Node, filePath: string, line: number, context
     if (fns.size >= JS_FN_CODE_KEEP) fns.delete(fns.keys().next().value!);
   }
   fns.set(key, own);
-  // Through `line`, or the file's last when it ends sooner.
-  const last = Math.min(line, fn.startLine - 1 + own.lineEnds.length) - fn.startLine;
-  return last < 0 ? '' : own.code.slice(0, own.lineEnds[last]);
+  return own;
 }
 
 const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
@@ -15986,6 +16399,33 @@ function matchEnclosingScopeMember(
  */
 const RAZOR_VIEW = /\.(?:cshtml|razor)$/i;
 
+/** By a name's nodes, as the context hands them out: those that are not import statements. */
+const NOT_IMPORT_NODES = new WeakMap<Node[], Node[]>();
+
+/** `nodes` without its import statements, which no reference names (see matchByExactName); `nodes` itself when it has none. */
+function withoutImportNodes(nodes: Node[]): Node[] {
+  let kept = NOT_IMPORT_NODES.get(nodes);
+  if (!kept) {
+    kept = nodes.some((n) => n.kind === 'import') ? nodes.filter((n) => n.kind !== 'import') : nodes;
+    NOT_IMPORT_NODES.set(nodes, kept);
+  }
+  return kept;
+}
+
+/** By a name's nodes, as the context hands them out: the functions, methods and classes among them. */
+const CALLABLE_NODES = new WeakMap<Node[], Node[]>();
+
+/** The functions, methods and classes of `nodes`, which are all matchFuzzy answers with; `nodes` itself when it holds nothing else. */
+function callableNodes(nodes: Node[]): Node[] {
+  let kept = CALLABLE_NODES.get(nodes);
+  if (!kept) {
+    const callable = (n: Node): boolean => n.kind === 'function' || n.kind === 'method' || n.kind === 'class';
+    kept = nodes.every(callable) ? nodes : nodes.filter(callable);
+    CALLABLE_NODES.set(nodes, kept);
+  }
+  return kept;
+}
+
 export function matchByExactName(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -16036,9 +16476,11 @@ export function matchByExactName(
   let bareGlobalName: boolean | undefined;
   const jsBareGlobalName = (): boolean => (bareGlobalName ??= isJsBareGlobalName(ref, context));
   const ambientDeclarations = ambientModuleDeclarations(context);
-  const sameName = outOfRepoCall
-    ? innerScopeShadows(context.getNodesByName(ref.referenceName), ref, context)
-    : context.getNodesByName(ref.referenceName);
+  // Import statements are dropped from the name's nodes once, not for each
+  // reference to it: every `use crate::…` of a Rust project is an import
+  // named `crate`, and each of them went through all the others.
+  const named = withoutImportNodes(context.getNodesByName(ref.referenceName));
+  const sameName = outOfRepoCall ? innerScopeShadows(named, ref, context) : named;
   // `NAME(...)` where NAME is a function-like macro somewhere in the project is
   // an expansion or a call to a same-named function — never the macro itself
   // (#1839), and never a type that happens to share the name (#2070: expat's
@@ -16423,7 +16865,7 @@ function javaLambdaParameterType(name: string, ref: UnresolvedRef, context: Reso
     if (!called) return null;
     const position = m[1] ? m[1].split(',').length - 1 : 0;
     const found = new Set<string>();
-    for (const method of context.getNodesInFile(ref.filePath)) {
+    for (const method of nodesNamed(context, ref.filePath, called)) {
       if (method.kind !== 'method' || method.name !== called) continue;
       const written = javaParameters(method.signature)?.[index]?.written;
       if (written === undefined) continue;
@@ -16466,7 +16908,7 @@ function javaFieldType(field: Node): string | null {
 
 /** The declared type of a field of a class around `ref`, its own or one it inherits, the tightest class first. */
 function javaFieldDeclaredType(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
-  const around = context.getNodesInFile(ref.filePath)
+  const around = nodesAroundLine(context, ref.filePath, ref.line)
     .filter((n) => JAVA_TYPE_KINDS_VISIBLE.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
     .sort((a, b) => b.startLine - a.startLine);
   for (const cls of around) {
@@ -16562,7 +17004,7 @@ function javaArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionCo
   const cast = /^\(\s*([\w$.]+(?:\s*<[^()]*>)?(?:\s*\[\s*\])*)\s*\)\s*[\w$("']/.exec(arg);
   if (cast) return javaBareType(cast[1]!);
   if (arg === 'this') {
-    const around = context.getNodesInFile(ref.filePath)
+    const around = nodesAroundLine(context, ref.filePath, ref.line)
       .filter((n) => JAVA_TYPE_KINDS_VISIBLE.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
       .sort((a, b) => b.startLine - a.startLine)[0];
     return around && !isAnonymousClass(around) ? around.name : null;
@@ -16969,25 +17411,29 @@ export function resolveObjectLiteralMember(
   if (!OBJECT_LITERAL_LANGUAGES.has(container.language)) return null;
   if (!sameLanguageFamily(container.language, ref.language)) return null;
 
-  const inFile = context.getNodesInFile(container.filePath);
   const callable = (n: Node) => n.kind === 'function' || n.kind === 'method';
   const valueMember = (n: Node) =>
     callable(n) || n.kind === 'property' || n.kind === 'variable' || n.kind === 'constant';
   const accepts = ref.referenceKind === 'calls' ? callable : valueMember;
 
-  const inside = inFile.filter((n) => n.id !== container.id && rangeWithin(n, container));
+  // What the literal holds: looked for among the file's nodes of the member's
+  // name, and around a candidate's line, not among all of the file's nodes
+  // for each reference.
+  const inside = (n: Node): boolean => n.id !== container.id && rangeWithin(n, container);
   const property = objectLiteralProperty(container, member, context);
   if (property === null || property?.binding) return null;
-  let candidates = inside.filter((n) => n.name === member && accepts(n) && (!property || property.contains(n)));
+  let candidates = nodesNamed(context, container.filePath, member)
+    .filter((n) => inside(n) && n.name === member && accepts(n) && (!property || property.contains(n)));
   if (candidates.length === 0) return null;
 
   // Drop a candidate nested inside ANOTHER callable's body within the literal
   // (`{ run() { const call = () => {}; } }` — `call` is `run`'s local, not a
   // member). Strict containment: an identically-ranged sibling node for the
   // same member (a property node over an arrow function) is not a body.
-  const bodies = inside.filter(callable);
+  // A body a candidate is nested in holds the candidate's first line.
   candidates = candidates.filter(
-    (c) => !bodies.some((b) => b.id !== c.id && !sameRange(b, c) && rangeWithin(c, b))
+    (c) => !nodesAroundLine(context, container.filePath, c.startLine)
+      .some((b) => inside(b) && callable(b) && b.id !== c.id && !sameRange(b, c) && rangeWithin(c, b))
   );
   if (candidates.length === 0) return null;
 
@@ -17138,6 +17584,92 @@ function objectLiteralProperty(
 }
 
 /**
+ * A file's braces, read once: where each `{` or `}` of its code stands
+ * (comments and strings blanked), which `{` is the innermost one open after
+ * it, and for each `{` the one open around it. What says, for any place in
+ * the file, which blocks are open there.
+ */
+interface JsFileBraces {
+  /** Where each line starts in the code. */
+  offsets: number[];
+  length: number;
+  /** Each `{` and `}` in order: where it is, and the innermost `{` open after it, as an index into `opens` (-1 for none). */
+  at: number[];
+  top: number[];
+  /** Each `{`: where it is, and the index of the one open around it (-1 for none). */
+  opens: number[];
+  parents: number[];
+}
+
+/** Per context: the braces of the last few files resolveObjectLiteralBinding read, most recent last. */
+const JS_FILE_BRACES = new WeakMap<ResolutionContext, Map<string, JsFileBraces | null>>();
+
+/**
+ * The braces of `filePath` (see JsFileBraces), or null for a file that can't
+ * be read. Kept while the file is the one being resolved: read again for
+ * each call through an object literal's alias, with the whole file stripped
+ * and its braces counted from the top each time, a bundle of 3.8 MB took
+ * forty-five seconds.
+ */
+function jsFileBraces(filePath: string, context: ResolutionContext): JsFileBraces | null {
+  let files = JS_FILE_BRACES.get(context);
+  if (!files) JS_FILE_BRACES.set(context, (files = new Map()));
+  let braces = files.get(filePath);
+  if (braces !== undefined) {
+    files.delete(filePath);
+    files.set(filePath, braces);
+    return braces;
+  }
+  const lines = context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split('\n');
+  if (!lines) {
+    braces = null;
+  } else {
+    const code = blankStringContents(stripCommentsForRegex(lines.join('\n'), 'typescript'));
+    braces = { offsets: [0], length: code.length, at: [], top: [], opens: [], parents: [] };
+    let open = -1;
+    for (let i = 0; i < code.length; i++) {
+      const c = code.charCodeAt(i);
+      if (c === 10) {
+        braces.offsets.push(i + 1);
+      } else if (c === 123) {
+        braces.opens.push(i);
+        braces.parents.push(open);
+        open = braces.opens.length - 1;
+        braces.at.push(i);
+        braces.top.push(open);
+      } else if (c === 125) {
+        // A `}` with nothing open closes nothing.
+        if (open >= 0) open = braces.parents[open]!;
+        braces.at.push(i);
+        braces.top.push(open);
+      }
+    }
+  }
+  if (files.size >= JS_FILE_BRACES_KEEP) files.delete(files.keys().next().value!);
+  files.set(filePath, braces);
+  return braces;
+}
+
+/** How many files' braces are kept: the one being resolved, and one it reads through. */
+const JS_FILE_BRACES_KEEP = 2;
+
+/** Where each `{` still open where `node` starts is, outermost first. */
+function jsBracesOpenAt(braces: JsFileBraces, node: Node): number[] {
+  const end = (braces.offsets[node.startLine - 1] ?? braces.length) + node.startColumn;
+  // The last brace before the node, and what it left open.
+  let low = 0;
+  let high = braces.at.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (braces.at[mid]! < end) low = mid + 1;
+    else high = mid;
+  }
+  const scope: number[] = [];
+  for (let open = low > 0 ? braces.top[low - 1]! : -1; open >= 0; open = braces.parents[open]!) scope.push(braces.opens[open]!);
+  return scope.reverse();
+}
+
+/**
  * Shared lexical lookup for namespace-object aliases (#1932): `api.getUser()` where
  * `api` is `const api = { getUser }` (or `{ getUser: fetchUser }`) in the
  * object's own file. The member's function is declared OUTSIDE the literal, so
@@ -17156,25 +17688,14 @@ export function resolveObjectLiteralBinding(
   if (!binding) return null;
   const at: UnresolvedRef = { ...ref, filePath: container.filePath, language: container.language,
     fromNodeId: container.id, line: container.startLine, column: container.startColumn };
-  const inFile = context.getNodesInFile(container.filePath);
-  if (inFile.some((n) => (n.kind === 'function' || n.kind === 'method') &&
+  // A function around the literal holds its first line.
+  if (nodesAroundLine(context, container.filePath, container.startLine).some((n) => (n.kind === 'function' || n.kind === 'method') &&
       rangeWithin(container, n) && n.signature &&
       hasParameterBinding(`${n.signature} {`, binding.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))) return null;
 
-  const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
-  if (!lines) return null;
-  const code = blankStringContents(stripCommentsForRegex(lines.join('\n'), 'typescript'));
-  const offsets = [0];
-  for (let i = 0; i < code.length; i++) if (code[i] === '\n') offsets.push(i + 1);
-  const scopeAt = (node: Node): number[] => {
-    const end = (offsets[node.startLine - 1] ?? code.length) + node.startColumn;
-    const scope: number[] = [];
-    for (let i = 0; i < end; i++) {
-      if (code[i] === '{') scope.push(i);
-      else if (code[i] === '}') scope.pop();
-    }
-    return scope;
-  };
+  const braces = jsFileBraces(container.filePath, context);
+  if (!braces) return null;
+  const scopeAt = (node: Node): number[] => jsBracesOpenAt(braces, node);
   const scope = scopeAt(container);
 
   const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class';
@@ -17183,8 +17704,9 @@ export function resolveObjectLiteralBinding(
       ? callable
       : (n: Node) => callable(n) || n.kind === 'constant' || n.kind === 'variable' || n.kind === 'component';
 
-  const locals = inFile
-    .filter((n) => n.name === binding && n.id !== container.id &&
+  const locals = (context.getNodesInFileNamed?.(container.filePath, binding) ??
+      nodesNamed(context, container.filePath, binding).filter((n) => n.name === binding))
+    .filter((n) => n.id !== container.id &&
       ['function', 'class', 'constant', 'variable', 'component'].includes(n.kind))
     .map((node) => ({ node, scope: scopeAt(node) }))
     .filter((entry) => entry.scope.every((position, i) => scope[i] === position))
@@ -20740,7 +21262,7 @@ function cppOverloadFor(candidates: Node[], name: string, ref: UnresolvedRef, co
   const args = cppCallArguments(ref, name, context);
   if (!args) return overloads[0]!;
   const fits = overloads.map((n) => cppOverloadFit(n, name, args, context));
-  const top = Math.max(...fits);
+  const top = maxOf(fits);
   return cppArgumentTypeChoice(overloads.filter((_, i) => fits[i] === top), name, args, ref, context);
 }
 
@@ -20770,7 +21292,7 @@ function cppArgumentTypeChoice(tied: Node[], name: string, args: string[], ref: 
   }
   if (types.every((t) => t === null)) return tied[0]!;
   const fits = tied.map((n) => cppArgumentTypeFit(n, name, types, context));
-  const top = Math.max(...fits);
+  const top = maxOf(fits);
   const best = tied[fits.indexOf(top)]!;
   return cppConstTwinChoice(best, tied.filter((n, i) => fits[i] === top && n !== best), name, types, context);
 }
@@ -23046,7 +23568,7 @@ function javaEnclosingFieldType(receiverName: string, ref: UnresolvedRef, inFile
   const m = receiverName.match(/^(?:(?:(\w+)\.)?this\.)?(\w+)$/);
   if (!m) return null;
   const [, outer, fieldName] = m;
-  const enclosing = inFile
+  const enclosing = nodesAroundLineIn(inFile, ref.line)
     .filter(
       (n) =>
         (n.kind === 'class' || n.kind === 'interface' || n.kind === 'enum') &&
@@ -23716,7 +24238,7 @@ function kotlinQualifiedCallResultType(
   if (owner) {
     candidates = candidates.filter((n) => n.qualifiedName.endsWith(`${owner}::${fn}`));
   } else {
-    const ownClass = context.getNodesInFile(ref.filePath)
+    const ownClass = nodesAroundLine(context, ref.filePath, ref.line)
       .filter((n) => (n.kind === 'class' || n.kind === 'interface') && n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
       .sort((a, b) => b.startLine - a.startLine)[0];
     const inOwnClass = ownClass
@@ -23794,7 +24316,7 @@ function kotlinReceiverDeclaredType(
 
 /** The tightest Kotlin class or interface enclosing `ref`'s line. */
 function kotlinEnclosingClass(ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
-  return context.getNodesInFile(ref.filePath)
+  return nodesAroundLine(context, ref.filePath, ref.line)
     .filter((n) => (n.kind === 'class' || n.kind === 'interface') && n.language === 'kotlin' &&
       n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
     .sort((a, b) => b.startLine - a.startLine)[0];
@@ -23806,7 +24328,7 @@ function kotlinEnclosingClass(ref: UnresolvedRef, context: ResolutionContext): N
  * scope it is written in, through the first named class.
  */
 function kotlinEnclosingClasses(ref: UnresolvedRef, context: ResolutionContext): Node[] {
-  const around = context.getNodesInFile(ref.filePath)
+  const around = nodesAroundLine(context, ref.filePath, ref.line)
     .filter((n) => (n.kind === 'class' || n.kind === 'interface') && n.language === 'kotlin' &&
       n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
     .sort((a, b) => b.startLine - a.startLine);
@@ -24233,6 +24755,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CSHARP_EXTENSION_THIS.delete(context);
   CSHARP_FILE_BASENAMES.delete(context);
   JS_ASSIGNED_MEMBERS.delete(context);
+  MODULE_DEFAULTS_STATED.delete(context);
   JS_CONSTRUCTOR_METHODS.delete(context);
   CFML_CHAINS.delete(context);
   NO_RECEIVER_LINES.delete(context);
@@ -24294,6 +24817,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   DESTRUCTURED_FILES.delete(context);
   JS_FN_LOCAL_MEMO.delete(context);
   JS_CODE_BINDS.delete(context);
+  JS_FILE_BRACES.delete(context);
+  SCALA_SCOPE_CODE.delete(context);
+  JS_NAME_TO_PROPERTY.delete(context);
   JS_FN_CODE.delete(context);
   JS_SCOPE_FILES.delete(context);
   JS_MODULE_VALUES.delete(context);
@@ -24600,14 +25126,17 @@ const MEMBER_TYPE_NON_TYPES: ReadonlySet<string> = new Set([
 function inferMemberReceiverType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
   const name = receiver.replace(/^(?:this|self)\./, '');
   if (!/^[A-Za-z_]\w*$/.test(name)) return null;
-  const inFile = context.getNodesInFile(ref.filePath).filter((n) => n.language === ref.language);
-  let cls: Node | undefined;
-  let fn: Node | undefined;
-  for (const n of inFile) {
-    if (n.startLine > ref.line || n.endLine < ref.line) continue;
-    if (MEMBER_CLASS_KINDS.has(n.kind) && (!cls || n.startLine >= cls.startLine)) cls = n;
-    else if ((n.kind === 'method' || n.kind === 'function') && (!fn || n.startLine >= fn.startLine)) fn = n;
-  }
+  // The class and the function around each line, read once for the file.
+  const { inFile, classes, functions } = fileScan(context, `member-scopes\0${ref.filePath}\0${ref.language}`, () => {
+    const inFile = context.getNodesInFile(ref.filePath).filter((n) => n.language === ref.language);
+    return {
+      inFile,
+      classes: latestAround(inFile.filter((n) => MEMBER_CLASS_KINDS.has(n.kind))),
+      functions: latestAround(inFile.filter((n) => !MEMBER_CLASS_KINDS.has(n.kind) && (n.kind === 'method' || n.kind === 'function'))),
+    };
+  });
+  const cls = ref.line >= 0 ? classes[ref.line] : undefined;
+  const fn = ref.line >= 0 ? functions[ref.line] : undefined;
   if (!cls) return null;
   let found = memberTypeThroughHierarchy(cls, name, context);
   // A Kotlin object expression's code sees the class it is written in, as
@@ -24975,7 +25504,7 @@ function classMemberLines(cls: Node, context: ResolutionContext): Array<{ text: 
  * undefined when it is not a type parameter there at all.
  */
 function typeParameterBound(typeName: string, ref: UnresolvedRef, context: ResolutionContext): string | null | undefined {
-  const around = context.getNodesInFile(ref.filePath).filter((n) => n.startLine <= ref.line && n.endLine >= ref.line &&
+  const around = nodesAroundLine(context, ref.filePath, ref.line).filter((n) => n.startLine <= ref.line && n.endLine >= ref.line &&
     (MEMBER_CLASS_KINDS.has(n.kind) || n.kind === 'method' || n.kind === 'function'));
   return typeParameterBoundIn(typeName, around, context);
 }
@@ -25084,18 +25613,33 @@ function pascalNestedRoutineLines(filePath: string, startIdx: number, context: R
 
 /** 1-based start line of the tightest function/method enclosing the call. */
 function enclosingScopeStartLine(ref: UnresolvedRef, context: ResolutionContext): number {
-  let start = 1;
-  for (const n of context.getNodesInFile(ref.filePath)) {
-    if (n.kind !== 'function' && n.kind !== 'method') continue;
-    if (n.language !== ref.language) continue;
-    // Pascal fields precede separately implemented methods; only nested routines bound this scan.
-    if (n.language === 'pascal' && (n.kind !== 'function' || !n.qualifiedName.includes('::'))) continue;
-    const end = n.endLine ?? n.startLine;
-    if (n.startLine <= ref.line && end >= ref.line && n.startLine >= start) {
-      start = n.startLine;
-    }
+  const around = fileScan(context, `scope-starts\0${ref.filePath}\0${ref.language}`, () =>
+    latestAround(context.getNodesInFile(ref.filePath).filter((n) =>
+      (n.kind === 'function' || n.kind === 'method') && n.language === ref.language &&
+      // Pascal fields precede separately implemented methods; only nested routines bound this scan.
+      !(n.language === 'pascal' && (n.kind !== 'function' || !n.qualifiedName.includes('::'))))));
+  return (ref.line >= 0 ? around[ref.line]?.startLine : undefined) ?? 1;
+}
+
+/** What `scan` reads from a file, kept for the context under `key` and shared by every reference of the file (pythonNameScan, for any language). */
+const fileScan = pythonNameScan;
+
+/**
+ * For each line, the one of `nodes` that holds it and starts latest, and of
+ * those that start together the last: what a pass over `nodes` that keeps
+ * each one starting no earlier than the one it has picks, read for every
+ * line at once. Found by such a pass for each reference, the function around
+ * a call cost a file of some thousand methods all of its symbols per call.
+ */
+function latestAround(nodes: readonly Node[]): Array<Node | undefined> {
+  const around: Array<Node | undefined> = new Array(nodes.reduce((most, n) => Math.max(most, n.endLine ?? n.startLine), 0) + 2);
+  // By start, and of equals in the order given: the one such a pass ends on is written last.
+  const order = nodes.map((_, i) => i).sort((a, b) => nodes[a]!.startLine - nodes[b]!.startLine || a - b);
+  for (const i of order) {
+    const n = nodes[i]!;
+    around.fill(n, Math.max(0, n.startLine), (n.endLine ?? n.startLine) + 1);
   }
-  return start;
+  return around;
 }
 
 /**
@@ -25324,6 +25868,20 @@ export function inferLocalReceiverType(
         }
         return state.ansType;
       }
+      // A line above the last one asked about. Nothing between the answer and
+      // that last line matched, so when the answer is at or above this line
+      // it is this line's answer too, and no answer is none. Scanned again
+      // from this line down, a file of some thousand route handlers, each
+      // calling a method on a parameter nothing declares, went through every
+      // line above each of them: 58 seconds for 1.2 MB.
+      if (state.ansIdx <= hi) {
+        if (state.ansIdx < lo) return null;
+        if (decl) {
+          decl.raw = state.ansRaw;
+          decl.line = state.ansIdx + 1;
+        }
+        return state.ansType;
+      }
       for (let i = hi; i >= lo; i--) {
         const type = matchLine(i);
         if (type) {
@@ -25478,7 +26036,7 @@ function resolveAwaitedCallType(
   if (new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${escaped}\\b|\\{[^}]*\\b${escaped}\\b)`).test(rest) ||
       new RegExp(`\\b${escaped}\\s*=(?!=)`).test(rest) || hasParameterBinding(rest, escaped)) return unknown;
 
-  const bindingLine = file.code.slice(0, binding.index!).split('\n').length;
+  const bindingLine = lineAt(file.code, binding.index!);
   const bindingRef = { ...ref, line: bindingLine, column: binding.index! - file.offsets[bindingLine - 1]! };
   const callee = call[1]!;
   const calleeEscaped = callee.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -25504,7 +26062,7 @@ function resolveAwaitedCallType(
     for (const shadow of beforeBinding.matchAll(shadows)) {
       if (!visibleAt(shadow.index!, binding.index)) continue;
       // A typed arrow function may itself be the declared local factory.
-      const line = file.code.slice(0, shadow.index!).split('\n').length;
+      const line = lineAt(file.code, shadow.index!);
       if (line !== declaring.startLine || shadow.index! - file.offsets[line - 1]! > declaring.startColumn) return unknown;
     }
   }
@@ -26425,7 +26983,7 @@ function jsCalledFunction(name: string, at: number, file: JsScopeFile, ref: Unre
     // Overloads are declarations of the name in one block; another block's helper of the name is another function.
     if (site.kind !== 'function' || jsBindingSites(name, file).filter((s) => s.kind === 'function' && s.from === site.from).length !== 1) return null;
     const line = jsLineOf(file, site.at);
-    const own = context.getNodesInFile(ref.filePath).find((n) => n.kind === 'function' && n.name === name && n.startLine === line);
+    const own = nodesNamed(context, ref.filePath, name).find((n) => n.kind === 'function' && n.name === name && n.startLine === line);
     return own && own.signature && ESM_FAMILY.has(own.language) ? own : null;
   }
   if (!(context.getImportMappings?.(ref.filePath, ref.language) ?? []).some((m) => m.localName === name)) return null;
@@ -26978,7 +27536,7 @@ function tsStaticReturnedType(cls: Node, name: string, at: UnresolvedRef, contex
   if (annotation === undefined || /^(?:asserts\b|(?:this|[A-Za-z_$][\w$]*)\s+is\b)/.test(annotation) || tsHidesMembers(annotation, context)) return null;
   const raw = new RegExp(`^${TS_ANNOTATED_TYPE}`).exec(annotation)?.[1];
   if (!raw || raw.endsWith(']') || !tsOneType(annotation, raw) || raw === 'this') return null;
-  const owner = context.getNodesInFile(method.filePath).find((n) => n.kind === 'class' && n.startLine <= method.startLine && n.endLine >= method.endLine);
+  const owner = nodesAroundLine(context, method.filePath, method.startLine).find((n) => n.kind === 'class' && n.startLine <= method.startLine && n.endLine >= method.endLine);
   if (owner && tsClassTypeParameter(owner, raw.split(/[.<\s]/)[0]!, context)) return null;
   return { raw, file: method.filePath, language: method.language, line: method.startLine, from: [method.filePath] };
 }
@@ -28998,17 +29556,52 @@ const ESM_DEFAULT_EXPORT_STATEMENT = /^[ \t]*export\s+(?:default\b|=)|\bas\s+def
  * the members of its class, which the module file declares or imports.
  */
 function projectModuleMemberCall(file: string, methodName: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
-  const source = context.readFile(file) ?? '';
-  const commonJs = source.includes('module.exports') ? MODULE_EXPORTS_DEFAULT.exec(source) : null;
-  const made = commonJs?.[2];
-  if (made) {
+  const stated = moduleDefaultStated(file, context);
+  if (stated.made) {
     const language = context.getNodesInFile(file)[0]?.language ?? ref.language;
-    const declaring = tsImportedTypeFile(made, { ...ref, filePath: file, language }, context) ?? file;
-    return resolveMethodOnType(made, methodName, ref, context, 0.85, 'instance-method', declaring);
+    const declaring = tsImportedTypeFile(stated.made, { ...ref, filePath: file, language }, context) ?? file;
+    return resolveMethodOnType(stated.made, methodName, ref, context, 0.85, 'instance-method', declaring);
   }
-  if (commonJs) return commonJs[1] === '{' ? null : undefined;
-  const esmDefault = (source.includes('default') || source.includes('export =')) && ESM_DEFAULT_EXPORT_STATEMENT.test(source);
-  return esmDefault ? undefined : null;
+  if (stated.commonJs) return stated.literal ? null : undefined;
+  return stated.esmDefault ? undefined : null;
+}
+
+/** What a module's file states as its default: see projectModuleMemberCall. */
+interface ModuleDefaultStated {
+  /** It says `module.exports = …`. */
+  commonJs: boolean;
+  /** The class of `module.exports = new Class(…)`. */
+  made: string | undefined;
+  /** `module.exports = {`. */
+  literal: boolean;
+  /** No `module.exports = …`, and an ES default: `export default …`, `export { x as default }`, `export = …`. */
+  esmDefault: boolean;
+}
+const MODULE_DEFAULTS_STATED = new WeakMap<ResolutionContext, Map<string, ModuleDefaultStated>>();
+
+/**
+ * What `file` states as its default, read once for the file. Read for each
+ * member called on the module's default binding, a module that says neither
+ * `module.exports` nor `default` was searched to its end for both, every
+ * time: a file of eight thousand calls on one native module's binding took
+ * four seconds.
+ */
+function moduleDefaultStated(file: string, context: ResolutionContext): ModuleDefaultStated {
+  let memo = MODULE_DEFAULTS_STATED.get(context);
+  if (!memo) MODULE_DEFAULTS_STATED.set(context, (memo = new Map()));
+  let stated = memo.get(file);
+  if (!stated) {
+    const source = context.readFile(file) ?? '';
+    const commonJs = source.includes('module.exports') ? MODULE_EXPORTS_DEFAULT.exec(source) : null;
+    stated = {
+      commonJs: commonJs !== null,
+      made: commonJs?.[2],
+      literal: commonJs?.[1] === '{',
+      esmDefault: commonJs === null && (source.includes('default') || source.includes('export =')) && ESM_DEFAULT_EXPORT_STATEMENT.test(source),
+    };
+    memo.set(file, stated);
+  }
+  return stated;
 }
 
 const JS_ASSIGNED_MEMBERS = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
@@ -29125,7 +29718,8 @@ export function reExportSource(name: string, ref: UnresolvedRef, context: Resolu
  * binding does.
  */
 function isOutOfRepoBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === name);
+  const mappings = context.getImportMappings?.(ref.filePath, ref.language);
+  const binding = mappings ? importsBoundTo(mappings, name)[0] : undefined;
   const source = dynamicImportSource(name, ref, context) ?? binding?.source ??
     (ref.referenceKind === 'imports' ? reExportSource(name, ref, context) : undefined);
   return source !== undefined && context.isOutOfRepoImport?.(source, ref.filePath, ref.language) === true;
@@ -29383,7 +29977,7 @@ function csharpArgumentsFit(params: CsharpParameter[], args: string[]): boolean 
 function csharpExtensionOverload(picked: Node, ref: UnresolvedRef, context: ResolutionContext): Node | null | undefined {
   if (picked.language !== 'csharp' || picked.kind !== 'method' || ref.referenceKind !== 'calls') return undefined;
   const owner = picked.qualifiedName.slice(0, Math.max(0, picked.qualifiedName.lastIndexOf('::')));
-  const overloads = (context.getNodesInFileNamed?.(picked.filePath, picked.name) ?? context.getNodesInFile(picked.filePath).filter((n) => n.name === picked.name))
+  const overloads = (context.getNodesInFileNamed?.(picked.filePath, picked.name) ?? nodesNamed(context, picked.filePath, picked.name).filter((n) => n.name === picked.name))
     .filter((n) => n.kind === 'method' && n.qualifiedName === picked.qualifiedName);
   if (overloads.length < 2 || !isCsharpExtensionMethod(picked, context)) return undefined;
   // The receiver is written before the name, unless it is the class itself.
@@ -32794,8 +33388,8 @@ function pythonScopeBindings(scope: Node, name: string, context: ResolutionConte
  * declares it `global`.
  */
 function pythonBindingScope(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
-  for (const scope of pythonFileDefs(ref.filePath, context)) {
-    if (scope.startLine > ref.line || scope.endLine < ref.line) continue;
+  // The defs around the reference, innermost first: those of the file's defs that hold its line.
+  for (const scope of pythonScopesAround(ref, context)) {
     const { param, bindings } = pythonScopeBindings(scope, name, context);
     if (param !== undefined) return scope;
     if (bindings.some((b) => b.kind === 'global')) return null;
@@ -33008,7 +33602,7 @@ function matchPythonFactoryChain(ref: UnresolvedRef, context: ResolutionContext)
   // call spells is a local there, not the module's class or factory.
   const lines = pythonLines(context, ref.filePath);
   let fn: Node | null = null;
-  for (const n of context.getNodesInFile(ref.filePath)) {
+  for (const n of nodesAroundLine(context, ref.filePath, ref.line)) {
     if ((n.kind !== 'function' && n.kind !== 'method') || n.startLine > ref.line || n.endLine < ref.line) continue;
     if (!fn || n.startLine > fn.startLine) fn = n;
   }
@@ -34385,7 +34979,7 @@ const TS_MEMBER_OWNER_KINDS = new Set<string>(['class', 'interface']);
 
 /** The class or interface named `name` that `file` declares. */
 function tsTypeDeclaredIn(file: string, name: string, context: ResolutionContext): Node | undefined {
-  return context.getNodesInFile(file).find((n) => n.name === name && TS_MEMBER_OWNER_KINDS.has(n.kind));
+  return nodesNamed(context, file, name).find((n) => n.name === name && TS_MEMBER_OWNER_KINDS.has(n.kind));
 }
 
 /**
@@ -34456,7 +35050,7 @@ function tsNamedType(
     found = !node || isMergedAmbientDeclaration(node, context) ? null
       : TS_MEMBER_OWNER_KINDS.has(node.kind) ? node : tsTypeDeclaredIn(node.filePath, node.name, context) ?? null;
   } else if (!written.includes('.')) {
-    found = context.getNodesInFile(from.filePath).find((n) => n.id !== from.id && n.name === written && TS_MEMBER_OWNER_KINDS.has(n.kind)) ?? null;
+    found = nodesNamed(context, from.filePath, written).find((n) => n.id !== from.id && n.name === written && TS_MEMBER_OWNER_KINDS.has(n.kind)) ?? null;
   }
   memo.set(key, found);
   return found;
@@ -34625,7 +35219,7 @@ function tsAliasedType(name: string, file: string, at: UnresolvedRef, context: R
     }
     if (walked.has(key)) break;
     walked.add(key);
-    const alias = (context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file).filter((n) => n.name === name))
+    const alias = (context.getNodesInFileNamed?.(file, name) ?? nodesNamed(context, file, name).filter((n) => n.name === name))
       .find((n) => n.kind === 'type_alias');
     const written = alias ? tsAliasValueName(alias, context) : null;
     // `type Box<T> = T | null` holds whatever its argument is.
@@ -34891,7 +35485,7 @@ function tsNamedClass(name: string, from: Node, ref: UnresolvedRef, context: Res
     const node = imported ? context.getNodeById?.(imported.targetNodeId) : undefined;
     if (node && (node.kind === 'class' || node.kind === 'component') && !isMergedAmbientDeclaration(node, context)) found = node;
   } else {
-    found = context.getNodesInFile(from.filePath).find((n) => n.kind === 'class' && n.name === name) ?? null;
+    found = nodesNamed(context, from.filePath, name).find((n) => n.kind === 'class' && n.name === name) ?? null;
   }
   memo.set(key, found);
   return found;
@@ -35155,7 +35749,7 @@ export function newReceiverClass(ref: UnresolvedRef, context: ResolutionContext)
     return imported.exportedName;
   }
   if (!imported && !written.includes('.') && JS_BUILT_INS.has(last) &&
-      !context.getNodesInFile(ref.filePath).some((n) => n.kind === 'class' && n.name === last)) {
+      !nodesNamed(context, ref.filePath, last).some((n) => n.kind === 'class' && n.name === last)) {
     return null;
   }
   return last;
@@ -35289,7 +35883,7 @@ function matchDestructuredStoreCall(ref: UnresolvedRef, context: ResolutionConte
   if (!eligible) return null;
   source ??= context.readFile(ref.filePath);
   if (!source) return null;
-  const lines = source.split('\n');
+  const lines = linesOf(source);
   const start = enclosingScopeStartLine(ref, context) - 1;
   const before = lines.slice(start, ref.line - 1).concat(lines[ref.line - 1]!.slice(0, ref.column)).join('\n');
   const code = blankStringContents(stripCommentsForRegex(before, 'typescript'));
@@ -35546,7 +36140,7 @@ function blocksThrough(text: string, enclosing: number): { enclosing: number; op
 
 /** matchDestructuredCallResult by scanning the text above the call, where the whole file's reading may not hold. */
 function matchDestructuredCallAbove(ref: UnresolvedRef, source: string, context: ResolutionContext): ResolvedRef | null {
-  const lines = source.split('\n');
+  const lines = linesOf(source);
   const before = lines.slice(0, ref.line - 1).concat(lines[ref.line - 1]?.slice(0, ref.column) ?? '').join('\n');
   const code = blankStringContents(stripCommentsForRegex(before, 'typescript'));
   const stackAt = (end: number): number[] => {
@@ -35597,10 +36191,10 @@ function destructuredKeyTarget(calleeName: string, key: string, ref: UnresolvedR
   if (!new RegExp(`\\breturn\\s*\\{[^]*?\\b${escapeRegExp(key)}\\b`).test(calleeText)) return null;
   const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'constant' || n.kind === 'variable';
   const inFile = context.getNodesInFile(callee.filePath);
-  const inner = inFile.filter((n) => n.name === key && callable(n) && n.id !== callee.id && rangeWithin(n, callee) &&
+  const inner = nodesNamed(context, callee.filePath, key).filter((n) => n.name === key && callable(n) && n.id !== callee.id && rangeWithin(n, callee) &&
     !inFile.some((f) => f.id !== callee.id && f.id !== n.id && (f.kind === 'function' || f.kind === 'method') &&
       rangeWithin(f, callee) && rangeWithin(n, f) && !sameRange(f, n)));
-  const top = inner.length > 0 ? inner : inFile.filter((n) => n.name === key && callable(n) && !n.qualifiedName.includes('::') &&
+  const top = inner.length > 0 ? inner : nodesNamed(context, callee.filePath, key).filter((n) => n.name === key && callable(n) && !n.qualifiedName.includes('::') &&
     !inFile.some((f) => (f.kind === 'function' || f.kind === 'method') && f.id !== n.id && rangeWithin(n, f) && !sameRange(f, n)));
   const target = top.sort((a, b) => Number(b.kind === 'function') - Number(a.kind === 'function'))[0];
   if (!target) return null;
@@ -35630,18 +36224,23 @@ const SELECTOR_NAMES = new WeakMap<ResolutionContext, Map<string, Set<string>>>(
  * lexical block identity so closures may capture it but sibling scopes and
  * shadowing parameters/declarations cannot donate a binding. */
 function matchSelectedStoreCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
-  const source = context.readFile(ref.filePath);
-  if (!source?.includes('=>')) return null;
   let files = SELECTOR_NAMES.get(context);
   if (!files) { files = new Map(); SELECTOR_NAMES.set(context, files); }
   let names = files.get(ref.filePath);
   if (!names) {
-    names = new Set([...source.matchAll(/\bconst\s+([\w$]+)\s*=\s*[\w$]+\s*\(\s*(?:\(\s*[\w$]+\s*\)|[\w$]+)\s*=>/g)].map(m => m[1]!));
+    // Read once for the file: a file with no arrow in it was searched to its
+    // end for one, for each of its calls.
+    const text = context.readFile(ref.filePath);
+    names = new Set(text?.includes('=>')
+      ? [...text.matchAll(/\bconst\s+([\w$]+)\s*=\s*[\w$]+\s*\(\s*(?:\(\s*[\w$]+\s*\)|[\w$]+)\s*=>/g)].map(m => m[1]!)
+      : []);
     files.set(ref.filePath, names);
   }
   if (!names.has(ref.referenceName)) return null;
+  const source = context.readFile(ref.filePath);
+  if (!source) return null;
   const name = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const lines = source.split('\n');
+  const lines = linesOf(source);
   const before = lines.slice(0, ref.line - 1).concat(lines[ref.line - 1]!.slice(0, ref.column)).join('\n');
   const code = blankStringContents(stripCommentsForRegex(before, 'typescript'));
   const binding = new RegExp(`\\bconst\\s+${name}\\s*=\\s*([\\w$]+)\\s*\\(\\s*(?:\\(\\s*([\\w$]+)\\s*\\)|([\\w$]+))\\s*=>\\s*([\\w$]+)\\.([\\w$]+)\\s*\\)`, 'g');
@@ -35673,7 +36272,7 @@ function importShadowedAt(name: string, ref: UnresolvedRef, context: ResolutionC
     if ((fn.kind === 'function' || fn.kind === 'method') && fn.startLine <= ref.line && fn.endLine >= ref.line &&
         fn.signature && hasParameterBinding(`${fn.signature} {`, escaped)) return true;
   }
-  const lines = (context.readFile(ref.filePath) ?? '').split('\n');
+  const lines = linesOf(context.readFile(ref.filePath) ?? '');
   const before = lines.slice(0, ref.line - 1).concat(lines[ref.line - 1]?.slice(0, ref.column) ?? '').join('\n');
   const code = blankStringContents(stripCommentsForRegex(before, 'typescript'));
   const stackAt = (end: number): number[] => {
@@ -36087,10 +36686,9 @@ export function matchFuzzy(
   const lowerName = ref.referenceName.toLowerCase();
 
   // Use pre-built lowercase index for O(1) lookup instead of scanning all nodes
-  const candidates = context.getNodesByLowerName(lowerName);
+  const candidates = callableNodes(context.getNodesByLowerName(lowerName));
 
   // Filter to callable kinds only (function, method, class)
-  const callableKinds = new Set(['function', 'method', 'class']);
   const typeRef = isDotNetTypeRef(ref, context);
   const rustBare = ref.language === 'rust' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const pythonShape = pythonCallShape(ref, context);
@@ -36126,7 +36724,7 @@ export function matchFuzzy(
   // lowercase index is for.
   const bareR = isBareRCall(ref, context);
   const solidityBare = isReceiverLessSolidityCall(ref, context);
-  const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind) && !(typeRef && !canNameInTypePosition(n)) &&
+  const callableCandidates = candidates.filter((n) => !(typeRef && !canNameInTypePosition(n)) &&
     !(bareR && n.kind === 'method') &&
     !(solidityBare && !isSolidityMemberInScope(n, ref, context)) &&
     // `new …MockData()` makes an instance of a type; a method is never what it names.
@@ -36559,7 +37157,7 @@ function overloadSetOf(id: string, context: ResolutionContext): { name: string; 
   if (!self || (self.kind !== 'method' && self.kind !== 'function')) return null;
   const name = self.name;
   const owner = self.qualifiedName.slice(0, Math.max(0, self.qualifiedName.lastIndexOf('::')));
-  const siblings = (context.getNodesInFileNamed?.(self.filePath, name) ?? context.getNodesInFile(self.filePath).filter((n) => n.name === name))
+  const siblings = (context.getNodesInFileNamed?.(self.filePath, name) ?? nodesNamed(context, self.filePath, name).filter((n) => n.name === name))
     .filter((n) => n.id !== self.id && (n.kind === 'method' || n.kind === 'function') &&
       n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))) === owner);
   if (siblings.length === 0) return null;
@@ -36658,7 +37256,7 @@ function matchReferenceInner(
     // `ipairs(t)` is Lua's, unless the file defines its own: telescope's 122
     // `for _, v in ipairs(…)` went to a linked list's `ipairs` method.
     if (LUA_GLOBAL_FUNCTIONS.has(ref.referenceName) &&
-        !context.getNodesInFile(ref.filePath).some((n) => n.name === ref.referenceName && n.kind === 'function')) return null;
+        !nodesNamed(context, ref.filePath, ref.referenceName).some((n) => n.name === ref.referenceName && n.kind === 'function')) return null;
   }
 
   // Erlang `-behaviour(m)` refs target a MODULE. Letting them fall through to
@@ -36957,7 +37555,7 @@ function isSolidityMemberInScope(n: Node, ref: UnresolvedRef, context: Resolutio
   let names = memo.get(ref);
   if (!names) {
     names = new Set<string>();
-    const queue = context.getNodesInFile(ref.filePath)
+    const queue = nodesAroundLine(context, ref.filePath, ref.line)
       .filter((c) => SOLIDITY_TYPE_KINDS.has(c.kind) && c.startLine <= ref.line && c.endLine >= ref.line)
       .map((c) => c.name);
     while (queue.length > 0 && names.size < 60) {
@@ -37027,7 +37625,7 @@ function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext)
   // not color.h's `format(const text_style&, …)`.
   const args = pool.length > 1 && ref.referenceKind === 'calls' ? cppCallArguments(ref, name, context) : null;
   const scores = pool.map((n) => (isTestPath(n.filePath) ? -10 : 0) + (args ? cppOverloadFit(n, name, args, context) : 0));
-  const top = Math.max(...scores);
+  const top = maxOf(scores);
   const tied = pool.filter((_, i) => scores[i] === top);
   const best = args ? cppArgumentTypeChoice(tied, name, args, ref, context) : tied[0]!;
   return { original: ref, targetNodeId: best.id, confidence: 0.8, resolvedBy: 'qualified-name' };

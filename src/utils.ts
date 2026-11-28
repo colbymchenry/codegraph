@@ -415,6 +415,30 @@ export function safeJsonParse<T>(value: string, fallback: T): T {
  * Clamp a numeric value to a range.
  * Used to enforce sane limits on MCP tool inputs.
  */
+/**
+ * `target.push(...items)`, for a list of any length. Spread into a call's
+ * arguments, a list of some hundred thousand overflows the stack ("Maximum
+ * call stack size exceeded"): the imports, references or symbols of one
+ * source file of a few megabytes are that many.
+ */
+export function pushAll<T>(target: T[], items: readonly T[]): void {
+  for (let i = 0; i < items.length; i++) target.push(items[i]!);
+}
+
+/** `Math.max(...values)` for a list of any length (see pushAll); -Infinity for none. */
+export function maxOf(values: readonly number[]): number {
+  let most = -Infinity;
+  for (const value of values) most = Math.max(most, value);
+  return most;
+}
+
+/** `Math.min(...values)` for a list of any length (see pushAll); Infinity for none. */
+export function minOf(values: readonly number[]): number {
+  let least = Infinity;
+  for (const value of values) least = Math.min(least, value);
+  return least;
+}
+
 export function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }

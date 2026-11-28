@@ -13,6 +13,7 @@
 
 import type { Language, Node } from '../../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from '../types';
+import { nodesNamed } from '../nodes-around';
 
 /** The component name a single-file-component extractor gives a file: its basename, extension off. */
 export function pageComponentName(filePath: string, extension: string): string {
@@ -37,8 +38,7 @@ export function pageComponentRef(route: Node, extension: string, language: Langu
 /** A page route's reference to its file's own component, or null when this is not one. */
 export function resolvePageComponent(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   if (ref.referenceKind !== 'calls' || !ref.fromNodeId.startsWith(`route:${ref.filePath}:`)) return null;
-  const component = context
-    .getNodesInFile(ref.filePath)
+  const component = nodesNamed(context, ref.filePath, ref.referenceName)
     .find((n) => n.kind === 'component' && n.name === ref.referenceName);
   return component ? { original: ref, targetNodeId: component.id, confidence: 0.95, resolvedBy: 'framework' } : null;
 }

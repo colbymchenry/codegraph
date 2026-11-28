@@ -39,6 +39,8 @@ import { HOLE, readStringAt } from './frameworks/expo-router';
 import { FN_KINDS, enclosingFn, enclosingValue, makeLineAt } from './synth-utils';
 import { TIER_CLIENT_TO_SERVER, TIER_SERVER_TO_CLIENT } from './tier-synthesizer';
 import { jsCodeBindsName } from './name-matcher';
+import { maxOf } from '../utils';
+import { nodesNamed } from './nodes-around';
 
 const FRONTEND_FILE = /\.(?:[cm]?[jt]sx?|vue|svelte)$/;
 const FRONTEND_GATE = /invoke|listen|once|\bemit|\bcommands\b|\bevents\b|__TAURI/;
@@ -381,7 +383,7 @@ function commandsFor(entry: ListEntry, list: HandlerList, crates: Map<string, st
   }
   if (candidates.length > 1) {
     const scores = candidates.map((n) => pathScore(entry.segments, n));
-    const best = Math.max(...scores);
+    const best = maxOf(scores);
     candidates = candidates.filter((_, i) => scores[i] === best);
   }
   return candidates.length <= MAX_VARIANTS ? candidates : [];
@@ -863,10 +865,33 @@ function shadowed(name: string, owner: Node, front: FrontFile, line: number, col
   if (owner.kind !== 'function' && owner.kind !== 'method') return false;
   if (jsCodeBindsName(name, owner, front.file, line, ctx)) return true;
   // Destructured, which that check leaves alone: `const { invoke } = api`, `({ invoke }) => …`.
-  const before = front.code.slice(front.offsetOfLine(owner.startLine) + owner.startColumn, front.offsetOfLine(line) + column);
-  const n = escapeRe(name);
-  return new RegExp(`(?:\\b(?:const|let|var)\\s*|\\(\\s*)[{[][^=;(){}]*?(?<![\\w$:.])${n}(?![\\w$])`).test(before);
+  // Where the first such binding in the function ends is read once for the
+  // function and the name: a call is shadowed when it stands after that. The
+  // pattern reads on from a bracket to the first mention of the name, so the
+  // first match is the one that ends soonest, and a call starts a word, so no
+  // match ends at it. Tried on the code before each call, a function of some
+  // thousand `invoke` calls read itself that many times.
+  let ends = DESTRUCTURED_ENDS.get(front);
+  if (!ends) DESTRUCTURED_ENDS.set(front, (ends = new Map()));
+  const key = `${owner.id}\0${name}`;
+  const from = front.offsetOfLine(owner.startLine) + owner.startColumn;
+  let end = ends.get(key);
+  if (end === undefined) {
+    // Through the function's last line: the start of the line after it, or the end of the code when it has none.
+    const lastLine = owner.endLine ?? owner.startLine;
+    const after = front.offsetOfLine(lastLine + 1);
+    const stop = after > front.offsetOfLine(lastLine) ? after : front.code.length;
+    const n = escapeRe(name);
+    const found = new RegExp(`(?:\\b(?:const|let|var)\\s*|\\(\\s*)[{[][^=;(){}]*?(?<![\\w$:.])${n}(?![\\w$])`)
+      .exec(front.code.slice(from, stop));
+    end = found ? from + found.index + found[0].length : Infinity;
+    ends.set(key, end);
+  }
+  return end <= front.offsetOfLine(line) + column;
 }
+
+/** Per front-end file read: by function and name, where the first destructured binding of the name in the function ends (Infinity for none). */
+const DESTRUCTURED_ENDS = new WeakMap<FrontFile, Map<string, number>>();
 
 /** The node a JS handler argument names, else the function the listener is written in. */
 function handlerOf(front: FrontFile, span: [number, number] | undefined, imports: readonly ImportMapping[], language: Language, owner: Node, ctx: ResolutionContext): Node {
@@ -879,7 +904,7 @@ function handlerOf(front: FrontFile, span: [number, number] | undefined, imports
   if (!imported) return owner;
   const path = resolveImportPath(imported.source, front.file, language, ctx);
   if (!path) return owner;
-  return ctx.getNodesInFile(path).find((n) => n.name === imported.exportedName && FN_KINDS.has(n.kind)) ?? owner;
+  return nodesNamed(ctx, path, imported.exportedName).find((n) => n.name === imported.exportedName && FN_KINDS.has(n.kind)) ?? owner;
 }
 
 interface Collected {

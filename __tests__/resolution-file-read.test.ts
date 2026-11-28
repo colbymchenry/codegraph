@@ -38,7 +38,7 @@ describe('resolution file reads', () => {
     const fd = fs.openSync(archive, 'w');
     try {
       fs.writeSync(fd, Buffer.from([0x1f, 0x8b]));
-      fs.ftruncateSync(fd, 2 * 1024 * 1024);
+      fs.ftruncateSync(fd, 2 * MAX_SOURCE_FILE_SIZE_BYTES);
     } finally {
       fs.closeSync(fd);
     }
@@ -64,7 +64,9 @@ describe('resolution file reads', () => {
   });
 
   it('accepts exactly the byte limit and rejects one byte more', () => {
-    const content = 'a'.repeat(MAX_SOURCE_FILE_SIZE_BYTES);
+    // Lines, not one run of a letter: a run longer than any name is read blanked (withoutLongRuns).
+    const content = 'a\n'.repeat(MAX_SOURCE_FILE_SIZE_BYTES / 2);
+    expect(Buffer.byteLength(content)).toBe(MAX_SOURCE_FILE_SIZE_BYTES);
     fs.writeFileSync(path.join(root, 'boundary.ts'), content);
     expect(context.readFile('boundary.ts')).toBe(content);
     fs.appendFileSync(path.join(root, 'boundary.ts'), 'a');

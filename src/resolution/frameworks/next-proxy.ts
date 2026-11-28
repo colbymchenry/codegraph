@@ -14,6 +14,7 @@ import type { ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { HOLE, readStringAt } from './expo-router';
 import { matchBracket, readFields, skipString } from './object-literal';
+import { nodesNamed } from '../nodes-around';
 
 const PROXY_EXTENSIONS = ['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs'];
 
@@ -87,7 +88,7 @@ export function nextProxyFor(context: ResolutionContext, dir: string, root: stri
     /\bexport\s+default\s+(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)/.exec(safe)?.[1] ??
     /\bexport\s+default\s+([A-Za-z_$][\w$]*)\s*;?\s*$/m.exec(safe)?.[1] ??
     /\bexport\s*\{[^}]*?\b([A-Za-z_$][\w$]*)\s+as\s+(?:default|middleware|proxy)\b[^}]*\}(?!\s*from\b)/.exec(safe)?.[1];
-  const entry = (local ? nodes.find((n) => ENTRY_KINDS.has(n.kind) && n.name === local) : undefined) ?? nodes.find((n) => n.kind === 'file');
+  const entry = (local ? nodesNamed(context, file, local).find((n) => ENTRY_KINDS.has(n.kind) && n.name === local) : undefined) ?? nodes.find((n) => n.kind === 'file');
   return entry ? { file, entry } : null;
 }
 

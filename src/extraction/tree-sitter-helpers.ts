@@ -47,6 +47,40 @@ export class NodeIdAllocator {
 }
 
 /**
+ * A node's children, one after another.
+ *
+ * `node.child(i)` reads the children before the i-th to reach it when they
+ * are a flat run, as some thousand comment lines under one parent are, so a
+ * loop over them by index takes the square of their number: a megabyte of
+ * comment lines under a VB.NET module, four seconds. A cursor steps from
+ * each child to the next. Leaving the loop early releases the cursor.
+ */
+export function* childrenOf(node: SyntaxNode): Generator<SyntaxNode, void, undefined> {
+  const cursor = node.walk();
+  try {
+    if (!cursor.gotoFirstChild()) return;
+    do {
+      yield cursor.currentNode;
+    } while (cursor.gotoNextSibling());
+  } finally {
+    cursor.delete();
+  }
+}
+
+/** A node's named children, one after another (see childrenOf). */
+export function* namedChildrenOf(node: SyntaxNode): Generator<SyntaxNode, void, undefined> {
+  const cursor = node.walk();
+  try {
+    if (!cursor.gotoFirstChild()) return;
+    do {
+      if (cursor.nodeIsNamed) yield cursor.currentNode;
+    } while (cursor.gotoNextSibling());
+  } finally {
+    cursor.delete();
+  }
+}
+
+/**
  * Extract text from a syntax node
  */
 export function getNodeText(node: SyntaxNode, source: string): string {

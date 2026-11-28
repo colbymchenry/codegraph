@@ -199,7 +199,7 @@ pub struct Walker<'t> {
     src: &'t str,
     file_path: &'t str,
     variant: Variant,
-    line_starts: Vec<usize>,
+    line_starts: util::LineStarts,
     arena: Arena,
     node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
@@ -233,6 +233,9 @@ pub struct Walker<'t> {
     /// The function of a `module.exports = {…}` member being extracted: the
     /// module exports it (#2966). Mirrors TreeSitterExtractor.exportedMemberFn.
     exported_member_fn: Option<usize>,
+    /// The names a later statement exports, read from the source the first
+    /// time one is asked for. See `is_exported_later`.
+    later_exports: std::cell::OnceCell<HashSet<&'t str>>,
 }
 
 const MAX_VALUE_REF_NODES: usize = 20_000;
@@ -284,6 +287,7 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         owns_objects: !util::is_generated_file(file_path) && !util::is_minified_content(file_path, source),
         scope_declarations: HashMap::new(),
         exported_member_fn: None,
+        later_exports: std::cell::OnceCell::new(),
     };
 
     // File node (TreeSitterExtractor.extract): id `file:<path>`, endLine =
@@ -558,10 +562,8 @@ impl<'t> Walker<'t> {
                     }
                 }
             }
-            for i in 0..n.named_child_count() {
-                if let Some(c) = n.named_child(i) {
-                    dstack.push(c);
-                }
+            for c in n.named_children(&mut n.walk()) {
+                dstack.push(c);
             }
         }
         let shadowed: Vec<String> = decl_counts
@@ -612,10 +614,8 @@ impl<'t> Walker<'t> {
                         }
                     }
                 }
-                for i in 0..n.named_child_count() {
-                    if let Some(c) = n.named_child(i) {
-                        stack.push(c);
-                    }
+                for c in n.named_children(&mut n.walk()) {
+                    stack.push(c);
                 }
             }
         }
@@ -651,10 +651,8 @@ impl<'t> Walker<'t> {
             return;
         }
         self.maybe_capture_fn_refs(node);
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1, walked);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.scan_fn_ref_subtree(c, depth + 1, walked);
         }
     }
 
@@ -792,10 +790,8 @@ impl<'t> Walker<'t> {
         }
 
         if !skip_children {
-            for i in 0..node.named_child_count() {
-                if let Some(c) = node.named_child(i) {
-                    self.visit_node(c);
-                }
+            for c in node.named_children(&mut node.walk()) {
+                self.visit_node(c);
             }
         }
     }
@@ -887,10 +883,8 @@ impl<'t> Walker<'t> {
             return;
         }
 
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.visit_for_calls_and_structure(c);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.visit_for_calls_and_structure(c);
         }
     }
 
@@ -1035,11 +1029,9 @@ impl<'t> Walker<'t> {
         if matches!(node.kind(), "arrow_function" | "function_expression" | "generator_function") {
             return "<anonymous>".to_string();
         }
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                if matches!(c.kind(), "identifier" | "type_identifier" | "simple_identifier" | "constant") {
-                    return self.text(c).to_string();
-                }
+        for c in node.named_children(&mut node.walk()) {
+            if matches!(c.kind(), "identifier" | "type_identifier" | "simple_identifier" | "constant") {
+                return self.text(c).to_string();
             }
         }
         "<anonymous>".to_string()
@@ -1093,11 +1085,9 @@ impl<'t> Walker<'t> {
     }
 
     fn has_keyword_child(&self, node: Node, kw: &str) -> bool {
-        for i in 0..node.child_count() {
-            if let Some(c) = node.child(i) {
-                if c.kind() == kw {
-                    return true;
-                }
+        for c in node.children(&mut node.walk()) {
+            if c.kind() == kw {
+                return true;
             }
         }
         false
@@ -1132,18 +1122,15 @@ fn classify_ts_class_member(node: Node) -> Member {
     if !matches!(node.kind(), "public_field_definition" | "field_definition") {
         return Member::Method;
     }
-    for i in 0..node.named_child_count() {
-        let Some(child) = node.named_child(i) else { continue };
+    for child in node.named_children(&mut node.walk()) {
         if matches!(child.kind(), "arrow_function" | "function_expression") {
             return Member::Method;
         }
         if child.kind() == "call_expression" {
             if let Some(args) = child.child_by_field_name("arguments") {
-                for j in 0..args.named_child_count() {
-                    if let Some(arg) = args.named_child(j) {
-                        if matches!(arg.kind(), "arrow_function" | "function_expression") {
-                            return Member::Method;
-                        }
+                for arg in args.named_children(&mut args.walk()) {
+                    if matches!(arg.kind(), "arrow_function" | "function_expression") {
+                        return Member::Method;
                     }
                 }
             }
@@ -1165,11 +1152,9 @@ fn resolve_field_body(node: Node) -> Option<Node> {
         }
         if child.kind() == "call_expression" {
             if let Some(args) = child.child_by_field_name("arguments") {
-                for j in 0..args.named_child_count() {
-                    if let Some(arg) = args.named_child(j) {
-                        if matches!(arg.kind(), "arrow_function" | "function_expression") {
-                            return arg.child_by_field_name("body");
-                        }
+                for arg in args.named_children(&mut args.walk()) {
+                    if matches!(arg.kind(), "arrow_function" | "function_expression") {
+                        return arg.child_by_field_name("body");
                     }
                 }
             }
@@ -1246,11 +1231,9 @@ fn is_ambient_function_signature(node: Node, file_path: &str) -> bool {
 /// hasExportDeclaration: a statement that exports by name or by assignment
 /// (`export {…}`, `export =`, `export default x`), not by declaring.
 fn has_export_declaration(block: Node) -> bool {
-    for i in 0..block.named_child_count() {
-        if let Some(statement) = block.named_child(i) {
-            if statement.kind() == "export_statement" && statement.child_by_field_name("declaration").is_none() {
-                return true;
-            }
+    for statement in block.named_children(&mut block.walk()) {
+        if statement.kind() == "export_statement" && statement.child_by_field_name("declaration").is_none() {
+            return true;
         }
     }
     false

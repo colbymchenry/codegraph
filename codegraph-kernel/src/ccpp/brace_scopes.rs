@@ -85,7 +85,7 @@ impl BraceScopes {
     }
 
     /// The 1-based line and the UTF-16 column of `offset`.
-    pub fn position_of(src: &str, line_starts: &[usize], offset: usize) -> (u32, u32) {
+    pub fn position_of(src: &str, line_starts: &util::LineStarts, offset: usize) -> (u32, u32) {
         let row = line_starts.partition_point(|&s| s <= offset).saturating_sub(1);
         (row as u32 + 1, util::col16(src, line_starts, row, offset))
     }

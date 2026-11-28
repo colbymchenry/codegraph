@@ -4,6 +4,7 @@ import { generateNodeId, NodeIdAllocator } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { getParser } from './grammars';
 import { indexParseBudgetMs, parseTimeoutMessage, parseWithinBudget } from './parse-budget';
+import { pushAll } from '../utils';
 
 /** Tags whose own children include an expression: `<cfset …>`, `<cfif …>`, `<cfelseif …>`, `<cfreturn …>`, and `#…#`. */
 const TAG_EXPRESSION_PARENTS: ReadonlySet<string> = new Set([
@@ -136,12 +137,12 @@ export class CfmlExtractor {
       }
       this.nodes.push(node);
     }
-    this.edges.push(...result.edges);
+    pushAll(this.edges, result.edges);
     for (const ref of result.unresolvedReferences) {
       ref.language = this.language;
       this.unresolvedReferences.push(ref);
     }
-    this.errors.push(...result.errors);
+    pushAll(this.errors, result.errors);
   }
 
   /** Legacy tag-based CFML: walk `<cfcomponent>`/`<cffunction>`, delegating `<cfscript>` bodies. */
@@ -458,8 +459,7 @@ export class CfmlExtractor {
    * methods scoped under the component.
    */
   private delegateNestedTags(node: SyntaxNode, containerId: string, parentClassName?: string, declScope = false): void {
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of node.namedChildren) {
       if (child) this.visitTag(child, node.type, containerId, parentClassName, declScope);
     }
   }
@@ -779,13 +779,11 @@ export class CfmlExtractor {
    */
   private tagAttrValueNode(tag: SyntaxNode, attrName: string, wholeValue = false): SyntaxNode | null | undefined {
     const attrs: SyntaxNode[] = [];
-    for (let i = 0; i < tag.namedChildCount; i++) {
-      const child = tag.namedChild(i);
+    for (const child of tag.namedChildren) {
       if (!child) continue;
       if (child.type === 'cf_attribute') attrs.push(child);
       else if (child.type === 'cf_tag_attributes') {
-        for (let j = 0; j < child.namedChildCount; j++) {
-          const inner = child.namedChild(j);
+        for (const inner of child.namedChildren) {
           if (inner?.type === 'cf_attribute') attrs.push(inner);
         }
       }

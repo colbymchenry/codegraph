@@ -1,9 +1,10 @@
 /**
  * A Go method a type declares in a file the index couldn't read.
  *
- * kubernetes' core/v1 generated.pb.go is 1.7 MB, over the index's 1 MB
- * limit, so `Pod`'s own `String`, `Marshal` and `Unmarshal` are not in the
- * graph. Resolving `pod.String()` on a `*v1.Pod`, the walk over the types
+ * kubernetes' core/v1 generated.pb.go was 1.7 MB against an index limit of
+ * 1 MB, so `Pod`'s own `String`, `Marshal` and `Unmarshal` were not in the
+ * graph. (The limit is 4 MB now, which takes that file in; what follows holds
+ * for any file over it.) Resolving `pod.String()` on a `*v1.Pod`, the walk over the types
  * `Pod` embeds found the `String` its `TypeMeta` has and linked that, a
  * method the call never runs. Every typed Go receiver took that walk: a
  * parameter, a local, a field, an assertion, a package-level variable.
@@ -18,6 +19,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../src/file-limits';
 
 let root = '';
 let cg: CodeGraph;
@@ -52,13 +54,13 @@ type Pod struct {
 	Spec string
 }
 `,
-    // Over the index's 1 MB limit, so none of it is read.
+    // Over the index's size limit, so none of it is read.
     'api/generated.pb.go': `package api
 
 func (m *Pod) String() string { return "" }
 
 func (m *Pod) Unmarshal(dAtA []byte) error { return nil }
-${'// generated padding, never read by the indexer\n'.repeat(24_000)}`,
+${'// generated padding, never read by the indexer\n'.repeat(Math.ceil(MAX_SOURCE_FILE_SIZE_BYTES / 40))}`,
     'caller/caller.go': `package caller
 
 import "example.com/app/api"

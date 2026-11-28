@@ -9,6 +9,7 @@ import { FrameworkResolver, UnresolvedRef, ResolutionContext, FrameworkExtractio
 import { stripCommentsForRegex } from '../strip-comments';
 import { resolveImportPath } from '../import-resolver';
 import { pickByNameAndKind } from './name-heuristic';
+import { lineAt } from '../synth-utils';
 
 export const djangoResolver: FrameworkResolver = {
   name: 'django',
@@ -76,7 +77,7 @@ export const djangoResolver: FrameworkResolver = {
     let match: RegExpExecArray | null;
     while ((match = routeRegex.exec(safe)) !== null) {
       const [, _fn, urlPath, handlerExpr] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
 
       const routeNode: Node = {
         id: `route:${filePath}:${line}:${urlPath}`,
@@ -118,7 +119,7 @@ export const djangoResolver: FrameworkResolver = {
       const prefix = match[1]!.replace(/^\^|\/?\$$/g, '');
       const viewset = match[2]!.split('.').pop()!;
       if (!/View(Set)?$/.test(viewset)) continue;
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       const routeNode: Node = {
         id: `route:${filePath}:${line}:VIEWSET:${prefix}`,
         kind: 'route',
@@ -332,7 +333,7 @@ export const fastapiResolver: FrameworkResolver = {
       own.set(file, vars);
       const byLine = new Map<number, string>();
       const deco = /@([A-Za-z_]\w*)\.(?:get|post|put|patch|delete|options|head)\s*\(/g;
-      while ((m = deco.exec(safe)) !== null) byLine.set(safe.slice(0, m.index).split('\n').length, m[1]!);
+      while ((m = deco.exec(safe)) !== null) byLine.set(lineAt(safe, m.index), m[1]!);
       receivers.set(file, byLine);
       const inc = /\b([A-Za-z_]\w*)\.include_router\s*\(\s*([A-Za-z_][\w.]*)\s*((?:,[^)]*)?)\)/g;
       while ((m = inc.exec(safe)) !== null) {
@@ -453,7 +454,7 @@ function extractDecoratorRoutes(filePath: string, content: string, opts: Decorat
       const m = match[opts.methodFromGroup]!.match(/['"]([A-Z]+)['"]/i);
       if (m) method = m[1]!.toUpperCase();
     }
-    const line = content.slice(0, match.index).split('\n').length;
+    const line = lineAt(content, match.index);
     const name = method ? `${method} ${routePath || '/'}` : (routePath || '/');
     const routeNode: Node = {
       id: `route:${filePath}:${line}:${method}:${routePath}`,
@@ -509,7 +510,7 @@ function extractFlaskRestful(filePath: string, safe: string): FrameworkExtractio
   while ((m = re.exec(safe)) !== null) {
     const className = m[1]!;
     const paths = (m[2]!.match(/['"]([^'"]+)['"]/g) || []).map((s) => s.slice(1, -1));
-    const line = safe.slice(0, m.index).split('\n').length;
+    const line = lineAt(safe, m.index);
     for (const routePath of paths) {
       const routeNode: Node = {
         id: `route:${filePath}:${line}:ANY:${routePath}`,
@@ -580,7 +581,7 @@ function extractFlaskUrlRules(filePath: string, safe: string): FrameworkExtracti
     const methods = listed
       ? (listed.match(/['"](\w+)['"]/g) ?? []).map((q) => q.slice(1, -1).toUpperCase())
       : [classView ? 'ANY' : 'GET'];
-    const line = safe.slice(0, m.index).split('\n').length;
+    const line = lineAt(safe, m.index);
     const name = target.split('.').pop()!;
     for (const routePath of paths) {
       for (const method of methods) {

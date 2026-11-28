@@ -12,10 +12,11 @@ import { resolveImportPath } from '../import-resolver';
 import { defaultExportBinding, extractLocalExportAliases } from '../alias-binding';
 import { stripCommentsForRegex } from '../strip-comments';
 import { escapeRegExp } from '../../utils';
-import { FN_KINDS, makeLineAt } from '../synth-utils';
+import { FN_KINDS, makeLineAt, lineAt } from '../synth-utils';
 import { isTestPath } from '../../search/query-utils';
 import { matchBracket, skipString } from './object-literal';
 import { inReferencingFolder } from './component-folder';
+import { nodesNamed } from '../nodes-around';
 
 /** The languages React components, hooks and contexts are written and used in. */
 const REACT_SCRIPT_LANGUAGES: ReadonlySet<string> = new Set(['typescript', 'javascript', 'tsx', 'jsx']);
@@ -180,7 +181,7 @@ export const reactResolver: FrameworkResolver = {
     const declarations = scanRouteDeclarations(content, allowsJsx(filePath));
     for (const route of declarations) {
       const { path: routePath, parts, at } = route;
-      const line = content.slice(0, at).split('\n').length;
+      const line = lineAt(content, at);
       const routeNode: Node = {
         id: `route:${filePath}:${line}:${routePath}`,
         kind: 'route',
@@ -314,7 +315,7 @@ function constantPathValue(expr: string, fromFile: string, context: ResolutionCo
     file = resolved;
     if (mapping.exportedName && mapping.exportedName !== 'default' && mapping.exportedName !== '*') name = mapping.exportedName;
   }
-  const decl = context.getNodesInFile(file).find((n) => n.name === name && (n.kind === 'constant' || n.kind === 'variable'));
+  const decl = nodesNamed(context, file, name).find((n) => n.name === name && (n.kind === 'constant' || n.kind === 'variable'));
   if (!decl) return null;
   const lines = context.readFile(file)?.split('\n') ?? [];
   const text = lines.slice(decl.startLine - 1, decl.endLine).join('\n');
@@ -346,7 +347,7 @@ export function configHrefExpression(expr: string, fromFile: string, context: Re
     file = resolved;
     if (mapping.exportedName && mapping.exportedName !== 'default' && mapping.exportedName !== '*') name = mapping.exportedName;
   }
-  const decl = context.getNodesInFile(file).find((n) => n.name === name && (n.kind === 'constant' || n.kind === 'variable'));
+  const decl = nodesNamed(context, file, name).find((n) => n.name === name && (n.kind === 'constant' || n.kind === 'variable'));
   if (!decl) return null;
   const lines = context.readFile(file)?.split('\n') ?? [];
   const text = lines.slice(decl.startLine - 1, decl.endLine).join('\n');
@@ -553,9 +554,8 @@ export function exportedComponent(
   const code = stripCommentsForRegex(context.readFile(file) ?? '', 'typescript');
   const local = ownExport(code, name);
   if (local) {
-    const nodes = context.getNodesInFile(file);
     const declaredAs = (binding: string): Node | undefined => {
-      const named = nodes.filter((n) => n.name === binding && EXPORTED_COMPONENT_KINDS.has(n.kind));
+      const named = nodesNamed(context, file, binding).filter((n) => n.name === binding && EXPORTED_COMPONENT_KINDS.has(n.kind));
       return named.find((n) => n.qualifiedName === binding) ?? named[0];
     };
     const exported = declaredAs(local);
@@ -727,7 +727,7 @@ export function lazyValueModules(filePath: string, context: ResolutionContext): 
 
 /** The module-level `const`, `let` or `var` `filePath` declares as `name`. */
 function declaredValue(name: string, filePath: string, context: ResolutionContext): Node | undefined {
-  return (context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name))
+  return (context.getNodesInFileNamed?.(filePath, name) ?? nodesNamed(context, filePath, name).filter((n) => n.name === name))
     .find((n) => (n.kind === 'constant' || n.kind === 'variable') && n.qualifiedName === name);
 }
 
@@ -931,7 +931,7 @@ function layoutComponent(spec: string, ref: UnresolvedRef, context: ResolutionCo
   // import names — never a same-named component somewhere else.
   if (mapping.isDefault || mapping.exportedName === 'default') return lazyRouteComponent(mapping.source, ref.filePath, context);
   const file = resolveImportPath(mapping.source, ref.filePath, ref.language, context);
-  return file ? context.getNodesInFile(file).find((n) => n.name === mapping.exportedName && COMPONENT_KINDS.has(n.kind))?.id ?? null : null;
+  return file ? nodesNamed(context, file, mapping.exportedName).find((n) => n.name === mapping.exportedName && COMPONENT_KINDS.has(n.kind))?.id ?? null : null;
 }
 
 interface RouteDeclaration {
@@ -1346,8 +1346,21 @@ function scanRoutes(
   const inherited = options.table?.layouts ?? [];
   const renders = (s: RouteScope): boolean => Boolean(s.component || s.lazy);
   const holds = (outer: RouteScope, start: number, end: number): boolean => outer.start < start && outer.end >= end;
+  // The scopes that reach each stretch of the source, in their own order: a
+  // scope around a place reaches the stretch the place is in. Looked for
+  // among every scope for each route, a table of eight thousand routes took
+  // the square of their number.
+  const STRETCH = 4096;
+  const stretches: RouteScope[][] = [];
+  const placed = scopes.every((s) => s.start >= 0 && s.end >= s.start && Number.isFinite(s.end));
+  if (placed) {
+    for (const s of scopes) {
+      for (let b = Math.floor(s.start / STRETCH); b <= Math.floor(s.end / STRETCH); b++) (stretches[b] ??= []).push(s);
+    }
+  }
+  const near = (start: number): readonly RouteScope[] => (placed && start >= 0 ? stretches[Math.floor(start / STRETCH)] ?? [] : scopes);
   const around = (start: number, end: number): RouteScope[] =>
-    scopes.filter((outer) => holds(outer, start, end)).sort((a, b) => a.start - b.start);
+    near(start).filter((outer) => holds(outer, start, end)).sort((a, b) => a.start - b.start);
   const shown = (p: RoutePart): string => p.lit ?? `{${p.expr}}`;
   const layoutOf = (s: RouteScope): string => (s.component ?? s.lazy)!;
   const partsOf = new Map<RouteScope, RoutePart[]>();
@@ -1369,14 +1382,23 @@ function scanRoutes(
   };
   const pages = new Set(scopes.filter((s) => !s.pathless && !s.opaque && (s.jsx || s.outlet || renders(s)) && addressed(s)));
   const layout = (c: RouteScope): boolean => renders(c) && !c.opaque;
+  // The pages that render something, by the path each claims.
+  const pagesAt = new Map<string, RouteScope[]>();
+  for (const inner of scopes) {
+    if (!pages.has(inner) || !renders(inner)) continue;
+    const path = pathOf.get(inner)!;
+    const same = pagesAt.get(path);
+    if (same) same.push(inner);
+    else pagesAt.set(path, [inner]);
+  }
   const routes: RouteDeclaration[] = [];
   for (const scope of pages) {
     const path = pathOf.get(scope)!;
     // A route around others is the layout they render inside; when one of
     // them claims its address, the page there is that one — not the layout,
     // nor a `<Route path>` that only groups them.
-    if (scopes.some((inner) => pages.has(inner) && !inner.jsx === !scope.jsx && renders(inner) &&
-      holds(scope, inner.start, inner.end) && pathOf.get(inner) === path)) continue;
+    if ((pagesAt.get(path) ?? []).some((inner) => !inner.jsx === !scope.jsx &&
+      holds(scope, inner.start, inner.end))) continue;
     // A route object renders inside the route objects around it; a `<Route>`,
     // inside the routes around it of either kind.
     const layouts = [...inherited, ...around(scope.start, scope.end)
@@ -2397,7 +2419,7 @@ const COMPONENT_KINDS = new Set(['component', 'function', 'class']);
  * owner in its qualified name; an import is no declaration.
  */
 function ownDeclarations(name: string, filePath: string, context: ResolutionContext): Node[] {
-  return (context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name))
+  return (context.getNodesInFileNamed?.(filePath, name) ?? nodesNamed(context, filePath, name).filter((n) => n.name === name))
     .filter((n) => n.qualifiedName === name && n.kind !== 'import' && n.kind !== 'export' && n.kind !== 'file');
 }
 

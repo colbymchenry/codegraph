@@ -1,4 +1,4 @@
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
+import { getNodeText, getChildByField, childrenOf, namedChildrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 import { hasFlowPragma } from '../grammars';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
@@ -9,8 +9,8 @@ import type { Node as SyntaxNode } from 'web-tree-sitter';
  * extractors, which parse class bodies alike.
  */
 export function hasStaticModifier(node: SyntaxNode): boolean {
-  for (let i = 0; i < node.childCount; i++) {
-    if (node.child(i)?.type === 'static') return true;
+  for (const child of childrenOf(node)) {
+    if (child.type === 'static') return true;
   }
   return false;
 }
@@ -30,8 +30,7 @@ export function classifyTsClassMember(node: SyntaxNode): 'method' | 'property' {
   if (node.type !== 'public_field_definition' && node.type !== 'field_definition') {
     return 'method'; // method_definition, getters/setters — untouched
   }
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of namedChildrenOf(node)) {
     if (!child) continue;
     if (child.type === 'arrow_function' || child.type === 'function_expression') {
       return 'method';
@@ -39,8 +38,7 @@ export function classifyTsClassMember(node: SyntaxNode): 'method' | 'property' {
     if (child.type === 'call_expression') {
       const args = getChildByField(child, 'arguments');
       if (args) {
-        for (let j = 0; j < args.namedChildCount; j++) {
-          const arg = args.namedChild(j);
+        for (const arg of namedChildrenOf(args)) {
           if (arg && (arg.type === 'arrow_function' || arg.type === 'function_expression')) {
             return 'method';
           }
@@ -124,8 +122,8 @@ export function isAmbientExport(node: SyntaxNode): boolean {
     if (current.type === 'statement_block' && hasExportDeclaration(current)) return false;
     if (current.type !== 'ambient_declaration') continue;
     // `declare global` is the keyword and a bare block, with no field names.
-    for (let i = 0; i < current.childCount; i++) {
-      if (current.child(i)?.type === 'global') return true;
+    for (const child of childrenOf(current)) {
+      if (child.type === 'global') return true;
     }
     const declared = current.namedChild(0);
     if (declared?.type === 'module' && getChildByField(declared, 'name')?.type === 'string') return true;
@@ -135,8 +133,7 @@ export function isAmbientExport(node: SyntaxNode): boolean {
 
 /** A statement in `block` that exports by name or by assignment, not by declaring. */
 function hasExportDeclaration(block: SyntaxNode): boolean {
-  for (let i = 0; i < block.namedChildCount; i++) {
-    const statement = block.namedChild(i);
+  for (const statement of namedChildrenOf(block)) {
     if (statement?.type === 'export_statement' && !getChildByField(statement, 'declaration')) return true;
   }
   return false;
@@ -217,8 +214,7 @@ export const typescriptExtractor: LanguageExtractor = {
     // Also handles wrapper patterns like: field = withBatchedUpdates((e) => { ... })
     //   public_field_definition → call_expression → arguments → arrow_function → body
     if (node.type === 'public_field_definition') {
-      for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
+      for (const child of namedChildrenOf(node)) {
         if (!child) continue;
         if (child.type === 'arrow_function' || child.type === 'function_expression') {
           return getChildByField(child, bodyField);
@@ -227,8 +223,7 @@ export const typescriptExtractor: LanguageExtractor = {
         if (child.type === 'call_expression') {
           const args = getChildByField(child, 'arguments');
           if (args) {
-            for (let j = 0; j < args.namedChildCount; j++) {
-              const arg = args.namedChild(j);
+            for (const arg of namedChildrenOf(args)) {
               if (arg && (arg.type === 'arrow_function' || arg.type === 'function_expression')) {
                 return getChildByField(arg, bodyField);
               }
@@ -252,8 +247,7 @@ export const typescriptExtractor: LanguageExtractor = {
     return sig;
   },
   getVisibility: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'accessibility_modifier') {
         const text = child.text;
         if (text === 'public') return 'public';
@@ -276,8 +270,7 @@ export const typescriptExtractor: LanguageExtractor = {
     return isAmbientExport(node);
   },
   isAsync: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'async') return true;
     }
     return false;
@@ -287,8 +280,7 @@ export const typescriptExtractor: LanguageExtractor = {
     // For lexical_declaration, check if it's 'const' or 'let'
     // For variable_declaration, it's always 'var'
     if (node.type === 'lexical_declaration') {
-      for (let i = 0; i < node.childCount; i++) {
-        const child = node.child(i);
+      for (const child of childrenOf(node)) {
         if (child?.type === 'const') return true;
       }
     }

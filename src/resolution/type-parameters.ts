@@ -17,6 +17,7 @@
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 import { escapeRegExp } from '../utils';
+import { nodesAroundLine } from './nodes-around';
 
 const GENERIC_LANGUAGES: ReadonlySet<string> = new Set([
   'scala', 'java', 'kotlin', 'csharp', 'typescript', 'tsx', 'swift', 'rust', 'dart', 'go', 'cpp', 'vbnet', 'arkts',
@@ -150,8 +151,7 @@ function scalaMemberInScope(result: ResolvedRef, ref: UnresolvedRef, context: Re
 }
 
 function enclosingDeclarations(at: { filePath: string; line: number }, context: ResolutionContext): Node[] {
-  return context
-    .getNodesInFile(at.filePath)
+  return nodesAroundLine(context, at.filePath, at.line)
     .filter((n) => DECLARATION_KINDS.has(n.kind) && n.startLine <= at.line && n.endLine >= at.line);
 }
 

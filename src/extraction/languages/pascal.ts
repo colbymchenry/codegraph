@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
+import { getNodeText, getChildByField, childrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 import { preParsePascal } from './pascal-preparse';
 
@@ -50,8 +50,7 @@ export const pascalExtractor: LanguageExtractor = {
     let current = node.parent;
     while (current) {
       if (current.type === 'declSection') {
-        for (let i = 0; i < current.childCount; i++) {
-          const child = current.child(i);
+        for (const child of childrenOf(current)) {
           if (child?.type === 'kPublic' || child?.type === 'kPublished')
             return 'public';
           if (child?.type === 'kPrivate') return 'private';
@@ -67,8 +66,8 @@ export const pascalExtractor: LanguageExtractor = {
     return false;
   },
   isStatic: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      if (node.child(i)?.type === 'kClass') return true;
+    for (const child of childrenOf(node)) {
+      if (child.type === 'kClass') return true;
     }
     return false;
   },

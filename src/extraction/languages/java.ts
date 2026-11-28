@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
+import { getNodeText, getChildByField, childrenOf } from '../tree-sitter-helpers';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
 import { IMPLICIT_RECORD_ACCESSOR_DOC } from '../../types';
 
@@ -347,8 +347,7 @@ export const javaExtractor: LanguageExtractor = {
     return returnType ? getNodeText(returnType, source) + ' ' + paramsText : paramsText;
   },
   getVisibility: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'modifiers') {
         const text = child.text;
         if (text.includes('public')) return 'public';
@@ -361,8 +360,7 @@ export const javaExtractor: LanguageExtractor = {
   isStatic: (node) => {
     // An interface constant is implicitly `public static final`.
     if (node.type === 'constant_declaration') return true;
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'modifiers' && child.text.includes('static')) {
         return true;
       }
@@ -374,8 +372,7 @@ export const javaExtractor: LanguageExtractor = {
   // instance / `final`-only / `static`-only fields stay mutable `field`s.
   isConst: (node) => {
     if (node.type === 'constant_declaration') return true;
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'modifiers') {
         const text = child.text;
         return /\bstatic\b/.test(text) && /\bfinal\b/.test(text);

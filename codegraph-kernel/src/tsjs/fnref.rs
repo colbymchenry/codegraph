@@ -54,10 +54,8 @@ pub fn capture(container: Node, mode: Mode, src: &str) -> Vec<(Candidate, Mode)>
 
     match mode {
         Mode::Args | Mode::List => {
-            for i in 0..container.named_child_count() {
-                if let Some(c) = container.named_child(i) {
-                    value_nodes.push(c);
-                }
+            for c in container.named_children(&mut container.walk()) {
+                value_nodes.push(c);
             }
         }
         Mode::Rhs => {

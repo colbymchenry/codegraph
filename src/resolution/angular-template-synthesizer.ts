@@ -49,6 +49,8 @@ import type { ResolutionContext } from './types';
 import type { MaybeYield } from './cooperative-yield';
 import { isTestPath } from '../search/query-utils';
 import { stripCommentsForRegex } from './strip-comments';
+import { lineAt, linesOf } from './synth-utils';
+import { nodesNamed, nodesUnder } from './nodes-around';
 import { matchBracket, readFields, skipString } from './frameworks/object-literal';
 import { dependsOn } from './frameworks/package-deps';
 import { appRootFor, HOLE, toHref, type HrefLiteral } from './frameworks/expo-router';
@@ -70,14 +72,16 @@ const MAX_CHILDREN_PER_COMPONENT = 40;
 /** An element selector: `app-article-list`, not `[appDirective]` or `button[app-x]`. */
 const ELEMENT_SELECTOR = /^[a-zA-Z][\w-]*$/;
 
-const lineOfOffset = (text: string, at: number): number => {
-  let line = 1;
-  for (let i = 0; i < at && i < text.length; i++) if (text.charCodeAt(i) === 10) line++;
-  return line;
-};
+/**
+ * The 1-based line of `at` in `text`, from the text's newline index
+ * (lineAt). Counted character by character from the text's start for each
+ * binding and each component, a file of some thousand components took the
+ * square of its length.
+ */
+const lineOfOffset = (text: string, at: number): number => (at > 0 ? lineAt(text, at) : 1);
 
 /** Every `@Component` class a file declares, with its selectors and template. */
-function componentsIn(file: string, content: string, nodes: readonly Node[], ctx: ResolutionContext): AngularComponent[] {
+function componentsIn(file: string, content: string, ctx: ResolutionContext): AngularComponent[] {
   const out: AngularComponent[] = [];
   const safe = stripCommentsForRegex(content, 'typescript');
   const decorator = /@Component\s*\(/g;
@@ -93,7 +97,7 @@ function componentsIn(file: string, content: string, nodes: readonly Node[], ctx
     if (objEnd < 0) continue;
     const cls = /^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/.exec(safe.slice(close + 1, close + 400));
     if (!cls) continue;
-    const node = nodes.find((n) => n.kind === 'class' && n.name === cls[1]);
+    const node = nodesNamed(ctx, file, cls[1]).find((n) => n.kind === 'class' && n.name === cls[1]);
     if (!node) continue;
     const fields = readFields(safe, open, objEnd);
     const selectorText = fields.get('selector')?.text;
@@ -141,7 +145,7 @@ export function angularComponents(ctx: ResolutionContext): AngularComponent[] {
     if (!(ctx.fileContains?.(file, '@Component') ?? ctx.readFile(file)?.includes('@Component'))) continue;
     const content = ctx.readFile(file);
     if (!content) continue;
-    components.push(...componentsIn(file, content, ctx.getNodesInFile(file), ctx));
+    for (const component of componentsIn(file, content, ctx)) components.push(component);
   }
   componentIndexes.set(ctx, { source, components });
   return components;
@@ -689,8 +693,7 @@ export async function angularTemplateEdges(ctx: ResolutionContext, onYield: Mayb
     // Event bindings: `(click)="toggleFavorite()"` runs the component's own
     // method when the user acts. The binding is the trigger Steps draws —
     // known only from the template, so it rides on the edge.
-    const own = ctx
-      .getNodesInFile(component.file)
+    const own = nodesUnder(ctx, component.file, component.node.qualifiedName)
       .filter((n) => (n.kind === 'method' || n.kind === 'property') && n.qualifiedName.startsWith(`${component.node.qualifiedName}::`));
     const members = new Map(own.filter((n) => n.kind === 'method').map((n) => [n.name, n]));
     /** Members this template already links — only the first edge between two nodes survives the merge. */
@@ -731,12 +734,12 @@ export async function angularTemplateEdges(ctx: ResolutionContext, onYield: Mayb
     // Bindings: `[name]="icon()"`, `{{ label() }}`, `@if (loading())` read the
     // component every time it renders, so the hop carries no trigger. At most
     // one edge per member, so the class's own size bounds them.
-    let declaration: string[] | null = null;
+    let declaration: readonly string[] | null = null;
     const shapes = new Map<string, MemberShape>();
     const shape = (n: Node): MemberShape => {
       const known = shapes.get(n.id);
       if (known) return known;
-      declaration ??= (ctx.readFile(component.file) ?? '').split('\n');
+      declaration ??= linesOf(ctx.readFile(component.file) ?? '');
       const read = memberShape(declaration, n);
       shapes.set(n.id, read);
       return read;
@@ -775,7 +778,7 @@ export async function angularTemplateEdges(ctx: ResolutionContext, onYield: Mayb
     // in a loop. The destination is the field this class wrote.
     const source = ctx.readFile(component.file);
     if (source) {
-      const lines = source.split('\n');
+      const lines = linesOf(source);
       const body = lines.slice(component.node.startLine - 1, component.node.endLine).join('\n');
       ROUTER_LINK_FIELD.lastIndex = 0;
       let f: RegExpExecArray | null;

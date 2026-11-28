@@ -140,7 +140,7 @@ struct Cand {
 pub struct Walker<'t> {
     src: &'t str,
     file_path: &'t str,
-    line_starts: Vec<usize>,
+    line_starts: util::LineStarts,
     arena: Arena,
     node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
@@ -224,8 +224,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
     // pushed for the whole walk — QNs become `App\Services::Name` and import
     // nodes/refs hang off it.
     let mut pkg_pushed = false;
-    for i in 0..root.named_child_count() {
-        let Some(child) = root.named_child(i) else { continue };
+    for child in root.named_children(&mut root.walk()) {
         if child.kind() != "namespace_definition" {
             continue;
         }
@@ -415,11 +414,9 @@ impl<'t> Walker<'t> {
         if let Some(name_node) = node.child_by_field_name("name") {
             return self.text(name_node).to_string();
         }
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                if matches!(c.kind(), "identifier" | "type_identifier" | "simple_identifier" | "constant") {
-                    return self.text(c).to_string();
-                }
+        for c in node.named_children(&mut node.walk()) {
+            if matches!(c.kind(), "identifier" | "type_identifier" | "simple_identifier" | "constant") {
+                return self.text(c).to_string();
             }
         }
         "<anonymous>".to_string()
@@ -430,8 +427,7 @@ impl<'t> Walker<'t> {
     /// getVisibility: any `visibility_modifier` child with one of the three
     /// texts; none → public (the php default).
     fn visibility_of(&self, node: Node) -> u8 {
-        for i in 0..node.child_count() {
-            let Some(child) = node.child(i) else { continue };
+        for child in node.children(&mut node.walk()) {
             if child.kind() == "visibility_modifier" {
                 match self.text(child) {
                     "public" => return 1,
@@ -606,10 +602,8 @@ impl<'t> Walker<'t> {
         // match / attributes: no branch — children visited.
 
         if !skip_children {
-            for i in 0..node.named_child_count() {
-                if let Some(c) = node.named_child(i) {
-                    self.visit_node(c);
-                }
+            for c in node.named_children(&mut node.walk()) {
+                self.visit_node(c);
             }
         }
     }
@@ -682,10 +676,8 @@ impl<'t> Walker<'t> {
             return;
         }
 
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.visit_for_calls_and_structure(c);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.visit_for_calls_and_structure(c);
         }
     }
 
@@ -751,10 +743,8 @@ impl<'t> Walker<'t> {
         // decorators: none.
         self.stack.push(Scope { row, kind, name });
         let body = node.child_by_field_name("body").unwrap_or(node);
-        for i in 0..body.named_child_count() {
-            if let Some(c) = body.named_child(i) {
-                self.visit_node(c);
-            }
+        for c in body.named_children(&mut body.walk()) {
+            self.visit_node(c);
         }
         self.stack.pop();
     }
@@ -770,10 +760,8 @@ impl<'t> Walker<'t> {
         self.extract_inheritance(node, row);
         self.stack.push(Scope { row, kind: "interface", name });
         let body = node.child_by_field_name("body").unwrap_or(node);
-        for i in 0..body.named_child_count() {
-            if let Some(c) = body.named_child(i) {
-                self.visit_node(c);
-            }
+        for c in body.named_children(&mut body.walk()) {
+            self.visit_node(c);
         }
         self.stack.pop();
     }
@@ -792,8 +780,7 @@ impl<'t> Walker<'t> {
         // read (it's not in a base_clause).
         self.extract_inheritance(node, row);
         self.stack.push(Scope { row, kind: "enum", name });
-        for i in 0..body.named_child_count() {
-            let Some(child) = body.named_child(i) else { continue };
+        for child in body.named_children(&mut body.walk()) {
             if child.kind() == "enum_case" {
                 self.extract_enum_members(child);
             } else {
@@ -1014,8 +1001,7 @@ impl<'t> Walker<'t> {
             return None;
         }
         let mut content: Option<Node> = None;
-        for i in 0..arg.named_child_count() {
-            let Some(c) = arg.named_child(i) else { continue };
+        for c in arg.named_children(&mut arg.walk()) {
             if c.kind() != "string_content" {
                 return None;
             }
@@ -1270,10 +1256,8 @@ impl<'t> Walker<'t> {
         };
         self.push_ref(row, &type_name, edge_kind_index("extends").unwrap(), line, column);
         self.stack.push(Scope { row, kind: "class", name: anon_name });
-        for i in 0..body.named_child_count() {
-            if let Some(c) = body.named_child(i) {
-                self.visit_node(c);
-            }
+        for c in body.named_children(&mut body.walk()) {
+            self.visit_node(c);
         }
         self.stack.pop();
     }
@@ -1332,16 +1316,14 @@ impl<'t> Walker<'t> {
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
         let extends_kind = edge_kind_index("extends").unwrap();
         let implements_kind = edge_kind_index("implements").unwrap();
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i) else { continue };
+        for child in node.named_children(&mut node.walk()) {
             if child.kind() == "base_clause" {
                 if let Some(target) = child.named_child(0) {
                     let name = self.text(target).to_string();
                     self.push_ref_at(class_row, &name, extends_kind, target);
                 }
             } else if child.kind() == "class_interface_clause" {
-                for j in 0..child.named_child_count() {
-                    let Some(iface) = child.named_child(j) else { continue };
+                for iface in child.named_children(&mut child.walk()) {
                     let name = self.text(iface).to_string();
                     self.push_ref_at(class_row, &name, implements_kind, iface);
                 }
@@ -1356,18 +1338,15 @@ impl<'t> Walker<'t> {
             .filter_map(|i| node.named_child(i))
             .find(|c| c.kind() == "formal_parameters");
         if let Some(params) = params {
-            for i in 0..params.named_child_count() {
-                let Some(p) = params.named_child(i) else { continue };
-                for j in 0..p.named_child_count() {
-                    let Some(c) = p.named_child(j) else { continue };
+            for p in params.named_children(&mut params.walk()) {
+                for c in p.named_children(&mut p.walk()) {
                     if is_php_type_node(c.kind()) {
                         self.walk_php_type_position(c, from_row);
                     }
                 }
             }
         }
-        for i in 0..node.named_child_count() {
-            let Some(c) = node.named_child(i) else { continue };
+        for c in node.named_children(&mut node.walk()) {
             if is_php_type_node(c.kind()) {
                 self.walk_php_type_position(c, from_row);
             }
@@ -1392,10 +1371,8 @@ impl<'t> Walker<'t> {
                 }
             }
             _ => {
-                for i in 0..node.named_child_count() {
-                    if let Some(c) = node.named_child(i) {
-                        self.walk_php_type_position(c, from_row);
-                    }
+                for c in node.named_children(&mut node.walk()) {
+                    self.walk_php_type_position(c, from_row);
                 }
             }
         }
@@ -1411,10 +1388,8 @@ impl<'t> Walker<'t> {
             return;
         }
         let from = self.top_row();
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.normalize_fn_ref_value(c, from, 0);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.normalize_fn_ref_value(c, from, 0);
         }
     }
 
@@ -1425,10 +1400,8 @@ impl<'t> Walker<'t> {
         }
         match v.kind() {
             "argument" => {
-                for i in 0..v.named_child_count() {
-                    if let Some(c) = v.named_child(i) {
-                        self.normalize_fn_ref_value(c, from, depth + 1);
-                    }
+                for c in v.named_children(&mut v.walk()) {
+                    self.normalize_fn_ref_value(c, from, depth + 1);
                 }
             }
             // String callable — trustworthy ONLY as an argument to a known
@@ -1483,8 +1456,7 @@ impl<'t> Walker<'t> {
 
     /// phpStringContent: the string's first string_content child, trimmed.
     fn php_string_content(&self, node: Node) -> Option<String> {
-        for i in 0..node.named_child_count() {
-            let Some(c) = node.named_child(i) else { continue };
+        for c in node.named_children(&mut node.walk()) {
             if c.kind() == "string_content" {
                 return Some(self.text(c).trim().to_string());
             }
@@ -1525,10 +1497,8 @@ impl<'t> Walker<'t> {
             return;
         }
         self.maybe_capture_fn_refs(node);
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.scan_fn_ref_subtree(c, depth + 1);
         }
     }
 
@@ -1624,10 +1594,8 @@ impl<'t> Walker<'t> {
                         }
                     }
                 }
-                for i in 0..n.named_child_count() {
-                    if let Some(c) = n.named_child(i) {
-                        stack.push(c);
-                    }
+                for c in n.named_children(&mut n.walk()) {
+                    stack.push(c);
                 }
             }
         }
@@ -1790,11 +1758,9 @@ fn php_use_shadows_dirname(raw: &str) -> bool {
 }
 
 fn find_anonymous_class_body(node: Node) -> Option<Node> {
-    for i in 0..node.named_child_count() {
-        if let Some(child) = node.named_child(i) {
-            if matches!(child.kind(), "class_body" | "declaration_list") {
-                return Some(child);
-            }
+    for child in node.named_children(&mut node.walk()) {
+        if matches!(child.kind(), "class_body" | "declaration_list") {
+            return Some(child);
         }
     }
     None

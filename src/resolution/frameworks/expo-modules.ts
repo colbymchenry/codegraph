@@ -49,6 +49,7 @@ import {
 import { resolveImportPath } from '../import-resolver';
 import { stripCommentsForRegex } from '../strip-comments';
 import { escapeRegExp } from '../../utils';
+import { lineAt } from '../synth-utils';
 
 /**
  * Match `Function("name")`, `AsyncFunction("name")`, or `Property("name")`
@@ -123,7 +124,7 @@ function extractExpoMethods(filePath: string, source: string, language: 'swift' 
     const methodName = m[2]!;
     // Compute line number from match index.
     const before = source.slice(0, m.index);
-    const startLine = before.split('\n').length;
+    const startLine = lineAt(source, m.index);
     // Avoid duplicates if the same method literal appears twice in one
     // file (e.g., declared and re-declared inside a `View {...}` block).
     const dedupKey = `${methodName}:${startLine}`;

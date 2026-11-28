@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
+import { getNodeText, getChildByField, childrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /**
@@ -128,15 +128,13 @@ export const rustExtractor: LanguageExtractor = {
     return sig;
   },
   isAsync: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'async') return true;
     }
     return false;
   },
   getVisibility: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'visibility_modifier') {
         return child.text.includes('pub') ? 'public' : 'private';
       }

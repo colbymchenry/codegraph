@@ -48,6 +48,7 @@ import {
   FrameworkExtractionResult,
   FrameworkResolver,
 } from '../types';
+import { firstIndexOfEach, lineAt } from '../synth-utils';
 
 const CODEGEN_DECL_RE =
   /\b(codegenNativeComponent|requireNativeComponent)\s*(?:<[^>]+>)?\s*\(\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]/g;
@@ -169,8 +170,7 @@ function extractLegacyViewManagerNodes(filePath: string, source: string): Node[]
   // works for legacy too. The native class IS the manager itself in this
   // case; the convention-based suffix lookup in the synthesizer
   // (`Manager`, `ViewManager`) will find it.
-  const before = source.slice(0, implMatch.index ?? 0);
-  const startLine = before.split('\n').length;
+  const startLine = lineAt(source, implMatch.index ?? 0);
   nodes.push({
     id: `fabric-component:${filePath}:${componentName}:${startLine}`,
     kind: 'component',
@@ -196,8 +196,7 @@ function extractLegacyViewManagerNodes(filePath: string, source: string): Node[]
     const propName = m[1]!;
     if (seen.has(propName)) continue;
     seen.add(propName);
-    const propBefore = source.slice(0, m.index);
-    const propLine = propBefore.split('\n').length;
+    const propLine = lineAt(source, m.index);
     nodes.push({
       id: `fabric-prop:${filePath}:${propName}:${propLine}`,
       kind: 'property',
@@ -242,8 +241,7 @@ function extractJvmViewManagerNodes(filePath: string, source: string): Node[] {
   const now = Date.now();
   const nodes: Node[] = [];
 
-  const classBefore = source.slice(0, classMatch.index ?? 0);
-  const startLine = classBefore.split('\n').length;
+  const startLine = lineAt(source, classMatch.index ?? 0);
   nodes.push({
     id: `fabric-component:${filePath}:${componentName}:${startLine}`,
     kind: 'component',
@@ -271,8 +269,7 @@ function extractJvmViewManagerNodes(filePath: string, source: string): Node[] {
     const propName = m[1]!;
     if (seen.has(propName)) continue;
     seen.add(propName);
-    const propBefore = source.slice(0, m.index);
-    const propLine = propBefore.split('\n').length;
+    const propLine = lineAt(source, m.index);
     nodes.push({
       id: `fabric-prop:${filePath}:${propName}:${propLine}`,
       kind: 'property',
@@ -292,6 +289,9 @@ function extractJvmViewManagerNodes(filePath: string, source: string): Node[] {
   return nodes;
 }
 
+/** Up to this many props, each is looked for on its own, as before. */
+const FEW_PROPS = 24;
+
 function extractFabricNodes(filePath: string, source: string): Node[] {
   if (!isFabricSpec(source)) return [];
 
@@ -303,9 +303,9 @@ function extractFabricNodes(filePath: string, source: string): Node[] {
   while ((m = CODEGEN_DECL_RE.exec(source)) !== null) {
     const declaredWith = m[1]!;
     const componentName = m[2]!;
-    const before = source.slice(0, m.index);
-    const startLine = before.split('\n').length;
-    const startColumn = before.length - before.lastIndexOf('\n') - 1;
+    const startLine = lineAt(source, m.index);
+    // From the last newline before the declaration, without copying the source up to it.
+    const startColumn = m.index - (m.index > 0 ? source.lastIndexOf('\n', m.index - 1) : -1) - 1;
 
     // The component itself — kind: 'component' so the existing
     // reactJsxChildEdges synthesizer matches `<MyComponent>` JSX tags to
@@ -338,10 +338,19 @@ function extractFabricNodes(filePath: string, source: string): Node[] {
   const body = findNativePropsBody(source);
   if (body) {
     const props = extractPropNames(body);
+    // A prop is placed where its name first occurs from the interface's body
+    // on. Looked for one prop at a time, that read the body from its first
+    // line for each of them (and looked for the body itself each time), the
+    // square of an interface's size. Past a few props, where each first
+    // occurs in the body is read in one pass: every name is in the body, so
+    // its first occurrence from the body's start is its first in the body.
+    const bodyStart = source.indexOf(body);
+    const firsts = bodyStart >= 0 && props.length > FEW_PROPS ? firstIndexOfEach(body, props) : null;
     for (const propName of props) {
-      const propBefore = source.indexOf(propName, source.indexOf(body));
+      const inBody = firsts?.get(propName);
+      const propBefore = inBody !== undefined && inBody >= 0 ? bodyStart + inBody : source.indexOf(propName, bodyStart);
       const propLine =
-        propBefore >= 0 ? source.slice(0, propBefore).split('\n').length : 1;
+        propBefore >= 0 ? lineAt(source, propBefore) : 1;
       nodes.push({
         id: `fabric-prop:${filePath}:${propName}:${propLine}`,
         kind: 'property',

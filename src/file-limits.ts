@@ -4,9 +4,16 @@ import * as fsp from 'fs/promises';
 /**
  * Largest source file CodeGraph will parse or read during resolution. Generated
  * bundles, minified sources, and dependency archives above this limit provide no
- * useful symbols; 1 MB covers essentially all hand-written source.
+ * useful symbols.
+ *
+ * It was 1 MB, on the reasoning that 1 MB covers essentially all hand-written
+ * source. It does not: this repository's own src/resolution/name-matcher.ts is
+ * 1.9 MB and 37,000 lines, and at 1 MB the graph held none of it. At 4 MB that
+ * file is indexed and the generated parsers beside it (7 to 35 MB) still are
+ * not. Files between the two, such as a 1.7 MB generated protobuf file, are now
+ * indexed as well.
  */
-export const MAX_SOURCE_FILE_SIZE_BYTES = 1024 * 1024;
+export const MAX_SOURCE_FILE_SIZE_BYTES = 4 * 1024 * 1024;
 
 /**
  * What stands in for the content of a file over MAX_SOURCE_FILE_SIZE_BYTES. Such a file is
@@ -47,6 +54,54 @@ export function readSourceText(file: string, encoding: BufferEncoding = 'utf-8')
   } finally {
     fs.closeSync(fd);
   }
+}
+
+/**
+ * The longest run of name characters a pattern is given as written. No name,
+ * path, number or chain of members is this long; a longer one is data: an
+ * embedded asset, a key, a table of hex.
+ */
+export const LONGEST_NAME_RUN = 1024;
+
+/** What a longer run reads as: no part of a name, no blank, no bracket and no quote. */
+const RUN_FILL = '\u0001';
+
+/** Whether a character code is a name's, or what joins names into one run: `A-Z a-z 0-9 _ $ . : / + = -`. */
+const IN_NAME_RUN = (() => {
+  const set = new Uint8Array(128);
+  for (const c of 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$.:/+=-') set[c.charCodeAt(0)] = 1;
+  return set;
+})();
+
+/**
+ * `text` with every run of name characters longer than LONGEST_NAME_RUN
+ * blanked, at the same length: what the patterns that read a file for names
+ * are given. Such a pattern starts a name at each character of a run and
+ * reads to the run's end, so its time grows with the square of the run: one
+ * 30 KB string of hex cost a second, and a megabyte of it eighteen minutes.
+ * Returns `text` itself when it has no such run.
+ */
+export function withoutLongRuns(text: string): string {
+  let parts: string[] | null = null;
+  let copied = 0;
+  let start = -1;
+  for (let i = 0; i <= text.length; i++) {
+    const code = i < text.length ? text.charCodeAt(i) : 0;
+    if (code < 128 && IN_NAME_RUN[code] === 1) {
+      if (start < 0) start = i;
+      continue;
+    }
+    if (start >= 0) {
+      if (i - start > LONGEST_NAME_RUN) {
+        (parts ??= []).push(text.slice(copied, start), RUN_FILL.repeat(i - start));
+        copied = i;
+      }
+      start = -1;
+    }
+  }
+  if (!parts) return text;
+  parts.push(text.slice(copied));
+  return parts.join('');
 }
 
 /** A source file's stats, and its bytes when they are within the limit (null = oversize). */

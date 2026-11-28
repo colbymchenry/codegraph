@@ -38,6 +38,7 @@ import {
   swiftBaseNamesForObjcSelector,
   isObjcExposed,
 } from '../swift-objc-bridge';
+import { linesOf } from '../synth-utils';
 
 /**
  * Memoized "Swift base name → ObjC method nodes" map.
@@ -157,10 +158,18 @@ const SOURCE_PROBE_LINES = 3;
 function declarationSourceWindow(node: Node, context: ResolutionContext): string {
   const content = context.readFile(node.filePath);
   if (!content) return '';
-  const lines = content.split(/\r?\n/);
+  // The file's lines, split once (linesOf) where they were split for each
+  // ObjC message a Swift method might answer: a class of eight thousand
+  // `@objc` methods, each sent to once, split its file that many times.
+  // linesOf splits at `\n`, where this split at `\r?\n`: a line that ends
+  // in `\r` before its newline is read without it, as before.
+  const lines = linesOf(content);
   const startIdx = Math.max(0, node.startLine - 1 - SOURCE_PROBE_LINES);
   const endIdx = Math.min(lines.length, node.startLine);
-  return lines.slice(startIdx, endIdx).join('\n');
+  return lines
+    .slice(startIdx, endIdx)
+    .map((line, i) => (startIdx + i < lines.length - 1 && line.endsWith('\r') ? line.slice(0, -1) : line))
+    .join('\n');
 }
 
 /**

@@ -64,6 +64,8 @@ import {
   type RouteTable,
 } from './expo-router';
 import { destinationsForHref } from './nextjs';
+import { lineAt } from '../synth-utils';
+import { nodesAroundLine, nodesNamed } from '../nodes-around';
 
 // =============================================================================
 // Reading a routes array
@@ -258,7 +260,7 @@ export function parseAngularRoutes(content: string): { routes: AngularRoute[]; m
   const redirects: AngularRedirect[] = [];
   if (!ROUTER_IMPORT.test(content)) return { routes, mounts, redirects };
   const safe = stripCommentsForRegex(content, 'typescript');
-  const lineOf = (at: number) => safe.slice(0, at).split('\n').length;
+  const lineOf = (at: number) => lineAt(safe, at);
   const seenPaths = new Set<string>();
   const walked = new Set<number>();
 
@@ -400,7 +402,7 @@ function lazyComponent(spec: string, member: string | null, fromFile: string, co
     }
   }
   if (!name) return null;
-  return context.getNodesInFile(file).find((n) => n.kind === 'class' && n.name === name) ?? null;
+  return nodesNamed(context, file, name).find((n) => n.kind === 'class' && n.name === name) ?? null;
 }
 
 /** A path's segments with each `{expr}` read from the constant it names, as seen from `file` — where the route (or the mount) is written. */
@@ -423,7 +425,7 @@ function routeComponent(encoded: string, fromFile: string, context: ResolutionCo
   const lazy = LAZY_COMPONENT_REF.exec(encoded);
   if (lazy) return lazyComponent(lazy[1]!, lazy[2] === 'default' ? null : lazy[2]!, fromFile, context);
   const file = declaringFile(encoded, fromFile, context);
-  return file ? (context.getNodesInFile(file).find((n) => n.kind === 'class' && n.name === encoded) ?? null) : null;
+  return file ? (nodesNamed(context, file, encoded).find((n) => n.kind === 'class' && n.name === encoded) ?? null) : null;
 }
 
 // =============================================================================
@@ -1091,8 +1093,7 @@ export const angularRouterResolver: FrameworkResolver = {
     // `navigate(['..', id], { relativeTo: this.route })` goes somewhere relative to here.
     const extras = nthArgumentText(lines, ref.line, ref.column, verb, 1);
     if (extras && /\brelativeTo\b/.test(extras)) return null;
-    const owner = context
-      .getNodesInFile(ref.filePath)
+    const owner = nodesAroundLine(context, ref.filePath, ref.line)
       .filter((n) => n.kind === 'class' && n.startLine <= ref.line && n.endLine >= ref.line)
       .reduce<Node | null>((inner, n) => (!inner || n.startLine >= inner.startLine ? n : inner), null);
     const href = angularDestination(arg, ref.filePath, owner, context, 0, true);

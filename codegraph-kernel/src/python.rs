@@ -140,7 +140,7 @@ struct Cand {
 pub struct Walker<'t> {
     src: &'t str,
     file_path: &'t str,
-    line_starts: Vec<usize>,
+    line_starts: util::LineStarts,
     arena: Arena,
     node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
@@ -372,11 +372,9 @@ impl<'t> Walker<'t> {
         if let Some(name_node) = node.child_by_field_name("name") {
             return self.text(name_node).to_string();
         }
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                if matches!(c.kind(), "identifier" | "type_identifier" | "simple_identifier" | "constant") {
-                    return self.text(c).to_string();
-                }
+        for c in node.named_children(&mut node.walk()) {
+            if matches!(c.kind(), "identifier" | "type_identifier" | "simple_identifier" | "constant") {
+                return self.text(c).to_string();
             }
         }
         "<anonymous>".to_string()
@@ -432,7 +430,7 @@ impl<'t> Walker<'t> {
             // The right-hand side extract_variable walked under the assigned
             // name took its own candidates; the scan covers the rest.
             let walked = self.extract_variable(node);
-            self.scan_fn_ref_subtree(node, 0, &walked);
+            self.scan_fn_ref_subtree(node, 0, &walked.into_iter().collect());
             skip_children = true;
         } else if kind == "import_statement" || kind == "import_from_statement" {
             self.extract_import(node);
@@ -441,10 +439,8 @@ impl<'t> Walker<'t> {
         }
 
         if !skip_children {
-            for i in 0..node.named_child_count() {
-                if let Some(c) = node.named_child(i) {
-                    self.visit_node(c);
-                }
+            for c in node.named_children(&mut node.walk()) {
+                self.visit_node(c);
             }
         }
     }
@@ -476,10 +472,8 @@ impl<'t> Walker<'t> {
             return;
         }
 
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.visit_for_calls_and_structure(c);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.visit_for_calls_and_structure(c);
         }
     }
 
@@ -541,11 +535,9 @@ impl<'t> Walker<'t> {
         // A parameterized base, `class Leaf(Base[str])`, is a `subscript`
         // whose value names the class.
         let extends_kind = edge_kind_index("extends").unwrap();
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i) else { continue };
+        for child in node.named_children(&mut node.walk()) {
             if child.kind() == "argument_list" {
-                for j in 0..child.named_child_count() {
-                    let Some(base) = child.named_child(j) else { continue };
+                for base in child.named_children(&mut child.walk()) {
                     let arg = if base.kind() == "subscript" {
                         let Some(value) = base.child_by_field_name("value") else { continue };
                         value
@@ -563,10 +555,8 @@ impl<'t> Walker<'t> {
 
         self.stack.push(Scope { row, kind: "class", name });
         let body = node.child_by_field_name("body").unwrap_or(node);
-        for i in 0..body.named_child_count() {
-            if let Some(c) = body.named_child(i) {
-                self.visit_node(c);
-            }
+        for c in body.named_children(&mut body.walk()) {
+            self.visit_node(c);
         }
         self.stack.pop();
     }
@@ -636,8 +626,7 @@ impl<'t> Walker<'t> {
             self.push_ref_at(parent, &module_name.clone(), imports_kind, node);
 
             // emitPyFromImportRefs: one `imports` ref per imported name.
-            for i in 0..node.named_child_count() {
-                let Some(child) = node.named_child(i) else { continue };
+            for child in node.named_children(&mut node.walk()) {
                 if child.start_byte() == module_node.start_byte()
                     && child.end_byte() == module_node.end_byte()
                 {
@@ -668,8 +657,7 @@ impl<'t> Walker<'t> {
         // import_statement: `import a.b, x as y` — one import node + module ref
         // per dotted name (the python multi-import branch).
         let parent = self.top_row();
-        for i in 0..node.named_child_count() {
-            let Some(child) = node.named_child(i) else { continue };
+        for child in node.named_children(&mut node.walk()) {
             if child.kind() == "dotted_name" {
                 let name = self.text(child).to_string();
                 self.create_node(
@@ -807,35 +795,19 @@ impl<'t> Walker<'t> {
     /// (python's `call` kind isn't `call_expression`, and `attribute` isn't in
     /// the target-kind list — mirrored exactly).
     fn extract_decorators_for(&mut self, decl: Node<'t>, decorated_row: u32) {
-        for i in 0..decl.named_child_count() {
-            if let Some(child) = decl.named_child(i) {
-                self.consider_decorator(child, decorated_row);
-            }
+        for child in decl.named_children(&mut decl.walk()) {
+            self.consider_decorator(child, decorated_row);
         }
-        let Some(parent) = decl.parent() else { return };
-        let decl_start = decl.start_byte();
-        let mut decl_idx: isize = -1;
-        for i in 0..parent.named_child_count() {
-            if let Some(sib) = parent.named_child(i) {
-                if sib.start_byte() == decl_start {
-                    decl_idx = i as isize;
-                    break;
-                }
+        // Walked back from the declaration itself. Finding its place first, by counting the
+        // parent's children from the start, cost each declaration as much as it has
+        // siblings before it: a file of twenty thousand took minutes.
+        let mut sibling = decl.prev_named_sibling();
+        while let Some(sib) = sibling {
+            if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
+                break;
             }
-        }
-        if decl_idx > 0 {
-            let mut j = decl_idx - 1;
-            while j >= 0 {
-                let Some(sib) = parent.named_child(j as usize) else {
-                    j -= 1;
-                    continue;
-                };
-                if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
-                    break;
-                }
-                self.consider_decorator(sib, decorated_row);
-                j -= 1;
-            }
+            self.consider_decorator(sib, decorated_row);
+            sibling = sib.prev_named_sibling();
         }
     }
 
@@ -844,8 +816,7 @@ impl<'t> Walker<'t> {
             return;
         }
         let mut target: Option<Node> = None;
-        for i in 0..n.named_child_count() {
-            let Some(child) = n.named_child(i) else { continue };
+        for child in n.named_children(&mut n.walk()) {
             if child.kind() == "call_expression" {
                 target = child.child_by_field_name("function").or_else(|| child.named_child(0));
                 if target.is_some() {
@@ -910,10 +881,8 @@ impl<'t> Walker<'t> {
         let mut values: Vec<Node> = Vec::new();
         match mode {
             "args" | "list" => {
-                for i in 0..node.named_child_count() {
-                    if let Some(c) = node.named_child(i) {
-                        values.push(c);
-                    }
+                for c in node.named_children(&mut node.walk()) {
+                    values.push(c);
                 }
             }
             "rhs" => {
@@ -968,7 +937,7 @@ impl<'t> Walker<'t> {
         }
     }
 
-    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &[usize]) {
+    fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32, walked: &HashSet<usize>) {
         stack_guard!();
         if depth > 12 {
             return;
@@ -989,10 +958,8 @@ impl<'t> Walker<'t> {
             return;
         }
         self.maybe_capture_fn_refs(node);
-        for i in 0..node.named_child_count() {
-            if let Some(c) = node.named_child(i) {
-                self.scan_fn_ref_subtree(c, depth + 1, walked);
-            }
+        for c in node.named_children(&mut node.walk()) {
+            self.scan_fn_ref_subtree(c, depth + 1, walked);
         }
     }
 
@@ -1062,23 +1029,19 @@ impl<'t> Walker<'t> {
                             *decl_counts.entry(nm).or_insert(0) += 1;
                         }
                     } else {
-                        for i in 0..left.named_child_count() {
-                            if let Some(c) = left.named_child(i) {
-                                if c.kind() == "identifier" {
-                                    let nm = self.text(c);
-                                    if targets.contains_key(nm) {
-                                        *decl_counts.entry(nm).or_insert(0) += 1;
-                                    }
+                        for c in left.named_children(&mut left.walk()) {
+                            if c.kind() == "identifier" {
+                                let nm = self.text(c);
+                                if targets.contains_key(nm) {
+                                    *decl_counts.entry(nm).or_insert(0) += 1;
                                 }
                             }
                         }
                     }
                 }
             }
-            for i in 0..n.named_child_count() {
-                if let Some(c) = n.named_child(i) {
-                    dstack.push(c);
-                }
+            for c in n.named_children(&mut n.walk()) {
+                dstack.push(c);
             }
         }
         let shadowed: Vec<String> = decl_counts
@@ -1127,10 +1090,8 @@ impl<'t> Walker<'t> {
                         }
                     }
                 }
-                for i in 0..n.named_child_count() {
-                    if let Some(c) = n.named_child(i) {
-                        stack.push(c);
-                    }
+                for c in n.named_children(&mut n.walk()) {
+                    stack.push(c);
                 }
             }
         }

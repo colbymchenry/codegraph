@@ -130,15 +130,53 @@ pub fn is_minified_content(file_path: &str, content: &str) -> bool {
     long as f64 >= total as f64 * 0.5 && punctuation as f64 >= long as f64 * 0.03
 }
 
-/// Byte offsets of each line start, for UTF-16 column conversion.
-pub fn line_starts(src: &str) -> Vec<usize> {
-    let mut out = vec![0usize];
-    for (i, b) in src.bytes().enumerate() {
-        if b == b'\n' {
-            out.push(i + 1);
+/// Where each line of a source starts, and what turns a byte offset on a
+/// line into its UTF-16 column without reading the line: see `col16`. Reads
+/// as the slice of line starts.
+pub struct LineStarts {
+    starts: Vec<usize>,
+    /// Each character of more than one byte, in order: where it starts, and
+    /// the bytes the source spends up to and including it beyond the UTF-16
+    /// units it counts for. Empty for a source that is all ASCII.
+    wide: Vec<(usize, usize)>,
+}
+
+impl LineStarts {
+    /// The bytes before `pos` that count for no UTF-16 unit.
+    fn spare_before(&self, pos: usize) -> usize {
+        match self.wide.partition_point(|&(at, _)| at < pos) {
+            0 => 0,
+            n => self.wide[n - 1].1,
         }
     }
-    out
+}
+
+impl std::ops::Deref for LineStarts {
+    type Target = [usize];
+    fn deref(&self) -> &[usize] {
+        &self.starts
+    }
+}
+
+/// Byte offsets of each line start, for UTF-16 column conversion.
+pub fn line_starts(src: &str) -> LineStarts {
+    let mut starts = vec![0usize];
+    for (i, b) in src.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    let mut wide = Vec::new();
+    if !src.is_ascii() {
+        let mut spare = 0usize;
+        for (at, c) in src.char_indices() {
+            if c.len_utf8() > 1 {
+                spare += c.len_utf8() - c.len_utf16();
+                wide.push((at, spare));
+            }
+        }
+    }
+    LineStarts { starts, wide }
 }
 
 /// UTF-16 code units in `s` — what web-tree-sitter (and JS string ops)
@@ -148,12 +186,18 @@ pub fn utf16_len(s: &str) -> usize {
 }
 
 /// Column (UTF-16 units) of `byte_pos` on line `row`, given `line_starts`.
-pub fn col16(src: &str, starts: &[usize], row: usize, byte_pos: usize) -> u32 {
+///
+/// Read from the table: the bytes from the line's start, less those that
+/// count for no unit. Counted character by character from the line's start
+/// for every symbol and reference, a script minified to one line took the
+/// square of its length: a megabyte, a minute.
+/// The source is no longer read; the parameter stays so every caller is as it was.
+pub fn col16(_src: &str, starts: &LineStarts, row: usize, byte_pos: usize) -> u32 {
     let ls = starts.get(row).copied().unwrap_or(0);
     if byte_pos <= ls {
         return 0;
     }
-    utf16_len(&src[ls..byte_pos]) as u32
+    (byte_pos - ls - (starts.spare_before(byte_pos) - starts.spare_before(ls))) as u32
 }
 
 /// JS `String.prototype.slice(0, n)` in UTF-16 units, without splitting a
@@ -221,6 +265,24 @@ mod tests {
         assert_eq!(col16(src, &starts, 0, 1), 1); // after 'a'
         assert_eq!(col16(src, &starts, 0, 3), 2); // after 'é'
         assert_eq!(col16(src, &starts, 0, 7), 4); // after '😀'
+    }
+
+    /// The table gives, at every character of every line, the column that
+    /// counting the line's characters gives.
+    #[test]
+    fn utf16_cols_match_counting() {
+        let src = "plain ascii\naé😀b — ü\n\n日本語 x 😀😀\nlast";
+        let starts = line_starts(src);
+        for (row, &start) in starts.iter().enumerate() {
+            let end = starts.get(row + 1).map_or(src.len(), |next| next - 1);
+            for (offset, _) in src[start..end].char_indices().chain([(end - start, ' ')]) {
+                let counted = utf16_len(&src[start..start + offset]) as u32;
+                assert_eq!(col16(src, &starts, row, start + offset), counted, "row {row} offset {offset}");
+            }
+        }
+        // Before a line's start, or on a row the source does not have: 0, and the offset itself.
+        assert_eq!(col16(src, &starts, 1, 3), 0);
+        assert_eq!(col16("abc", &line_starts("abc"), 9, 2), 2);
     }
 
     #[test]

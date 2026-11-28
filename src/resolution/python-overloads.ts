@@ -18,6 +18,7 @@
  */
 import type { Node } from '../types';
 import type { ResolutionContext, ResolvedRef } from './types';
+import { nodesNamed } from './nodes-around';
 
 /** Per context: a def's id → the id of the def a call to it runs, or null when that is the def itself. */
 const RUNS_INSTEAD = new WeakMap<ResolutionContext, Map<string, string | null>>();
@@ -57,7 +58,7 @@ export function preferPythonImplementation(
 function implementationOf(def: Node, context: ResolutionContext): string | null {
   if (def.language !== 'python' || (def.kind !== 'function' && def.kind !== 'method')) return null;
   const named = context.getNodesInFileNamed?.(def.filePath, def.name) ??
-    context.getNodesInFile(def.filePath).filter((n) => n.name === def.name);
+    nodesNamed(context, def.filePath, def.name).filter((n) => n.name === def.name);
   const scope = named.filter((n) => n.kind === def.kind && n.qualifiedName === def.qualifiedName);
   // The one def of its name in its scope: the common case, decided without reading the file.
   if (scope.length < 2) return null;

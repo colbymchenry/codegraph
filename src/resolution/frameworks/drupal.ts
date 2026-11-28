@@ -59,8 +59,9 @@
 import { generateNodeId } from '../../extraction/tree-sitter-helpers';
 import { Node } from '../../types';
 import { FrameworkResolver, ResolutionContext, ResolvedRef, UnresolvedRef } from '../types';
-import { makeLineAt } from '../synth-utils';
+import { makeLineAt, lineAt } from '../synth-utils';
 import { matchBracket } from './object-literal';
+import { nodesNamed } from '../nodes-around';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -249,7 +250,7 @@ function extractDrupalHooks(
     const name = fm[1]!;
     if (!funcLineMap.has(name)) {
       // line = number of newlines before match start + 1
-      funcLineMap.set(name, content.slice(0, fm.index).split('\n').length);
+      funcLineMap.set(name, lineAt(content, fm.index));
     }
   }
 
@@ -762,7 +763,7 @@ export const drupalResolver: FrameworkResolver = {
     if (name.startsWith(FQCN_REF)) return resolved(classByFqcn(name.slice(FQCN_REF.length).replace(':', ''), context), 0.9);
     if (name.startsWith(CLASS_REF)) {
       const [file, className] = name.slice(CLASS_REF.length).split('#');
-      return resolved(context.getNodesInFile(file!).find((n) => n.kind === 'class' && n.name === className), 0.95);
+      return resolved(nodesNamed(context, file!, className).find((n) => n.kind === 'class' && n.name === className), 0.95);
     }
 
     const onContainer = CONTAINER_CALL.exec(name);
@@ -782,8 +783,7 @@ export const drupalResolver: FrameworkResolver = {
       const classNodes = context.getNodesByName(className!);
       for (const cls of classNodes) {
         if (cls.kind !== 'class') continue;
-        const fileNodes = context.getNodesInFile(cls.filePath);
-        const method = fileNodes.find((n) => n.kind === 'method' && n.name === methodName);
+        const method = nodesNamed(context, cls.filePath, methodName).find((n) => n.kind === 'method' && n.name === methodName);
         if (method) {
           return { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'framework' };
         }

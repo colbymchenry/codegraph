@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText } from '../tree-sitter-helpers';
+import { getNodeText, childrenOf } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /**
@@ -71,8 +71,8 @@ export const csharpExtractor: LanguageExtractor = {
   structTypes: ['struct_declaration', 'record_struct_declaration'],
   classifyClassNode: (node) => {
     if (node.type === 'record_declaration') {
-      for (let i = 0; i < node.childCount; i++) {
-        if (node.child(i)?.type === 'struct') return 'struct';
+      for (const child of childrenOf(node)) {
+        if (child.type === 'struct') return 'struct';
       }
     }
     return 'class';
@@ -103,8 +103,7 @@ export const csharpExtractor: LanguageExtractor = {
   returnField: 'type',
   getReturnType: extractCsharpReturnType,
   getVisibility: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'modifier') {
         const text = child.text;
         if (text === 'public') return 'public';
@@ -121,8 +120,7 @@ export const csharpExtractor: LanguageExtractor = {
     return 'private';
   },
   isStatic: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'modifier' && child.text === 'static') {
         return true;
       }
@@ -135,8 +133,7 @@ export const csharpExtractor: LanguageExtractor = {
   isConst: (node) => {
     let hasStatic = false;
     let hasReadonly = false;
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type !== 'modifier') continue;
       const t = child.text;
       if (t === 'const') return true;
@@ -146,8 +143,7 @@ export const csharpExtractor: LanguageExtractor = {
     return hasStatic && hasReadonly;
   },
   isAsync: (node) => {
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
+    for (const child of childrenOf(node)) {
       if (child?.type === 'modifier' && child.text === 'async') {
         return true;
       }

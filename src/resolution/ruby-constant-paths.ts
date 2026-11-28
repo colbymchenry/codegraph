@@ -35,6 +35,7 @@ import type { ResolutionContext, ResolvedRef, UnresolvedRef } from './types';
 import { isTestPath } from '../search/query-utils';
 import { isRubyDeclarationVisible, rubyAncestry, rubyMethodsOf, rubyMethodsOfKindFirst, type RubyMethodKind } from './name-matcher';
 import { stripCommentsForRegex } from './strip-comments';
+import { nodesAroundLine } from './nodes-around';
 
 /** `A::B`, `::A`, `::A::B`: a constant path. Group 1 is a leading `::`. */
 const CONSTANT_PATH = /^(::)?([A-Z]\w*(?:::[A-Z]\w*)*)$/;
@@ -147,7 +148,7 @@ function lexicalScope(ref: UnresolvedRef, context: ResolutionContext): string {
 /** The innermost class or module around `ref`, if any. */
 function innermostNamespace(ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
   let inner: Node | undefined;
-  for (const n of context.getNodesInFile(ref.filePath)) {
+  for (const n of nodesAroundLine(context, ref.filePath, ref.line)) {
     if (!NAMESPACE_KINDS.has(n.kind) || n.language !== 'ruby' || n.startLine > ref.line || n.endLine < ref.line) continue;
     // Of the ranges around a point, the innermost starts last.
     if (!inner || n.startLine > inner.startLine || (n.startLine === inner.startLine && n.startColumn > inner.startColumn)) inner = n;

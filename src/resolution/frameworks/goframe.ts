@@ -34,6 +34,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { lineAt } from '../synth-utils';
 
 /**
  * A request type carrying a routable `g.Meta` tag. `g.Meta` is, by GoFrame
@@ -84,7 +85,7 @@ export const goframeResolver: FrameworkResolver = {
       const methodMatch = META_METHOD_RE.exec(tag!);
       // GoFrame defaults to all methods when `method:` is omitted.
       const method = methodMatch ? methodMatch[1]!.toUpperCase() : 'ANY';
-      const line = safe.slice(0, match.index).split('\n').length;
+      const line = lineAt(safe, match.index);
       // The handler's signature qualifies the request type with its package
       // (`req *cash.ListReq`); encode `pkg.Type` so the synthesizer can match it.
       const joinKey = pkg ? `${pkg}.${requestType}` : requestType!;

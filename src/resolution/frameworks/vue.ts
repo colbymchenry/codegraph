@@ -11,6 +11,7 @@ import { isJsPathImportRef, resolveImportPath } from '../import-resolver';
 import { dependsOn } from './package-deps';
 import { pageComponentRef, resolvePageComponent } from './page-component';
 import { inReferencingFolder } from './component-folder';
+import { nodesNamed } from '../nodes-around';
 
 /** The languages a Vue app's scripts are written in. */
 const VUE_SCRIPT_LANGUAGES: ReadonlySet<string> = new Set(['vue', 'javascript', 'typescript', 'tsx', 'jsx']);
@@ -325,8 +326,7 @@ function moduleFileNode(file: string | null, ref: UnresolvedRef, context: Resolu
 
 /** Does the reference's own file declare a function (or a const holding one) by that name? */
 function declaresOwnFunction(ref: UnresolvedRef, context: ResolutionContext): boolean {
-  return context
-    .getNodesInFile(ref.filePath)
+  return nodesNamed(context, ref.filePath, ref.referenceName)
     .some((n) => n.name === ref.referenceName && (n.kind === 'function' || n.kind === 'constant' || n.kind === 'variable'));
 }
 
@@ -358,8 +358,7 @@ function resolveComponent(
   if (matches.length === 0) return null;
 
   const componentIn = (file: string): string | null => {
-    const nodes = context.getNodesInFile(file);
-    const component = nodes.find((n) => n.kind === 'component' && n.name === name);
+    const component = nodesNamed(context, file, name).find((n) => n.kind === 'component' && n.name === name);
     return component ? component.id : null;
   };
 

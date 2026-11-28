@@ -20,6 +20,7 @@ import { indexParseBudgetMs, parseTimeoutResult } from '../parse-budget';
 import { EXTRACTORS } from '../languages';
 import { getKernel, kernelSupports } from './loader';
 import { decodeExtractBuffers } from './decode';
+import { pushAll } from '../../utils';
 import {
   KERNEL_ABI_VERSION as LAYOUT_ABI,
   META as LAYOUT_META,
@@ -324,7 +325,7 @@ export function materializeKernelResult(
   );
   decoded.durationMs = result.durationMs;
   // References read beside the tables (a CommonJS `require`) ride on the transport.
-  if (result.unresolvedReferences.length > 0) decoded.unresolvedReferences.push(...result.unresolvedReferences);
+  if (result.unresolvedReferences.length > 0) pushAll(decoded.unresolvedReferences, result.unresolvedReferences);
   return decoded;
 }
 
@@ -355,7 +356,7 @@ export function tryKernelExtract(
     if (keepsReExportsAsWritten(source, pre, language)) restoreReExportSignatures(result, source);
     POST_PASSES[language]?.(result, source);
     // Read beside the tables, as TreeSitterExtractor does (a CommonJS `require`).
-    result.unresolvedReferences.push(...commonJsRequireRefs(filePath, source, language));
+    pushAll(result.unresolvedReferences, commonJsRequireRefs(filePath, source, language));
     result.durationMs = Date.now() - t0;
     return result;
   } catch (err) {
