@@ -971,9 +971,10 @@ function hasCppParameterSyntax(params: string): boolean {
  *
  * An Objective-C header — an `#import`, or an `@` anywhere in its code
  * (`@interface`, `@"…"`, `@[…]`) — is left alone: its generics and block
- * parameters look like C++, and {@link looksLikeObjc} only samples the head of
- * the file. A C header that declares C++ this way in an `#ifdef __cplusplus`
- * section reads as C++, as one with a class or a template there already does.
+ * parameters look like C++; headers without an Objective-C declaration should
+ * not be pulled into C++ by these shapes either. A C header that declares C++
+ * this way in an `#ifdef __cplusplus` section reads as C++, as one with a
+ * class or a template there already does.
  */
 export function findCppDeclarationSyntax(source: string): string | null {
   if (/^[ \t]*#[ \t]*import\b/m.test(source)) return null;
@@ -1005,8 +1006,8 @@ export function findCppDeclarationSyntax(source: string): string | null {
  * Heuristic: does a .h file contain Objective-C constructs?
  */
 function looksLikeObjc(source: string): boolean {
-  const sample = source.substring(0, 8192);
-  return /@(?:interface|implementation|protocol|synthesize)\b/.test(sample);
+  // 生成头的兼容宏可能超过 8 KB；检查完整声明区，但不把注释、字符串或宏体当作声明。
+  return /@(?:interface|implementation|protocol|synthesize)\b/.test(cDeclarationView(source));
 }
 
 /**

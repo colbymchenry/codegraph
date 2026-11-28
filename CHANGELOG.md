@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Objective-C declarations in generated headers are indexed even after a long compatibility preamble, without treating examples in comments or strings as code.
+
 
 ## [1.6.5] - 2026-11-28
 
