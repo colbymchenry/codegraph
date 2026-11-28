@@ -967,6 +967,15 @@ Framework routing is validated the same way, on a canonical app per framework: E
 
 **Very large repositories (hundreds of thousands of files), or a large `.codegraph/codegraph.db-wal` file** — The `-wal` file is SQLite's write-ahead log: writes waiting to be folded into `codegraph.db`. While a big index is being built, CodeGraph lets it grow in proportion to the index (soft threshold = the larger of 256 MB and a quarter of the index size, up to 2 GB) before folding it back, because folding too often is what made large indexes slow on ordinary disks. At rest it is trimmed to 64 MB, and a leftover from a killed session is folded and trimmed the next time the project opens — the index itself has no size limit. Two environment variables tune this: `CODEGRAPH_WAL_VALVE_MB` (the soft threshold during indexing) and `CODEGRAPH_WAL_HEAL_MB` (the resting size and the trim threshold). `CODEGRAPH_WAL_VALVE_DEBUG=1` prints every decision to stderr.
 
+## Agent Plugin
+
+This repo also ships an agent-agnostic plugin marketplace at
+[`.agents/plugins/marketplace.json`](.agents/plugins/marketplace.json). It registers
+[`plugins/codegraph`](plugins/codegraph): [agent skills](https://agentskills.io/) for setup,
+exploring code and running affected tests, plus an MCP config for `codegraph serve --mcp`.
+Codex and Claude Code manifests are in the plugin directory. You still need the CLI
+installed and each project indexed with `codegraph init`.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) to build from source, test a change and prepare a pull request. The [documentation index](docs/README.md) links to the project's guides and design notes.

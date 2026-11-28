@@ -1,0 +1,45 @@
+{
+  "name": "codegraph",
+  "version": "1.0.0",
+  "description": "Agent skills for setting up CodeGraph, answering code questions with codegraph_explore and the CLI, and running only affected tests, plus the CodeGraph MCP server.",
+  "author": {
+    "name": "Colby McHenry",
+    "url": "https://colbymchenry.github.io/codegraph/"
+  },
+  "homepage": "https://colbymchenry.github.io/codegraph/",
+  "repository": "https://github.com/colbymchenry/codegraph",
+  "license": "MIT",
+  "keywords": [
+    "codegraph",
+    "code-intelligence",
+    "knowledge-graph",
+    "tree-sitter",
+    "call-graph",
+    "impact-analysis",
+    "mcp",
+    "agent-skills"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "CodeGraph",
+    "shortDescription": "Local code knowledge graph",
+    "longDescription": "Skills for CodeGraph, the pre-indexed, auto-syncing code knowledge graph for coding agents. Covers installing the CLI and wiring agents, indexing projects and tuning codegraph.json, answering how-does-this-work, who-calls and blast-radius questions with the codegraph_explore MCP tool or CLI (explore, callers, callees, impact, files, cycles), and running only the tests codegraph affected reports. Bundles the codegraph serve --mcp server. 100% local.",
+    "developerName": "Colby McHenry",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://colbymchenry.github.io/codegraph/",
+    "defaultPrompt": [
+      "Index this repo with CodeGraph",
+      "How does a request reach the database here?",
+      "Which tests are affected by my current diff?"
+    ],
+    "brandColor": "#16150F",
+    "composerIcon": "./assets/logo.png",
+    "logo": "./assets/logo.png"
+  }
+}
