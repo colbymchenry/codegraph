@@ -12,7 +12,7 @@ import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { ExtractionError, Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'sql' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -101,6 +101,9 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.yaml': 'yaml',
   // Twig templates (file-level tracking only, no symbol extraction)
   '.twig': 'twig',
+  // SQL (file-level tracking only; the Supabase resolver reads migrations
+  // without a grammar — see resolution/frameworks/supabase-sql.ts)
+  '.sql': 'sql',
   '.rb': 'ruby',
   '.rake': 'ruby',
   '.swift': 'swift',
@@ -1060,7 +1063,7 @@ export function isGrammarLoaded(language: Language): boolean {
  * indexed rather than skipped, so it must stay in sync with that branch.
  */
 export function isFileLevelOnlyLanguage(language: Language): boolean {
-  return language === 'yaml' || language === 'twig' || language === 'properties';
+  return language === 'yaml' || language === 'twig' || language === 'properties' || language === 'sql';
 }
 
 /**
@@ -1171,6 +1174,7 @@ export function getLanguageDisplayName(language: Language): string {
     twig: 'Twig',
     xml: 'XML',
     properties: 'Java properties',
+    sql: 'SQL',
     cfml: 'CFML',
     cfscript: 'CFScript',
     cfquery: 'CFQuery (SQL)',

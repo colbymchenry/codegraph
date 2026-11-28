@@ -38,6 +38,7 @@ import { expoRouterResolver } from './expo-router';
 import { fabricViewResolver } from './fabric';
 import { cicsResolver } from './cics';
 import { terraformResolver } from './terraform';
+import { supabaseResolver, supabaseFunctionsResolver, supabaseTablesResolver, supabaseRulesResolver } from './supabase';
 
 /**
  * All registered framework resolvers
@@ -105,6 +106,11 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   cicsResolver,
   // Terraform / OpenTofu — disambiguate var/local/module/resource refs to same-dir module
   terraformResolver,
+  // Supabase — migrations read into SQL nodes; `supabase.rpc('x')` / `.from('t')` bound to them
+  supabaseFunctionsResolver,
+  supabaseTablesResolver,
+  supabaseRulesResolver,
+  supabaseResolver,
 ];
 
 /**
