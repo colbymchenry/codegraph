@@ -168,6 +168,66 @@ def test_go():
     expect(targets('test_go', 'tests/test_tools.py', 'calls')).toEqual(['go@lib/nsp/tools.py']);
   });
 
+  it.each([
+    { source: 'pytest', config: '[tool.pytest.ini_options]\npythonpath = ["server"]\n', resolves: true },
+    { source: 'Pyright', config: '[tool.pyright]\nextraPaths = ["server"]\n', resolves: true },
+    { source: 'BasedPyright', config: '[tool.basedpyright]\nextraPaths = ["server"]\n', resolves: true },
+    { source: 'unrelated tool', config: '[tool.other]\nextraPaths = ["server"]\n', resolves: false },
+  ])('reads Python import roots from pyproject.toml for $source', async ({ config, resolves }) => {
+    write({
+      'pyproject.toml': config,
+      'server/helpers.py': 'def check(x):\n    return x\n',
+      'tests/test_attr.py': `import helpers
+from helpers import check
+
+
+def test_attr():
+    assert helpers.check(1) == 1
+
+
+def test_name():
+    assert check(1) == 1
+`,
+    });
+    cg = await CodeGraph.init(tempDir, { index: true });
+
+    const expected = resolves ? ['check@server/helpers.py'] : [];
+    expect(targets('test_attr', 'tests/test_attr.py', 'calls')).toEqual(expected);
+    expect(targets('test_name', 'tests/test_attr.py', 'calls')).toEqual(expected);
+  });
+
+  it('does not promote a Pyright execution environment path to a project-wide root', async () => {
+    write({
+      'pyproject.toml': '[tool.pyright]\ninclude = ["app"]\n[[tool.pyright.executionEnvironments]]\nroot = "tests"\nextraPaths = ["server"]\n',
+      'server/helpers.py': 'def check():\n    pass\n',
+      'app/main.py': 'import helpers\n',
+    });
+    cg = await CodeGraph.init(tempDir, { index: true });
+    expect(targets('main.py', 'app/main.py', 'imports')).not.toContain('helpers.py@server/helpers.py');
+  });
+
+  it('keeps global Pyright roots when an execution environment follows', async () => {
+    write({
+      'pyproject.toml': '[tool.pyright]\nextraPaths = ["common"]\n[[tool.pyright.executionEnvironments]]\nroot = "tests"\nextraPaths = ["server"]\n',
+      'common/shared.py': 'def check():\n    pass\n',
+      'server/helpers.py': 'def check():\n    pass\n',
+      'app/main.py': 'import helpers\nimport shared\n',
+    });
+    cg = await CodeGraph.init(tempDir, { index: true });
+    expect(targets('main.py', 'app/main.py', 'imports')).toContain('shared.py@common/shared.py');
+    expect(targets('main.py', 'app/main.py', 'imports')).not.toContain('helpers.py@server/helpers.py');
+  });
+
+  it('reads paths after closing brackets inside a TOML array comment', async () => {
+    write({
+      'pyproject.toml': '[tool.pytest.ini_options]\npythonpath = [\n  "src", # see [docs]\n  "lib",\n]\n',
+      'lib/helpers.py': 'def check():\n    pass\n',
+      'tests/test_app.py': 'from helpers import check\n\ndef test_check():\n    check()\n',
+    });
+    cg = await CodeGraph.init(tempDir, { index: true });
+    expect(targets('test_check', 'tests/test_app.py', 'calls')).toEqual(['check@lib/helpers.py']);
+  });
+
   it('resolves a namespace package from inside itself', async () => {
     write({
       'backend/myapp/models.py': 'def fetch():\n    return 1\n',
